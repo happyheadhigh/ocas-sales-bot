@@ -327,6 +327,10 @@ client.on('messageCreate', async (msg) => {
             '**!saleson / !salesoff** — Resume / pause pings\n\n' +
             '**!salesstatus** — Show bot status\n\n' +
             '**!saleshelp** — This message\n\n' +
+            '**— Testing commands —**\n' +
+            '**!lastsale** — Post the most recent sale right now\n' +
+            '**!recentsales [N]** — Post last N sales (default 5, max 10)\n' +
+            '**!sale #1234** — Post most recent sale for a specific token\n\n' +
             '*Trait names and values are case-insensitive.*'
           )
       ],
@@ -390,6 +394,72 @@ client.on('messageCreate', async (msg) => {
       `• OpenSea key: ${OPENSEA_KEY ? 'Set ✅' : 'Not set ⚠️'}\n` +
       `• Image cache: ${imageCache.size} tokens`
     );
+    return;
+  }
+
+  // !lastsale — fetch the single most recent sale (great for testing image display)
+  if (cmd === 'lastsale') {
+    await msg.reply('🔍 Fetching most recent sale...');
+    try {
+      const url = `https://api.opensea.io/api/v2/events/collection/${OS_SLUG}?event_type=sale&limit=1`;
+      const r   = await fetch(url, { headers: osHeaders() });
+      if (!r.ok) { await msg.reply(`❌ OpenSea error: ${r.status}`); return; }
+      const j     = await r.json();
+      const sales = j.asset_events || [];
+      if (!sales.length) { await msg.reply('No sales found.'); return; }
+      const embed = await buildEmbed(sales[0]);
+      embed.setTitle(`🧪 TEST — ${embed.data.title}`);
+      await msg.reply({ embeds: [embed] });
+    } catch (e) {
+      await msg.reply(`❌ Error: ${e.message}`);
+    }
+    return;
+  }
+
+  // !recentsales [count] — show last N sales (default 5, max 10)
+  if (cmd === 'recentsales') {
+    const count = Math.min(parseInt(parts[1]) || 5, 10);
+    await msg.reply(`🔍 Fetching last ${count} sales...`);
+    try {
+      const url = `https://api.opensea.io/api/v2/events/collection/${OS_SLUG}?event_type=sale&limit=${count}`;
+      const r   = await fetch(url, { headers: osHeaders() });
+      if (!r.ok) { await msg.reply(`❌ OpenSea error: ${r.status}`); return; }
+      const j     = await r.json();
+      const sales = j.asset_events || [];
+      if (!sales.length) { await msg.reply('No sales found.'); return; }
+      for (const sale of sales.reverse()) {
+        const embed = await buildEmbed(sale);
+        embed.setTitle(`🧪 TEST — ${embed.data.title}`);
+        await msg.channel.send({ embeds: [embed] });
+        await new Promise(res => setTimeout(res, 800));
+      }
+    } catch (e) {
+      await msg.reply(`❌ Error: ${e.message}`);
+    }
+    return;
+  }
+
+  // !sale #ID — fetch a specific token's most recent sale
+  if (cmd === 'sale') {
+    const tokenId = parts[1]?.replace('#', '');
+    if (!tokenId || isNaN(tokenId)) {
+      await msg.reply('Usage: `!sale 1234` or `!sale #1234`');
+      return;
+    }
+    await msg.reply(`🔍 Fetching sale for #${tokenId}...`);
+    try {
+      const url = `https://api.opensea.io/api/v2/events/chain/ethereum/contract/${CONTRACT}/nfts/${tokenId}?event_type=sale&limit=1`;
+      const r   = await fetch(url, { headers: osHeaders() });
+      if (!r.ok) { await msg.reply(`❌ OpenSea error: ${r.status}`); return; }
+      const j     = await r.json();
+      const sales = j.asset_events || [];
+      if (!sales.length) { await msg.reply(`No sales found for #${tokenId}.`); return; }
+      const embed = await buildEmbed(sales[0]);
+      embed.setTitle(`🧪 TEST — ${embed.data.title}`);
+      await msg.reply({ embeds: [embed] });
+    } catch (e) {
+      await msg.reply(`❌ Error: ${e.message}`);
+    }
     return;
   }
 });
