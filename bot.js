@@ -616,27 +616,76 @@ client.on('guildCreate', async (guild)=>{
       .sort((a,b)=>a.position-b.position).first();
     if(!channel) return;
 
-    const desc='I post NFT sale and listing alerts with token images, price, traits, and links.\n\nWorks with any OpenSea collection.';
-    const setup=[
-      '**1.** `/setup channel:#sales collection:your-slug contract:0x...`',
-      '**2.** `/setlistings channel:#listings` (optional separate listings channel)',
-      '**3.** `/lastsale` to test',
+    const desc=[
+      'I post NFT **sales** and **listings** alerts with token images, price, traits, buyer/seller links, and more.',
       '',
-      'Thats it! Sales and listings post automatically.'
-    ].join('\n');
-    const cmds=[
-      '`/salesfilter trait:Type value:Zombie` - Auto-post only matching sales',
-      '`/listingfilter trait:Background value:Blue` - Auto-post only matching listings',
-      '`/myalert` - Get personal DMs for matching sales/listings',
-      '`/traitfind` - Search recent sales history by trait',
-      '`/listings` - Show recent new listings',
-      '`/help` - All commands'
+      'Works with **any OpenSea collection**. Each server configures independently.'
     ].join('\n');
 
-    await channel.send({embeds:[new EmbedBuilder().setTitle('Thanks for adding the NFT Sales Bot!').setColor(0x2dd4bf)
+    const setup=[
+      '**Step 1 - Sales channel:**',
+      '`/setup channel:#all-sales collection:your-slug contract:0x...`',
+      '',
+      '**Step 2 - Listings channel:**',
+      '`/setlistings channel:#all-listings`',
+      '',
+      '**Step 3 - Test it:**',
+      '`/lastsale` and `/listings`',
+      '',
+      'Thats it! Both channels will auto-post immediately.'
+    ].join('\n');
+
+    const channelTip=[
+      'Recommended 4-channel setup:',
+      '',
+      '**#all-sales** - auto-posts every sale (make read-only for members)',
+      '**#all-listings** - auto-posts every listing (make read-only for members)',
+      '**#sales-search** - members use `/traitfind`, `/recentsales`, `/sale`',
+      '**#listings-search** - members use `/listings`',
+      '',
+      'To make a channel read-only: Channel Settings > Permissions > @everyone > disable Send Messages'
+    ].join('\n');
+
+    const personalAlerts=[
+      'Anyone can set personal DM alerts with `/myalert`.',
+      'They get a private DM when a matching sale or listing happens.',
+      '',
+      '`/myalert trait:Type value:Zombie sales:true listings:true`',
+      '- DM me whenever a Zombie sells or gets listed',
+      '',
+      '`/myalert trait:Background value:Blue listings:true sales:false`',
+      '- DM me only when a Blue Background token gets listed',
+      '',
+      '`/myalertclear` - Remove your alert',
+      '`/myalertstatus` - See your current alert'
+    ].join('\n');
+
+    const serverFilters=[
+      'Admins can filter what auto-posts to each channel:',
+      '',
+      '`/salesfilter trait:Type value:Zombie`',
+      'Only post sales where Type = Zombie',
+      '',
+      '`/listingfilter trait:Background value:Blue`',
+      'Only post listings where Background = Blue',
+      '',
+      '`/clearfilters` - Remove all server filters',
+      '`/status` - See current configuration'
+    ].join('\n');
+
+    const embed = new EmbedBuilder()
+      .setTitle('Thanks for adding the NFT Sales Bot!')
+      .setColor(0x2dd4bf)
       .setDescription(desc)
-      .addFields({name:'Quick Setup',value:setup,inline:false},{name:'Key Commands',value:cmds,inline:false})
-      .setFooter({text:'Use /help anytime - works with any OpenSea collection'})]});
+      .addFields(
+        {name:'Quick Setup (2 minutes)', value:setup, inline:false},
+        {name:'Recommended Channel Layout', value:channelTip, inline:false},
+        {name:'Personal DM Alerts (anyone can use)', value:personalAlerts, inline:false},
+        {name:'Server-Wide Filters (admin only)', value:serverFilters, inline:false}
+      )
+      .setFooter({text:'Use /help anytime to see all commands'});
+
+    await channel.send({embeds:[embed]});
   }catch(e){ console.warn('[Welcome]',guild.name,e.message); }
 });
 
