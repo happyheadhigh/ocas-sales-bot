@@ -7,10 +7,9 @@
     "start": "node bot.js"
   },
   "dependencies": {
-    "@sparticuz/chromium": "^138.0.2",
-    "discord.js": "^14.14.0",
-    "dotenv": "^16.4.5",
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.3.1",
     "node-fetch": "^2.7.0",
-    "puppeteer-core": "^24.7.1"
+    "sharp": "^0.34.5"
   }
 }

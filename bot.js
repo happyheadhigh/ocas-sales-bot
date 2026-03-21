@@ -1,21 +1,15 @@
 /**
- * OCAS Discord Sales Bot — FULL DEBUG VERSION
+ * OCAS Discord Sales Bot — Sharp Renderer Version
  * ---------------------------------------------------------
- * Includes:
- * - Reliable channel fetching for auto-posts
- * - Poll locking
- * - Persistent lastSeenSaleId via state.json
- * - Automatic SVG / base64 SVG -> PNG conversion using Puppeteer
- * - Debug logging for image resolution pipeline
- */
+ * Uses browser-free SVG -> PNG rendering with sharp
+
 
 require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
 const fetch = require('node-fetch');
-const chromium = require('@sparticuz/chromium');
-const puppeteer = require('puppeteer-core');
+const sharp = require('sharp');
 const {
   Client,
   GatewayIntentBits,
@@ -155,6 +149,10 @@ function stripDataUriPrefix(dataUri) {
   return idx === -1 ? dataUri : dataUri.slice(idx + 1);
 }
 
+function dedupeArray(arr) {
+  return [...new Set(arr.filter(Boolean))];
+}
+
 // ── Data URI / metadata helpers ──────────────────────────────────────────────
 function extractSvgFromDataUri(input) {
   if (!input || typeof input !== 'string') return null;
@@ -217,119 +215,28 @@ async function fetchText(url) {
   return r.text();
 }
 
-// ── Puppeteer browser / SVG rendering ────────────────────────────────────────
-let browserPromise = null;
+// ── Sharp SVG rendering ──────────────────────────────────────────────────────
+async function renderSvgToPngBuffer(svgString, tokenId = 'unknown') {
+  console.log(`[Render] Starting sharp SVG -> PNG render for #${tokenId}`);
 
-async function getBrowser() {
-  if (!browserPromise) {
-    browserPromise = puppeteer.launch({
-      args: chromium.args,
-      defaultViewport: {
-        width: 1000,
-        height: 1000,
-        deviceScaleFactor: 2,
-      },
-      executablePath: await chromium.executablePath(),
-      headless: true,
-    });
-  }
-  return browserPromise;
+  const svgBuffer = Buffer.from(svgString, 'utf8');
+
+  const png = await sharp(svgBuffer, { density: 1200 })
+    .resize(1000, 1000, {
+      fit: 'contain',
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png()
+    .toBuffer();
+
+  console.log(`[Render] Sharp SVG -> PNG success for #${tokenId}`);
+  return png;
 }
 
-async function renderSvgToPngBuffer(svgString) {
-  console.log('[Render] Starting SVG -> PNG render');
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-
-  try {
-    await page.setViewport({
-      width: 1000,
-      height: 1000,
-      deviceScaleFactor: 2,
-    });
-
-    const html = `
-      <!doctype html>
-      <html>
-        <head>
-          <meta charset="utf-8" />
-          <style>
-            html, body {
-              margin: 0;
-              padding: 0;
-              width: 1000px;
-              height: 1000px;
-              background: transparent;
-              overflow: hidden;
-            }
-            body {
-              display: flex;
-              align-items: center;
-              justify-content: center;
-            }
-            #wrap {
-              width: 1000px;
-              height: 1000px;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              background: transparent;
-            }
-            #wrap svg {
-              width: 1000px;
-              height: 1000px;
-              display: block;
-            }
-          </style>
-        </head>
-        <body>
-          <div id="wrap">${svgString}</div>
-        </body>
-      </html>
-    `;
-
-    await page.setContent(html, {
-      waitUntil: 'networkidle0',
-    });
-
-    await page.evaluate(async () => {
-      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-
-      const images = Array.from(document.images || []);
-      await Promise.all(
-        images.map((img) => {
-          if (img.complete) return Promise.resolve();
-          return new Promise((resolve) => {
-            img.onload = resolve;
-            img.onerror = resolve;
-          });
-        })
-      );
-
-      await wait(500);
-    });
-
-    const el = await page.$('#wrap');
-    if (!el) {
-      throw new Error('SVG wrapper not found in browser render');
-    }
-
-    const png = await el.screenshot({
-      type: 'png',
-      omitBackground: true,
-    });
-
-    console.log('[Render] SVG -> PNG render success');
-    return png;
-  } finally {
-    await page.close();
-  }
-}
-
-async function svgUrlToPngBuffer(svgUrl) {
+async function svgUrlToPngBuffer(svgUrl, tokenId = 'unknown') {
   console.log('[Render] Fetching SVG URL:', svgUrl.slice(0, 180));
   const svgText = await fetchText(svgUrl);
-  return renderSvgToPngBuffer(svgText);
+  return renderSvgToPngBuffer(svgText, tokenId);
 }
 
 // ── OpenSea NFT lookup ───────────────────────────────────────────────────────
@@ -345,7 +252,7 @@ async function fetchNftFromOpenSea(tokenId) {
 }
 
 function collectImageCandidates(sale, nft) {
-  return [
+  return dedupeArray([
     sale?.nft?.display_image_url,
     sale?.nft?.image_url,
     sale?.nft?.image_preview_url,
@@ -359,10 +266,10 @@ function collectImageCandidates(sale, nft) {
     nft?.token_uri,
     nft?.tokenUri,
     nft?.image_original_url,
-  ].filter(Boolean);
+  ]);
 }
 
-async function tryResolveFromMetadataSource(source) {
+async function tryResolveFromMetadataSource(source, tokenId) {
   console.log(
     '[Image] Trying source:',
     typeof source === 'string' ? source.slice(0, 180) : source
@@ -371,7 +278,7 @@ async function tryResolveFromMetadataSource(source) {
   const directSvg = extractSvgFromDataUri(source);
   if (directSvg) {
     console.log('[Image] Found direct SVG data URI / raw SVG');
-    const png = await renderSvgToPngBuffer(directSvg);
+    const png = await renderSvgToPngBuffer(directSvg, tokenId);
     console.log('[Image] Successfully rendered direct SVG to PNG');
     return { type: 'pngBuffer', value: png };
   }
@@ -390,7 +297,7 @@ async function tryResolveFromMetadataSource(source) {
     const nestedSvg = extractSvgFromDataUri(jsonFromDataUri.image);
     if (nestedSvg) {
       console.log('[Image] Found nested SVG inside JSON data URI');
-      const png = await renderSvgToPngBuffer(nestedSvg);
+      const png = await renderSvgToPngBuffer(nestedSvg, tokenId);
       console.log('[Image] Successfully rendered nested SVG to PNG');
       return { type: 'pngBuffer', value: png };
     }
@@ -402,7 +309,7 @@ async function tryResolveFromMetadataSource(source) {
 
     if (isSvg(jsonFromDataUri.image) && isHttpUrl(jsonFromDataUri.image)) {
       console.log('[Image] Found SVG URL inside JSON data URI');
-      const png = await svgUrlToPngBuffer(jsonFromDataUri.image);
+      const png = await svgUrlToPngBuffer(jsonFromDataUri.image, tokenId);
       console.log('[Image] Successfully rendered SVG URL to PNG');
       return { type: 'pngBuffer', value: png };
     }
@@ -415,7 +322,7 @@ async function tryResolveFromMetadataSource(source) {
 
   if (isSvg(source) && isHttpUrl(source)) {
     console.log('[Image] Found direct SVG URL');
-    const png = await svgUrlToPngBuffer(source);
+    const png = await svgUrlToPngBuffer(source, tokenId);
     console.log('[Image] Successfully rendered direct SVG URL to PNG');
     return { type: 'pngBuffer', value: png };
   }
@@ -437,7 +344,7 @@ async function tryResolveFromMetadataSource(source) {
           const nestedSvg = extractSvgFromDataUri(json.image);
           if (nestedSvg) {
             console.log('[Image] Found nested SVG inside fetched JSON');
-            const png = await renderSvgToPngBuffer(nestedSvg);
+            const png = await renderSvgToPngBuffer(nestedSvg, tokenId);
             console.log('[Image] Successfully rendered fetched JSON SVG to PNG');
             return { type: 'pngBuffer', value: png };
           }
@@ -449,7 +356,7 @@ async function tryResolveFromMetadataSource(source) {
 
           if (isSvg(json.image) && isHttpUrl(json.image)) {
             console.log('[Image] Found SVG URL inside fetched JSON');
-            const png = await svgUrlToPngBuffer(json.image);
+            const png = await svgUrlToPngBuffer(json.image, tokenId);
             console.log('[Image] Successfully rendered fetched JSON SVG URL to PNG');
             return { type: 'pngBuffer', value: png };
           }
@@ -460,7 +367,7 @@ async function tryResolveFromMetadataSource(source) {
 
       if (text.trim().startsWith('<svg')) {
         console.log('[Image] HTTP source returned raw SVG');
-        const png = await renderSvgToPngBuffer(text);
+        const png = await renderSvgToPngBuffer(text, tokenId);
         console.log('[Image] Successfully rendered raw fetched SVG to PNG');
         return { type: 'pngBuffer', value: png };
       }
@@ -498,7 +405,7 @@ async function resolveImageAsset(sale) {
 
   for (const candidate of candidates) {
     try {
-      const resolved = await tryResolveFromMetadataSource(candidate);
+      const resolved = await tryResolveFromMetadataSource(candidate, tokenId);
       if (resolved) {
         imageCache.set(tokenId, resolved);
         console.log(`[Image] #${tokenId} — resolved as ${resolved.type}`);
@@ -867,27 +774,6 @@ client.on('messageCreate', async (msg) => {
 
     return;
   }
-});
-
-// ── Browser cleanup ──────────────────────────────────────────────────────────
-async function closeBrowser() {
-  if (!browserPromise) return;
-  try {
-    const browser = await browserPromise;
-    await browser.close();
-  } catch (e) {
-    console.warn('[Browser] Failed to close cleanly:', e.message);
-  }
-}
-
-process.on('SIGINT', async () => {
-  await closeBrowser();
-  process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-  await closeBrowser();
-  process.exit(0);
 });
 
 // ── Process safety ───────────────────────────────────────────────────────────
