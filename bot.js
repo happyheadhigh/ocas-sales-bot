@@ -528,6 +528,63 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
+  // ── /traitfind ─────────────────────────────────────────────────────────────
+  // Search recent sales history for a specific trait without touching auto-post filters
+  if(commandName === 'traitfind'){
+    const slug  = interaction.options.getString('collection') || config.slug;
+    const trait = interaction.options.getString('trait').toLowerCase().trim();
+    const value = interaction.options.getString('value').toLowerCase().trim();
+    const want  = Math.min(interaction.options.getInteger('count') || 5, 10);
+    if(!slug) return interaction.reply({ content:'⚠️ Provide a collection or run `/setup` first.', ephemeral:true });
+
+    await interaction.deferReply();
+    try{
+      const matched = [];
+      let cursor    = null;
+      let pages     = 0;
+      const MAX_PAGES = 15; // search up to 1500 sales back
+
+      await interaction.editReply(`🔍 Searching sales for **${trait}: ${value}**…`);
+
+      while(matched.length < want && pages < MAX_PAGES){
+        const qs  = new URLSearchParams({ event_type:'sale', limit:'100' });
+        if(cursor) qs.set('next', cursor);
+        const url = `https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?${qs}`;
+        const r   = await fetch(url, { headers: osHeaders() });
+        if(!r.ok) throw new Error(`OpenSea ${r.status}`);
+        const j   = await r.json();
+        const sales = j.asset_events || [];
+        if(!sales.length) break;
+
+        for(const sale of sales){
+          if(matched.length >= want) break;
+          const traits = sale.nft?.traits || [];
+          const lookup = {};
+          for(const t of traits) lookup[t.trait_type?.toLowerCase()] = String(t.value).toLowerCase();
+          if(lookup[trait] === value) matched.push(sale);
+        }
+
+        cursor = j.next || null;
+        if(!cursor) break;
+        pages++;
+      }
+
+      if(!matched.length){
+        await interaction.editReply(`No sales found with **${trait}: ${value}** in the last ${pages * 100} sales.`);
+        return;
+      }
+
+      await interaction.editReply(`✅ Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait}: ${value}**:`);
+      const cfg = { ...config, slug };
+      for(const sale of matched){
+        const embed = await buildEmbed(sale, cfg, true);
+        await sendEmbed(interaction.channel, embed);
+        await new Promise(res => setTimeout(res, 800));
+      }
+    }catch(e){ await interaction.editReply(`❌ Error: ${e.message}`); }
+    return;
+  }
+
   // ── /sale ──────────────────────────────────────────────────────────────────
   if(commandName === 'sale'){
     const tokenId  = interaction.options.getString('token').replace('#','');

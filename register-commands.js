@@ -77,6 +77,14 @@ const commands = [
     .addStringOption(o => o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
 
   new SlashCommandBuilder()
+    .setName('traitfind')
+    .setDescription('Search recent sales history for a specific trait — no filter changes needed')
+    .addStringOption(o => o.setName('trait').setDescription('Trait name (e.g. Type, Background, Hair)').setRequired(true))
+    .addStringOption(o => o.setName('value').setDescription('Trait value (e.g. Zombie, Blue, Funky Teal)').setRequired(true))
+    .addIntegerOption(o => o.setName('count').setDescription('How many matching sales to find (max 10, default 5)').setRequired(false).setMinValue(1).setMaxValue(10))
+    .addStringOption(o => o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
+
+  new SlashCommandBuilder()
     .setName('help')
     .setDescription('Show all available commands'),
 ].map(c => c.toJSON());
