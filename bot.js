@@ -293,59 +293,66 @@ function matchesFilters(sale) {
   return true;
 }
 
-// ── Build Discord embed ───────────────────────────────────────────────────────
+// ── Build Discord embed — compact side-by-side layout ────────────────────────
+// Layout: thumbnail image (left) + all info (right) so multiple sales fit on screen
 async function buildEmbed(sale) {
   const id       = sale.nft?.identifier;
   const name     = sale.nft?.name || `#${id}`;
   const ethPrice = formatEth(sale);
-  const buyer    = shortAddr(sale.buyer);
-  const seller   = shortAddr(sale.seller);
-  const timeStr  = sale.event_timestamp ? timeSince(sale.event_timestamp) : '';
   const osUrl    = `https://opensea.io/assets/ethereum/${CONTRACT}/${id}`;
   const meUrl    = `https://magiceden.io/collections/ethereum/on-chain_all_stars/${id}`;
   const tvUrl    = `https://traitview.com/#${id}`;
+  const timeStr  = sale.event_timestamp ? timeSince(sale.event_timestamp) : '';
+
+  // Buyer/seller as clickable OpenSea profile links
+  const buyerAddr  = sale.buyer  || 'unknown';
+  const sellerAddr = sale.seller || 'unknown';
+  const buyerLink  = buyerAddr  !== 'unknown' ? `[${shortAddr(buyerAddr)}](https://opensea.io/${buyerAddr})`   : 'unknown';
+  const sellerLink = sellerAddr !== 'unknown' ? `[${shortAddr(sellerAddr)}](https://opensea.io/${sellerAddr})` : 'unknown';
 
   const embed = new EmbedBuilder()
-    .setTitle(`🟢  Sale — On-Chain All Stars ${name}`)
+    .setTitle(`🟢 OCAS ${name} — ◆ ${ethPrice ? ethPrice + ' ETH' : '—'}`)
     .setColor(0x2dd4bf)
     .setURL(osUrl)
     .setFooter({ text: `OCAS Sales Bot • traitview.com${timeStr ? ' • ' + timeStr : ''}` })
     .setTimestamp();
 
-  // Resolve image — may return a URL string or a PNG buffer
+  // Use setThumbnail for compact side-by-side layout (image on right, text on left)
+  // _imageResult stores the resolved image; caller handles attachment if buffer
   const imageResult = await resolveImage(sale);
-  // We'll return the result alongside the embed so the caller can attach files
   embed._imageResult = imageResult;
 
+  // Buyer / Seller / Price all inline on one row
   embed.addFields(
-    { name: 'Price',  value: ethPrice ? `◆ ${ethPrice} ETH` : '—', inline: true },
-    { name: 'Buyer',  value: buyer,  inline: true },
-    { name: 'Seller', value: seller, inline: true },
+    { name: '◆ Price',  value: ethPrice ? `${ethPrice} ETH` : '—', inline: true },
+    { name: '🛒 Buyer',  value: buyerLink,  inline: true },
+    { name: '💰 Seller', value: sellerLink, inline: true },
   );
 
-  // Traits
+  // Traits — compact: all on one inline field so they sit beside the thumbnail
   const nftTraits = sale.nft?.traits || [];
   if (nftTraits.length > 0) {
     const traitLines = nftTraits
       .slice(0, 12)
       .map(t => `**${t.trait_type}**: ${t.value}`)
       .join('\n');
-    embed.addFields({ name: 'Traits', value: traitLines, inline: false });
+    embed.addFields({ name: 'Traits', value: traitLines, inline: true });
   }
 
-  // Active filter note
-  if (traitFilters.size > 0) {
-    const filterStr = [...traitFilters.entries()]
-      .map(([k, v]) => `${k}: ${v}`)
-      .join(' • ');
-    embed.addFields({ name: '🔍 Filter active', value: filterStr, inline: false });
-  }
-
+  // Links row
   embed.addFields({
     name: 'Links',
     value: `[OpenSea](${osUrl}) • [Magic Eden](${meUrl}) • [TraitView](${tvUrl})`,
     inline: false,
   });
+
+  // Active filter note (only shown when filter is set)
+  if (traitFilters.size > 0) {
+    const filterStr = [...traitFilters.entries()]
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(' • ');
+    embed.addFields({ name: '🔍 Filter', value: filterStr, inline: false });
+  }
 
   return embed;
 }
@@ -407,12 +414,12 @@ async function pollSales() {
       delete embed._imageResult;
 
       if (imageResult?.type === 'buffer') {
-        // Attach PNG file and reference it in the embed
+        // Attach as file; use setThumbnail for compact right-side image
         const attachment = new AttachmentBuilder(imageResult.buffer, { name: imageResult.filename });
-        embed.setImage(`attachment://${imageResult.filename}`);
+        embed.setThumbnail(`attachment://${imageResult.filename}`);
         await channel.send({ embeds: [embed], files: [attachment] });
       } else if (imageResult?.type === 'url') {
-        embed.setImage(imageResult.url);
+        embed.setThumbnail(imageResult.url);
         await channel.send({ embeds: [embed] });
       } else {
         await channel.send({ embeds: [embed] });
@@ -530,14 +537,14 @@ client.on('messageCreate', async (msg) => {
       const sales = j.asset_events || [];
       if (!sales.length) { await msg.reply('No sales found.'); return; }
       const embed = await buildEmbed(sales[0]);
-      embed.setTitle(`🧪 TEST — ${embed.data.title}`);
+      // No TEST prefix — show exactly as it would appear in a real sale
       const ir = embed._imageResult; delete embed._imageResult;
       if (ir?.type === 'buffer') {
         const att = new AttachmentBuilder(ir.buffer, { name: ir.filename });
-        embed.setImage(`attachment://${ir.filename}`);
+        embed.setThumbnail(`attachment://${ir.filename}`);
         await msg.reply({ embeds: [embed], files: [att] });
       } else {
-        if (ir?.type === 'url') embed.setImage(ir.url);
+        if (ir?.type === 'url') embed.setThumbnail(ir.url);
         await msg.reply({ embeds: [embed] });
       }
     } catch (e) {
@@ -559,14 +566,13 @@ client.on('messageCreate', async (msg) => {
       if (!sales.length) { await msg.reply('No sales found.'); return; }
       for (const sale of sales.reverse()) {
         const embed = await buildEmbed(sale);
-        embed.setTitle(`🧪 TEST — ${embed.data.title}`);
         const ir2 = embed._imageResult; delete embed._imageResult;
         if (ir2?.type === 'buffer') {
           const att2 = new AttachmentBuilder(ir2.buffer, { name: ir2.filename });
-          embed.setImage(`attachment://${ir2.filename}`);
+          embed.setThumbnail(`attachment://${ir2.filename}`);
           await msg.channel.send({ embeds: [embed], files: [att2] });
         } else {
-          if (ir2?.type === 'url') embed.setImage(ir2.url);
+          if (ir2?.type === 'url') embed.setThumbnail(ir2.url);
           await msg.channel.send({ embeds: [embed] });
         }
         await new Promise(res => setTimeout(res, 800));
@@ -593,14 +599,13 @@ client.on('messageCreate', async (msg) => {
       const sales = j.asset_events || [];
       if (!sales.length) { await msg.reply(`No sales found for #${tokenId}.`); return; }
       const embed = await buildEmbed(sales[0]);
-      embed.setTitle(`🧪 TEST — ${embed.data.title}`);
       const ir3 = embed._imageResult; delete embed._imageResult;
       if (ir3?.type === 'buffer') {
         const att3 = new AttachmentBuilder(ir3.buffer, { name: ir3.filename });
-        embed.setImage(`attachment://${ir3.filename}`);
+        embed.setThumbnail(`attachment://${ir3.filename}`);
         await msg.reply({ embeds: [embed], files: [att3] });
       } else {
-        if (ir3?.type === 'url') embed.setImage(ir3.url);
+        if (ir3?.type === 'url') embed.setThumbnail(ir3.url);
         await msg.reply({ embeds: [embed] });
       }
     } catch (e) {
