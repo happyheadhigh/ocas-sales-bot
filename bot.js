@@ -611,10 +611,10 @@ client.on('interactionCreate', async (interaction)=>{
 // ── Welcome message on server join ────────────────────────────────────────────
 client.on('guildCreate', async (guild)=>{
   try{
-    const channel=guild.channels.cache
-      .filter(c=>c.type===0&&c.permissionsFor(guild.members.me)?.has('SendMessages'))
-      .sort((a,b)=>a.position-b.position).first();
-    if(!channel) return;
+    // Send welcome DM to server owner only — keeps it private and targeted
+    const owner = await guild.fetchOwner().catch(()=>null);
+    const target = owner?.user || null;
+    if(!target) return;
 
     const desc=[
       'I post NFT **sales** and **listings** alerts with token images, price, traits, buyer/seller links, and more.',
@@ -685,7 +685,8 @@ client.on('guildCreate', async (guild)=>{
       )
       .setFooter({text:'Use /help anytime to see all commands'});
 
-    await channel.send({embeds:[embed]});
+    await target.send({embeds:[embed]});
+    console.log('[Welcome] Sent setup DM to owner of '+guild.name);
   }catch(e){ console.warn('[Welcome]',guild.name,e.message); }
 });
 
