@@ -300,8 +300,7 @@ async function buildEmbed(sale) {
   const name     = sale.nft?.name || `#${id}`;
   const ethPrice = formatEth(sale);
   const osUrl    = `https://opensea.io/assets/ethereum/${CONTRACT}/${id}`;
-  const meUrl    = `https://magiceden.io/collections/ethereum/on-chain_all_stars/${id}`;
-  const tvUrl    = `https://traitview.com/#${id}`;
+  const tvUrl    = `https://traitview.com/?jump=${id}`;
   const timeStr  = sale.event_timestamp ? timeSince(sale.event_timestamp) : '';
 
   // Buyer/seller as clickable OpenSea profile links
@@ -342,7 +341,7 @@ async function buildEmbed(sale) {
   // Links row
   embed.addFields({
     name: 'Links',
-    value: `[OpenSea](${osUrl}) • [Magic Eden](${meUrl}) • [TraitView](${tvUrl})`,
+    value: `[OpenSea](${osUrl}) • [TraitView](${tvUrl})`,
     inline: false,
   });
 
