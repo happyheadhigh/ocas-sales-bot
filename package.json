@@ -1,7 +1,7 @@
 {
   "name": "ocas-sales-bot",
   "version": "1.0.0",
-  "description": "On-Chain All Stars Discord Sales Bot — watches OpenSea v2 API and posts rich sale embeds with trait filter commands.",
+  "description": "On-Chain All Stars Discord Sales Bot with SVG image support",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
@@ -10,7 +10,8 @@
   "dependencies": {
     "discord.js": "^14.14.0",
     "dotenv": "^16.4.5",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "sharp": "^0.33.3"
   },
   "engines": {
     "node": ">=18.0.0"

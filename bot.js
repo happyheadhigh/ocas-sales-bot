@@ -24,8 +24,9 @@
  */
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const fetch = require('node-fetch');
+const sharp = require('sharp');
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -100,36 +101,61 @@ function isDiscordCompatible(url) {
          !s.startsWith('<svg');
 }
 
-// ── SVG → Discord-compatible image resolver ───────────────────────────────────
+// ── SVG → PNG converter using sharp ──────────────────────────────────────────
+// Returns a Buffer of PNG bytes from an SVG URL or data URI
+async function svgToPngBuffer(svgSource) {
+  let svgBuffer;
+
+  if (svgSource.startsWith('data:image/svg')) {
+    // data URI — decode the base64 or URL-encoded SVG directly
+    const base64 = svgSource.split(',')[1];
+    if (!base64) throw new Error('Empty data URI');
+    svgBuffer = Buffer.from(base64, 'base64');
+  } else {
+    // Remote URL — fetch the SVG bytes
+    const r = await fetch(svgSource);
+    if (!r.ok) throw new Error(`SVG fetch failed: ${r.status}`);
+    svgBuffer = Buffer.from(await r.arrayBuffer());
+  }
+
+  // Convert SVG → PNG at 500×500 using sharp
+  return sharp(svgBuffer, { density: 150 })
+    .resize(500, 500, { fit: 'contain', background: { r:15, g:20, b:28, alpha:1 } })
+    .png()
+    .toBuffer();
+}
+
+// ── Image resolver — returns { url } or { buffer, filename } ─────────────────
 // Strategy:
-//   1. Check if sale already has a usable PNG/JPG URL from OpenSea CDN
-//   2. If not (SVG/data URI), fetch the token from OpenSea NFT endpoint
-//      which usually has a display_image_url pointing to a CDN PNG
-//   3. If still SVG, use a public SVG-to-PNG proxy
-//   4. Cache result so we don't re-fetch the same token repeatedly
+//   1. Check if OpenSea already has a Discord-compatible CDN PNG/JPG
+//   2. Fetch the OpenSea NFT endpoint for better image fields
+//   3. If all we have is SVG, download and convert to PNG with sharp
+//   4. Cache results
 
 async function resolveImage(sale) {
   const id = sale.nft?.identifier;
 
-  // Return cached result
   if (id && imageCache.has(id)) return imageCache.get(id);
 
-  // Check URLs already in the sale event
+  // Gather all candidate URLs from the sale event
   const candidates = [
     sale.nft?.display_image_url,
     sale.nft?.image_url,
     sale.nft?.image_preview_url,
   ];
 
+  // Step 1: direct CDN URL check
   for (const url of candidates) {
     if (isDiscordCompatible(url)) {
-      if (id) imageCache.set(id, url);
-      console.log(`[Image] #${id} — direct CDN URL found`);
-      return url;
+      const result = { type: 'url', url };
+      if (id) imageCache.set(id, result);
+      console.log(`[Image] #${id} — direct CDN URL`);
+      return result;
     }
   }
 
-  // Fetch full NFT from OpenSea — it usually has a CDN-rasterized PNG
+  // Step 2: fetch full NFT from OpenSea
+  let svgSource = null;
   if (id) {
     try {
       console.log(`[Image] #${id} — fetching from OpenSea NFT endpoint`);
@@ -146,29 +172,40 @@ async function resolveImage(sale) {
         ];
         for (const url of deepCandidates) {
           if (isDiscordCompatible(url)) {
-            imageCache.set(id, url);
-            console.log(`[Image] #${id} — resolved from NFT endpoint: ${url.slice(0, 60)}...`);
-            return url;
+            const result = { type: 'url', url };
+            imageCache.set(id, result);
+            console.log(`[Image] #${id} — CDN URL from NFT endpoint`);
+            return result;
           }
         }
-
-        // OpenSea only has SVG — use a proxy to convert to PNG
-        const svgSource = deepCandidates.find(u => u && !u.startsWith('<svg') && !u.startsWith('data:') && isSvg(u))
-                       || candidates.find(u => u && !u.startsWith('<svg') && !u.startsWith('data:') && isSvg(u));
-
-        if (svgSource) {
-          const proxyUrl = `https://resvg.vercel.app/api?url=${encodeURIComponent(svgSource)}&width=500&height=500`;
-          imageCache.set(id, proxyUrl);
-          console.log(`[Image] #${id} — using SVG proxy for: ${svgSource.slice(0, 60)}`);
-          return proxyUrl;
-        }
+        // Collect the SVG source for step 3
+        svgSource = deepCandidates.find(u => u && isSvg(u))
+                 || candidates.find(u => u && isSvg(u));
       }
     } catch (e) {
-      console.warn(`[Image] #${id} — NFT endpoint failed: ${e.message}`);
+      console.warn(`[Image] #${id} — NFT endpoint error: ${e.message}`);
     }
   }
 
-  console.log(`[Image] #${id} — no displayable image found, embedding without image`);
+  if (!svgSource) {
+    svgSource = candidates.find(u => u && isSvg(u));
+  }
+
+  // Step 3: convert SVG → PNG with sharp
+  if (svgSource) {
+    try {
+      console.log(`[Image] #${id} — converting SVG to PNG with sharp`);
+      const pngBuffer = await svgToPngBuffer(svgSource);
+      const result = { type: 'buffer', buffer: pngBuffer, filename: `ocas-${id}.png` };
+      if (id) imageCache.set(id, result);
+      console.log(`[Image] #${id} — SVG converted to PNG (${pngBuffer.length} bytes)`);
+      return result;
+    } catch (e) {
+      console.warn(`[Image] #${id} — SVG conversion failed: ${e.message}`);
+    }
+  }
+
+  console.log(`[Image] #${id} — no image available`);
   return null;
 }
 
@@ -205,9 +242,10 @@ async function buildEmbed(sale) {
     .setFooter({ text: `OCAS Sales Bot • traitview.com${timeStr ? ' • ' + timeStr : ''}` })
     .setTimestamp();
 
-  // Resolve image with SVG fallback
-  const imageUrl = await resolveImage(sale);
-  if (imageUrl) embed.setImage(imageUrl);
+  // Resolve image — may return a URL string or a PNG buffer
+  const imageResult = await resolveImage(sale);
+  // We'll return the result alongside the embed so the caller can attach files
+  embed._imageResult = imageResult;
 
   embed.addFields(
     { name: 'Price',  value: ethPrice ? `◆ ${ethPrice} ETH` : '—', inline: true },
@@ -265,21 +303,21 @@ async function pollSales() {
 
   // First run — set cursor without posting
   if (lastSeenSaleId === null) {
-    lastSeenSaleId = sales[0].id || sales[0].event_timestamp;
+    lastSeenSaleId = String(sales[0].id || sales[0].event_timestamp);
     console.log(`[Sales] Bot ready. Watching from sale ID: ${lastSeenSaleId}`);
     return;
   }
 
-  // Collect new sales since last check
+  // Collect new sales since last check — always compare as strings
   const newSales = [];
   for (const sale of sales) {
-    const sid = sale.id || sale.event_timestamp;
+    const sid = String(sale.id || sale.event_timestamp);
     if (sid === lastSeenSaleId) break;
     newSales.push(sale);
   }
 
   if (!newSales.length) return;
-  lastSeenSaleId = sales[0].id || sales[0].event_timestamp;
+  lastSeenSaleId = String(sales[0].id || sales[0].event_timestamp);
 
   const channel = client.channels.cache.get(CHANNEL_ID);
   if (!channel) {
@@ -295,7 +333,20 @@ async function pollSales() {
     }
     try {
       const embed = await buildEmbed(sale);
-      await channel.send({ embeds: [embed] });
+      const imageResult = embed._imageResult;
+      delete embed._imageResult;
+
+      if (imageResult?.type === 'buffer') {
+        // Attach PNG file and reference it in the embed
+        const attachment = new AttachmentBuilder(imageResult.buffer, { name: imageResult.filename });
+        embed.setImage(`attachment://${imageResult.filename}`);
+        await channel.send({ embeds: [embed], files: [attachment] });
+      } else if (imageResult?.type === 'url') {
+        embed.setImage(imageResult.url);
+        await channel.send({ embeds: [embed] });
+      } else {
+        await channel.send({ embeds: [embed] });
+      }
       console.log(`[Sales] Posted sale #${sale.nft?.identifier}`);
     } catch (e) {
       console.error('[Sales] Error posting embed:', e.message);
@@ -410,7 +461,15 @@ client.on('messageCreate', async (msg) => {
       if (!sales.length) { await msg.reply('No sales found.'); return; }
       const embed = await buildEmbed(sales[0]);
       embed.setTitle(`🧪 TEST — ${embed.data.title}`);
-      await msg.reply({ embeds: [embed] });
+      const ir = embed._imageResult; delete embed._imageResult;
+      if (ir?.type === 'buffer') {
+        const att = new AttachmentBuilder(ir.buffer, { name: ir.filename });
+        embed.setImage(`attachment://${ir.filename}`);
+        await msg.reply({ embeds: [embed], files: [att] });
+      } else {
+        if (ir?.type === 'url') embed.setImage(ir.url);
+        await msg.reply({ embeds: [embed] });
+      }
     } catch (e) {
       await msg.reply(`❌ Error: ${e.message}`);
     }
@@ -431,7 +490,15 @@ client.on('messageCreate', async (msg) => {
       for (const sale of sales.reverse()) {
         const embed = await buildEmbed(sale);
         embed.setTitle(`🧪 TEST — ${embed.data.title}`);
-        await msg.channel.send({ embeds: [embed] });
+        const ir2 = embed._imageResult; delete embed._imageResult;
+        if (ir2?.type === 'buffer') {
+          const att2 = new AttachmentBuilder(ir2.buffer, { name: ir2.filename });
+          embed.setImage(`attachment://${ir2.filename}`);
+          await msg.channel.send({ embeds: [embed], files: [att2] });
+        } else {
+          if (ir2?.type === 'url') embed.setImage(ir2.url);
+          await msg.channel.send({ embeds: [embed] });
+        }
         await new Promise(res => setTimeout(res, 800));
       }
     } catch (e) {
@@ -457,7 +524,15 @@ client.on('messageCreate', async (msg) => {
       if (!sales.length) { await msg.reply(`No sales found for #${tokenId}.`); return; }
       const embed = await buildEmbed(sales[0]);
       embed.setTitle(`🧪 TEST — ${embed.data.title}`);
-      await msg.reply({ embeds: [embed] });
+      const ir3 = embed._imageResult; delete embed._imageResult;
+      if (ir3?.type === 'buffer') {
+        const att3 = new AttachmentBuilder(ir3.buffer, { name: ir3.filename });
+        embed.setImage(`attachment://${ir3.filename}`);
+        await msg.reply({ embeds: [embed], files: [att3] });
+      } else {
+        if (ir3?.type === 'url') embed.setImage(ir3.url);
+        await msg.reply({ embeds: [embed] });
+      }
     } catch (e) {
       await msg.reply(`❌ Error: ${e.message}`);
     }
