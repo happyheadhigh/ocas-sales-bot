@@ -645,80 +645,55 @@ client.on('interactionCreate', async (interaction) => {
 // ── Welcome message when bot joins a new server ───────────────────────────────
 client.on('guildCreate', async (guild) => {
   try{
-    // Find the first channel the bot can send messages in
     const channel = guild.channels.cache
       .filter(c => c.type === 0 && c.permissionsFor(guild.members.me)?.has('SendMessages'))
       .sort((a, b) => a.position - b.position)
       .first();
-
     if(!channel) return;
 
-    const { EmbedBuilder } = require('discord.js');
+    const desc = 'I post NFT sale alerts with token images, price, traits, and buyer/seller links.\n\nWorks with **any OpenSea collection** - just run /setup to get started.';
+
+    const setup = [
+      '**1.** Run `/setup` and fill in:',
+      '> **channel** - where to post sales',
+      '> **collection** - OpenSea slug (e.g. `on-chain-all-stars`)',
+      '> **contract** - contract address (optional)',
+      '**2.** Done! Sales post automatically.',
+      '**3.** Test it with `/lastsale`'
+    ].join('\n');
+
+    const cmds = [
+      '`/setup` - Configure channel + collection',
+      '`/lastsale` - Show most recent sale now',
+      '`/recentsales count:10` - Show last 10 sales',
+      '`/traitfind trait:Type value:Zombie` - Find sales by trait',
+      '`/salesfilter trait:Background value:Blue` - Auto-post matching traits only',
+      '`/clearfilters` - Remove filters, watch all sales',
+      '`/help` - See all commands'
+    ].join('\n');
+
+    const howto = [
+      '**Slug** - look at the OpenSea URL:',
+      '`opensea.io/collection/` **on-chain-all-stars**',
+      '',
+      '**Contract** - collection page, any token, Details tab'
+    ].join('\n');
 
     const embed = new EmbedBuilder()
-      .setTitle('👋 Thanks for adding the NFT Sales Bot!')
+      .setTitle('Thanks for adding the NFT Sales Bot!')
       .setColor(0x2dd4bf)
-      .setDescription(
-        'I automatically post NFT sale alerts to your server with **token images, price, traits, and buyer/seller links**.
-
-' +
-        'I work with **any OpenSea collection** — just run `/setup` to get started.'
-      )
+      .setDescription(desc)
       .addFields(
-        {
-          name: '🚀 Quick Setup (30 seconds)',
-          value:
-            '**1.** Run `/setup` and fill in:
-' +
-            '> • **channel** — where to post sales (e.g. `#sales`)
-' +
-            '> • **collection** — OpenSea slug (e.g. `on-chain-all-stars`)
-' +
-            '> • **contract** — contract address (optional, needed for `/sale`)
-
-' +
-            '**2.** Done! Sales will post automatically.
-
-' +
-            '**3.** Test it with `/lastsale`',
-          inline: false,
-        },
-        {
-          name: '📋 Key Commands',
-          value:
-            '`/setup` — Configure channel + collection
-' +
-            '`/lastsale` — Show most recent sale now
-' +
-            '`/recentsales count:10` — Show last 10 sales
-' +
-            '`/traitfind trait:Type value:Zombie` — Find sales by trait
-' +
-            '`/salesfilter trait:Background value:Blue` — Auto-post only matching traits
-' +
-            '`/clearfilters` — Remove filters, watch all sales
-' +
-            '`/help` — See all commands',
-          inline: false,
-        },
-        {
-          name: '💡 Finding your collection slug & contract',
-          value:
-            '**Slug** — look at the OpenSea URL:
-' +
-            '`opensea.io/collection/`**`on-chain-all-stars`**
-
-' +
-            '**Contract** — OpenSea collection page → any token → Details → Contract Address',
-          inline: false,
-        },
+        { name: 'Quick Setup (30 seconds)', value: setup, inline: false },
+        { name: 'Key Commands', value: cmds, inline: false },
+        { name: 'Finding your collection slug and contract', value: howto, inline: false }
       )
-      .setFooter({ text: 'Use /help anytime to see all commands • Works with any OpenSea collection' });
+      .setFooter({ text: 'Use /help anytime to see all commands' });
 
     await channel.send({ embeds: [embed] });
-    console.log(`[Welcome] Sent setup guide to ${guild.name}`);
-  } catch(e) {
-    console.warn(`[Welcome] Could not send welcome to ${guild.name}:`, e.message);
+    console.log('[Welcome] Sent setup guide to ' + guild.name);
+  }catch(e){
+    console.warn('[Welcome] Could not send to ' + guild.name + ': ' + e.message);
   }
 });
 
