@@ -1,12 +1,12 @@
 /**
- * OCAS Discord Sales Bot — Puppeteer Image Renderer Version
+ * OCAS Discord Sales Bot — FULL DEBUG VERSION
  * ---------------------------------------------------------
- * Fixes included:
+ * Includes:
  * - Reliable channel fetching for auto-posts
- * - Poll locking (prevents overlapping intervals)
+ * - Poll locking
  * - Persistent lastSeenSaleId via state.json
  * - Automatic SVG / base64 SVG -> PNG conversion using Puppeteer
- * - Discord-safe image attachments for fully onchain NFTs
+ * - Debug logging for image resolution pipeline
  */
 
 require('dotenv').config();
@@ -37,11 +37,7 @@ const STATE_FILE = path.join(__dirname, 'state.json');
 let lastSeenSaleId = null;
 let paused = false;
 let pollInProgress = false;
-let traitFilters = new Map(); // Map<traitName lowercase, value lowercase>
-
-// imageCache stores:
-// tokenId -> { type: 'url', value: 'https://...' }
-// tokenId -> { type: 'pngBuffer', value: <Buffer> }
+let traitFilters = new Map();
 const imageCache = new Map();
 
 // ── Discord client ───────────────────────────────────────────────────────────
@@ -241,6 +237,7 @@ async function getBrowser() {
 }
 
 async function renderSvgToPngBuffer(svgString) {
+  console.log('[Render] Starting SVG -> PNG render');
   const browser = await getBrowser();
   const page = await browser.newPage();
 
@@ -317,16 +314,20 @@ async function renderSvgToPngBuffer(svgString) {
       throw new Error('SVG wrapper not found in browser render');
     }
 
-    return await el.screenshot({
+    const png = await el.screenshot({
       type: 'png',
       omitBackground: true,
     });
+
+    console.log('[Render] SVG -> PNG render success');
+    return png;
   } finally {
     await page.close();
   }
 }
 
 async function svgUrlToPngBuffer(svgUrl) {
+  console.log('[Render] Fetching SVG URL:', svgUrl.slice(0, 180));
   const svgText = await fetchText(svgUrl);
   return renderSvgToPngBuffer(svgText);
 }
@@ -334,6 +335,7 @@ async function svgUrlToPngBuffer(svgUrl) {
 // ── OpenSea NFT lookup ───────────────────────────────────────────────────────
 async function fetchNftFromOpenSea(tokenId) {
   const nftUrl = `https://api.opensea.io/api/v2/chain/ethereum/contract/${CONTRACT}/nfts/${tokenId}`;
+  console.log(`[OpenSea] Fetching NFT metadata for #${tokenId}`);
   const r = await fetch(nftUrl, { headers: osHeaders() });
   if (!r.ok) {
     throw new Error(`OpenSea NFT endpoint returned ${r.status}`);
@@ -361,74 +363,113 @@ function collectImageCandidates(sale, nft) {
 }
 
 async function tryResolveFromMetadataSource(source) {
+  console.log(
+    '[Image] Trying source:',
+    typeof source === 'string' ? source.slice(0, 180) : source
+  );
+
   const directSvg = extractSvgFromDataUri(source);
   if (directSvg) {
+    console.log('[Image] Found direct SVG data URI / raw SVG');
     const png = await renderSvgToPngBuffer(directSvg);
+    console.log('[Image] Successfully rendered direct SVG to PNG');
     return { type: 'pngBuffer', value: png };
   }
 
   const jsonFromDataUri = extractJsonFromDataUri(source);
+  if (jsonFromDataUri) {
+    console.log('[Image] Found JSON data URI');
+  }
+
   if (jsonFromDataUri?.image) {
+    console.log(
+      '[Image] JSON data URI contains image:',
+      String(jsonFromDataUri.image).slice(0, 180)
+    );
+
     const nestedSvg = extractSvgFromDataUri(jsonFromDataUri.image);
     if (nestedSvg) {
+      console.log('[Image] Found nested SVG inside JSON data URI');
       const png = await renderSvgToPngBuffer(nestedSvg);
+      console.log('[Image] Successfully rendered nested SVG to PNG');
       return { type: 'pngBuffer', value: png };
     }
 
     if (isDiscordCompatibleRasterUrl(jsonFromDataUri.image)) {
+      console.log('[Image] Using raster URL from JSON data URI');
       return { type: 'url', value: jsonFromDataUri.image };
     }
 
     if (isSvg(jsonFromDataUri.image) && isHttpUrl(jsonFromDataUri.image)) {
+      console.log('[Image] Found SVG URL inside JSON data URI');
       const png = await svgUrlToPngBuffer(jsonFromDataUri.image);
+      console.log('[Image] Successfully rendered SVG URL to PNG');
       return { type: 'pngBuffer', value: png };
     }
   }
 
   if (isDiscordCompatibleRasterUrl(source)) {
+    console.log('[Image] Using direct raster URL');
     return { type: 'url', value: source };
   }
 
   if (isSvg(source) && isHttpUrl(source)) {
+    console.log('[Image] Found direct SVG URL');
     const png = await svgUrlToPngBuffer(source);
+    console.log('[Image] Successfully rendered direct SVG URL to PNG');
     return { type: 'pngBuffer', value: png };
   }
 
   if (isHttpUrl(source) && !isSvg(source)) {
+    console.log('[Image] Fetching HTTP source text for deeper inspection');
+
     try {
       const text = await fetchText(source);
+      console.log('[Image] HTTP source fetched, first 180 chars:', text.slice(0, 180));
 
       try {
         const json = JSON.parse(text);
+        console.log('[Image] HTTP source parsed as JSON');
+
         if (json?.image) {
+          console.log('[Image] JSON has image field:', String(json.image).slice(0, 180));
+
           const nestedSvg = extractSvgFromDataUri(json.image);
           if (nestedSvg) {
+            console.log('[Image] Found nested SVG inside fetched JSON');
             const png = await renderSvgToPngBuffer(nestedSvg);
+            console.log('[Image] Successfully rendered fetched JSON SVG to PNG');
             return { type: 'pngBuffer', value: png };
           }
 
           if (isDiscordCompatibleRasterUrl(json.image)) {
+            console.log('[Image] Using raster URL from fetched JSON');
             return { type: 'url', value: json.image };
           }
 
           if (isSvg(json.image) && isHttpUrl(json.image)) {
+            console.log('[Image] Found SVG URL inside fetched JSON');
             const png = await svgUrlToPngBuffer(json.image);
+            console.log('[Image] Successfully rendered fetched JSON SVG URL to PNG');
             return { type: 'pngBuffer', value: png };
           }
         }
       } catch {
-        // not JSON
+        console.log('[Image] HTTP source is not JSON');
       }
 
       if (text.trim().startsWith('<svg')) {
+        console.log('[Image] HTTP source returned raw SVG');
         const png = await renderSvgToPngBuffer(text);
+        console.log('[Image] Successfully rendered raw fetched SVG to PNG');
         return { type: 'pngBuffer', value: png };
       }
-    } catch {
-      // ignore and continue
+    } catch (e) {
+      console.log('[Image] Failed while inspecting HTTP source:', e.message);
     }
   }
 
+  console.log('[Image] Source not usable');
   return null;
 }
 
@@ -436,6 +477,7 @@ async function resolveImageAsset(sale) {
   const tokenId = safeTokenId(sale);
 
   if (imageCache.has(tokenId)) {
+    console.log(`[Image] #${tokenId} loaded from cache`);
     return imageCache.get(tokenId);
   }
 
@@ -447,6 +489,12 @@ async function resolveImageAsset(sale) {
   }
 
   const candidates = collectImageCandidates(sale, nft);
+
+  console.log(`[Image] #${tokenId} candidate count:`, candidates.length);
+  console.log(
+    '[Image] Candidates:',
+    candidates.map((c) => String(c).slice(0, 180))
+  );
 
   for (const candidate of candidates) {
     try {
@@ -507,13 +555,17 @@ async function buildMessagePayload(sale, { testMode = false } = {}) {
   const files = [];
   const imageAsset = await resolveImageAsset(sale);
 
+  console.log(`[Image] buildMessagePayload #${tokenId}:`, imageAsset ? imageAsset.type : 'null');
+
   if (imageAsset) {
     if (imageAsset.type === 'url') {
       embed.setImage(imageAsset.value);
+      console.log(`[Image] #${tokenId} using embed image URL`);
     } else if (imageAsset.type === 'pngBuffer') {
       const filename = `token-${tokenId}.png`;
       files.push(new AttachmentBuilder(imageAsset.value, { name: filename }));
       embed.setImage(`attachment://${filename}`);
+      console.log(`[Image] #${tokenId} using attachment image ${filename}`);
     }
   }
 
