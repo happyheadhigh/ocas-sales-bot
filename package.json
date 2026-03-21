@@ -1,10 +1,11 @@
 {
-  "name": "ocas-sales-bot",
-  "version": "1.0.0",
-  "description": "On-Chain All Stars Discord Sales Bot with SVG image support",
+  "name": "nft-sales-bot",
+  "version": "2.0.0",
+  "description": "Public multi-server NFT sales bot — works with any OpenSea collection",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
+    "register": "node register-commands.js",
     "dev": "node --watch bot.js"
   },
   "dependencies": {

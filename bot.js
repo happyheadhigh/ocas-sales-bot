@@ -1,670 +1,599 @@
 /**
- * OCAS Discord Sales Bot — SVG IMAGE FIX EDITION
+ * OCAS Discord Sales Bot — Public Multi-Server Edition
  * ─────────────────────────────────────────────────────────────
- * Watches On-Chain All Stars sales via OpenSea API v2 and posts
- * rich embeds with token image to a Discord channel.
+ * Anyone can add this bot to their server and configure it
+ * entirely through slash commands — no code changes needed.
  *
- * SVG FIX: OCAS is a fully on-chain collection. Raw SVG images
- * don't display in Discord. This bot resolves each token's image
- * through OpenSea's NFT endpoint which returns a CDN-hosted PNG,
- * then falls back to a resvg PNG conversion service if needed.
+ * SLASH COMMANDS (server admins):
+ *   /setup channel:#sales-channel collection:on-chain-all-stars
+ *   /setchannel channel:#new-channel
+ *   /setcollection slug:on-chain-all-stars contract:0x...
+ *   /salesfilter trait:Background value:Blue
+ *   /clearfilters
+ *   /pause
+ *   /resume
+ *   /status
  *
- * TRAIT FILTER commands (usable by anyone in Discord):
- *   !salesfilter Background Blue        → only ping sales with Background = Blue
- *   !salesfilter Eyes Laser             → filter by Eyes = Laser
- *   !salesfilter Background Blue Eyes Laser → multi-trait AND filter
- *   !salesfilters                       → show active filters
- *   !clearsalesfilters                  → remove all filters
- *   !saleson / !salesoff                → pause / resume sale pings
- *   !salesstatus                        → show bot status
- *   !saleshelp                          → show all commands
+ * SLASH COMMANDS (anyone):
+ *   /lastsale
+ *   /recentsales count:5
+ *   /sale token:7370
+ *   /help
  *
- * HOST FREE: Railway.app (connect GitHub repo, add env vars)
+ * SETUP FOR BOT OWNER:
+ *   1. npm install
+ *   2. Set env vars: DISCORD_TOKEN, OPENSEA_KEY (optional but recommended)
+ *   3. node register-commands.js   ← register slash commands once
+ *   4. node bot.js
+ *
+ * HOST: Railway.app — connect GitHub repo, add env vars, deploy
  * ─────────────────────────────────────────────────────────────
  */
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder } = require('discord.js');
-const fetch = require('node-fetch');
-const sharp = require('sharp');
+const {
+  Client, GatewayIntentBits, REST, Routes,
+  EmbedBuilder, AttachmentBuilder, PermissionFlagsBits,
+  SlashCommandBuilder
+} = require('discord.js');
+const fetch  = require('node-fetch');
+const sharp  = require('sharp');
+const fs     = require('fs');
+const path   = require('path');
 
 // ── Config ───────────────────────────────────────────────────────────────────
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_ID    = process.env.SALES_CHANNEL_ID;
-const OPENSEA_KEY   = process.env.OPENSEA_KEY || '';
-const OS_SLUG       = 'on-chain-all-stars';
-const CONTRACT      = '0x078be86f3104a32313a47815792230a3808642cc';
-const POLL_MS       = parseInt(process.env.POLL_MS || '30000', 10);
-const CMD_PREFIX    = '!';
+const DISCORD_TOKEN  = process.env.DISCORD_TOKEN;
+const OPENSEA_KEY    = process.env.OPENSEA_KEY || '';
+const POLL_MS        = parseInt(process.env.POLL_MS || '30000', 10);
+const CONFIG_FILE    = path.join(__dirname, 'server-configs.json');
 
-// ── State ────────────────────────────────────────────────────────────────────
-let lastSeenSaleId = null;
-let paused         = false;
-let traitFilters   = new Map(); // Map<traitName lowercase, value lowercase>
+// ── Per-server config persistence ────────────────────────────────────────────
+// Stored as: { guildId: { channelId, slug, contract, traitFilters, paused } }
+function loadConfigs(){
+  try{ return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); }
+  catch{ return {}; }
+}
+function saveConfigs(configs){
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(configs, null, 2));
+}
 
-// Image cache: tokenId → resolved PNG url (avoids re-fetching same token)
-const imageCache = new Map();
+let serverConfigs = loadConfigs();
+
+function getConfig(guildId){
+  return serverConfigs[guildId] || null;
+}
+function setConfig(guildId, updates){
+  serverConfigs[guildId] = { ...(serverConfigs[guildId] || {}), ...updates };
+  saveConfigs(serverConfigs);
+}
+
+// ── Per-server sale cursor (not persisted — resets on restart) ────────────────
+const lastSeenIds = new Map(); // guildId → last seen sale id string
+
+// ── Image cache ───────────────────────────────────────────────────────────────
+const imageCache = new Map(); // "slug:tokenId" → resolved result
 
 // ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
+  intents: [GatewayIntentBits.Guilds],
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function osHeaders() {
+function osHeaders(){
   const h = { accept: 'application/json' };
-  if (OPENSEA_KEY) h['x-api-key'] = OPENSEA_KEY;
+  if(OPENSEA_KEY) h['x-api-key'] = OPENSEA_KEY;
   return h;
 }
 
-function formatEth(event) {
-  try {
+function formatEth(event){
+  try{
     const qty = BigInt(event.payment?.quantity || '0');
     const dec = event.payment?.decimals ?? 18;
     const eth = Number(qty) / Math.pow(10, dec);
-    if (!isFinite(eth) || eth <= 0) return null;
+    if(!isFinite(eth) || eth <= 0) return null;
     return eth >= 1 ? eth.toFixed(4) : eth.toFixed(5);
-  } catch { return null; }
+  }catch{ return null; }
 }
 
-function shortAddr(addr) {
-  if (!addr || addr.length < 10) return addr || 'unknown';
-  return addr.slice(0, 6) + '…' + addr.slice(-4);
+function shortAddr(addr){
+  if(!addr || addr.length < 10) return addr || 'unknown';
+  return addr.slice(0,6) + '…' + addr.slice(-4);
 }
 
-function timeSince(unixTs) {
-  const s = Math.floor(Date.now() / 1000 - unixTs);
-  if (s < 60)   return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  return `${Math.floor(s / 3600)}h ago`;
+function timeSince(unixTs){
+  const s = Math.floor(Date.now()/1000 - unixTs);
+  if(s < 60)   return `${s}s ago`;
+  if(s < 3600) return `${Math.floor(s/60)}m ago`;
+  return `${Math.floor(s/3600)}h ago`;
 }
 
-function isSvg(url) {
-  if (!url) return false;
+function isSvg(url){
+  if(!url) return false;
   const s = String(url).trim();
-  return s.startsWith('<svg') ||
-         s.startsWith('data:image/svg') ||
-         s.toLowerCase().endsWith('.svg') ||
-         s.includes('image/svg');
+  return s.startsWith('<svg') || s.startsWith('data:image/svg') ||
+         s.toLowerCase().endsWith('.svg') || s.includes('image/svg');
 }
 
-function isDiscordCompatible(url) {
-  if (!url) return false;
-  if (isSvg(url)) return false;
+function isDiscordCompatible(url){
+  if(!url || isSvg(url)) return false;
   const s = url.toLowerCase();
   return (s.startsWith('http://') || s.startsWith('https://')) &&
-         !s.startsWith('data:') &&
-         !s.startsWith('<svg');
+         !s.startsWith('data:') && !s.startsWith('<svg');
 }
 
-// ── OCAS image builder ───────────────────────────────────────────────────────
-// OCAS SVGs have two layers:
-//   1. <g id="Background"> — a linearGradient rect (can be multi-stop)
-//   2. <g id="GeneratedImage"><foreignObject><img src="data:image/png;base64,...">
-//      — the actual pixel art PNG (librsvg ignores foreignObject)
-//
-// Strategy: extract gradient stops → build a clean background-only SVG →
-// render it with sharp → extract the character PNG → composite on top.
-
-async function extractPngFromOcasSvg(svgSource) {
+// ── SVG → PNG (extracts embedded PNG from foreignObject, composites background) ─
+async function extractPngFromSvg(svgSource){
   let svgText;
-
-  if (svgSource.startsWith('data:image/svg')) {
+  if(svgSource.startsWith('data:image/svg')){
     const b64 = svgSource.split(',')[1];
-    if (!b64) throw new Error('Empty SVG data URI');
+    if(!b64) throw new Error('Empty SVG data URI');
     svgText = Buffer.from(b64, 'base64').toString('utf-8');
   } else {
     const r = await fetch(svgSource);
-    if (!r.ok) throw new Error(`SVG fetch: ${r.status}`);
+    if(!r.ok) throw new Error(`SVG fetch: ${r.status}`);
     svgText = await r.text();
   }
 
-  const SIZE = 500; // output PNG size
+  const SIZE = 500;
 
-  // ── Step 1: Extract character PNG ────────────────────────────────────────
+  // Extract embedded PNG character
   const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
   let charBuffer = null;
-  if (pngMatch) {
+  if(pngMatch){
     const pngB64 = pngMatch[1].replace(/\s/g, '');
     const rawPng = Buffer.from(pngB64, 'base64');
-    // Scale up 24×24 pixel art to 500×500 with nearest-neighbor (keeps pixels crisp)
     charBuffer = await sharp(rawPng)
       .resize(SIZE, SIZE, { kernel: 'nearest' })
-      .png()
-      .toBuffer();
+      .png().toBuffer();
   }
 
-  // ── Step 2: Extract gradient stops from the background group ─────────────
-  // Grab all stop-color values in order — may be 2 (simple) or many (rainbow)
+  // Extract gradient stops for background
   const stopMatches = [...svgText.matchAll(/stop-color=["'](#[0-9a-fA-F]{6,8})["']/g)];
-  const stops = stopMatches.map(m => {
-    const hex = m[1].slice(0, 7); // strip alpha if present (#rrggbbaa → #rrggbb)
-    return hex;
-  });
+  const stops = stopMatches.map(m => m[1].slice(0,7));
+  const uniqueStops = stops.filter((c,i) => c !== stops[i-1]);
 
-  // Deduplicate consecutive identical stops to find true gradient points
-  const uniqueStops = stops.filter((c, i) => c !== stops[i - 1]);
-
-  // ── Step 3: Build a clean background-only SVG (no foreignObject) ─────────
-  // linearGradient direction: check x1/y1/x2/y2 from original
-  const gradDirMatch = svgText.match(/linearGradient[^>]+x1=["']([\.\d]+)["'][^>]+y1=["']([\.\d]+)["'][^>]+x2=["']([\.\d]+)["'][^>]+y2=["']([\.\d]+)["']/);
-  const [gx1, gy1, gx2, gy2] = gradDirMatch
+  const gradDirMatch = svgText.match(/linearGradient[^>]+x1=["']([\d.]+)["'][^>]+y1=["']([\d.]+)["'][^>]+x2=["']([\d.]+)["'][^>]+y2=["']([\d.]+)["']/);
+  const [gx1,gy1,gx2,gy2] = gradDirMatch
     ? [gradDirMatch[1], gradDirMatch[2], gradDirMatch[3], gradDirMatch[4]]
-    : ['0', '0', '0', '1'];
+    : ['0','0','0','1'];
 
-  let gradientStopsSvg;
-  if (uniqueStops.length <= 1) {
-    // Solid color
-    const color = uniqueStops[0] || '#1a1a2e';
-    gradientStopsSvg = `<stop offset="0%" stop-color="${color}"/><stop offset="100%" stop-color="${color}"/>`;
+  let gradStops;
+  if(uniqueStops.length <= 1){
+    const c = uniqueStops[0] || '#1a1a2e';
+    gradStops = `<stop offset="0%" stop-color="${c}"/><stop offset="100%" stop-color="${c}"/>`;
   } else {
-    // Multi-stop gradient — distribute evenly
-    gradientStopsSvg = uniqueStops.map((color, i) => {
-      const pct = Math.round((i / (uniqueStops.length - 1)) * 100);
-      return `<stop offset="${pct}%" stop-color="${color}"/>`;
+    gradStops = uniqueStops.map((c,i) => {
+      const pct = Math.round((i/(uniqueStops.length-1))*100);
+      return `<stop offset="${pct}%" stop-color="${c}"/>`;
     }).join('');
   }
 
   const bgSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}">
-    <defs>
-      <linearGradient id="bg" x1="${gx1}" y1="${gy1}" x2="${gx2}" y2="${gy2}">
-        ${gradientStopsSvg}
-      </linearGradient>
-    </defs>
+    <defs><linearGradient id="bg" x1="${gx1}" y1="${gy1}" x2="${gx2}" y2="${gy2}">${gradStops}</linearGradient></defs>
     <rect width="${SIZE}" height="${SIZE}" fill="url(#bg)"/>
   </svg>`;
 
-  const bgBuffer = await sharp(Buffer.from(bgSvg))
-    .resize(SIZE, SIZE)
-    .png()
-    .toBuffer();
+  const bgBuffer = await sharp(Buffer.from(bgSvg)).resize(SIZE, SIZE).png().toBuffer();
 
-  // ── Step 4: Composite character on background ─────────────────────────────
-  if (charBuffer) {
-    return sharp(bgBuffer)
-      .composite([{ input: charBuffer, blend: 'over' }])
-      .png()
-      .toBuffer();
+  if(charBuffer){
+    return sharp(bgBuffer).composite([{input: charBuffer, blend:'over'}]).png().toBuffer();
   }
-
-  // No character PNG found — return just the background
   return bgBuffer;
 }
 
-// ── Image resolver — returns { url } or { buffer, filename } ─────────────────
-// Strategy:
-//   1. Check if OpenSea already has a Discord-compatible CDN PNG/JPG
-//   2. Fetch the OpenSea NFT endpoint for better image fields
-//   3. If all we have is SVG, download and convert to PNG with sharp
-//   4. Cache results
+// ── Image resolver ────────────────────────────────────────────────────────────
+async function resolveImage(sale, contract){
+  const id  = sale.nft?.identifier;
+  const key = `${contract}:${id}`;
 
-async function resolveImage(sale) {
-  const id = sale.nft?.identifier;
+  if(id && imageCache.has(key)) return imageCache.get(key);
 
-  if (id && imageCache.has(id)) return imageCache.get(id);
-
-  // Gather all candidate URLs from the sale event
   const candidates = [
     sale.nft?.display_image_url,
     sale.nft?.image_url,
     sale.nft?.image_preview_url,
   ];
 
-  // Step 1: direct CDN URL check
-  for (const url of candidates) {
-    if (isDiscordCompatible(url)) {
-      const result = { type: 'url', url };
-      if (id) imageCache.set(id, result);
-      console.log(`[Image] #${id} — direct CDN URL`);
+  for(const url of candidates){
+    if(isDiscordCompatible(url)){
+      const result = { type:'url', url };
+      if(id) imageCache.set(key, result);
       return result;
     }
   }
 
-  // Step 2: fetch full NFT from OpenSea
-  let svgSource = null;
-  if (id) {
-    try {
-      console.log(`[Image] #${id} — fetching from OpenSea NFT endpoint`);
-      const nftUrl = `https://api.opensea.io/api/v2/chain/ethereum/contract/${CONTRACT}/nfts/${id}`;
+  if(id){
+    try{
+      const nftUrl = `https://api.opensea.io/api/v2/chain/ethereum/contract/${contract}/nfts/${id}`;
       const r = await fetch(nftUrl, { headers: osHeaders() });
-      if (r.ok) {
-        const j = await r.json();
+      if(r.ok){
+        const j   = await r.json();
         const nft = j.nft || j;
-        const deepCandidates = [
-          nft.display_image_url,
-          nft.image_url,
-          nft.image_preview_url,
-          nft.image_thumbnail_url,
-        ];
-        for (const url of deepCandidates) {
-          if (isDiscordCompatible(url)) {
-            const result = { type: 'url', url };
-            imageCache.set(id, result);
-            console.log(`[Image] #${id} — CDN URL from NFT endpoint`);
+        const deep = [nft.display_image_url, nft.image_url, nft.image_preview_url, nft.image_thumbnail_url];
+        for(const url of deep){
+          if(isDiscordCompatible(url)){
+            const result = { type:'url', url };
+            imageCache.set(key, result);
             return result;
           }
         }
-        // Collect the SVG source for step 3
-        svgSource = deepCandidates.find(u => u && isSvg(u))
-                 || candidates.find(u => u && isSvg(u));
+        const svgSrc = deep.find(u => u && !u.startsWith('<svg') && !u.startsWith('data:') && isSvg(u))
+                    || candidates.find(u => u && isSvg(u));
+        if(svgSrc){
+          const buf    = await extractPngFromSvg(svgSrc);
+          const result = { type:'buffer', buffer:buf, filename:`token-${id}.png` };
+          imageCache.set(key, result);
+          return result;
+        }
       }
-    } catch (e) {
-      console.warn(`[Image] #${id} — NFT endpoint error: ${e.message}`);
-    }
+    }catch(e){ console.warn(`[Image] #${id} error:`, e.message); }
   }
-
-  if (!svgSource) {
-    svgSource = candidates.find(u => u && isSvg(u));
-  }
-
-  // Step 3: convert SVG → PNG with sharp
-  if (svgSource) {
-    try {
-      console.log(`[Image] #${id} — converting SVG to PNG with sharp`);
-      const pngBuffer = await extractPngFromOcasSvg(svgSource);
-      const result = { type: 'buffer', buffer: pngBuffer, filename: `ocas-${id}.png` };
-      if (id) imageCache.set(id, result);
-      console.log(`[Image] #${id} — SVG converted to PNG (${pngBuffer.length} bytes)`);
-      return result;
-    } catch (e) {
-      console.warn(`[Image] #${id} — SVG conversion failed: ${e.message}`);
-    }
-  }
-
-  console.log(`[Image] #${id} — no image available`);
   return null;
 }
 
 // ── Trait filter check ────────────────────────────────────────────────────────
-function matchesFilters(sale) {
-  if (traitFilters.size === 0) return true;
+function matchesFilters(sale, traitFilters){
+  if(!traitFilters || Object.keys(traitFilters).length === 0) return true;
   const nftTraits = sale.nft?.traits || [];
   const lookup = {};
-  for (const t of nftTraits) {
-    lookup[t.trait_type?.toLowerCase()] = String(t.value).toLowerCase();
-  }
-  for (const [name, val] of traitFilters) {
-    if (lookup[name] !== val) return false;
+  for(const t of nftTraits) lookup[t.trait_type?.toLowerCase()] = String(t.value).toLowerCase();
+  for(const [name, val] of Object.entries(traitFilters)){
+    if(lookup[name] !== val) return false;
   }
   return true;
 }
 
-// ── Build Discord embed — compact side-by-side layout ────────────────────────
-// Layout: thumbnail image (left) + all info (right) so multiple sales fit on screen
-async function buildEmbed(sale) {
-  const id       = sale.nft?.identifier;
-  const name     = sale.nft?.name || `#${id}`;
-  const ethPrice = formatEth(sale);
-  const osUrl    = `https://opensea.io/assets/ethereum/${CONTRACT}/${id}`;
-  const tvUrl    = `https://traitview.com/?jump=${id}`;
-  const timeStr  = sale.event_timestamp ? timeSince(sale.event_timestamp) : '';
+// ── Build embed ───────────────────────────────────────────────────────────────
+async function buildEmbed(sale, config, isTest=false){
+  const id        = sale.nft?.identifier;
+  const name      = sale.nft?.name || `#${id}`;
+  const ethPrice  = formatEth(sale);
+  const contract  = config.contract || '';
+  const slug      = config.slug     || '';
+  const osUrl     = `https://opensea.io/assets/ethereum/${contract}/${id}`;
+  const tvUrl     = `https://traitview.com/?jump=${id}`;
+  const timeStr   = sale.event_timestamp ? timeSince(sale.event_timestamp) : '';
 
-  // Buyer/seller as clickable OpenSea profile links
   const buyerAddr  = sale.buyer  || 'unknown';
   const sellerAddr = sale.seller || 'unknown';
   const buyerLink  = buyerAddr  !== 'unknown' ? `[${shortAddr(buyerAddr)}](https://opensea.io/${buyerAddr})`   : 'unknown';
   const sellerLink = sellerAddr !== 'unknown' ? `[${shortAddr(sellerAddr)}](https://opensea.io/${sellerAddr})` : 'unknown';
 
+  const title = isTest
+    ? `🧪 ${name} — ◆ ${ethPrice ? ethPrice+' ETH' : '—'}`
+    : `🟢 ${name} — ◆ ${ethPrice ? ethPrice+' ETH' : '—'}`;
+
   const embed = new EmbedBuilder()
-    .setTitle(`🟢 OCAS ${name} — ◆ ${ethPrice ? ethPrice + ' ETH' : '—'}`)
+    .setTitle(title)
     .setColor(0x2dd4bf)
     .setURL(osUrl)
-    .setFooter({ text: `OCAS Sales Bot • traitview.com${timeStr ? ' • ' + timeStr : ''}` })
+    .setFooter({ text: `Sales Bot • ${slug}${timeStr ? ' • '+timeStr : ''}` })
     .setTimestamp();
 
-  // Use setThumbnail for compact side-by-side layout (image on right, text on left)
-  // _imageResult stores the resolved image; caller handles attachment if buffer
-  const imageResult = await resolveImage(sale);
+  const imageResult = await resolveImage(sale, contract);
   embed._imageResult = imageResult;
 
-  // Buyer / Seller / Price all inline on one row
   embed.addFields(
-    { name: '◆ Price',  value: ethPrice ? `${ethPrice} ETH` : '—', inline: true },
-    { name: '🛒 Buyer',  value: buyerLink,  inline: true },
-    { name: '💰 Seller', value: sellerLink, inline: true },
+    { name:'◆ Price',  value: ethPrice ? `${ethPrice} ETH` : '—', inline:true },
+    { name:'🛒 Buyer',  value: buyerLink,  inline:true },
+    { name:'💰 Seller', value: sellerLink, inline:true },
   );
 
-  // Traits — compact: all on one inline field so they sit beside the thumbnail
   const nftTraits = sale.nft?.traits || [];
-  if (nftTraits.length > 0) {
-    const traitLines = nftTraits
-      .slice(0, 12)
-      .map(t => `**${t.trait_type}**: ${t.value}`)
-      .join('\n');
-    embed.addFields({ name: 'Traits', value: traitLines, inline: true });
+  if(nftTraits.length > 0){
+    embed.addFields({
+      name: 'Traits',
+      value: nftTraits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`).join('\n'),
+      inline: true,
+    });
   }
 
-  // Links row
-  embed.addFields({
-    name: 'Links',
-    value: `[OpenSea](${osUrl}) • [TraitView](${tvUrl})`,
-    inline: false,
-  });
-
-  // Active filter note (only shown when filter is set)
-  if (traitFilters.size > 0) {
-    const filterStr = [...traitFilters.entries()]
-      .map(([k, v]) => `${k}: ${v}`)
-      .join(' • ');
-    embed.addFields({ name: '🔍 Filter', value: filterStr, inline: false });
-  }
+  const links = [`[OpenSea](${osUrl})`];
+  if(config.traitviewUrl !== false) links.push(`[TraitView](${tvUrl})`);
+  embed.addFields({ name:'Links', value: links.join(' • '), inline:false });
 
   return embed;
 }
 
-// ── Poll OpenSea for new sales ────────────────────────────────────────────────
-async function pollSales() {
-  if (paused) return;
-
-  let sales;
-  try {
-    const url = `https://api.opensea.io/api/v2/events/collection/${OS_SLUG}?event_type=sale&limit=20`;
-    const r   = await fetch(url, { headers: osHeaders() });
-    if (!r.ok) {
-      console.warn(`[Sales] OpenSea returned ${r.status}`);
-      return;
-    }
-    const j = await r.json();
-    sales = j.asset_events || [];
-  } catch (e) {
-    console.error('[Sales] fetch error:', e.message);
-    return;
+// ── Send embed helper (handles buffer vs url) ─────────────────────────────────
+async function sendEmbed(target, embed){
+  const ir = embed._imageResult;
+  delete embed._imageResult;
+  if(ir?.type === 'buffer'){
+    const att = new AttachmentBuilder(ir.buffer, { name: ir.filename });
+    embed.setThumbnail(`attachment://${ir.filename}`);
+    return target.send({ embeds:[embed], files:[att] });
   }
+  if(ir?.type === 'url') embed.setThumbnail(ir.url);
+  return target.send({ embeds:[embed] });
+}
 
-  if (!sales.length) return;
+// ── Poll sales for all configured servers ─────────────────────────────────────
+async function pollAllServers(){
+  for(const [guildId, config] of Object.entries(serverConfigs)){
+    if(!config.channelId || !config.slug || config.paused) continue;
 
-  // First run — set cursor without posting
-  if (lastSeenSaleId === null) {
-    lastSeenSaleId = String(sales[0].id || sales[0].event_timestamp);
-    console.log(`[Sales] Bot ready. Watching from sale ID: ${lastSeenSaleId}`);
-    return;
-  }
+    try{
+      const url = `https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(config.slug)}?event_type=sale&limit=20`;
+      const r   = await fetch(url, { headers: osHeaders() });
+      if(!r.ok){ console.warn(`[${config.slug}] OpenSea ${r.status}`); continue; }
+      const j     = await r.json();
+      const sales = j.asset_events || [];
+      if(!sales.length) continue;
 
-  // Collect new sales since last check — always compare as strings
-  const newSales = [];
-  for (const sale of sales) {
-    const sid = String(sale.id || sale.event_timestamp);
-    if (sid === lastSeenSaleId) break;
-    newSales.push(sale);
-  }
+      const lastId = lastSeenIds.get(guildId);
 
-  if (!newSales.length) return;
-  lastSeenSaleId = String(sales[0].id || sales[0].event_timestamp);
-
-  const channel = client.channels.cache.get(CHANNEL_ID);
-  if (!channel) {
-    console.warn('[Sales] Channel not found:', CHANNEL_ID);
-    return;
-  }
-
-  // Post newest→oldest so Discord shows chronological order
-  for (const sale of newSales.reverse()) {
-    if (!matchesFilters(sale)) {
-      console.log(`[Sales] Skipping #${sale.nft?.identifier} — filtered`);
-      continue;
-    }
-    try {
-      const embed = await buildEmbed(sale);
-      const imageResult = embed._imageResult;
-      delete embed._imageResult;
-
-      if (imageResult?.type === 'buffer') {
-        // Attach as file; use setThumbnail for compact right-side image
-        const attachment = new AttachmentBuilder(imageResult.buffer, { name: imageResult.filename });
-        embed.setThumbnail(`attachment://${imageResult.filename}`);
-        await channel.send({ embeds: [embed], files: [attachment] });
-      } else if (imageResult?.type === 'url') {
-        embed.setThumbnail(imageResult.url);
-        await channel.send({ embeds: [embed] });
-      } else {
-        await channel.send({ embeds: [embed] });
+      // First run for this server — just set cursor
+      if(!lastId){
+        lastSeenIds.set(guildId, String(sales[0].id || sales[0].event_timestamp));
+        console.log(`[${guildId}] Watching "${config.slug}" from sale ${lastSeenIds.get(guildId)}`);
+        continue;
       }
-      console.log(`[Sales] Posted sale #${sale.nft?.identifier}`);
-    } catch (e) {
-      console.error('[Sales] Error posting embed:', e.message);
-    }
+
+      // Find new sales
+      const newSales = [];
+      for(const sale of sales){
+        const sid = String(sale.id || sale.event_timestamp);
+        if(sid === lastId) break;
+        newSales.push(sale);
+      }
+      if(!newSales.length) continue;
+
+      lastSeenIds.set(guildId, String(sales[0].id || sales[0].event_timestamp));
+
+      const channel = client.channels.cache.get(config.channelId);
+      if(!channel){ console.warn(`[${guildId}] Channel ${config.channelId} not found`); continue; }
+
+      for(const sale of newSales.reverse()){
+        if(!matchesFilters(sale, config.traitFilters)) continue;
+        try{
+          const embed = await buildEmbed(sale, config);
+          await sendEmbed(channel, embed);
+          console.log(`[${guildId}] Posted #${sale.nft?.identifier}`);
+        }catch(e){ console.error(`[${guildId}] Post error:`, e.message); }
+      }
+
+    }catch(e){ console.error(`[${guildId}] Poll error:`, e.message); }
   }
 }
 
-// ── Discord commands ──────────────────────────────────────────────────────────
-client.on('messageCreate', async (msg) => {
-  if (msg.author.bot) return;
-  if (!msg.content.startsWith(CMD_PREFIX)) return;
+// ── Slash command handlers ────────────────────────────────────────────────────
+client.on('interactionCreate', async (interaction) => {
+  if(!interaction.isChatInputCommand()) return;
 
-  const raw   = msg.content.slice(CMD_PREFIX.length).trim();
-  const parts = raw.split(/\s+/);
-  const cmd   = parts[0]?.toLowerCase();
+  const { commandName, guildId } = interaction;
+  const config = getConfig(guildId) || {};
+  const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
 
-  if (cmd === 'saleshelp') {
-    await msg.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle('🤖 OCAS Sales Bot — Commands')
-          .setColor(0x7aa2ff)
-          .setDescription(
-            '**!salesfilter <Trait> <Value>**\n' +
-            'Filter to sales matching that trait.\n' +
-            'Stack multiple: `!salesfilter Background Blue Eyes Laser`\n\n' +
-            '**!salesfilters** — Show active filters\n\n' +
-            '**!clearsalesfilters** — Remove all filters\n\n' +
-            '**!saleson / !salesoff** — Resume / pause pings\n\n' +
-            '**!salesstatus** — Show bot status\n\n' +
-            '**!saleshelp** — This message\n\n' +
-            '**— Testing commands —**\n' +
-            '**!lastsale** — Post the most recent sale right now\n' +
-            '**!recentsales [N]** — Post last N sales (default 5, max 10)\n' +
-            '**!sale #1234** — Post most recent sale for a specific token\n' +
-            '**!debugimage #1234** — Show raw image URLs for a token (diagnose SVG issue)\n\n' +
-            '*Trait names and values are case-insensitive.*'
-          )
-      ],
+  // ── /setup ─────────────────────────────────────────────────────────────────
+  if(commandName === 'setup'){
+    if(!isAdmin) return interaction.reply({ content:'❌ You need **Manage Server** permission.', ephemeral:true });
+    const channel    = interaction.options.getChannel('channel');
+    const slug       = interaction.options.getString('collection');
+    const contract   = interaction.options.getString('contract') || '';
+    const traitview  = interaction.options.getBoolean('traitview') ?? true;
+
+    setConfig(guildId, {
+      channelId:   channel.id,
+      slug:        slug.toLowerCase().trim(),
+      contract:    contract.toLowerCase().trim(),
+      traitviewUrl: traitview,
+      traitFilters: {},
+      paused:      false,
+    });
+
+    await interaction.reply({
+      embeds:[new EmbedBuilder()
+        .setTitle('✅ Sales Bot Configured!')
+        .setColor(0x2dd4bf)
+        .addFields(
+          { name:'Channel',    value:`<#${channel.id}>`,    inline:true },
+          { name:'Collection', value:slug,                   inline:true },
+          { name:'Contract',   value:contract || 'not set',  inline:true },
+        )
+        .setDescription('Sales will start posting automatically. Use `/status` to check.')
+      ]
     });
     return;
   }
 
-  if (cmd === 'salesfilter') {
-    const args = parts.slice(1);
-    if (args.length < 2 || args.length % 2 !== 0) {
-      await msg.reply('⚠️ Usage: `!salesfilter <TraitName> <Value>`\nExample: `!salesfilter Background Blue`\nMulti: `!salesfilter Background Blue Eyes Laser`');
+  // ── /setchannel ────────────────────────────────────────────────────────────
+  if(commandName === 'setchannel'){
+    if(!isAdmin) return interaction.reply({ content:'❌ Need **Manage Server** permission.', ephemeral:true });
+    const channel = interaction.options.getChannel('channel');
+    setConfig(guildId, { channelId: channel.id });
+    await interaction.reply({ content:`✅ Sales channel set to <#${channel.id}>`, ephemeral:true });
+    return;
+  }
+
+  // ── /setcollection ─────────────────────────────────────────────────────────
+  if(commandName === 'setcollection'){
+    if(!isAdmin) return interaction.reply({ content:'❌ Need **Manage Server** permission.', ephemeral:true });
+    const slug     = interaction.options.getString('slug').toLowerCase().trim();
+    const contract = (interaction.options.getString('contract') || '').toLowerCase().trim();
+    setConfig(guildId, { slug, contract, traitFilters:{} });
+    await interaction.reply({ content:`✅ Collection set to **${slug}**${contract ? ` (${contract})` : ''}`, ephemeral:true });
+    return;
+  }
+
+  // ── /salesfilter ───────────────────────────────────────────────────────────
+  if(commandName === 'salesfilter'){
+    if(!isAdmin) return interaction.reply({ content:'❌ Need **Manage Server** permission.', ephemeral:true });
+    const trait = interaction.options.getString('trait').toLowerCase().trim();
+    const value = interaction.options.getString('value').toLowerCase().trim();
+    const filters = { ...(config.traitFilters || {}), [trait]: value };
+    setConfig(guildId, { traitFilters: filters });
+    const lines = Object.entries(filters).map(([k,v])=>`**${k}** = ${v}`).join('\n');
+    await interaction.reply({ content:`✅ Filters set:\n${lines}\nUse \`/clearfilters\` to remove all.`, ephemeral:true });
+    return;
+  }
+
+  // ── /clearfilters ──────────────────────────────────────────────────────────
+  if(commandName === 'clearfilters'){
+    if(!isAdmin) return interaction.reply({ content:'❌ Need **Manage Server** permission.', ephemeral:true });
+    setConfig(guildId, { traitFilters:{} });
+    await interaction.reply({ content:'✅ All filters cleared — watching all sales.', ephemeral:true });
+    return;
+  }
+
+  // ── /pause ─────────────────────────────────────────────────────────────────
+  if(commandName === 'pause'){
+    if(!isAdmin) return interaction.reply({ content:'❌ Need **Manage Server** permission.', ephemeral:true });
+    setConfig(guildId, { paused:true });
+    await interaction.reply({ content:'⏸ Sale notifications paused. Use `/resume` to restart.', ephemeral:true });
+    return;
+  }
+
+  // ── /resume ────────────────────────────────────────────────────────────────
+  if(commandName === 'resume'){
+    if(!isAdmin) return interaction.reply({ content:'❌ Need **Manage Server** permission.', ephemeral:true });
+    setConfig(guildId, { paused:false });
+    await interaction.reply({ content:'▶️ Sale notifications resumed!', ephemeral:true });
+    return;
+  }
+
+  // ── /status ────────────────────────────────────────────────────────────────
+  if(commandName === 'status'){
+    if(!config.slug){
+      await interaction.reply({ content:'⚠️ Not configured yet. Use `/setup` to get started.', ephemeral:true });
       return;
     }
-    traitFilters.clear();
-    const pairs = [];
-    for (let i = 0; i < args.length; i += 2) {
-      traitFilters.set(args[i].toLowerCase(), args[i + 1].toLowerCase());
-      pairs.push(`**${args[i]}** = ${args[i + 1]}`);
-    }
-    await msg.reply(`✅ Filter set! Only posting sales matching:\n${pairs.join('\n')}\n\nUse \`!clearsalesfilters\` to remove.`);
-    return;
-  }
-
-  if (cmd === 'salesfilters') {
-    if (traitFilters.size === 0) {
-      await msg.reply('No filters active — showing all sales.');
-    } else {
-      const lines = [...traitFilters.entries()].map(([k, v]) => `• **${k}** = ${v}`).join('\n');
-      await msg.reply(`Current filters:\n${lines}`);
-    }
-    return;
-  }
-
-  if (cmd === 'clearsalesfilters') {
-    traitFilters.clear();
-    await msg.reply('✅ Filters cleared — watching all sales.');
-    return;
-  }
-
-  if (cmd === 'salesoff') {
-    paused = true;
-    await msg.reply('⏸ Paused. Use `!saleson` to resume.');
-    return;
-  }
-
-  if (cmd === 'saleson') {
-    paused = false;
-    await msg.reply('▶️ Resumed!');
-    return;
-  }
-
-  if (cmd === 'salesstatus') {
-    const filterStr = traitFilters.size > 0
-      ? [...traitFilters.entries()].map(([k, v]) => `${k}=${v}`).join(', ')
+    const filters = config.traitFilters && Object.keys(config.traitFilters).length > 0
+      ? Object.entries(config.traitFilters).map(([k,v])=>`${k}=${v}`).join(', ')
       : 'none (all sales)';
-    await msg.reply(
-      `📊 **OCAS Sales Bot Status**\n` +
-      `• Paused: ${paused ? 'Yes ⏸' : 'No ▶️'}\n` +
-      `• Poll: every ${POLL_MS / 1000}s\n` +
-      `• Filters: ${filterStr}\n` +
-      `• OpenSea key: ${OPENSEA_KEY ? 'Set ✅' : 'Not set ⚠️'}\n` +
-      `• Image cache: ${imageCache.size} tokens`
-    );
+    await interaction.reply({
+      embeds:[new EmbedBuilder()
+        .setTitle('📊 Sales Bot Status')
+        .setColor(0x7aa2ff)
+        .addFields(
+          { name:'Collection', value:config.slug || '—',                              inline:true },
+          { name:'Channel',    value:config.channelId ? `<#${config.channelId}>` : '—', inline:true },
+          { name:'Paused',     value:config.paused ? 'Yes ⏸' : 'No ▶️',              inline:true },
+          { name:'Filters',    value:filters,                                          inline:false },
+        )
+      ],
+      ephemeral:true
+    });
     return;
   }
 
-  // !lastsale — fetch the single most recent sale (great for testing image display)
-  if (cmd === 'lastsale') {
-    await msg.reply('🔍 Fetching most recent sale...');
-    try {
-      const url = `https://api.opensea.io/api/v2/events/collection/${OS_SLUG}?event_type=sale&limit=1`;
+  // ── /lastsale ──────────────────────────────────────────────────────────────
+  if(commandName === 'lastsale'){
+    const slug = interaction.options.getString('collection') || config.slug;
+    if(!slug) return interaction.reply({ content:'⚠️ Provide a collection or run `/setup` first.', ephemeral:true });
+    await interaction.deferReply();
+    try{
+      const url = `https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=sale&limit=1`;
       const r   = await fetch(url, { headers: osHeaders() });
-      if (!r.ok) { await msg.reply(`❌ OpenSea error: ${r.status}`); return; }
+      if(!r.ok){ await interaction.editReply(`❌ OpenSea error: ${r.status}`); return; }
       const j     = await r.json();
       const sales = j.asset_events || [];
-      if (!sales.length) { await msg.reply('No sales found.'); return; }
-      const embed = await buildEmbed(sales[0]);
-      // No TEST prefix — show exactly as it would appear in a real sale
-      const ir = embed._imageResult; delete embed._imageResult;
-      if (ir?.type === 'buffer') {
-        const att = new AttachmentBuilder(ir.buffer, { name: ir.filename });
+      if(!sales.length){ await interaction.editReply('No sales found.'); return; }
+      const cfg   = { ...config, slug };
+      const embed = await buildEmbed(sales[0], cfg, true);
+      const ir    = embed._imageResult; delete embed._imageResult;
+      if(ir?.type === 'buffer'){
+        const att = new AttachmentBuilder(ir.buffer, { name:ir.filename });
         embed.setThumbnail(`attachment://${ir.filename}`);
-        await msg.reply({ embeds: [embed], files: [att] });
+        await interaction.editReply({ embeds:[embed], files:[att] });
       } else {
-        if (ir?.type === 'url') embed.setThumbnail(ir.url);
-        await msg.reply({ embeds: [embed] });
+        if(ir?.type === 'url') embed.setThumbnail(ir.url);
+        await interaction.editReply({ embeds:[embed] });
       }
-    } catch (e) {
-      await msg.reply(`❌ Error: ${e.message}`);
-    }
+    }catch(e){ await interaction.editReply(`❌ Error: ${e.message}`); }
     return;
   }
 
-  // !recentsales [count] — show last N sales (default 5, max 10)
-  if (cmd === 'recentsales') {
-    const count = Math.min(parseInt(parts[1]) || 5, 10);
-    await msg.reply(`🔍 Fetching last ${count} sales...`);
-    try {
-      const url = `https://api.opensea.io/api/v2/events/collection/${OS_SLUG}?event_type=sale&limit=${count}`;
+  // ── /recentsales ───────────────────────────────────────────────────────────
+  if(commandName === 'recentsales'){
+    const slug  = interaction.options.getString('collection') || config.slug;
+    const count = Math.min(interaction.options.getInteger('count') || 5, 10);
+    if(!slug) return interaction.reply({ content:'⚠️ Provide a collection or run `/setup` first.', ephemeral:true });
+    await interaction.deferReply();
+    try{
+      const url = `https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=sale&limit=${count}`;
       const r   = await fetch(url, { headers: osHeaders() });
-      if (!r.ok) { await msg.reply(`❌ OpenSea error: ${r.status}`); return; }
+      if(!r.ok){ await interaction.editReply(`❌ OpenSea error: ${r.status}`); return; }
       const j     = await r.json();
       const sales = j.asset_events || [];
-      if (!sales.length) { await msg.reply('No sales found.'); return; }
-      for (const sale of sales.reverse()) {
-        const embed = await buildEmbed(sale);
-        const ir2 = embed._imageResult; delete embed._imageResult;
-        if (ir2?.type === 'buffer') {
-          const att2 = new AttachmentBuilder(ir2.buffer, { name: ir2.filename });
-          embed.setThumbnail(`attachment://${ir2.filename}`);
-          await msg.channel.send({ embeds: [embed], files: [att2] });
-        } else {
-          if (ir2?.type === 'url') embed.setThumbnail(ir2.url);
-          await msg.channel.send({ embeds: [embed] });
-        }
+      if(!sales.length){ await interaction.editReply('No sales found.'); return; }
+      await interaction.editReply(`📋 Last ${sales.length} sales for **${slug}**:`);
+      const cfg = { ...config, slug };
+      for(const sale of sales.reverse()){
+        const embed = await buildEmbed(sale, cfg, true);
+        await sendEmbed(interaction.channel, embed);
         await new Promise(res => setTimeout(res, 800));
       }
-    } catch (e) {
-      await msg.reply(`❌ Error: ${e.message}`);
-    }
+    }catch(e){ await interaction.editReply(`❌ Error: ${e.message}`); }
     return;
   }
 
-  // !sale #ID — fetch a specific token's most recent sale
-  if (cmd === 'sale') {
-    const tokenId = parts[1]?.replace('#', '');
-    if (!tokenId || isNaN(tokenId)) {
-      await msg.reply('Usage: `!sale 1234` or `!sale #1234`');
-      return;
-    }
-    await msg.reply(`🔍 Fetching sale for #${tokenId}...`);
-    try {
-      const url = `https://api.opensea.io/api/v2/events/chain/ethereum/contract/${CONTRACT}/nfts/${tokenId}?event_type=sale&limit=1`;
+  // ── /sale ──────────────────────────────────────────────────────────────────
+  if(commandName === 'sale'){
+    const tokenId  = interaction.options.getString('token').replace('#','');
+    const slug     = interaction.options.getString('collection') || config.slug;
+    const contract = config.contract || '';
+    if(!slug)     return interaction.reply({ content:'⚠️ Provide a collection or run `/setup` first.', ephemeral:true });
+    if(!contract) return interaction.reply({ content:'⚠️ Set a contract address with `/setcollection`.', ephemeral:true });
+    await interaction.deferReply();
+    try{
+      const url = `https://api.opensea.io/api/v2/events/chain/ethereum/contract/${contract}/nfts/${tokenId}?event_type=sale&limit=1`;
       const r   = await fetch(url, { headers: osHeaders() });
-      if (!r.ok) { await msg.reply(`❌ OpenSea error: ${r.status}`); return; }
+      if(!r.ok){ await interaction.editReply(`❌ OpenSea error: ${r.status}`); return; }
       const j     = await r.json();
       const sales = j.asset_events || [];
-      if (!sales.length) { await msg.reply(`No sales found for #${tokenId}.`); return; }
-      const embed = await buildEmbed(sales[0]);
-      const ir3 = embed._imageResult; delete embed._imageResult;
-      if (ir3?.type === 'buffer') {
-        const att3 = new AttachmentBuilder(ir3.buffer, { name: ir3.filename });
-        embed.setThumbnail(`attachment://${ir3.filename}`);
-        await msg.reply({ embeds: [embed], files: [att3] });
+      if(!sales.length){ await interaction.editReply(`No sales found for #${tokenId}.`); return; }
+      const embed = await buildEmbed(sales[0], config, true);
+      const ir    = embed._imageResult; delete embed._imageResult;
+      if(ir?.type === 'buffer'){
+        const att = new AttachmentBuilder(ir.buffer, { name:ir.filename });
+        embed.setThumbnail(`attachment://${ir.filename}`);
+        await interaction.editReply({ embeds:[embed], files:[att] });
       } else {
-        if (ir3?.type === 'url') embed.setThumbnail(ir3.url);
-        await msg.reply({ embeds: [embed] });
+        if(ir?.type === 'url') embed.setThumbnail(ir.url);
+        await interaction.editReply({ embeds:[embed] });
       }
-    } catch (e) {
-      await msg.reply(`❌ Error: ${e.message}`);
-    }
+    }catch(e){ await interaction.editReply(`❌ Error: ${e.message}`); }
     return;
   }
 
-  // !debugimage #ID — shows exactly what image URLs OpenSea returns for a token
-  if (cmd === 'debugimage') {
-    const tokenId = (parts[1] || '3930').replace('#', '');
-    await msg.reply(`🔬 Checking image URLs for #${tokenId}...`);
-    try {
-      // Step 1: check the NFT endpoint
-      const nftUrl = `https://api.opensea.io/api/v2/chain/ethereum/contract/${CONTRACT}/nfts/${tokenId}`;
-      const r = await fetch(nftUrl, { headers: osHeaders() });
-      const j = await r.json();
-      const nft = j.nft || j;
-
-      const fields = [
-        `**image_url:** ${nft.image_url || 'null'}`,
-        `**display_image_url:** ${nft.display_image_url || 'null'}`,
-        `**image_preview_url:** ${nft.image_preview_url || 'null'}`,
-        `**image_thumbnail_url:** ${nft.image_thumbnail_url || 'null'}`,
-        `**animation_url:** ${nft.animation_url || 'null'}`,
-        `**metadata_url:** ${nft.metadata_url || 'null'}`,
-        `\n**isSvg(image_url):** ${isSvg(nft.image_url)}`,
-        `**isDiscordCompatible(display_image_url):** ${isDiscordCompatible(nft.display_image_url)}`,
-        `**HTTP status:** ${r.status}`,
-      ];
-
-      // Also check what the sale event itself returns
-      const saleUrl = `https://api.opensea.io/api/v2/events/chain/ethereum/contract/${CONTRACT}/nfts/${tokenId}?event_type=sale&limit=1`;
-      const r2 = await fetch(saleUrl, { headers: osHeaders() });
-      const j2 = await r2.json();
-      const saleNft = j2.asset_events?.[0]?.nft;
-      if (saleNft) {
-        fields.push(`\n**Sale event image_url:** ${saleNft.image_url || 'null'}`);
-        fields.push(`**Sale event display_image_url:** ${saleNft.display_image_url || 'null'}`);
-      }
-
-      await msg.reply(fields.join('\n').slice(0, 1900));
-    } catch (e) {
-      await msg.reply(`❌ Error: ${e.message}`);
-    }
+  // ── /help ──────────────────────────────────────────────────────────────────
+  if(commandName === 'help'){
+    await interaction.reply({
+      embeds:[new EmbedBuilder()
+        .setTitle('🤖 NFT Sales Bot — Help')
+        .setColor(0x7aa2ff)
+        .setDescription(
+          '**Admin commands** *(Manage Server permission required)*\n' +
+          '`/setup` — Configure channel + collection\n' +
+          '`/setchannel` — Change the sales channel\n' +
+          '`/setcollection` — Change the collection\n' +
+          '`/salesfilter` — Filter to specific trait sales\n' +
+          '`/clearfilters` — Remove all filters\n' +
+          '`/pause` / `/resume` — Pause/resume notifications\n' +
+          '`/status` — Show current configuration\n\n' +
+          '**Anyone can use**\n' +
+          '`/lastsale [collection]` — Show most recent sale\n' +
+          '`/recentsales [count] [collection]` — Show last N sales\n' +
+          '`/sale token:1234` — Show a specific token\'s last sale\n' +
+          '`/help` — This message'
+        )
+      ],
+      ephemeral: true
+    });
     return;
   }
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-client.once('ready', () => {
-  console.log(`✅ OCAS Sales Bot online as ${client.user.tag}`);
-  console.log(`   Channel: ${CHANNEL_ID}`);
-  console.log(`   Poll every: ${POLL_MS / 1000}s`);
-  console.log(`   OpenSea key: ${OPENSEA_KEY ? 'set' : 'NOT SET — may be rate limited'}`);
-  pollSales();
-  setInterval(pollSales, POLL_MS);
+client.once('ready', ()=>{
+  console.log(`✅ Sales Bot online as ${client.user.tag}`);
+  console.log(`   Watching ${Object.keys(serverConfigs).length} server(s)`);
+  console.log(`   OpenSea key: ${OPENSEA_KEY ? 'set' : 'NOT SET'}`);
+  pollAllServers();
+  setInterval(pollAllServers, POLL_MS);
 });
 
-client.on('error', (e) => console.error('[Discord] Error:', e.message));
-process.on('unhandledRejection', (e) => console.error('[Bot] Unhandled rejection:', e));
-
+client.on('error', e => console.error('[Discord]', e.message));
+process.on('unhandledRejection', e => console.error('[Bot]', e));
 client.login(DISCORD_TOKEN);
