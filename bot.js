@@ -1,11 +1,11 @@
 /**
- * OCAS Discord Sales Bot — FIXED
- * ------------------------------------------------------------
+ * OCAS Discord Sales Bot — Puppeteer Image Renderer Version
+ * ---------------------------------------------------------
  * Fixes included:
  * - Reliable channel fetching for auto-posts
  * - Poll locking (prevents overlapping intervals)
  * - Persistent lastSeenSaleId via state.json
- * - Automatic SVG / base64 SVG -> PNG conversion
+ * - Automatic SVG / base64 SVG -> PNG conversion using Puppeteer
  * - Discord-safe image attachments for fully onchain NFTs
  */
 
@@ -14,7 +14,8 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const fetch = require('node-fetch');
-const { Resvg } = require('@resvg/resvg-js');
+const chromium = require('@sparticuz/chromium');
+const puppeteer = require('puppeteer-core');
 const {
   Client,
   GatewayIntentBits,
@@ -108,9 +109,6 @@ function timeSince(unixTs) {
   const ts = Number(unixTs);
   if (!ts || !Number.isFinite(ts)) return '';
   const nowSec = Math.floor(Date.now() / 1000);
-
-  // OpenSea sometimes returns seconds, sometimes ISO strings in other endpoints.
-  // Your existing event_timestamp has worked numerically, so keep seconds logic first.
   const s = nowSec - ts;
   if (s < 0) return 'just now';
   if (s < 60) return `${s}s ago`;
@@ -161,21 +159,12 @@ function stripDataUriPrefix(dataUri) {
   return idx === -1 ? dataUri : dataUri.slice(idx + 1);
 }
 
-function decodeBase64Utf8(base64) {
-  return Buffer.from(base64, 'base64').toString('utf8');
-}
-
-function isLikelyBase64(str) {
-  return /^[A-Za-z0-9+/=\r\n]+$/.test(str);
-}
-
 // ── Data URI / metadata helpers ──────────────────────────────────────────────
 function extractSvgFromDataUri(input) {
   if (!input || typeof input !== 'string') return null;
 
   const s = input.trim();
 
-  // data:image/svg+xml;base64,...
   if (s.startsWith('data:image/svg+xml;base64,')) {
     try {
       return Buffer.from(stripDataUriPrefix(s), 'base64').toString('utf8');
@@ -184,7 +173,6 @@ function extractSvgFromDataUri(input) {
     }
   }
 
-  // data:image/svg+xml;utf8,...
   if (s.startsWith('data:image/svg+xml;utf8,')) {
     try {
       return decodeURIComponent(stripDataUriPrefix(s));
@@ -193,7 +181,6 @@ function extractSvgFromDataUri(input) {
     }
   }
 
-  // raw SVG string
   if (s.startsWith('<svg')) return s;
 
   return null;
@@ -204,7 +191,6 @@ function extractJsonFromDataUri(input) {
 
   const s = input.trim();
 
-  // data:application/json;base64,...
   if (s.startsWith('data:application/json;base64,')) {
     try {
       return JSON.parse(Buffer.from(stripDataUriPrefix(s), 'base64').toString('utf8'));
@@ -213,7 +199,6 @@ function extractJsonFromDataUri(input) {
     }
   }
 
-  // data:application/json;utf8,...
   if (s.startsWith('data:application/json;utf8,')) {
     try {
       return JSON.parse(decodeURIComponent(stripDataUriPrefix(s)));
@@ -236,15 +221,109 @@ async function fetchText(url) {
   return r.text();
 }
 
+// ── Puppeteer browser / SVG rendering ────────────────────────────────────────
+let browserPromise = null;
+
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: {
+        width: 1000,
+        height: 1000,
+        deviceScaleFactor: 2,
+      },
+      executablePath: await chromium.executablePath(),
+      headless: true,
+    });
+  }
+  return browserPromise;
+}
+
 async function renderSvgToPngBuffer(svgString) {
-  const resvg = new Resvg(svgString, {
-    fitTo: {
-      mode: 'width',
-      value: 800,
-    },
-  });
-  const pngData = resvg.render();
-  return pngData.asPng();
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+
+  try {
+    await page.setViewport({
+      width: 1000,
+      height: 1000,
+      deviceScaleFactor: 2,
+    });
+
+    const html = `
+      <!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <style>
+            html, body {
+              margin: 0;
+              padding: 0;
+              width: 1000px;
+              height: 1000px;
+              background: transparent;
+              overflow: hidden;
+            }
+            body {
+              display: flex;
+              align-items: center;
+              justify-content: center;
+            }
+            #wrap {
+              width: 1000px;
+              height: 1000px;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              background: transparent;
+            }
+            #wrap svg {
+              width: 1000px;
+              height: 1000px;
+              display: block;
+            }
+          </style>
+        </head>
+        <body>
+          <div id="wrap">${svgString}</div>
+        </body>
+      </html>
+    `;
+
+    await page.setContent(html, {
+      waitUntil: 'networkidle0',
+    });
+
+    await page.evaluate(async () => {
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      const images = Array.from(document.images || []);
+      await Promise.all(
+        images.map((img) => {
+          if (img.complete) return Promise.resolve();
+          return new Promise((resolve) => {
+            img.onload = resolve;
+            img.onerror = resolve;
+          });
+        })
+      );
+
+      await wait(500);
+    });
+
+    const el = await page.$('#wrap');
+    if (!el) {
+      throw new Error('SVG wrapper not found in browser render');
+    }
+
+    return await el.screenshot({
+      type: 'png',
+      omitBackground: true,
+    });
+  } finally {
+    await page.close();
+  }
 }
 
 async function svgUrlToPngBuffer(svgUrl) {
@@ -252,7 +331,7 @@ async function svgUrlToPngBuffer(svgUrl) {
   return renderSvgToPngBuffer(svgText);
 }
 
-// ── Resolve image from sale / NFT endpoint ───────────────────────────────────
+// ── OpenSea NFT lookup ───────────────────────────────────────────────────────
 async function fetchNftFromOpenSea(tokenId) {
   const nftUrl = `https://api.opensea.io/api/v2/chain/ethereum/contract/${CONTRACT}/nfts/${tokenId}`;
   const r = await fetch(nftUrl, { headers: osHeaders() });
@@ -282,14 +361,12 @@ function collectImageCandidates(sale, nft) {
 }
 
 async function tryResolveFromMetadataSource(source) {
-  // Case 1: direct SVG data URI
   const directSvg = extractSvgFromDataUri(source);
   if (directSvg) {
     const png = await renderSvgToPngBuffer(directSvg);
     return { type: 'pngBuffer', value: png };
   }
 
-  // Case 2: data:application/json with image inside
   const jsonFromDataUri = extractJsonFromDataUri(source);
   if (jsonFromDataUri?.image) {
     const nestedSvg = extractSvgFromDataUri(jsonFromDataUri.image);
@@ -297,32 +374,30 @@ async function tryResolveFromMetadataSource(source) {
       const png = await renderSvgToPngBuffer(nestedSvg);
       return { type: 'pngBuffer', value: png };
     }
+
     if (isDiscordCompatibleRasterUrl(jsonFromDataUri.image)) {
       return { type: 'url', value: jsonFromDataUri.image };
     }
+
     if (isSvg(jsonFromDataUri.image) && isHttpUrl(jsonFromDataUri.image)) {
       const png = await svgUrlToPngBuffer(jsonFromDataUri.image);
       return { type: 'pngBuffer', value: png };
     }
   }
 
-  // Case 3: normal raster URL
   if (isDiscordCompatibleRasterUrl(source)) {
     return { type: 'url', value: source };
   }
 
-  // Case 4: SVG URL
   if (isSvg(source) && isHttpUrl(source)) {
     const png = await svgUrlToPngBuffer(source);
     return { type: 'pngBuffer', value: png };
   }
 
-  // Case 5: metadata URL that returns JSON
   if (isHttpUrl(source) && !isSvg(source)) {
     try {
       const text = await fetchText(source);
 
-      // Try JSON first
       try {
         const json = JSON.parse(text);
         if (json?.image) {
@@ -331,9 +406,11 @@ async function tryResolveFromMetadataSource(source) {
             const png = await renderSvgToPngBuffer(nestedSvg);
             return { type: 'pngBuffer', value: png };
           }
+
           if (isDiscordCompatibleRasterUrl(json.image)) {
             return { type: 'url', value: json.image };
           }
+
           if (isSvg(json.image) && isHttpUrl(json.image)) {
             const png = await svgUrlToPngBuffer(json.image);
             return { type: 'pngBuffer', value: png };
@@ -343,7 +420,6 @@ async function tryResolveFromMetadataSource(source) {
         // not JSON
       }
 
-      // Maybe the URL itself returned raw SVG
       if (text.trim().startsWith('<svg')) {
         const png = await renderSvgToPngBuffer(text);
         return { type: 'pngBuffer', value: png };
@@ -381,9 +457,7 @@ async function resolveImageAsset(sale) {
         return resolved;
       }
     } catch (e) {
-      console.warn(
-        `[Image] #${tokenId} — candidate resolution failed: ${e.message}`
-      );
+      console.warn(`[Image] #${tokenId} — candidate resolution failed: ${e.message}`);
     }
   }
 
@@ -394,14 +468,18 @@ async function resolveImageAsset(sale) {
 // ── Trait filter check ───────────────────────────────────────────────────────
 function matchesFilters(sale) {
   if (traitFilters.size === 0) return true;
+
   const nftTraits = sale.nft?.traits || [];
   const lookup = {};
+
   for (const t of nftTraits) {
     lookup[t.trait_type?.toLowerCase()] = String(t.value).toLowerCase();
   }
+
   for (const [name, val] of traitFilters) {
     if (lookup[name] !== val) return false;
   }
+
   return true;
 }
 
@@ -418,7 +496,7 @@ async function buildMessagePayload(sale, { testMode = false } = {}) {
   const tvUrl = `https://traitview.com/#${tokenId}`;
 
   const embed = new EmbedBuilder()
-    .setTitle(`${testMode ? '🧪 TEST — ' : '🟢  Sale — '}On-Chain All Stars ${name}`)
+    .setTitle(`${testMode ? '🧪 TEST — ' : '🟢 Sale — '}On-Chain All Stars ${name}`)
     .setColor(0x2dd4bf)
     .setURL(osUrl)
     .setFooter({
@@ -451,6 +529,7 @@ async function buildMessagePayload(sale, { testMode = false } = {}) {
       .slice(0, 12)
       .map((t) => `**${t.trait_type}**: ${t.value}`)
       .join('\n');
+
     embed.addFields({ name: 'Traits', value: traitLines, inline: false });
   }
 
@@ -458,6 +537,7 @@ async function buildMessagePayload(sale, { testMode = false } = {}) {
     const filterStr = [...traitFilters.entries()]
       .map(([k, v]) => `${k}: ${v}`)
       .join(' • ');
+
     embed.addFields({ name: '🔍 Filter active', value: filterStr, inline: false });
   }
 
@@ -505,7 +585,6 @@ async function pollSales() {
     const sales = await fetchLatestSales(20);
     if (!sales.length) return;
 
-    // First run: establish cursor without posting old sales
     if (lastSeenSaleId === null) {
       lastSeenSaleId = getSaleId(sales[0]);
       saveState();
@@ -530,7 +609,6 @@ async function pollSales() {
       return;
     }
 
-    // oldest -> newest so Discord reads in order
     for (const sale of newSales.reverse()) {
       if (!matchesFilters(sale)) {
         console.log(`[Sales] Skipping #${safeTokenId(sale)} — filtered`);
@@ -543,10 +621,7 @@ async function pollSales() {
         console.log(`[Sales] Posted sale #${safeTokenId(sale)}`);
         await sleep(700);
       } catch (e) {
-        console.error(
-          `[Sales] Error posting #${safeTokenId(sale)}:`,
-          e.message
-        );
+        console.error(`[Sales] Error posting #${safeTokenId(sale)}:`, e.message);
       }
     }
 
@@ -596,6 +671,7 @@ client.on('messageCreate', async (msg) => {
 
   if (cmd === 'salesfilter') {
     const args = parts.slice(1);
+
     if (args.length < 2 || args.length % 2 !== 0) {
       await msg.reply(
         '⚠️ Usage: `!salesfilter <TraitName> <Value>`\nExample: `!salesfilter Background Blue`\nMulti: `!salesfilter Background Blue Eyes Laser`'
@@ -605,6 +681,7 @@ client.on('messageCreate', async (msg) => {
 
     traitFilters.clear();
     const pairs = [];
+
     for (let i = 0; i < args.length; i += 2) {
       traitFilters.set(args[i].toLowerCase(), args[i + 1].toLowerCase());
       pairs.push(`**${args[i]}** = ${args[i + 1]}`);
@@ -684,12 +761,14 @@ client.on('messageCreate', async (msg) => {
   if (cmd === 'recentsales') {
     const count = Math.min(parseInt(parts[1], 10) || 5, 10);
     await msg.reply(`🔍 Fetching last ${count} sales...`);
+
     try {
       const sales = await fetchLatestSales(count);
       if (!sales.length) {
         await msg.reply('No sales found.');
         return;
       }
+
       for (const sale of sales.reverse()) {
         const payload = await buildMessagePayload(sale, { testMode: true });
         await msg.channel.send(payload);
@@ -703,6 +782,7 @@ client.on('messageCreate', async (msg) => {
 
   if (cmd === 'sale') {
     const tokenId = parts[1]?.replace('#', '');
+
     if (!tokenId || isNaN(tokenId)) {
       await msg.reply('Usage: `!sale 1234` or `!sale #1234`');
       return;
@@ -713,12 +793,15 @@ client.on('messageCreate', async (msg) => {
     try {
       const url = `https://api.opensea.io/api/v2/events/chain/ethereum/contract/${CONTRACT}/nfts/${tokenId}?event_type=sale&limit=1`;
       const r = await fetch(url, { headers: osHeaders() });
+
       if (!r.ok) {
         await msg.reply(`❌ OpenSea error: ${r.status}`);
         return;
       }
+
       const j = await r.json();
       const sales = j.asset_events || [];
+
       if (!sales.length) {
         await msg.reply(`No sales found for #${tokenId}.`);
         return;
@@ -734,6 +817,36 @@ client.on('messageCreate', async (msg) => {
   }
 });
 
+// ── Browser cleanup ──────────────────────────────────────────────────────────
+async function closeBrowser() {
+  if (!browserPromise) return;
+  try {
+    const browser = await browserPromise;
+    await browser.close();
+  } catch (e) {
+    console.warn('[Browser] Failed to close cleanly:', e.message);
+  }
+}
+
+process.on('SIGINT', async () => {
+  await closeBrowser();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  await closeBrowser();
+  process.exit(0);
+});
+
+// ── Process safety ───────────────────────────────────────────────────────────
+client.on('error', (e) => console.error('[Discord] Error:', e.message));
+process.on('unhandledRejection', (e) =>
+  console.error('[Bot] Unhandled rejection:', e)
+);
+process.on('uncaughtException', (e) =>
+  console.error('[Bot] Uncaught exception:', e)
+);
+
 // ── Boot ─────────────────────────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`✅ OCAS Sales Bot online as ${client.user.tag}`);
@@ -744,20 +857,13 @@ client.once('ready', async () => {
   loadState();
 
   await pollSales();
+
   setInterval(() => {
     pollSales().catch((e) => {
       console.error('[Sales] Interval poll failed:', e.message);
     });
   }, POLL_MS);
 });
-
-client.on('error', (e) => console.error('[Discord] Error:', e.message));
-process.on('unhandledRejection', (e) =>
-  console.error('[Bot] Unhandled rejection:', e)
-);
-process.on('uncaughtException', (e) =>
-  console.error('[Bot] Uncaught exception:', e)
-);
 
 if (!DISCORD_TOKEN) {
   console.error('Missing DISCORD_TOKEN');
