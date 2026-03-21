@@ -101,44 +101,98 @@ function isDiscordCompatible(url) {
          !s.startsWith('<svg');
 }
 
-// ── OCAS SVG image extractor ─────────────────────────────────────────────────
-// OCAS SVGs use <foreignObject><img src="data:image/png;base64,..."> to embed
-// the actual pixel art PNG. librsvg (used by sharp) doesn't support foreignObject,
-// so we extract the embedded PNG directly instead of rendering the SVG.
+// ── OCAS image builder ───────────────────────────────────────────────────────
+// OCAS SVGs have two layers:
+//   1. <g id="Background"> — a linearGradient rect (can be multi-stop)
+//   2. <g id="GeneratedImage"><foreignObject><img src="data:image/png;base64,...">
+//      — the actual pixel art PNG (librsvg ignores foreignObject)
+//
+// Strategy: extract gradient stops → build a clean background-only SVG →
+// render it with sharp → extract the character PNG → composite on top.
+
 async function extractPngFromOcasSvg(svgSource) {
   let svgText;
 
   if (svgSource.startsWith('data:image/svg')) {
-    // data URI — base64 decode to get SVG text
     const b64 = svgSource.split(',')[1];
     if (!b64) throw new Error('Empty SVG data URI');
     svgText = Buffer.from(b64, 'base64').toString('utf-8');
   } else {
-    // Remote URL — fetch SVG text
     const r = await fetch(svgSource);
     if (!r.ok) throw new Error(`SVG fetch: ${r.status}`);
     svgText = await r.text();
   }
 
-  // Extract the embedded PNG base64 from <img src="data:image/png;base64,...">
+  const SIZE = 500; // output PNG size
+
+  // ── Step 1: Extract character PNG ────────────────────────────────────────
   const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
+  let charBuffer = null;
   if (pngMatch) {
     const pngB64 = pngMatch[1].replace(/\s/g, '');
-    const pngBuffer = Buffer.from(pngB64, 'base64');
-    // Scale up from tiny pixel art (24x24) to 500x500 using nearest-neighbor
-    return sharp(pngBuffer)
-      .resize(500, 500, { kernel: 'nearest' })
+    const rawPng = Buffer.from(pngB64, 'base64');
+    // Scale up 24×24 pixel art to 500×500 with nearest-neighbor (keeps pixels crisp)
+    charBuffer = await sharp(rawPng)
+      .resize(SIZE, SIZE, { kernel: 'nearest' })
       .png()
       .toBuffer();
   }
 
-  // Fallback: no embedded PNG found, try rendering SVG directly
-  // (won't show character but at least shows background)
-  const svgBuffer = Buffer.from(svgText, 'utf-8');
-  return sharp(svgBuffer, { density: 150 })
-    .resize(500, 500, { fit: 'contain' })
+  // ── Step 2: Extract gradient stops from the background group ─────────────
+  // Grab all stop-color values in order — may be 2 (simple) or many (rainbow)
+  const stopMatches = [...svgText.matchAll(/stop-color=["'](#[0-9a-fA-F]{6,8})["']/g)];
+  const stops = stopMatches.map(m => {
+    const hex = m[1].slice(0, 7); // strip alpha if present (#rrggbbaa → #rrggbb)
+    return hex;
+  });
+
+  // Deduplicate consecutive identical stops to find true gradient points
+  const uniqueStops = stops.filter((c, i) => c !== stops[i - 1]);
+
+  // ── Step 3: Build a clean background-only SVG (no foreignObject) ─────────
+  // linearGradient direction: check x1/y1/x2/y2 from original
+  const gradDirMatch = svgText.match(/linearGradient[^>]+x1=["']([\.\d]+)["'][^>]+y1=["']([\.\d]+)["'][^>]+x2=["']([\.\d]+)["'][^>]+y2=["']([\.\d]+)["']/);
+  const [gx1, gy1, gx2, gy2] = gradDirMatch
+    ? [gradDirMatch[1], gradDirMatch[2], gradDirMatch[3], gradDirMatch[4]]
+    : ['0', '0', '0', '1'];
+
+  let gradientStopsSvg;
+  if (uniqueStops.length <= 1) {
+    // Solid color
+    const color = uniqueStops[0] || '#1a1a2e';
+    gradientStopsSvg = `<stop offset="0%" stop-color="${color}"/><stop offset="100%" stop-color="${color}"/>`;
+  } else {
+    // Multi-stop gradient — distribute evenly
+    gradientStopsSvg = uniqueStops.map((color, i) => {
+      const pct = Math.round((i / (uniqueStops.length - 1)) * 100);
+      return `<stop offset="${pct}%" stop-color="${color}"/>`;
+    }).join('');
+  }
+
+  const bgSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}">
+    <defs>
+      <linearGradient id="bg" x1="${gx1}" y1="${gy1}" x2="${gx2}" y2="${gy2}">
+        ${gradientStopsSvg}
+      </linearGradient>
+    </defs>
+    <rect width="${SIZE}" height="${SIZE}" fill="url(#bg)"/>
+  </svg>`;
+
+  const bgBuffer = await sharp(Buffer.from(bgSvg))
+    .resize(SIZE, SIZE)
     .png()
     .toBuffer();
+
+  // ── Step 4: Composite character on background ─────────────────────────────
+  if (charBuffer) {
+    return sharp(bgBuffer)
+      .composite([{ input: charBuffer, blend: 'over' }])
+      .png()
+      .toBuffer();
+  }
+
+  // No character PNG found — return just the background
+  return bgBuffer;
 }
 
 // ── Image resolver — returns { url } or { buffer, filename } ─────────────────
