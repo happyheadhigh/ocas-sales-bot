@@ -623,13 +623,18 @@ client.on('guildCreate', async (guild)=>{
     ].join('\n');
 
     const setup=[
-      '**Step 1 - Sales channel:**',
+      '**Step 1 - Find your collection slug:**',
+      'Go to your collection on OpenSea and look at the URL:',
+      '`opensea.io/collection/` **your-slug-is-here**',
+      'Copy exactly as shown - lowercase, dashes not spaces.',
+      '',
+      '**Step 2 - Sales channel:**',
       '`/setup channel:#all-sales collection:your-slug contract:0x...`',
       '',
-      '**Step 2 - Listings channel:**',
+      '**Step 3 - Listings channel:**',
       '`/setlistings channel:#all-listings`',
       '',
-      '**Step 3 - Test it:**',
+      '**Step 4 - Test it:**',
       '`/lastsale` and `/listings`',
       '',
       'Thats it! Both channels will auto-post immediately.'
