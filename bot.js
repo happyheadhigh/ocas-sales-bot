@@ -101,26 +101,42 @@ function isDiscordCompatible(url) {
          !s.startsWith('<svg');
 }
 
-// ── SVG → PNG converter using sharp ──────────────────────────────────────────
-// Returns a Buffer of PNG bytes from an SVG URL or data URI
-async function svgToPngBuffer(svgSource) {
-  let svgBuffer;
+// ── OCAS SVG image extractor ─────────────────────────────────────────────────
+// OCAS SVGs use <foreignObject><img src="data:image/png;base64,..."> to embed
+// the actual pixel art PNG. librsvg (used by sharp) doesn't support foreignObject,
+// so we extract the embedded PNG directly instead of rendering the SVG.
+async function extractPngFromOcasSvg(svgSource) {
+  let svgText;
 
   if (svgSource.startsWith('data:image/svg')) {
-    // data URI — decode the base64 or URL-encoded SVG directly
-    const base64 = svgSource.split(',')[1];
-    if (!base64) throw new Error('Empty data URI');
-    svgBuffer = Buffer.from(base64, 'base64');
+    // data URI — base64 decode to get SVG text
+    const b64 = svgSource.split(',')[1];
+    if (!b64) throw new Error('Empty SVG data URI');
+    svgText = Buffer.from(b64, 'base64').toString('utf-8');
   } else {
-    // Remote URL — fetch the SVG bytes
+    // Remote URL — fetch SVG text
     const r = await fetch(svgSource);
-    if (!r.ok) throw new Error(`SVG fetch failed: ${r.status}`);
-    svgBuffer = Buffer.from(await r.arrayBuffer());
+    if (!r.ok) throw new Error(`SVG fetch: ${r.status}`);
+    svgText = await r.text();
   }
 
-  // Convert SVG → PNG at 500×500 using sharp
+  // Extract the embedded PNG base64 from <img src="data:image/png;base64,...">
+  const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
+  if (pngMatch) {
+    const pngB64 = pngMatch[1].replace(/\s/g, '');
+    const pngBuffer = Buffer.from(pngB64, 'base64');
+    // Scale up from tiny pixel art (24x24) to 500x500 using nearest-neighbor
+    return sharp(pngBuffer)
+      .resize(500, 500, { kernel: 'nearest' })
+      .png()
+      .toBuffer();
+  }
+
+  // Fallback: no embedded PNG found, try rendering SVG directly
+  // (won't show character but at least shows background)
+  const svgBuffer = Buffer.from(svgText, 'utf-8');
   return sharp(svgBuffer, { density: 150 })
-    .resize(500, 500, { fit: 'contain', background: { r:15, g:20, b:28, alpha:1 } })
+    .resize(500, 500, { fit: 'contain' })
     .png()
     .toBuffer();
 }
@@ -195,7 +211,7 @@ async function resolveImage(sale) {
   if (svgSource) {
     try {
       console.log(`[Image] #${id} — converting SVG to PNG with sharp`);
-      const pngBuffer = await svgToPngBuffer(svgSource);
+      const pngBuffer = await extractPngFromOcasSvg(svgSource);
       const result = { type: 'buffer', buffer: pngBuffer, filename: `ocas-${id}.png` };
       if (id) imageCache.set(id, result);
       console.log(`[Image] #${id} — SVG converted to PNG (${pngBuffer.length} bytes)`);
