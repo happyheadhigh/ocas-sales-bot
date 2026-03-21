@@ -234,26 +234,66 @@ async function pollSales(){
   for(const [guildId,config] of Object.entries(serverConfigs)){
     if(!config.channelId||!config.slug||config.paused) continue;
     try{
-      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(config.slug)}?event_type=sale&limit=20`,{headers:osHeaders()});
-      if(!r.ok) continue;
-      const sales=(await r.json()).asset_events||[];
-      if(!sales.length) continue;
       const lastId=lastSaleIds.get(guildId);
-      if(!lastId){ lastSaleIds.set(guildId,String(sales[0].id||sales[0].event_timestamp)); continue; }
       const newSales=[];
-      for(const s of sales){ const sid=String(s.id||s.event_timestamp); if(sid===lastId) break; newSales.push(s); }
+      let cursor=null;
+      let pages=0;
+      const MAX_PAGES=5; // catch up on up to 500 missed sales
+
+      // Paginate until we find the last seen sale or run out of pages
+      outer: while(pages<MAX_PAGES){
+        const qs=new URLSearchParams({event_type:'sale',limit:'100'});
+        if(cursor) qs.set('next',cursor);
+        const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(config.slug)}?${qs}`,{headers:osHeaders()});
+        if(!r.ok) break;
+        const j=await r.json();
+        const sales=j.asset_events||[];
+        if(!sales.length) break;
+
+        // First run — just set cursor, don't post
+        if(!lastId){
+          lastSaleIds.set(guildId,String(sales[0].id||sales[0].event_timestamp));
+          console.log('['+config.slug+'] Watching from sale '+lastSaleIds.get(guildId));
+          break;
+        }
+
+        for(const s of sales){
+          const sid=String(s.id||s.event_timestamp);
+          if(sid===lastId) break outer; // caught up
+          newSales.push(s);
+        }
+
+        cursor=j.next||null;
+        if(!cursor) break;
+        pages++;
+      }
+
       if(!newSales.length) continue;
-      lastSaleIds.set(guildId,String(sales[0].id||sales[0].event_timestamp));
+      lastSaleIds.set(guildId,String(newSales[0].id||newSales[0].event_timestamp));
+
       const channel=client.channels.cache.get(config.channelId);
       if(!channel) continue;
-      for(const sale of newSales.reverse()){
-        // Server-level auto-post
-        if(matchesFilters(sale.nft?.traits,config.salesFilters)){
-          try{ const embed=await buildSaleEmbed(sale,config); await sendEmbed(channel,embed); }catch(e){ console.error('[Sale post]',e.message); }
-        }
-        // Personal DM alerts
-        await sendPersonalAlerts(sale, 'sale', config);
+
+      console.log('['+config.slug+'] Posting '+newSales.length+' new sale(s)');
+
+      // Build all embeds concurrently (parallel image fetching = much faster)
+      const toPost=newSales.reverse(); // oldest first
+      const embeds=await Promise.all(
+        toPost
+          .filter(sale=>matchesFilters(sale.nft?.traits,config.salesFilters))
+          .map(sale=>buildSaleEmbed(sale,config).catch(e=>{console.error('[Build sale]',e.message);return null;}))
+      );
+
+      // Post with a small stagger to avoid Discord rate limits (not 800ms — just 300ms)
+      for(const embed of embeds){
+        if(!embed) continue;
+        try{ await sendEmbed(channel,embed); }catch(e){ console.error('[Sale post]',e.message); }
+        await new Promise(r=>setTimeout(r,300));
       }
+
+      // Personal DM alerts (run after channel posts so channel isn't blocked)
+      for(const sale of toPost) await sendPersonalAlerts(sale,'sale',config);
+
     }catch(e){ console.error('[Poll sales]',guildId,e.message); }
   }
 }
@@ -263,27 +303,60 @@ async function pollListings(){
   for(const [guildId,config] of Object.entries(serverConfigs)){
     if(!config.listingsChannelId||!config.slug||config.paused) continue;
     try{
-      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(config.slug)}?event_type=listing&limit=20`,{headers:osHeaders()});
-      if(!r.ok) continue;
-      const listings=(await r.json()).asset_events||[];
-      if(!listings.length) continue;
       const lastId=lastListingIds.get(guildId);
-      if(!lastId){ lastListingIds.set(guildId,String(listings[0].id||listings[0].event_timestamp)); continue; }
       const newListings=[];
-      for(const l of listings){ const lid=String(l.id||l.event_timestamp); if(lid===lastId) break; newListings.push(l); }
+      let cursor=null;
+      let pages=0;
+      const MAX_PAGES=5;
+
+      outer: while(pages<MAX_PAGES){
+        const qs=new URLSearchParams({event_type:'listing',limit:'100'});
+        if(cursor) qs.set('next',cursor);
+        const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(config.slug)}?${qs}`,{headers:osHeaders()});
+        if(!r.ok) break;
+        const j=await r.json();
+        const listings=j.asset_events||[];
+        if(!listings.length) break;
+
+        if(!lastId){
+          lastListingIds.set(guildId,String(listings[0].id||listings[0].event_timestamp));
+          break;
+        }
+
+        for(const l of listings){
+          const lid=String(l.id||l.event_timestamp);
+          if(lid===lastId) break outer;
+          newListings.push(l);
+        }
+
+        cursor=j.next||null;
+        if(!cursor) break;
+        pages++;
+      }
+
       if(!newListings.length) continue;
-      lastListingIds.set(guildId,String(listings[0].id||listings[0].event_timestamp));
+      lastListingIds.set(guildId,String(newListings[0].id||newListings[0].event_timestamp));
+
       const channel=client.channels.cache.get(config.listingsChannelId);
       if(!channel) continue;
-      for(const listing of newListings.reverse()){
-        const nftTraits=listing.item?.traits||listing.nft?.traits||[];
-        // Server-level auto-post
-        if(matchesFilters(nftTraits,config.listingFilters)){
-          try{ const embed=await buildListingEmbed(listing,config); await sendEmbed(channel,embed); }catch(e){ console.error('[Listing post]',e.message); }
-        }
-        // Personal DM alerts
-        await sendPersonalAlerts(listing, 'listing', config);
+
+      console.log('['+config.slug+'] Posting '+newListings.length+' new listing(s)');
+
+      const toPost=newListings.reverse();
+      const embeds=await Promise.all(
+        toPost
+          .filter(l=>matchesFilters(l.item?.traits||l.nft?.traits||[],config.listingFilters))
+          .map(l=>buildListingEmbed(l,config).catch(e=>{console.error('[Build listing]',e.message);return null;}))
+      );
+
+      for(const embed of embeds){
+        if(!embed) continue;
+        try{ await sendEmbed(channel,embed); }catch(e){ console.error('[Listing post]',e.message); }
+        await new Promise(r=>setTimeout(r,300));
       }
+
+      for(const l of toPost) await sendPersonalAlerts(l,'listing',config);
+
     }catch(e){ console.error('[Poll listings]',guildId,e.message); }
   }
 }
