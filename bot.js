@@ -452,6 +452,35 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
+  // /setuphere — mobile-friendly setup, uses the CURRENT channel automatically
+  if(commandName==='setuphere'){
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    const slug=interaction.options.getString('collection');
+    const contract=(interaction.options.getString('contract')||'').toLowerCase().trim();
+    const chain=(interaction.options.getString('chain')||'ethereum').toLowerCase().trim();
+    const channelId=interaction.channelId; // use the channel this command was run in
+    setConfig(guildId,{channelId,slug:slug.toLowerCase().trim(),contract,chain,salesFilters:{},listingFilters:{},paused:false});
+    await interaction.reply({embeds:[new EmbedBuilder().setTitle('Sales Bot Configured!')
+      .setColor(0x2dd4bf)
+      .addFields(
+        {name:'Sales Channel',value:`<#${channelId}> (this channel)`,inline:true},
+        {name:'Collection',   value:slug,                              inline:true},
+        {name:'Contract',     value:contract||'not set',              inline:true},
+      )
+      .setDescription('Sales will post to **this channel** automatically.\nRun `/setlistingshere` in your listings channel to enable listing alerts.')
+    ]});
+    return;
+  }
+
+  // /setlistingshere — mobile-friendly listings setup, uses current channel
+  if(commandName==='setlistingshere'){
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    const channelId=interaction.channelId;
+    setConfig(guildId,{listingsChannelId:channelId});
+    await interaction.reply({content:`Listings channel set to this channel <#${channelId}>. New listings will post here automatically.`});
+    return;
+  }
+
   // /setlistings
   if(commandName==='setlistings'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
@@ -826,16 +855,17 @@ client.on('guildCreate', async (guild)=>{
       '`opensea.io/collection/` **your-slug-is-here**',
       'Copy exactly as shown - lowercase, dashes not spaces.',
       '',
-      '**Step 2 - Sales channel:**',
-      '`/setup channel:#all-sales collection:your-slug contract:0x...`',
+      '**Step 2 - Sales channel (go to your sales channel and run):****',
+      '`/setuphere collection:your-slug contract:0x...`',
       '',
-      '**Step 3 - Listings channel:**',
-      '`/setlistings channel:#all-listings`',
+      '**Step 3 - Listings channel (go to your listings channel and run):**',
+      '`/setlistingshere`',
       '',
       '**Step 4 - Test it:**',
       '`/lastsale` and `/listings`',
       '',
-      'Thats it! Both channels will auto-post immediately.'
+      'Works on mobile and desktop!',
+      'Tip: `/setup` also works on desktop if you prefer.'
     ].join('\n');
 
     const channelTip=[

@@ -18,6 +18,25 @@ const commands = [
         {name:'Solana',value:'solana'},
       )),
 
+  new SlashCommandBuilder().setName('setuphere')
+    .setDescription('Mobile-friendly setup — posts sales to the channel you run this in')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption(o=>o.setName('collection').setDescription('OpenSea collection slug (e.g. on-chain-all-stars)').setRequired(true))
+    .addStringOption(o=>o.setName('contract').setDescription('Contract address (e.g. 0x078be86...)').setRequired(false))
+    .addStringOption(o=>o.setName('chain').setDescription('Blockchain (default: ethereum)').setRequired(false)
+      .addChoices(
+        {name:'Ethereum',value:'ethereum'},
+        {name:'Base',value:'base'},
+        {name:'Polygon',value:'matic'},
+        {name:'Arbitrum',value:'arbitrum'},
+        {name:'Optimism',value:'optimism'},
+        {name:'Solana',value:'solana'},
+      )),
+
+  new SlashCommandBuilder().setName('setlistingshere')
+    .setDescription('Mobile-friendly — sets listings channel to the channel you run this in')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
   new SlashCommandBuilder().setName('setlistings').setDescription('Set the channel for new listing alerts')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o=>o.setName('channel').setDescription('Channel to post new listings in').setRequired(true)),
