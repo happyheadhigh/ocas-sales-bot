@@ -80,9 +80,11 @@ function formatEth(event){
 
 function formatListingEth(listing){
   try{
-    const price = listing.price?.current?.value || listing.price?.value;
-    if(!price) return null;
-    const eth = Number(price)/1e18;
+    // Listing events use payment.quantity (wei) just like sale events
+    const qty = listing.payment?.quantity;
+    if(!qty) return null;
+    const dec = listing.payment?.decimals ?? 18;
+    const eth = Number(qty) / Math.pow(10, dec);
     if(!isFinite(eth)||eth<=0) return null;
     return eth>=1?eth.toFixed(4):eth.toFixed(5);
   }catch{ return null; }
@@ -198,37 +200,56 @@ async function buildSaleEmbed(sale, config){
 }
 
 // ── Build LISTING embed ───────────────────────────────────────────────────────
+// OpenSea listing events (event_type:"order") real structure from debug:
+//   listing.asset        → NFT data (token_id, name, image_url, traits)
+//   listing.payment      → { quantity (wei), decimals, symbol }
+//   listing.maker        → seller address (string)
+//   listing.criteria     → trait filter if collection offer
 async function buildListingEmbed(listing, config){
-  const nft=listing.item||listing.nft||{};
-  const rawId=nft.nft_id||nft.identifier||'';
-  const id=rawId.includes('/')?rawId.split('/').pop():rawId;
-  const name=nft.name||`#${id}`;
-  const eth=formatListingEth(listing);
-  const contract=config.contract||'';
-  const slug=config.slug||'';
-  const chain=config.chain||'ethereum';
-  const osUrl=contract?`https://opensea.io/assets/${chain}/${contract}/${id}`:`https://opensea.io/assets/${chain}/${id}`;
-  const tvUrl=`https://traitview.com/?jump=${id}`;
-  const sellerAddr=listing.maker?.address||'';
-  const sellerLink=sellerAddr?`[${shortAddr(sellerAddr)}](https://opensea.io/${sellerAddr})`:'unknown';
+  const asset    = listing.asset || {};
+  const id       = String(asset.token_id || asset.identifier || '');
+  const name     = asset.name || (id ? '#'+id : 'Unknown');
+  const eth      = formatListingEth(listing);
+  const contract = config.contract || (asset.asset_contract && asset.asset_contract.address) || '';
+  const slug     = config.slug || '';
+  const chain    = config.chain || 'ethereum';
+  const osUrl    = (contract && id) ? 'https://opensea.io/assets/'+chain+'/'+contract+'/'+id : 'https://opensea.io/collection/'+slug;
+  const tvUrl    = id ? 'https://traitview.com/?jump='+id : '';
 
-  const embed=new EmbedBuilder()
-    .setTitle(`LISTED ${name} - ${eth?eth+' ETH':'--'}`)
+  // maker is a plain address string in listing events
+  const sellerAddr = (typeof listing.maker === 'string' ? listing.maker : (listing.maker && listing.maker.address)) || '';
+  const sellerLink = sellerAddr ? '['+shortAddr(sellerAddr)+'](https://opensea.io/'+sellerAddr+')' : 'unknown';
+
+  const embed = new EmbedBuilder()
+    .setTitle('LISTED '+name+' - '+(eth ? eth+' ETH' : '--'))
     .setColor(0x7aa2ff)
     .setURL(osUrl)
-    .setFooter({text:`Listings Bot - ${slug}`})
+    .setFooter({text:'Listings Bot - '+slug})
     .setTimestamp();
 
-  embed._imageResult=await resolveImage(nft,contract,config.chain||'ethereum');
+  // Build nft-like object for image resolver using asset fields
+  const nftLike = {
+    identifier:        id,
+    image_url:         asset.image_url || asset.display_image_url || null,
+    display_image_url: asset.display_image_url || asset.image_url || null,
+    image_preview_url: asset.image_preview_url || null,
+  };
+  embed._imageResult = await resolveImage(nftLike, contract, chain);
 
   embed.addFields(
-    {name:'Price', value:eth?eth+' ETH':'--', inline:true},
-    {name:'Seller',value:sellerLink,inline:true},
-    {name:'Buy Now',value:`[OpenSea](${osUrl})`,inline:true},
+    {name:'Price',   value: eth ? eth+' ETH' : '--', inline:true},
+    {name:'Seller',  value: sellerLink,               inline:true},
+    {name:'Buy Now', value: '[OpenSea]('+osUrl+')',   inline:true},
   );
-  const traits=nft.traits||[];
-  if(traits.length>0) embed.addFields({name:'Traits',value:traits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`).join('\n'),inline:true});
-  embed.addFields({name:'Links',value:`[OpenSea](${osUrl}) - [TraitView](${tvUrl})`,inline:false});
+
+  const traits = asset.traits || [];
+  if(traits.length > 0){
+    embed.addFields({name:'Traits', value:traits.slice(0,12).map(function(t){return '**'+t.trait_type+'**: '+t.value;}).join('\n'), inline:true});
+  }
+
+  const linkParts = ['[OpenSea]('+osUrl+')'];
+  if(tvUrl) linkParts.push('[TraitView]('+tvUrl+')');
+  embed.addFields({name:'Links', value:linkParts.join(' - '), inline:false});
   return embed;
 }
 
@@ -313,7 +334,7 @@ async function pollListings(){
       const MAX_PAGES=5;
 
       outer: while(pages<MAX_PAGES){
-        const qs=new URLSearchParams({event_type:'listing',limit:'100'});
+        const qs=new URLSearchParams({event_type:'order',order_type:'listing',limit:'100'});
         if(cursor) qs.set('next',cursor);
         const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(config.slug)}?${qs}`,{headers:osHeaders()});
         if(!r.ok) break;
@@ -592,7 +613,7 @@ client.on('interactionCreate', async (interaction)=>{
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.',ephemeral:true});
     await interaction.deferReply();
     try{
-      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=listing&limit=${count}`,{headers:osHeaders()});
+      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=order&order_type=listing&limit=${count}`,{headers:osHeaders()});
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const listings=(await r.json()).asset_events||[];
       if(!listings.length){await interaction.editReply('No listings found.');return;}
