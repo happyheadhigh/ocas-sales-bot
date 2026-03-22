@@ -206,17 +206,36 @@ async function buildSaleEmbed(sale, config){
 //   listing.maker        → seller address (string)
 //   listing.criteria     → trait filter if collection offer
 async function buildListingEmbed(listing, config){
-  const asset    = listing.asset || {};
-  const id       = String(asset.token_id || asset.identifier || '');
-  const name     = asset.name || (id ? '#'+id : 'Unknown');
-  const eth      = formatListingEth(listing);
-  const contract = config.contract || (asset.asset_contract && asset.asset_contract.address) || '';
-  const slug     = config.slug || '';
-  const chain    = config.chain || 'ethereum';
-  const osUrl    = (contract && id) ? 'https://opensea.io/assets/'+chain+'/'+contract+'/'+id : 'https://opensea.io/collection/'+slug;
-  const tvUrl    = id ? 'https://traitview.com/?jump='+id : '';
+  // OpenSea listing event structure (confirmed via /debuglisting):
+  //   asset = null for some collections (OCAS)
+  //   criteria.encoded_token_ids = token ID when asset is null
+  //   criteria.contract.address = contract address
+  //   payment.quantity = price in wei
+  //   maker = seller address string
+  const asset      = listing.asset || {};
+  const criteria   = listing.criteria || {};
+  const eth        = formatListingEth(listing);
+  const slug       = config.slug || '';
+  const chain      = config.chain || 'ethereum';
 
-  // maker is a plain address string in listing events
+  // Token ID: from asset first, then criteria
+  const id = String(
+    asset.token_id ||
+    asset.identifier ||
+    criteria.encoded_token_ids ||
+    ''
+  );
+
+  // Contract: from config first, then asset, then criteria
+  const contract = config.contract ||
+    (asset.asset_contract && asset.asset_contract.address) ||
+    (criteria.contract && criteria.contract.address) ||
+    '';
+
+  const name   = asset.name || (id ? '#'+id : 'Unknown');
+  const osUrl  = (contract && id) ? 'https://opensea.io/assets/'+chain+'/'+contract+'/'+id : 'https://opensea.io/collection/'+slug;
+  const tvUrl  = id ? 'https://traitview.com/?jump='+id : '';
+
   const sellerAddr = (typeof listing.maker === 'string' ? listing.maker : (listing.maker && listing.maker.address)) || '';
   const sellerLink = sellerAddr ? '['+shortAddr(sellerAddr)+'](https://opensea.io/'+sellerAddr+')' : 'unknown';
 
@@ -227,14 +246,15 @@ async function buildListingEmbed(listing, config){
     .setFooter({text:'Listings Bot - '+slug})
     .setTimestamp();
 
-  // Build nft-like object for image resolver using asset fields
+  // resolveImage fetches from OpenSea NFT endpoint using the token ID
+  // This handles the case where asset is null - it goes direct to the NFT endpoint
   const nftLike = {
     identifier:        id,
-    image_url:         asset.image_url || asset.display_image_url || null,
-    display_image_url: asset.display_image_url || asset.image_url || null,
+    image_url:         asset.image_url || null,
+    display_image_url: asset.display_image_url || null,
     image_preview_url: asset.image_preview_url || null,
   };
-  embed._imageResult = await resolveImage(nftLike, contract, chain);
+  embed._imageResult = id ? await resolveImage(nftLike, contract, chain) : null;
 
   embed.addFields(
     {name:'Price',   value: eth ? eth+' ETH' : '--', inline:true},
@@ -334,7 +354,7 @@ async function pollListings(){
       const MAX_PAGES=5;
 
       outer: while(pages<MAX_PAGES){
-        const qs=new URLSearchParams({event_type:'order',order_type:'listing',limit:'100'});
+        const qs=new URLSearchParams({event_type:'listing',limit:'100'});
         if(cursor) qs.set('next',cursor);
         const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(config.slug)}?${qs}`,{headers:osHeaders()});
         if(!r.ok) break;
@@ -369,7 +389,7 @@ async function pollListings(){
       const toPost=newListings.reverse();
       const embeds=await Promise.all(
         toPost
-          .filter(l=>matchesFilters(l.item?.traits||l.nft?.traits||[],config.listingFilters))
+          .filter(l=>matchesFilters((l.asset&&l.asset.traits)||[],config.listingFilters))
           .map(l=>buildListingEmbed(l,config).catch(e=>{console.error('[Build listing]',e.message);return null;}))
       );
 
@@ -613,7 +633,7 @@ client.on('interactionCreate', async (interaction)=>{
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.',ephemeral:true});
     await interaction.deferReply();
     try{
-      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=order&order_type=listing&limit=${count}`,{headers:osHeaders()});
+      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=listing&limit=${count}`,{headers:osHeaders()});
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const listings=(await r.json()).asset_events||[];
       if(!listings.length){await interaction.editReply('No listings found.');return;}
