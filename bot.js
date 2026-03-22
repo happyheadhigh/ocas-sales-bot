@@ -133,7 +133,7 @@ async function extractPngFromSvg(svgSource){
 }
 
 // ── Image resolver ────────────────────────────────────────────────────────────
-async function resolveImage(nft, contract){
+async function resolveImage(nft, contract, chain){
   const id=nft?.identifier||nft?.token_id;
   const key=`${contract}:${id}`;
   if(id&&imageCache.has(key)) return imageCache.get(key);
@@ -141,7 +141,7 @@ async function resolveImage(nft, contract){
   for(const url of candidates){ if(isDiscordOk(url)){ const r={type:'url',url}; if(id) imageCache.set(key,r); return r; } }
   if(id){
     try{
-      const chainForImg=config?.chain||'ethereum';
+      const chainForImg=chain||'ethereum';
       const r=await fetch(`https://api.opensea.io/api/v2/chain/${chainForImg}/contract/${contract}/nfts/${id}`,{headers:osHeaders()});
       if(r.ok){
         const j=await r.json(); const n=j.nft||j;
@@ -184,7 +184,7 @@ async function buildSaleEmbed(sale, config){
     .setFooter({text:`Sales Bot - ${slug}${timeStr?' - '+timeStr:''}`})
     .setTimestamp();
 
-  embed._imageResult=await resolveImage(sale.nft,contract);
+  embed._imageResult=await resolveImage(sale.nft,contract,config.chain||'ethereum');
 
   embed.addFields(
     {name:'Price', value:eth?eth+' ETH':'--', inline:true},
@@ -219,7 +219,7 @@ async function buildListingEmbed(listing, config){
     .setFooter({text:`Listings Bot - ${slug}`})
     .setTimestamp();
 
-  embed._imageResult=await resolveImage(nft,contract);
+  embed._imageResult=await resolveImage(nft,contract,config.chain||'ethereum');
 
   embed.addFields(
     {name:'Price', value:eth?eth+' ETH':'--', inline:true},
