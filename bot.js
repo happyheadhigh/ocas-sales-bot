@@ -603,7 +603,37 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
-  // /myalert — personal DM alert setup
+  // /debuglisting — show raw listing event to diagnose parsing issues
+  if(commandName==='debuglisting'){
+    const slug=interaction.options.getString('collection')||config.slug;
+    if(!slug) return interaction.reply({content:'Provide a collection.',ephemeral:true});
+    await interaction.deferReply({ephemeral:true});
+    try{
+      const r=await fetch('https://api.opensea.io/api/v2/events/collection/'+encodeURIComponent(slug)+'?event_type=listing&limit=1',{headers:osHeaders()});
+      if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
+      const j=await r.json();
+      const events=j.asset_events||[];
+      if(!events.length){await interaction.editReply('No listings found.');return;}
+      const ev=events[0];
+      const lines=[];
+      lines.push('**Top-level keys:** '+JSON.stringify(Object.keys(ev)));
+      lines.push('**event_type:** '+ev.event_type);
+      lines.push('**nft keys:** '+(ev.nft?JSON.stringify(Object.keys(ev.nft)):'null'));
+      lines.push('**nft.identifier:** '+(ev.nft?.identifier||'null'));
+      lines.push('**nft.name:** '+(ev.nft?.name||'null'));
+      lines.push('**nft.image_url:** '+(ev.nft?.image_url||'null'));
+      lines.push('**price:** '+JSON.stringify(ev.price||null));
+      lines.push('**payment:** '+JSON.stringify(ev.payment||null));
+      lines.push('**base_price:** '+(ev.base_price||'null'));
+      lines.push('**maker:** '+JSON.stringify(ev.maker||null));
+      lines.push('**seller:** '+(ev.seller||'null'));
+      lines.push('**item keys:** '+(ev.item?JSON.stringify(Object.keys(ev.item)):'null'));
+      await interaction.editReply(lines.join('\n').slice(0,1900));
+    }catch(err){await interaction.editReply('Error: '+err.message);}
+    return;
+  }
+
+    // /myalert — personal DM alert setup
   if(commandName==='myalert'){
     const trait=interaction.options.getString('trait')?.toLowerCase().trim();
     const value=interaction.options.getString('value')?.toLowerCase().trim();

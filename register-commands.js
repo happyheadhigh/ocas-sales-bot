@@ -81,6 +81,10 @@ const commands = [
     .addBooleanOption(o=>o.setName('listings').setDescription('DM me for listings? (default: true)').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
 
+  new SlashCommandBuilder().setName('debuglisting').setDescription('Show raw listing event data to diagnose issues (admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
+
   new SlashCommandBuilder().setName('myalertclear').setDescription('Remove your personal DM alert'),
 
   new SlashCommandBuilder().setName('myalertstatus').setDescription('See your current personal alert settings'),
