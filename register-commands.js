@@ -7,7 +7,16 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o=>o.setName('channel').setDescription('Channel to post sales in').setRequired(true))
     .addStringOption(o=>o.setName('collection').setDescription('OpenSea collection slug (e.g. on-chain-all-stars)').setRequired(true))
-    .addStringOption(o=>o.setName('contract').setDescription('Contract address (e.g. 0x078be86...)').setRequired(false)),
+    .addStringOption(o=>o.setName('contract').setDescription('Contract address (e.g. 0x078be86...)').setRequired(false))
+    .addStringOption(o=>o.setName('chain').setDescription('Blockchain (default: ethereum — use base, polygon, etc for other chains)').setRequired(false)
+      .addChoices(
+        {name:'Ethereum',value:'ethereum'},
+        {name:'Base',value:'base'},
+        {name:'Polygon',value:'matic'},
+        {name:'Arbitrum',value:'arbitrum'},
+        {name:'Optimism',value:'optimism'},
+        {name:'Solana',value:'solana'},
+      )),
 
   new SlashCommandBuilder().setName('setlistings').setDescription('Set the channel for new listing alerts')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)

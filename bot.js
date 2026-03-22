@@ -141,7 +141,8 @@ async function resolveImage(nft, contract){
   for(const url of candidates){ if(isDiscordOk(url)){ const r={type:'url',url}; if(id) imageCache.set(key,r); return r; } }
   if(id){
     try{
-      const r=await fetch(`https://api.opensea.io/api/v2/chain/ethereum/contract/${contract}/nfts/${id}`,{headers:osHeaders()});
+      const chainForImg=config?.chain||'ethereum';
+      const r=await fetch(`https://api.opensea.io/api/v2/chain/${chainForImg}/contract/${contract}/nfts/${id}`,{headers:osHeaders()});
       if(r.ok){
         const j=await r.json(); const n=j.nft||j;
         const deep=[n.display_image_url,n.image_url,n.image_preview_url,n.image_thumbnail_url];
@@ -163,20 +164,21 @@ async function sendEmbed(target, embed){
 }
 
 // ── Build SALE embed ──────────────────────────────────────────────────────────
-async function buildSaleEmbed(sale, config, isTest=false){
+async function buildSaleEmbed(sale, config){
   const id=sale.nft?.identifier;
   const name=sale.nft?.name||`#${id}`;
   const eth=formatEth(sale);
   const contract=config.contract||'';
   const slug=config.slug||'';
-  const osUrl=`https://opensea.io/assets/ethereum/${contract}/${id}`;
+  const chain=config.chain||'ethereum';
+  const osUrl=contract?`https://opensea.io/assets/${chain}/${contract}/${id}`:`https://opensea.io/assets/${chain}/${id}`;
   const tvUrl=`https://traitview.com/?jump=${id}`;
   const timeStr=sale.event_timestamp?timeSince(sale.event_timestamp):'';
   const buyerLink=sale.buyer&&sale.buyer!=='unknown'?`[${shortAddr(sale.buyer)}](https://opensea.io/${sale.buyer})`:'unknown';
   const sellerLink=sale.seller&&sale.seller!=='unknown'?`[${shortAddr(sale.seller)}](https://opensea.io/${sale.seller})`:'unknown';
 
   const embed=new EmbedBuilder()
-    .setTitle(`${isTest?'TEST ':''}SOLD ${name} - ${eth?eth+' ETH':'--'}`)
+    .setTitle(`SOLD ${name} - ${eth?eth+' ETH':'--'}`)
     .setColor(0x2dd4bf)
     .setURL(osUrl)
     .setFooter({text:`Sales Bot - ${slug}${timeStr?' - '+timeStr:''}`})
@@ -196,7 +198,7 @@ async function buildSaleEmbed(sale, config, isTest=false){
 }
 
 // ── Build LISTING embed ───────────────────────────────────────────────────────
-async function buildListingEmbed(listing, config, isTest=false){
+async function buildListingEmbed(listing, config){
   const nft=listing.item||listing.nft||{};
   const rawId=nft.nft_id||nft.identifier||'';
   const id=rawId.includes('/')?rawId.split('/').pop():rawId;
@@ -204,13 +206,14 @@ async function buildListingEmbed(listing, config, isTest=false){
   const eth=formatListingEth(listing);
   const contract=config.contract||'';
   const slug=config.slug||'';
-  const osUrl=`https://opensea.io/assets/ethereum/${contract}/${id}`;
+  const chain=config.chain||'ethereum';
+  const osUrl=contract?`https://opensea.io/assets/${chain}/${contract}/${id}`:`https://opensea.io/assets/${chain}/${id}`;
   const tvUrl=`https://traitview.com/?jump=${id}`;
   const sellerAddr=listing.maker?.address||'';
   const sellerLink=sellerAddr?`[${shortAddr(sellerAddr)}](https://opensea.io/${sellerAddr})`:'unknown';
 
   const embed=new EmbedBuilder()
-    .setTitle(`${isTest?'TEST ':''}LISTED ${name} - ${eth?eth+' ETH':'--'}`)
+    .setTitle(`LISTED ${name} - ${eth?eth+' ETH':'--'}`)
     .setColor(0x7aa2ff)
     .setURL(osUrl)
     .setFooter({text:`Listings Bot - ${slug}`})
@@ -394,7 +397,8 @@ client.on('interactionCreate', async (interaction)=>{
     const channel=interaction.options.getChannel('channel');
     const slug=interaction.options.getString('collection');
     const contract=(interaction.options.getString('contract')||'').toLowerCase().trim();
-    setConfig(guildId,{channelId:channel.id,slug:slug.toLowerCase().trim(),contract,salesFilters:{},listingFilters:{},paused:false});
+    const chain=(interaction.options.getString('chain')||'ethereum').toLowerCase().trim();
+    setConfig(guildId,{channelId:channel.id,slug:slug.toLowerCase().trim(),contract,chain,salesFilters:{},listingFilters:{},paused:false});
     await interaction.reply({embeds:[new EmbedBuilder().setTitle('Sales Bot Configured!').setColor(0x2dd4bf)
       .addFields({name:'Sales Channel',value:`<#${channel.id}>`,inline:true},{name:'Collection',value:slug,inline:true},{name:'Contract',value:contract||'not set',inline:true})
       .setDescription('Sales will post automatically. Use `/setlistings` to also enable listing alerts.')],ephemeral:false});
@@ -501,7 +505,7 @@ client.on('interactionCreate', async (interaction)=>{
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const sales=(await r.json()).asset_events||[];
       if(!sales.length){await interaction.editReply('No sales found.');return;}
-      const embed=await buildSaleEmbed(sales[0],{...config,slug},true);
+      const embed=await buildSaleEmbed(sales[0],{...config,slug});
       const ir=embed._imageResult;delete embed._imageResult;
       if(ir?.type==='buffer'){const att=new AttachmentBuilder(ir.buffer,{name:ir.filename});embed.setThumbnail(`attachment://${ir.filename}`);await interaction.editReply({embeds:[embed],files:[att]});}
       else{if(ir?.type==='url')embed.setThumbnail(ir.url);await interaction.editReply({embeds:[embed]});}
@@ -522,7 +526,7 @@ client.on('interactionCreate', async (interaction)=>{
       if(!sales.length){await interaction.editReply('No sales found.');return;}
       await interaction.editReply(`Last ${sales.length} sales for **${slug}**:`);
       const cfg={...config,slug};
-      for(const sale of sales.reverse()){const embed=await buildSaleEmbed(sale,cfg,true);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
+      for(const sale of sales.reverse()){const embed=await buildSaleEmbed(sale,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
   }
@@ -536,11 +540,12 @@ client.on('interactionCreate', async (interaction)=>{
     if(!contract) return interaction.reply({content:'Set a contract with `/setcollection`.',ephemeral:true});
     await interaction.deferReply();
     try{
-      const r=await fetch(`https://api.opensea.io/api/v2/events/chain/ethereum/contract/${contract}/nfts/${tokenId}?event_type=sale&limit=1`,{headers:osHeaders()});
+      const chainForSale=config.chain||'ethereum';
+      const r=await fetch(`https://api.opensea.io/api/v2/events/chain/${chainForSale}/contract/${contract}/nfts/${tokenId}?event_type=sale&limit=1`,{headers:osHeaders()});
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const sales=(await r.json()).asset_events||[];
       if(!sales.length){await interaction.editReply(`No sales found for #${tokenId}.`);return;}
-      const embed=await buildSaleEmbed(sales[0],config,true);
+      const embed=await buildSaleEmbed(sales[0],config);
       const ir=embed._imageResult;delete embed._imageResult;
       if(ir?.type==='buffer'){const att=new AttachmentBuilder(ir.buffer,{name:ir.filename});embed.setThumbnail(`attachment://${ir.filename}`);await interaction.editReply({embeds:[embed],files:[att]});}
       else{if(ir?.type==='url')embed.setThumbnail(ir.url);await interaction.editReply({embeds:[embed]});}
@@ -575,7 +580,7 @@ client.on('interactionCreate', async (interaction)=>{
       if(!matched.length){await interaction.editReply(`No sales found with **${trait}: ${value}** in the last ${pages*100} sales.`);return;}
       await interaction.editReply(`Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait}: ${value}**:`);
       const cfg={...config,slug};
-      for(const sale of matched){const embed=await buildSaleEmbed(sale,cfg,true);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
+      for(const sale of matched){const embed=await buildSaleEmbed(sale,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
   }
@@ -593,7 +598,7 @@ client.on('interactionCreate', async (interaction)=>{
       if(!listings.length){await interaction.editReply('No listings found.');return;}
       await interaction.editReply(`${listings.length} recent listings for **${slug}**:`);
       const cfg={...config,slug};
-      for(const l of listings.reverse()){const embed=await buildListingEmbed(l,cfg,true);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
+      for(const l of listings.reverse()){const embed=await buildListingEmbed(l,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
   }
