@@ -99,7 +99,13 @@ function matchesFilters(traits, filters){
   if(!filters||Object.keys(filters).length===0) return true;
   const lookup={};
   for(const t of (traits||[])) lookup[t.trait_type?.toLowerCase()]=String(t.value).toLowerCase();
-  for(const [k,v] of Object.entries(filters)){ if(lookup[k]!==v) return false; }
+  // Each filter key can have a single value (string) or multiple values (array = OR logic)
+  // Different keys = AND logic (must match all keys)
+  // Same key multiple values = OR logic (must match at least one value)
+  for(const [k,v] of Object.entries(filters)){
+    const allowed = Array.isArray(v) ? v : [v];
+    if(!allowed.includes(lookup[k])) return false;
+  }
   return true;
 }
 
@@ -479,9 +485,17 @@ client.on('interactionCreate', async (interaction)=>{
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
     const trait=interaction.options.getString('trait').toLowerCase().trim();
     const value=interaction.options.getString('value').toLowerCase().trim();
-    const filters={...(config.salesFilters||{}),[trait]:value};
+    const existing=config.salesFilters||{};
+    const current=existing[trait];
+    // Stack multiple values for same trait into an array (OR logic)
+    let newVal;
+    if(!current) newVal=value;
+    else if(Array.isArray(current)) newVal=current.includes(value)?current:[...current,value];
+    else newVal=current===value?current:[current,value];
+    const filters={...existing,[trait]:newVal};
     setConfig(guildId,{salesFilters:filters});
-    await interaction.reply({content:`Sales filter set: **${trait}** = ${value}\nUse \`/clearfilters\` to remove.`,ephemeral:true});
+    const display=Array.isArray(newVal)?newVal.join(' OR '):newVal;
+    await interaction.reply({content:`Sales filter updated: **${trait}** = ${display}\nUse \`/clearfilters\` to remove all.`,ephemeral:true});
     return;
   }
 
@@ -490,9 +504,16 @@ client.on('interactionCreate', async (interaction)=>{
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
     const trait=interaction.options.getString('trait').toLowerCase().trim();
     const value=interaction.options.getString('value').toLowerCase().trim();
-    const filters={...(config.listingFilters||{}),[trait]:value};
+    const existing=config.listingFilters||{};
+    const current=existing[trait];
+    let newVal;
+    if(!current) newVal=value;
+    else if(Array.isArray(current)) newVal=current.includes(value)?current:[...current,value];
+    else newVal=current===value?current:[current,value];
+    const filters={...existing,[trait]:newVal};
     setConfig(guildId,{listingFilters:filters});
-    await interaction.reply({content:`Listing filter set: **${trait}** = ${value}\nUse \`/clearfilters\` to remove.`,ephemeral:true});
+    const display=Array.isArray(newVal)?newVal.join(' OR '):newVal;
+    await interaction.reply({content:`Listing filter updated: **${trait}** = ${display}\nUse \`/clearfilters\` to remove all.`,ephemeral:true});
     return;
   }
 
@@ -501,6 +522,33 @@ client.on('interactionCreate', async (interaction)=>{
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
     setConfig(guildId,{salesFilters:{},listingFilters:{}});
     await interaction.reply({content:'All server filters cleared.',ephemeral:true});
+    return;
+  }
+
+  // /removefilter — remove a single value from an existing filter
+  if(commandName==='removefilter'){
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    const filterType=interaction.options.getString('type'); // 'sales' or 'listings'
+    const trait=interaction.options.getString('trait').toLowerCase().trim();
+    const value=interaction.options.getString('value').toLowerCase().trim();
+    const key=filterType==='sales'?'salesFilters':'listingFilters';
+    const existing={...(config[key]||{})};
+    if(!existing[trait]){
+      await interaction.reply({content:`No filter found for **${trait}**.`,ephemeral:true}); return;
+    }
+    const current=existing[trait];
+    if(Array.isArray(current)){
+      const updated=current.filter(v=>v!==value);
+      if(updated.length===0) delete existing[trait];
+      else if(updated.length===1) existing[trait]=updated[0];
+      else existing[trait]=updated;
+    } else {
+      delete existing[trait];
+    }
+    setConfig(guildId,{[key]:existing});
+    const remaining=Object.keys(existing).length===0?'none':Object.entries(existing).map(([k,v])=>`${k}=${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
+    await interaction.reply({content:`Removed **${value}** from ${filterType} filter for **${trait}**.
+Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
     return;
   }
 
@@ -522,8 +570,9 @@ client.on('interactionCreate', async (interaction)=>{
 
   // /status
   if(commandName==='status'){
-    const sf=config.salesFilters&&Object.keys(config.salesFilters).length>0?Object.entries(config.salesFilters).map(([k,v])=>`${k}=${v}`).join(', '):'none';
-    const lf=config.listingFilters&&Object.keys(config.listingFilters).length>0?Object.entries(config.listingFilters).map(([k,v])=>`${k}=${v}`).join(', '):'none';
+    const fmtFilter=f=>Object.keys(f||{}).length===0?'none':Object.entries(f).map(([k,v])=>`${k}=${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
+    const sf=fmtFilter(config.salesFilters);
+    const lf=fmtFilter(config.listingFilters);
     await interaction.reply({embeds:[new EmbedBuilder().setTitle('Bot Status').setColor(0x7aa2ff)
       .addFields(
         {name:'Collection',value:config.slug||'not set',inline:true},

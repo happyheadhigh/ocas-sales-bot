@@ -81,6 +81,13 @@ const commands = [
     .addBooleanOption(o=>o.setName('listings').setDescription('DM me for listings? (default: true)').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
 
+  new SlashCommandBuilder().setName('removefilter').setDescription('Remove a single value from a sales or listing filter')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption(o=>o.setName('type').setDescription('Which filter to modify').setRequired(true)
+      .addChoices({name:'Sales',value:'sales'},{name:'Listings',value:'listings'}))
+    .addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Type)').setRequired(true))
+    .addStringOption(o=>o.setName('value').setDescription('Value to remove (e.g. Zombie)').setRequired(true)),
+
   new SlashCommandBuilder().setName('debuglisting').setDescription('Show raw listing event data to diagnose issues (admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
