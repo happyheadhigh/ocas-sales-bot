@@ -37,25 +37,72 @@ const sharp = require('sharp');
 const fs    = require('fs');
 const path  = require('path');
 
+// ── Supabase client (free tier — persists config across Railway redeploys) ────
+let supabase = null;
+if(process.env.SUPABASE_URL && process.env.SUPABASE_KEY){
+  const { createClient } = require('@supabase/supabase-js');
+  supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+  console.log('[DB] Supabase connected');
+} else {
+  console.warn('[DB] No Supabase config — using local file storage (config lost on redeploy)');
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const OPENSEA_KEY   = process.env.OPENSEA_KEY || '';
 const POLL_MS       = parseInt(process.env.POLL_MS || '30000', 10);
-const SERVER_FILE   = path.join(__dirname, 'server-configs.json');
-const ALERTS_FILE   = path.join(__dirname, 'user-alerts.json');
+const SERVER_FILE = path.join(__dirname, 'server-configs.json');
+const ALERTS_FILE = path.join(__dirname, 'user-alerts.json');
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 function loadJson(file){ try{ return JSON.parse(fs.readFileSync(file,'utf8')); }catch{ return {}; } }
-function saveJson(file, data){ fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
+function saveJson(file, data){ try{ fs.writeFileSync(file, JSON.stringify(data, null, 2)); }catch{} }
 
-let serverConfigs = loadJson(SERVER_FILE); // { guildId: { channelId, listingsChannelId, slug, contract, salesFilters, listingFilters, paused } }
-let userAlerts    = loadJson(ALERTS_FILE); // { userId: { slug, contract, traitFilters, alertSales, alertListings } }
+// ── Supabase helpers — load/save entire config table as single JSON row ───────
+async function dbLoad(key){
+  if(!supabase) return null;
+  try{
+    const {data,error} = await supabase.from('bot_config').select('value').eq('key',key).single();
+    if(error||!data) return null;
+    return typeof data.value === 'string' ? JSON.parse(data.value) : data.value;
+  }catch(e){ console.warn('[DB] load error',e.message); return null; }
+}
+async function dbSave(key, value){
+  if(!supabase) return;
+  try{
+    await supabase.from('bot_config').upsert({key, value: JSON.stringify(value)},{onConflict:'key'});
+  }catch(e){ console.warn('[DB] save error',e.message); }
+}
+
+// ── Config helpers — use Supabase if available, else local file ───────────────
+async function loadAllConfigs(){
+  const db = await dbLoad('server_configs');
+  if(db){ serverConfigs = db; console.log('[Config] Loaded '+Object.keys(db).length+' server(s) from Supabase'); return; }
+  serverConfigs = loadJson(SERVER_FILE);
+  console.log('[Config] Loaded from local file ('+Object.keys(serverConfigs).length+' servers)');
+}
+async function saveAllConfigs(){
+  saveJson(SERVER_FILE, serverConfigs); // always save locally too as backup
+  await dbSave('server_configs', serverConfigs);
+}
+async function loadAllAlerts(){
+  const db = await dbLoad('user_alerts');
+  if(db){ userAlerts = db; return; }
+  userAlerts = loadJson(ALERTS_FILE);
+}
+async function saveAllAlerts(){
+  saveJson(ALERTS_FILE, userAlerts);
+  await dbSave('user_alerts', userAlerts);
+}
+
+let serverConfigs = {}; // loaded from Supabase or local file on startup
+let userAlerts    = {}; // loaded from Supabase or local file on startup
 
 function getConfig(guildId){ return serverConfigs[guildId] || {}; }
-function setConfig(guildId, updates){ serverConfigs[guildId] = { ...getConfig(guildId), ...updates }; saveJson(SERVER_FILE, serverConfigs); }
+function setConfig(guildId, updates){ serverConfigs[guildId] = { ...getConfig(guildId), ...updates }; saveAllConfigs(); }
 function getAlert(userId){ return userAlerts[userId] || null; }
-function setAlert(userId, updates){ userAlerts[userId] = { ...(userAlerts[userId]||{}), ...updates }; saveJson(ALERTS_FILE, userAlerts); }
-function deleteAlert(userId){ delete userAlerts[userId]; saveJson(ALERTS_FILE, userAlerts); }
+function setAlert(userId, updates){ userAlerts[userId] = { ...(userAlerts[userId]||{}), ...updates }; saveAllAlerts(); }
+function deleteAlert(userId){ delete userAlerts[userId]; saveAllAlerts(); }
 
 // ── Cursors (not persisted) ───────────────────────────────────────────────────
 const lastSaleIds    = new Map(); // guildId → last sale id
@@ -763,11 +810,19 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
 
     const existing=getAlert(interaction.user.id)||{};
     const filters={...(existing.traitFilters||{})};
-    if(trait&&value) filters[trait]=value;
+
+    // Stack multiple values for same trait (OR logic) — same as server filters
+    if(trait&&value){
+      const current=filters[trait];
+      if(!current) filters[trait]=value;
+      else if(Array.isArray(current)) filters[trait]=current.includes(value)?current:[...current,value];
+      else filters[trait]=current===value?current:[current,value];
+    }
 
     setAlert(interaction.user.id,{slug,traitFilters:filters,alertSales,alertListings});
 
-    const filterStr=Object.keys(filters).length>0?Object.entries(filters).map(([k,v])=>`**${k}** = ${v}`).join(', '):'none (all)';
+    const fmtF=f=>Object.keys(f||{}).length===0?'none (all)':Object.entries(f).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
+    const filterStr=fmtF(filters);
     const lines=[
       `Personal alert set for **${slug}**!`,
       `Filters: ${filterStr}`,
@@ -785,8 +840,29 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
 
   // /myalertclear
   if(commandName==='myalertclear'){
-    deleteAlert(interaction.user.id);
-    await interaction.reply({content:'Your personal alert has been removed.',ephemeral:true});
+    const trait=interaction.options.getString('trait');
+    const value=interaction.options.getString('value');
+    if(trait){
+      // Remove just one trait/value from the alert
+      const alert=getAlert(interaction.user.id);
+      if(!alert){ await interaction.reply({content:'You have no alert set.',ephemeral:true}); return; }
+      const filters={...(alert.traitFilters||{})};
+      if(value&&filters[trait]){
+        const current=filters[trait];
+        if(Array.isArray(current)){
+          const updated=current.filter(v=>v!==value.toLowerCase().trim());
+          if(updated.length===0) delete filters[trait];
+          else if(updated.length===1) filters[trait]=updated[0];
+          else filters[trait]=updated;
+        } else { delete filters[trait]; }
+      } else { delete filters[trait]; }
+      setAlert(interaction.user.id,{...alert,traitFilters:filters});
+      const remaining=Object.keys(filters).length===0?'none':Object.entries(filters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
+      await interaction.reply({content:`Removed filter. Remaining: ${remaining}`,ephemeral:true});
+    } else {
+      deleteAlert(interaction.user.id);
+      await interaction.reply({content:'Your personal alert has been fully removed.',ephemeral:true});
+    }
     return;
   }
 
@@ -794,7 +870,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
   if(commandName==='myalertstatus'){
     const alert=getAlert(interaction.user.id);
     if(!alert){await interaction.reply({content:'You have no personal alert set. Use `/myalert` to create one.',ephemeral:true});return;}
-    const filterStr=alert.traitFilters&&Object.keys(alert.traitFilters).length>0?Object.entries(alert.traitFilters).map(([k,v])=>`**${k}** = ${v}`).join('\n'):'none (all events)';
+    const filterStr=alert.traitFilters&&Object.keys(alert.traitFilters).length>0?Object.entries(alert.traitFilters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n'):'none (all events)';
     const lines=[
       `Collection: **${alert.slug||'any'}**`,
       `Sales DMs: ${alert.alertSales?'on':'off'}`,
@@ -918,16 +994,41 @@ client.on('guildCreate', async (guild)=>{
       )
       .setFooter({text:'Use /help anytime to see all commands'});
 
-    await target.send({embeds:[embed]});
-    console.log('[Welcome] Sent setup DM to owner of '+guild.name);
+    // Try DM to owner first — if DMs are off, post in first available channel
+    let sent = false;
+    try{
+      await target.send({embeds:[embed]});
+      console.log('[Welcome] Sent setup DM to owner of '+guild.name);
+      sent = true;
+    }catch(dmErr){
+      console.warn('[Welcome] DM blocked for '+guild.name+', trying channel...');
+    }
+
+    if(!sent){
+      // Fall back to first channel bot can post in
+      const fallbackChannel = guild.channels.cache
+        .filter(c => c.type === 0 && c.permissionsFor(guild.members.me)?.has('SendMessages'))
+        .sort((a,b) => a.position - b.position)
+        .first();
+      if(fallbackChannel){
+        // Add a note so owner knows it posted publicly
+        const publicNote = (embed.data.description||'') + '\n\n*(Setup guide posted here because server owner DMs are off)*';
+        const publicEmbed = EmbedBuilder.from(embed).setDescription(publicNote);
+        await fallbackChannel.send({embeds:[publicEmbed]});
+        console.log('[Welcome] Posted in channel for '+guild.name);
+      }
+    }
   }catch(e){ console.warn('[Welcome]',guild.name,e.message); }
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-client.once('ready',()=>{
+client.once('ready', async ()=>{
   console.log('Bot online as '+client.user.tag);
-  console.log('Servers: '+Object.keys(serverConfigs).length);
   console.log('OpenSea key: '+(OPENSEA_KEY?'set':'NOT SET'));
+  // Load config from Supabase first (survives Railway redeploys)
+  await loadAllConfigs();
+  await loadAllAlerts();
+  console.log('Servers configured: '+Object.keys(serverConfigs).length);
   pollSales();
   pollListings();
   setInterval(pollSales, POLL_MS);

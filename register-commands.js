@@ -111,7 +111,9 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
 
-  new SlashCommandBuilder().setName('myalertclear').setDescription('Remove your personal DM alert'),
+  new SlashCommandBuilder().setName('myalertclear').setDescription('Remove your personal DM alert (all or just one filter)')
+    .addStringOption(o=>o.setName('trait').setDescription('Remove just this trait filter (leave blank to remove entire alert)').setRequired(false))
+    .addStringOption(o=>o.setName('value').setDescription('Specific value to remove from that trait filter').setRequired(false)),
 
   new SlashCommandBuilder().setName('myalertstatus').setDescription('See your current personal alert settings'),
 
