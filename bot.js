@@ -30,7 +30,7 @@
 require('dotenv').config();
 const {
   Client, GatewayIntentBits, REST, Routes,
-  EmbedBuilder, AttachmentBuilder, PermissionFlagsBits,
+  EmbedBuilder, AttachmentBuilder, PermissionFlagsBits, MessageFlags,
 } = require('discord.js');
 const fetch = require('node-fetch');
 const sharp = require('sharp');
@@ -487,7 +487,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   // /setup
   if(commandName==='setup'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const channel=interaction.options.getChannel('channel');
     const slug=interaction.options.getString('collection');
     const contract=(interaction.options.getString('contract')||'').toLowerCase().trim();
@@ -495,13 +495,13 @@ client.on('interactionCreate', async (interaction)=>{
     setConfig(guildId,{channelId:channel.id,slug:slug.toLowerCase().trim(),contract,chain,salesFilters:{},listingFilters:{},paused:false});
     await interaction.reply({embeds:[new EmbedBuilder().setTitle('Sales Bot Configured!').setColor(0x2dd4bf)
       .addFields({name:'Sales Channel',value:`<#${channel.id}>`,inline:true},{name:'Collection',value:slug,inline:true},{name:'Contract',value:contract||'not set',inline:true})
-      .setDescription('Sales will post automatically. Use `/setlistings` to also enable listing alerts.')],ephemeral:false});
+      .setDescription('Sales will post automatically. Use `/setlistings` to also enable listing alerts.')]});
     return;
   }
 
   // /setuphere — mobile-friendly setup, uses the CURRENT channel automatically
   if(commandName==='setuphere'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const slug=interaction.options.getString('collection');
     const contract=(interaction.options.getString('contract')||'').toLowerCase().trim();
     const chain=(interaction.options.getString('chain')||'ethereum').toLowerCase().trim();
@@ -521,7 +521,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   // /setlistingshere — mobile-friendly listings setup, uses current channel
   if(commandName==='setlistingshere'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const channelId=interaction.channelId;
     setConfig(guildId,{listingsChannelId:channelId});
     await interaction.reply({content:`Listings channel set to this channel <#${channelId}>. New listings will post here automatically.`});
@@ -530,35 +530,35 @@ client.on('interactionCreate', async (interaction)=>{
 
   // /setlistings
   if(commandName==='setlistings'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const channel=interaction.options.getChannel('channel');
     setConfig(guildId,{listingsChannelId:channel.id});
-    await interaction.reply({content:`Listings channel set to <#${channel.id}>. New listings will post there automatically.`,ephemeral:false});
+    await interaction.reply({content:`Listings channel set to <#${channel.id}>. New listings will post there automatically.`});
     return;
   }
 
   // /setchannel
   if(commandName==='setchannel'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const channel=interaction.options.getChannel('channel');
     setConfig(guildId,{channelId:channel.id});
-    await interaction.reply({content:`Sales channel updated to <#${channel.id}>`,ephemeral:true});
+    await interaction.reply({content:`Sales channel updated to <#${channel.id}>`, flags: MessageFlags.Ephemeral});
     return;
   }
 
   // /setcollection
   if(commandName==='setcollection'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const slug=interaction.options.getString('slug').toLowerCase().trim();
     const contract=(interaction.options.getString('contract')||'').toLowerCase().trim();
     setConfig(guildId,{slug,contract,salesFilters:{},listingFilters:{}});
-    await interaction.reply({content:`Collection set to **${slug}**`,ephemeral:true});
+    await interaction.reply({content:`Collection set to **${slug}**`, flags: MessageFlags.Ephemeral});
     return;
   }
 
   // /salesfilter
   if(commandName==='salesfilter'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const trait=interaction.options.getString('trait').toLowerCase().trim();
     const value=interaction.options.getString('value').toLowerCase().trim();
     const existing=config.salesFilters||{};
@@ -571,13 +571,13 @@ client.on('interactionCreate', async (interaction)=>{
     const filters={...existing,[trait]:newVal};
     setConfig(guildId,{salesFilters:filters});
     const display=Array.isArray(newVal)?newVal.join(' OR '):newVal;
-    await interaction.reply({content:`Sales filter updated: **${trait}** = ${display}\nUse \`/clearfilters\` to remove all.`,ephemeral:true});
+    await interaction.reply({content:`Sales filter updated: **${trait}** = ${display}\nUse \`/clearfilters\` to remove all.`, flags: MessageFlags.Ephemeral});
     return;
   }
 
   // /listingfilter
   if(commandName==='listingfilter'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const trait=interaction.options.getString('trait').toLowerCase().trim();
     const value=interaction.options.getString('value').toLowerCase().trim();
     const existing=config.listingFilters||{};
@@ -589,28 +589,28 @@ client.on('interactionCreate', async (interaction)=>{
     const filters={...existing,[trait]:newVal};
     setConfig(guildId,{listingFilters:filters});
     const display=Array.isArray(newVal)?newVal.join(' OR '):newVal;
-    await interaction.reply({content:`Listing filter updated: **${trait}** = ${display}\nUse \`/clearfilters\` to remove all.`,ephemeral:true});
+    await interaction.reply({content:`Listing filter updated: **${trait}** = ${display}\nUse \`/clearfilters\` to remove all.`, flags: MessageFlags.Ephemeral});
     return;
   }
 
   // /clearfilters
   if(commandName==='clearfilters'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     setConfig(guildId,{salesFilters:{},listingFilters:{}});
-    await interaction.reply({content:'All server filters cleared.',ephemeral:true});
+    await interaction.reply({content:'All server filters cleared.', flags: MessageFlags.Ephemeral});
     return;
   }
 
   // /removefilter — remove a single value from an existing filter
   if(commandName==='removefilter'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const filterType=interaction.options.getString('type'); // 'sales' or 'listings'
     const trait=interaction.options.getString('trait').toLowerCase().trim();
     const value=interaction.options.getString('value').toLowerCase().trim();
     const key=filterType==='sales'?'salesFilters':'listingFilters';
     const existing={...(config[key]||{})};
     if(!existing[trait]){
-      await interaction.reply({content:`No filter found for **${trait}**.`,ephemeral:true}); return;
+      await interaction.reply({content:`No filter found for **${trait}**.`, flags: MessageFlags.Ephemeral}); return;
     }
     const current=existing[trait];
     if(Array.isArray(current)){
@@ -624,23 +624,23 @@ client.on('interactionCreate', async (interaction)=>{
     setConfig(guildId,{[key]:existing});
     const remaining=Object.keys(existing).length===0?'none':Object.entries(existing).map(([k,v])=>`${k}=${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
     await interaction.reply({content:`Removed **${value}** from ${filterType} filter for **${trait}**.
-Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
+Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     return;
   }
 
   // /pause
   if(commandName==='pause'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     setConfig(guildId,{paused:true});
-    await interaction.reply({content:'Paused. Use `/resume` to restart.',ephemeral:true});
+    await interaction.reply({content:'Paused. Use `/resume` to restart.', flags: MessageFlags.Ephemeral});
     return;
   }
 
   // /resume
   if(commandName==='resume'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.',ephemeral:true});
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     setConfig(guildId,{paused:false});
-    await interaction.reply({content:'Resumed!',ephemeral:true});
+    await interaction.reply({content:'Resumed!', flags: MessageFlags.Ephemeral});
     return;
   }
 
@@ -657,14 +657,14 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
         {name:'Listings Channel',value:config.listingsChannelId?`<#${config.listingsChannelId}>`:'not set',inline:true},
         {name:'Sales Filters',value:sf,inline:true},
         {name:'Listing Filters',value:lf,inline:true},
-      )],ephemeral:true});
+      )], flags: MessageFlags.Ephemeral});
     return;
   }
 
   // /lastsale
   if(commandName==='lastsale'){
     const slug=interaction.options.getString('collection')||config.slug;
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.',ephemeral:true});
+    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=sale&limit=1`,{headers:osHeaders()});
@@ -683,7 +683,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
   if(commandName==='recentsales'){
     const slug=interaction.options.getString('collection')||config.slug;
     const count=Math.min(interaction.options.getInteger('count')||5,10);
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.',ephemeral:true});
+    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=sale&limit=${count}`,{headers:osHeaders()});
@@ -702,8 +702,8 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
     const tokenId=interaction.options.getString('token').replace('#','');
     const slug=interaction.options.getString('collection')||config.slug;
     const contract=config.contract||'';
-    if(!slug) return interaction.reply({content:'Run `/setup` first.',ephemeral:true});
-    if(!contract) return interaction.reply({content:'Set a contract with `/setcollection`.',ephemeral:true});
+    if(!slug) return interaction.reply({content:'Run `/setup` first.', flags: MessageFlags.Ephemeral});
+    if(!contract) return interaction.reply({content:'Set a contract with `/setcollection`.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const chainForSale=config.chain||'ethereum';
@@ -725,7 +725,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
     const trait=interaction.options.getString('trait').toLowerCase().trim();
     const value=interaction.options.getString('value').toLowerCase().trim();
     const want=Math.min(interaction.options.getInteger('count')||5,10);
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.',ephemeral:true});
+    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const matched=[];let cursor=null;let pages=0;
@@ -755,7 +755,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
   if(commandName==='listings'){
     const slug=interaction.options.getString('collection')||config.slug;
     const count=Math.min(interaction.options.getInteger('count')||5,10);
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.',ephemeral:true});
+    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=listing&limit=${count}`,{headers:osHeaders()});
@@ -772,7 +772,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
   // /debuglisting — show raw listing event to diagnose parsing issues
   if(commandName==='debuglisting'){
     const slug=interaction.options.getString('collection')||config.slug;
-    if(!slug) return interaction.reply({content:'Provide a collection.',ephemeral:true});
+    if(!slug) return interaction.reply({content:'Provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply({ephemeral:true});
     try{
       const r=await fetch('https://api.opensea.io/api/v2/events/collection/'+encodeURIComponent(slug)+'?event_type=listing&limit=1',{headers:osHeaders()});
@@ -806,7 +806,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
     const alertSales=interaction.options.getBoolean('sales')??true;
     const alertListings=interaction.options.getBoolean('listings')??true;
     const slug=interaction.options.getString('collection')||config.slug;
-    if(!slug) return interaction.reply({content:'Provide a collection or run `/setup` in a configured server first.',ephemeral:true});
+    if(!slug) return interaction.reply({content:'Provide a collection or run `/setup` in a configured server first.', flags: MessageFlags.Ephemeral});
 
     const existing=getAlert(interaction.user.id)||{};
     const filters={...(existing.traitFilters||{})};
@@ -834,7 +834,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
       'Use `/myalertclear` to remove your alert.'
     ].join('\n');
 
-    await interaction.reply({content:lines,ephemeral:true});
+    await interaction.reply({content:lines, flags: MessageFlags.Ephemeral});
     return;
   }
 
@@ -845,7 +845,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
     if(trait){
       // Remove just one trait/value from the alert
       const alert=getAlert(interaction.user.id);
-      if(!alert){ await interaction.reply({content:'You have no alert set.',ephemeral:true}); return; }
+      if(!alert){ await interaction.reply({content:'You have no alert set.', flags: MessageFlags.Ephemeral}); return; }
       const filters={...(alert.traitFilters||{})};
       if(value&&filters[trait]){
         const current=filters[trait];
@@ -858,10 +858,10 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
       } else { delete filters[trait]; }
       setAlert(interaction.user.id,{...alert,traitFilters:filters});
       const remaining=Object.keys(filters).length===0?'none':Object.entries(filters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
-      await interaction.reply({content:`Removed filter. Remaining: ${remaining}`,ephemeral:true});
+      await interaction.reply({content:`Removed filter. Remaining: ${remaining}`, flags: MessageFlags.Ephemeral});
     } else {
       deleteAlert(interaction.user.id);
-      await interaction.reply({content:'Your personal alert has been fully removed.',ephemeral:true});
+      await interaction.reply({content:'Your personal alert has been fully removed.', flags: MessageFlags.Ephemeral});
     }
     return;
   }
@@ -869,7 +869,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
   // /myalertstatus
   if(commandName==='myalertstatus'){
     const alert=getAlert(interaction.user.id);
-    if(!alert){await interaction.reply({content:'You have no personal alert set. Use `/myalert` to create one.',ephemeral:true});return;}
+    if(!alert){await interaction.reply({content:'You have no personal alert set. Use `/myalert` to create one.', flags: MessageFlags.Ephemeral});return;}
     const filterStr=alert.traitFilters&&Object.keys(alert.traitFilters).length>0?Object.entries(alert.traitFilters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n'):'none (all events)';
     const lines=[
       `Collection: **${alert.slug||'any'}**`,
@@ -877,7 +877,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
       `Listing DMs: ${alert.alertListings?'on':'off'}`,
       `Filters:\n${filterStr}`
     ].join('\n');
-    await interaction.reply({content:lines,ephemeral:true});
+    await interaction.reply({content:lines, flags: MessageFlags.Ephemeral});
     return;
   }
 
@@ -906,7 +906,7 @@ Remaining ${filterType} filters: ${remaining}`,ephemeral:true});
       '`/help` - This message'
     ].join('\n');
     await interaction.reply({embeds:[new EmbedBuilder().setTitle('NFT Sales Bot - Commands').setColor(0x7aa2ff)
-      .addFields({name:'Admin Commands (Manage Server required)',value:adminCmds,inline:false},{name:'Public Commands',value:publicCmds,inline:false})],ephemeral:true});
+      .addFields({name:'Admin Commands (Manage Server required)',value:adminCmds,inline:false},{name:'Public Commands',value:publicCmds,inline:false})], flags: MessageFlags.Ephemeral});
     return;
   }
 });
@@ -1022,7 +1022,7 @@ client.on('guildCreate', async (guild)=>{
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-client.once('ready', async ()=>{
+client.once('clientReady', async ()=>{
   console.log('Bot online as '+client.user.tag);
   console.log('OpenSea key: '+(OPENSEA_KEY?'set':'NOT SET'));
   // Load config from Supabase first (survives Railway redeploys)
