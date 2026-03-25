@@ -465,7 +465,7 @@ async function sendPersonalAlerts(event, type, config){
       if(alert.slug && alert.slug !== config.slug) continue;
       if(type==='sale'&&!alert.alertSales) continue;
       if(type==='listing'&&!alert.alertListings) continue;
-      const traits=type==='sale'?(event.nft?.traits||[]):(event.item?.traits||event.nft?.traits||[]);
+      const traits=type==='sale'?(event.nft?.traits||[]):(event.asset?.traits||event.item?.traits||event.nft?.traits||[]);
       if(!matchesFilters(traits,alert.traitFilters)) continue;
       const user=await client.users.fetch(userId).catch(()=>null);
       if(!user) continue;
