@@ -146,14 +146,14 @@ function matchesFilters(traits, filters){
   if(!filters||Object.keys(filters).length===0) return true;
   const lookup={};
   for(const t of (traits||[])) lookup[t.trait_type?.toLowerCase()]=String(t.value).toLowerCase();
-  // Each filter key can have a single value (string) or multiple values (array = OR logic)
-  // Different keys = AND logic (must match all keys)
-  // Same key multiple values = OR logic (must match at least one value)
+  // OR logic across all filter keys:
+  // A token matches if it satisfies ANY of the filter conditions.
+  // Within a single key, multiple values are also OR (e.g. type=zombie OR ape).
   for(const [k,v] of Object.entries(filters)){
     const allowed = Array.isArray(v) ? v : [v];
-    if(!allowed.includes(lookup[k])) return false;
+    if(allowed.includes(lookup[k])) return true;
   }
-  return true;
+  return false;
 }
 
 // ── SVG → PNG (OCAS on-chain SVG with embedded PNG + gradient background) ────
