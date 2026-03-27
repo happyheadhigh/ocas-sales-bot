@@ -251,10 +251,8 @@ async function buildSaleEmbed(sale, config){
   embed._imageResult=await resolveImage(sale.nft,contract,config.chain||'ethereum');
 
   embed.addFields(
-    {name:'Price',     value:eth?eth+' '+currencySymbol:'--', inline:true},
-    {name:'Sale Type', value:saleType,                         inline:true},
-    {name:'Buyer',     value:buyerLink,                        inline:true},
-    {name:'Seller',    value:sellerLink,                       inline:true},
+    {name:'Buyer',  value:buyerLink,  inline:true},
+    {name:'Seller', value:sellerLink, inline:true},
   );
   const traits=sale.nft?.traits||[];
   if(traits.length>0) embed.addFields({name:'Traits',value:traits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`).join('\n'),inline:true});
@@ -320,9 +318,8 @@ async function buildListingEmbed(listing, config){
   embed._imageResult = id ? await resolveImage(nftLike, contract, chain) : null;
 
   embed.addFields(
-    {name:'Price',   value: eth ? eth+' ETH' : '--', inline:true},
-    {name:'Seller',  value: sellerLink,               inline:true},
-    {name:'Buy Now', value: '[OpenSea]('+osUrl+')',   inline:true},
+    {name:'Seller',  value: sellerLink,             inline:true},
+    {name:'Buy Now', value: '[OpenSea]('+osUrl+')', inline:true},
   );
 
   const traits = asset.traits || [];
