@@ -106,7 +106,8 @@ function deleteAlert(userId){ delete userAlerts[userId]; saveAllAlerts(); }
 
 // ── Cursors (not persisted) ───────────────────────────────────────────────────
 const lastSaleIds    = new Map(); // guildId → last sale id
-const lastListingIds = new Map(); // guildId → last listing id
+const lastListingIds = new Map();
+const alertedEventIds = new Set(); // dedup personal DM alerts across multiple servers // guildId → last listing id
 const imageCache     = new Map(); // "contract:tokenId" → resolved image
 
 // ── Discord client ────────────────────────────────────────────────────────────
@@ -232,9 +233,17 @@ async function buildSaleEmbed(sale, config){
   const buyerLink=sale.buyer&&sale.buyer!=='unknown'?`[${shortAddr(sale.buyer)}](https://opensea.io/${sale.buyer})`:'unknown';
   const sellerLink=sale.seller&&sale.seller!=='unknown'?`[${shortAddr(sale.seller)}](https://opensea.io/${sale.seller})`:'unknown';
 
+  // Detect ETH vs WETH and sale type
+  const paymentToken = sale.payment?.symbol || '';
+  const paymentAddr  = (sale.payment?.token_address||'').toLowerCase();
+  const WETH_ADDR    = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
+  const isWeth       = paymentAddr === WETH_ADDR || paymentToken.toLowerCase() === 'weth';
+  const currencySymbol = isWeth ? 'WETH' : 'ETH';
+  const saleType     = sale.event_type === 'offer_accepted' ? 'Offer Accepted' : 'Listed Sale';
+
   const embed=new EmbedBuilder()
-    .setTitle(`SOLD ${name} - ${eth?eth+' ETH':'--'}`)
-    .setColor(0x2dd4bf)
+    .setTitle(`SOLD ${name} - ${eth?eth+' '+currencySymbol:'--'}`)
+    .setColor(isWeth ? 0x9b59b6 : 0x2dd4bf)  // purple for WETH, teal for ETH
     .setURL(osUrl)
     .setFooter({text:`Sales Bot - ${slug}${timeStr?' - '+timeStr:''}`})
     .setTimestamp();
@@ -242,9 +251,10 @@ async function buildSaleEmbed(sale, config){
   embed._imageResult=await resolveImage(sale.nft,contract,config.chain||'ethereum');
 
   embed.addFields(
-    {name:'Price', value:eth?eth+' ETH':'--', inline:true},
-    {name:'Buyer', value:buyerLink, inline:true},
-    {name:'Seller',value:sellerLink,inline:true},
+    {name:'Price',     value:eth?eth+' '+currencySymbol:'--', inline:true},
+    {name:'Sale Type', value:saleType,                         inline:true},
+    {name:'Buyer',     value:buyerLink,                        inline:true},
+    {name:'Seller',    value:sellerLink,                       inline:true},
   );
   const traits=sale.nft?.traits||[];
   if(traits.length>0) embed.addFields({name:'Traits',value:traits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`).join('\n'),inline:true});
@@ -460,6 +470,8 @@ async function pollListings(){
 
 // ── Personal DM alerts ────────────────────────────────────────────────────────
 async function sendPersonalAlerts(event, type, config){
+  // Dedup: same event can come through multiple guild configs — only DM once per event
+  const eventKey = `placeholder:${type}:${event.id||event.event_timestamp}`;
   for(const [userId, alert] of Object.entries(userAlerts)){
     try{
       if(alert.slug && alert.slug !== config.slug) continue;
@@ -467,6 +479,15 @@ async function sendPersonalAlerts(event, type, config){
       if(type==='listing'&&!alert.alertListings) continue;
       const traits=type==='sale'?(event.nft?.traits||[]):(event.asset?.traits||event.item?.traits||event.nft?.traits||[]);
       if(!matchesFilters(traits,alert.traitFilters)) continue;
+      // Skip if already sent this event to this user
+      const dedupKey = `${userId}:${type}:${event.id||event.event_timestamp}`;
+      if(alertedEventIds.has(dedupKey)) continue;
+      alertedEventIds.add(dedupKey);
+      // Keep set from growing forever — trim if over 5000 entries
+      if(alertedEventIds.size > 5000){
+        const first = alertedEventIds.values().next().value;
+        alertedEventIds.delete(first);
+      }
       const user=await client.users.fetch(userId).catch(()=>null);
       if(!user) continue;
       const embed=type==='sale'
