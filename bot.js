@@ -242,7 +242,7 @@ async function buildSaleEmbed(sale, config){
   const saleType     = sale.event_type === 'offer_accepted' ? 'Offer Accepted' : 'Listed Sale';
 
   const embed=new EmbedBuilder()
-    .setTitle(`SOLD ${name} - ${eth?eth+' '+currencySymbol:'--'}`)
+    .setTitle(`${eth?eth+' '+currencySymbol:'--'} — ${name} sold`)
     .setColor(isWeth ? 0x9b59b6 : 0x2dd4bf)  // purple for WETH, teal for ETH
     .setURL(osUrl)
     .setFooter({text:`Sales Bot - ${slug}${timeStr?' - '+timeStr:''}`})
@@ -301,7 +301,7 @@ async function buildListingEmbed(listing, config){
   const sellerLink = sellerAddr ? '['+shortAddr(sellerAddr)+'](https://opensea.io/'+sellerAddr+')' : 'unknown';
 
   const embed = new EmbedBuilder()
-    .setTitle('LISTED '+name+' - '+(eth ? eth+' ETH' : '--'))
+    .setTitle(`${eth ? eth+' ETH' : '--'} — ${name} listed`)
     .setColor(0x7aa2ff)
     .setURL(osUrl)
     .setFooter({text:'Listings Bot - '+slug})
