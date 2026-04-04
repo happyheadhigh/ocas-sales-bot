@@ -116,25 +116,32 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function osHeaders(){ const h={accept:'application/json'}; if(OPENSEA_KEY) h['x-api-key']=OPENSEA_KEY; return h; }
 
+function trimEth(eth){
+  // Strip trailing zeros: 0.00700 → 0.007, 1.2300 → 1.23, 0.00570 → 0.0057
+  if(eth >= 1)    return parseFloat(eth.toFixed(4)).toString();
+  if(eth >= 0.1)  return parseFloat(eth.toFixed(4)).toString();
+  if(eth >= 0.01) return parseFloat(eth.toFixed(4)).toString();
+  return parseFloat(eth.toFixed(5)).toString();
+}
+
 function formatEth(event){
   try{
     const qty = BigInt(event.payment?.quantity||'0');
     const dec = event.payment?.decimals??18;
     const eth = Number(qty)/Math.pow(10,dec);
     if(!isFinite(eth)||eth<=0) return null;
-    return eth>=1?eth.toFixed(4):eth.toFixed(5);
+    return trimEth(eth);
   }catch{ return null; }
 }
 
 function formatListingEth(listing){
   try{
-    // Listing events use payment.quantity (wei) just like sale events
     const qty = listing.payment?.quantity;
     if(!qty) return null;
     const dec = listing.payment?.decimals ?? 18;
     const eth = Number(qty) / Math.pow(10, dec);
     if(!isFinite(eth)||eth<=0) return null;
-    return eth>=1?eth.toFixed(4):eth.toFixed(5);
+    return trimEth(eth);
   }catch{ return null; }
 }
 
@@ -250,12 +257,25 @@ async function buildSaleEmbed(sale, config){
 
   embed._imageResult=await resolveImage(sale.nft,contract,config.chain||'ethereum');
 
+  // Buyer + Seller on same row (inline), then Traits full-width, then Links
+  // This eliminates dead space that was caused by tall Traits column next to thumbnail
   embed.addFields(
     {name:'Buyer',  value:buyerLink,  inline:true},
     {name:'Seller', value:sellerLink, inline:true},
+    {name:'​',   value:'​',        inline:true}, // blank field to complete the 3-col row
   );
   const traits=sale.nft?.traits||[];
-  if(traits.length>0) embed.addFields({name:'Traits',value:traits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`).join('\n'),inline:true});
+  if(traits.length>0){
+    // Two columns of traits side by side
+    const traitLines = traits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`);
+    const half = Math.ceil(traitLines.length/2);
+    const col1 = traitLines.slice(0,half).join('\n');
+    const col2 = traitLines.slice(half).join('\n');
+    embed.addFields(
+      {name:'Traits', value:col1, inline:true},
+      {name:'​',  value:col2||'​', inline:true},
+    );
+  }
   embed.addFields({name:'Links',value:`[OpenSea](${osUrl}) - [TraitView](${tvUrl})`,inline:false});
   return embed;
 }
