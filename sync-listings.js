@@ -10,7 +10,7 @@
 
 const { Pool } = require('pg');
 
-const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
+const OPENSEA_API_KEY = process.env.OPENSEA_KEY || process.env.OPENSEA_API_KEY;
 const DATABASE_URL    = process.env.DATABASE_URL;
 
 // Guard: don't crash the container if env vars missing
@@ -52,7 +52,7 @@ async function syncListings() {
 
       const resp = await fetch(
         `https://api.opensea.io/api/v2/listings/collection/${SLUG}/all?${qs}`,
-        { headers: { 'X-API-KEY': OPENSEA_API_KEY, 'Accept': 'application/json' } }
+        { headers: { 'X-Api-Key': OPENSEA_API_KEY, 'Accept': 'application/json' } }
       );
 
       if (!resp.ok) {
