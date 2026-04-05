@@ -12,12 +12,23 @@ const { Pool } = require('pg');
 
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
 const DATABASE_URL    = process.env.DATABASE_URL;
+
+// Guard: don't crash the container if env vars missing
+void (function() {
 const SLUG            = 'on-chain-all-stars';
 const CONTRACT        = '0x078be86f3104a32313a47815792230a3808642cc';
 const SYNC_INTERVAL   = 3 * 60 * 1000; // 3 minutes
 
-if (!DATABASE_URL)    { console.error('Missing DATABASE_URL'); process.exit(1); }
-if (!OPENSEA_API_KEY) { console.error('Missing OPENSEA_API_KEY'); process.exit(1); }
+if (!DATABASE_URL) {
+  console.error('[sync] Missing DATABASE_URL — listings sync disabled');
+  module.exports = { syncListings: () => Promise.resolve() };
+  return;
+}
+if (!OPENSEA_API_KEY) {
+  console.error('[sync] Missing OPENSEA_API_KEY — listings sync disabled');
+  module.exports = { syncListings: () => Promise.resolve() };
+  return;
+}
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -136,3 +147,4 @@ console.log(`[sync] Listings sync running — interval: ${SYNC_INTERVAL/1000}s`)
 
 // Export for use in api.js trigger endpoint
 module.exports = { syncListings };
+})(); // end guard IIFE
