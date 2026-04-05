@@ -52,15 +52,23 @@ async function syncListings() {
 
       const resp = await fetch(
         `https://api.opensea.io/api/v2/listings/collection/${SLUG}/all?${qs}`,
-        { headers: { 'X-Api-Key': OPENSEA_API_KEY, 'Accept': 'application/json' } }
+        { headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' } }
       );
 
       if (!resp.ok) {
-        console.warn(`[sync] OpenSea returned ${resp.status} on page ${pages}`);
+        const errText = await resp.text().catch(() => '');
+        console.warn(`[sync] OpenSea HTTP ${resp.status} on page ${pages}: ${errText.slice(0, 200)}`);
         break;
       }
 
       const body = await resp.json();
+      if (pages === 0) {
+        console.log(`[sync] First page: ${body.listings?.length ?? 0} listings, keys: ${Object.keys(body).join(', ')}`);
+        if (body.listings?.length > 0) {
+          const sample = body.listings[0];
+          console.log(`[sync] Sample listing keys: ${Object.keys(sample).join(', ')}`);
+        }
+      }
 
       // Extract token ID using same robust logic as the Cloudflare Worker
       function getTokenId(listing) {
