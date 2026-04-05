@@ -1,0 +1,138 @@
+/**
+ * TraitView Listings Sync
+ * 
+ * Fetches current OpenSea listings for OCAS and upserts into Postgres.
+ * Run as a cron job on Railway alongside the bot.
+ * 
+ * Runs every 3 minutes via setInterval.
+ * Can also be triggered manually via the API: GET /db/listings/sync?key=SECRET
+ */
+
+const { Pool } = require('pg');
+
+const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
+const DATABASE_URL    = process.env.DATABASE_URL;
+const SLUG            = 'on-chain-all-stars';
+const CONTRACT        = '0x078be86f3104a32313a47815792230a3808642cc';
+const SYNC_INTERVAL   = 3 * 60 * 1000; // 3 minutes
+
+if (!DATABASE_URL)    { console.error('Missing DATABASE_URL'); process.exit(1); }
+if (!OPENSEA_API_KEY) { console.error('Missing OPENSEA_API_KEY'); process.exit(1); }
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes('railway.internal') ? false : { rejectUnauthorized: false },
+  max: 3,
+});
+
+async function syncListings() {
+  const startTime = Date.now();
+  console.log(`[sync] Starting listings sync at ${new Date().toISOString()}`);
+
+  try {
+    // Fetch all current listings from OpenSea
+    const listingsMap = {}; // token_id -> {price_eth, url}
+    let next = null;
+    let pages = 0;
+
+    do {
+      const qs = new URLSearchParams({ chain: 'ethereum', limit: '100' });
+      if (next) qs.set('next', next);
+
+      const resp = await fetch(
+        `https://api.opensea.io/api/v2/listings/collection/${SLUG}/all?${qs}`,
+        { headers: { 'X-API-KEY': OPENSEA_API_KEY, 'Accept': 'application/json' } }
+      );
+
+      if (!resp.ok) {
+        console.warn(`[sync] OpenSea returned ${resp.status} on page ${pages}`);
+        break;
+      }
+
+      const body = await resp.json();
+
+      for (const listing of (body.listings || [])) {
+        const rawId = listing?.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria
+          || listing?.criteria?.nft?.identifier
+          || listing?.nft?.identifier;
+        const price = listing?.price?.current?.decimal;
+
+        if (!rawId || price == null) continue;
+        const id = parseInt(rawId, 10);
+        if (isNaN(id) || id < 1 || id > 10000) continue;
+
+        const priceEth = parseFloat(price);
+        if (isNaN(priceEth) || priceEth <= 0) continue;
+
+        const url = `https://opensea.io/assets/ethereum/${CONTRACT}/${id}`;
+
+        // Keep cheapest listing per token
+        if (!listingsMap[id] || priceEth < listingsMap[id].price_eth) {
+          listingsMap[id] = { price_eth: priceEth, url };
+        }
+      }
+
+      next = body.next || null;
+      pages++;
+
+      if (pages >= 25) break; // safety cap (25 × 100 = 2500 listings max)
+      if (next) await new Promise(r => setTimeout(r, 80)); // rate limit
+
+    } while (next);
+
+    const entries = Object.entries(listingsMap);
+    console.log(`[sync] Fetched ${entries.length} listings across ${pages} pages`);
+
+    if (entries.length === 0) {
+      console.warn('[sync] No listings returned — skipping DB write');
+      return;
+    }
+
+    // Upsert into Postgres in batches of 100
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Clear stale listings (tokens no longer listed)
+      await client.query('DELETE FROM listings');
+
+      // Insert fresh listings
+      for (let i = 0; i < entries.length; i += 100) {
+        const batch = entries.slice(i, i + 100);
+        const vals  = batch.map((_, j) => `($${j*3+1}, $${j*3+2}, $${j*3+3}, NOW())`).join(', ');
+        const params = batch.flatMap(([id, d]) => [parseInt(id), d.price_eth, d.url]);
+
+        await client.query(`
+          INSERT INTO listings (token_id, price_eth, url, updated_at)
+          VALUES ${vals}
+          ON CONFLICT (token_id) DO UPDATE
+            SET price_eth = EXCLUDED.price_eth,
+                url       = EXCLUDED.url,
+                updated_at = NOW()
+        `, params);
+      }
+
+      await client.query('COMMIT');
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[sync] ✓ Upserted ${entries.length} listings in ${elapsed}s`);
+
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+
+  } catch (e) {
+    console.error('[sync] Listings sync failed:', e.message);
+  }
+}
+
+// Run immediately on startup, then every 3 minutes
+syncListings();
+setInterval(syncListings, SYNC_INTERVAL);
+
+console.log(`[sync] Listings sync running — interval: ${SYNC_INTERVAL/1000}s`);
+
+// Export for use in api.js trigger endpoint
+module.exports = { syncListings };

@@ -210,11 +210,66 @@ app.get('/db/holders/trait', auth, async (req, res) => {
   }
 });
 
-// ── POST /db/listings/sync ───────────────────────────────────────────────────
-// Sync current listings from OpenSea into DB.
-// Called periodically (or manually). Requires API_SECRET.
+// ── GET /db/listings/sync — manually trigger a sync ──────────────────────────
 app.get('/db/listings/sync', auth, async (req, res) => {
-  res.json({ ok: true, message: 'Sync endpoint ready — wire up OpenSea fetch here' });
+  try {
+    const { syncListings } = require('./sync-listings');
+    res.json({ ok: true, message: 'Sync triggered — running in background' });
+    syncListings();
+  } catch(e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/listings — all current listings from DB ───────────────────────────
+app.get('/db/listings', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT token_id, price_eth, url FROM listings ORDER BY price_eth ASC`
+    );
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      listings: result.rows.map(r => ({
+        token_id: parseInt(r.token_id),
+        price_eth: parseFloat(r.price_eth),
+        url: r.url
+      })),
+      count: result.rows.length
+    });
+  } catch(e) {
+    console.error('/db/listings error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/floor-trend — aggregated sales for chart ─────────────────────────
+app.get('/db/floor-trend', auth, async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.query.days || '90'), 365);
+    const result = await pool.query(
+      `SELECT s.token_id, s.price_eth, s.currency, s.sale_ts, t.obs_rank
+       FROM sales s JOIN tokens t ON t.id = s.token_id
+       WHERE s.sale_ts > NOW() - ($1 || ' days')::INTERVAL
+       ORDER BY s.sale_ts DESC LIMIT 2000`,
+      [days]
+    );
+    res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
+    res.json({
+      ok: true,
+      sales: result.rows.map(r => ({
+        token_id: parseInt(r.token_id),
+        price_eth: parseFloat(r.price_eth),
+        currency: r.currency,
+        sale_ts: r.sale_ts,
+        obs_rank: parseInt(r.obs_rank)
+      })),
+      count: result.rows.length
+    });
+  } catch(e) {
+    console.error('/db/floor-trend error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ── Start server ──────────────────────────────────────────────────────────────
