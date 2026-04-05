@@ -62,22 +62,40 @@ async function syncListings() {
 
       const body = await resp.json();
 
+      // Extract token ID using same robust logic as the Cloudflare Worker
+      function getTokenId(listing) {
+        const cands = [
+          listing?.criteria?.nft?.identifier,
+          listing?.nft?.identifier,
+          listing?.asset?.token_id,
+          listing?.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria,
+          listing?.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria,
+        ];
+        for (let c of cands) {
+          if (!c) continue;
+          c = String(c);
+          const parts = c.includes('/') ? c.split('/') : c.split(':');
+          const last = parts[parts.length - 1];
+          if (last && /^\d+$/.test(last)) return parseInt(last, 10);
+        }
+        return null;
+      }
+
+      function getPriceEth(listing) {
+        const wei = listing?.price?.current?.value || listing?.price?.value || null;
+        const dec = listing?.price?.current?.decimal ?? listing?.price?.decimal
+          ?? (wei ? Number(wei) / 1e18 : null);
+        return dec != null ? parseFloat(dec) : null;
+      }
+
       for (const listing of (body.listings || [])) {
-        const rawId = listing?.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria
-          || listing?.criteria?.nft?.identifier
-          || listing?.nft?.identifier;
-        const price = listing?.price?.current?.decimal;
+        const id = getTokenId(listing);
+        const priceEth = getPriceEth(listing);
 
-        if (!rawId || price == null) continue;
-        const id = parseInt(rawId, 10);
-        if (isNaN(id) || id < 1 || id > 10000) continue;
-
-        const priceEth = parseFloat(price);
-        if (isNaN(priceEth) || priceEth <= 0) continue;
+        if (!id || isNaN(id) || id < 1 || id > 10000) continue;
+        if (priceEth == null || isNaN(priceEth) || priceEth <= 0) continue;
 
         const url = `https://opensea.io/assets/ethereum/${CONTRACT}/${id}`;
-
-        // Keep cheapest listing per token
         if (!listingsMap[id] || priceEth < listingsMap[id].price_eth) {
           listingsMap[id] = { price_eth: priceEth, url };
         }
