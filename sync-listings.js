@@ -171,6 +171,98 @@ setInterval(syncListings, SYNC_INTERVAL);
 
 console.log(`[sync] Listings sync running — interval: ${SYNC_INTERVAL/1000}s`);
 
+// ── Sync recent sales from OpenSea into DB ───────────────────────────────────
+async function syncSales() {
+  console.log(`[sync] Starting sales sync at ${new Date().toISOString()}`);
+  try {
+    let allSales = [];
+    let cursor = null;
+    let pages = 0;
+
+    do {
+      const qs = new URLSearchParams({ event_type: 'sale', limit: '100' });
+      if (cursor) qs.set('next', cursor);
+
+      const resp = await fetch(
+        `https://api.opensea.io/api/v2/events/collection/${SLUG}?${qs}`,
+        { headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' } }
+      );
+
+      if (!resp.ok) {
+        console.warn(`[sync-sales] OpenSea HTTP ${resp.status} on page ${pages}`);
+        break;
+      }
+
+      const body = await resp.json();
+      const events = body.asset_events || [];
+
+      for (const ev of events) {
+        const rawId = ev?.nft?.identifier || ev?.asset?.token_id;
+        if (!rawId) continue;
+        const token_id = parseInt(rawId, 10);
+        if (isNaN(token_id) || token_id < 1 || token_id > 10000) continue;
+
+        const priceWei = ev?.payment?.quantity || ev?.total_price;
+        if (!priceWei) continue;
+        const price_eth = parseFloat(priceWei) / 1e18;
+        if (isNaN(price_eth) || price_eth <= 0 || price_eth > 1000) continue;
+
+        const currency = ev?.payment?.symbol || 'ETH';
+        const buyer  = ev?.buyer  || ev?.winner_account?.address || null;
+        const seller = ev?.seller || ev?.from_account?.address   || null;
+        const sale_ts = ev?.closing_date
+          ? new Date(ev.closing_date * 1000).toISOString()
+          : ev?.event_timestamp || new Date().toISOString();
+        const tx_hash = ev?.transaction || null;
+
+        allSales.push({ token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash });
+      }
+
+      cursor = body.next || null;
+      pages++;
+      if (pages >= 10) break; // last 1000 sales
+      if (cursor) await new Promise(r => setTimeout(r, 80));
+    } while (cursor);
+
+    if (allSales.length === 0) {
+      console.log('[sync-sales] No sales to sync');
+      return;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (let i = 0; i < allSales.length; i += 100) {
+        const batch = allSales.slice(i, i + 100);
+        const vals = batch.map((_, j) =>
+          `($${j*7+1},$${j*7+2},$${j*7+3},$${j*7+4},$${j*7+5},$${j*7+6},$${j*7+7})`
+        ).join(', ');
+        const params = batch.flatMap(s => [
+          s.token_id, s.price_eth, s.currency, s.buyer, s.seller, s.sale_ts, s.tx_hash
+        ]);
+        await client.query(`
+          INSERT INTO sales (token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash)
+          VALUES ${vals}
+          ON CONFLICT (tx_hash) DO NOTHING
+        `, params);
+      }
+      await client.query('COMMIT');
+      console.log(`[sync-sales] ✓ Upserted ${allSales.length} sales`);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      console.error('[sync-sales] DB write failed:', e.message);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('[sync-sales] Failed:', e.message);
+  }
+}
+
+// Run sales sync on startup then every 15 minutes
+syncSales();
+setInterval(syncSales, 15 * 60 * 1000);
+
 // Export for use in api.js trigger endpoint
-module.exports = { syncListings };
+module.exports = { syncListings, syncSales };
 })(); // end guard IIFE
