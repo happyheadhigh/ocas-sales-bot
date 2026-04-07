@@ -26,6 +26,7 @@ const pool = new Pool({
 });
 
 async function ensureTable() {
+  // Create table if not exists (without unique constraint — we add it separately)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sales (
       id        SERIAL PRIMARY KEY,
@@ -35,14 +36,17 @@ async function ensureTable() {
       buyer     VARCHAR(42),
       seller    VARCHAR(42),
       tx_hash   VARCHAR(66),
-      sale_ts   TIMESTAMPTZ NOT NULL,
-      UNIQUE (token_id, sale_ts)
+      sale_ts   TIMESTAMPTZ NOT NULL
     )
   `);
   // Add columns if table existed without them
   for (const col of ['buyer VARCHAR(42)', 'seller VARCHAR(42)', 'tx_hash VARCHAR(66)']) {
     await pool.query(`ALTER TABLE sales ADD COLUMN IF NOT EXISTS ${col}`).catch(() => {});
   }
+  // Add unique constraint if missing — required for ON CONFLICT
+  await pool.query(`
+    ALTER TABLE sales ADD CONSTRAINT sales_token_sale_uniq UNIQUE (token_id, sale_ts)
+  `).catch(() => {}); // ignore if already exists
   await pool.query(`CREATE INDEX IF NOT EXISTS sales_token_id_idx ON sales(token_id)`).catch(() => {});
   console.log('✓ sales table ready');
 }
