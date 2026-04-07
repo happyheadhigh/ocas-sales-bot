@@ -272,6 +272,50 @@ app.get('/db/floor-trend', auth, async (req, res) => {
   }
 });
 
+
+// ── GET /db/token-sales ───────────────────────────────────────────────────────
+// Sale history for a specific token — used by price history chart in modal.
+// Query params:
+//   token_id — required
+//   limit    — default 200
+// Returns: { ok, sales: [{token_id, price_eth, currency, tx_hash, from_address, to_address, sale_ts}] }
+app.get('/db/token-sales', auth, async (req, res) => {
+  try {
+    const tokenId = parseInt(req.query.token_id);
+    if (!tokenId || tokenId < 1 || tokenId > 10000) {
+      return res.status(400).json({ ok: false, error: 'invalid token_id' });
+    }
+    const limit = Math.min(parseInt(req.query.limit || '200'), 500);
+
+    const result = await pool.query(
+      `SELECT token_id, price_eth, currency, tx_hash, from_address, to_address, sale_ts
+       FROM sales
+       WHERE token_id = $1
+       ORDER BY sale_ts ASC
+       LIMIT $2`,
+      [tokenId, limit]
+    );
+
+    res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
+    res.json({
+      ok: true,
+      sales: result.rows.map(r => ({
+        token_id:     parseInt(r.token_id),
+        price_eth:    parseFloat(r.price_eth),
+        currency:     r.currency || 'ETH',
+        tx_hash:      r.tx_hash || null,
+        from_address: r.from_address || null,
+        to_address:   r.to_address || null,
+        sale_ts:      r.sale_ts,
+      })),
+      count: result.rows.length
+    });
+  } catch (e) {
+    console.error('/db/token-sales error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
