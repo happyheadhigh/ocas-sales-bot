@@ -272,13 +272,12 @@ app.get('/db/floor-trend', auth, async (req, res) => {
   }
 });
 
-
 // ── GET /db/token-sales ───────────────────────────────────────────────────────
 // Sale history for a specific token — used by price history chart in modal.
 // Query params:
 //   token_id — required
 //   limit    — default 200
-// Returns: { ok, sales: [{token_id, price_eth, currency, tx_hash, from_address, to_address, sale_ts}] }
+// Returns: { ok, sales: [{token_id, price_eth, currency, buyer, seller, tx_hash, sale_ts}] }
 app.get('/db/token-sales', auth, async (req, res) => {
   try {
     const tokenId = parseInt(req.query.token_id);
@@ -288,7 +287,7 @@ app.get('/db/token-sales', auth, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '200'), 500);
 
     const result = await pool.query(
-      `SELECT token_id, price_eth, currency, tx_hash, from_address, to_address, sale_ts
+      `SELECT token_id, price_eth, currency, buyer, seller, tx_hash, sale_ts
        FROM sales
        WHERE token_id = $1
        ORDER BY sale_ts ASC
@@ -300,13 +299,13 @@ app.get('/db/token-sales', auth, async (req, res) => {
     res.json({
       ok: true,
       sales: result.rows.map(r => ({
-        token_id:     parseInt(r.token_id),
-        price_eth:    parseFloat(r.price_eth),
-        currency:     r.currency || 'ETH',
-        tx_hash:      r.tx_hash || null,
-        from_address: r.from_address || null,
-        to_address:   r.to_address || null,
-        sale_ts:      r.sale_ts,
+        token_id:  parseInt(r.token_id),
+        price_eth: parseFloat(r.price_eth),
+        currency:  r.currency || 'ETH',
+        buyer:     r.buyer  || null,
+        seller:    r.seller || null,
+        tx_hash:   r.tx_hash || null,
+        sale_ts:   r.sale_ts,
       })),
       count: result.rows.length
     });

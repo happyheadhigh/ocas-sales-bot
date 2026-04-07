@@ -243,7 +243,7 @@ async function syncSales() {
         await client.query(`
           INSERT INTO sales (token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash)
           VALUES ${vals}
-          ON CONFLICT (tx_hash) DO NOTHING
+          ON CONFLICT (token_id, sale_ts) DO NOTHING
         `, params);
       }
       await client.query('COMMIT');
