@@ -315,58 +315,6 @@ app.get('/db/token-sales', auth, async (req, res) => {
   }
 });
 
-
-
-// ── GET /db/trait-sales ───────────────────────────────────────────────────────
-// Sales history filtered by a trait value — full collection history, no pagination cap.
-// Query params:
-//   trait   — trait name  e.g. "Type"
-//   value   — trait value e.g. "Zombie"
-//   limit   — default 50, max 200
-//   sort    — "desc" (newest first, default) or "asc"
-// Returns: { ok, sales: [{token_id, price_eth, currency, sale_ts, buyer, seller}], count }
-app.get('/db/trait-sales', auth, async (req, res) => {
-  try {
-    const trait = (req.query.trait || '').trim();
-    const value = (req.query.value || '').trim();
-    if (!trait || !value) {
-      return res.status(400).json({ ok: false, error: 'trait and value are required' });
-    }
-    const limit = Math.min(parseInt(req.query.limit || '50'), 200);
-    const sort  = req.query.sort === 'asc' ? 'ASC' : 'DESC';
-
-    // Join sales with token_traits — case-insensitive match on both trait and value
-    const result = await pool.query(
-      `SELECT s.token_id, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller
-       FROM sales s
-       JOIN token_traits tt ON tt.token_id = s.token_id
-       WHERE LOWER(tt.trait_name)  = LOWER($1)
-         AND LOWER(tt.trait_value) = LOWER($2)
-       ORDER BY s.sale_ts ${sort}
-       LIMIT $3`,
-      [trait, value, limit]
-    );
-
-    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
-    res.json({
-      ok: true,
-      trait, value,
-      sales: result.rows.map(r => ({
-        token_id:  parseInt(r.token_id),
-        price_eth: parseFloat(r.price_eth),
-        currency:  r.currency || 'ETH',
-        sale_ts:   r.sale_ts,
-        buyer:     r.buyer  || null,
-        seller:    r.seller || null,
-      })),
-      count: result.rows.length
-    });
-  } catch (e) {
-    console.error('/db/trait-sales error:', e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
