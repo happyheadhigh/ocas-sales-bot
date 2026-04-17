@@ -800,21 +800,45 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           let shown = 0;
           for(const sale of sales){
             if(shown >= want) break;
-            const priceStr = sale.price_eth != null ? `Ξ ${Number(sale.price_eth) >= 1 ? Number(sale.price_eth).toFixed(3) : Number(sale.price_eth).toFixed(4)}` : '—';
-            const curr     = (sale.currency||'ETH').toUpperCase() === 'WETH' ? ' WETH' : '';
-            const date     = sale.sale_ts ? new Date(sale.sale_ts).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}) : '—';
-            const embed = new EmbedBuilder()
-              .setColor((sale.currency||'ETH').toUpperCase() === 'WETH' ? 0x9B59B6 : 0x2dd4bf)
-              .setTitle(`#${sale.token_id} — ${priceStr}${curr}`)
-              .setDescription(`**${trait}:** ${value}`)
-              .addFields(
-                { name: 'Date',   value: date, inline: true },
-                { name: 'Buyer',  value: sale.buyer  ? sale.buyer.slice(0,6)+'…'+sale.buyer.slice(-4)  : '—', inline: true },
-                { name: 'Seller', value: sale.seller ? sale.seller.slice(0,6)+'…'+sale.seller.slice(-4) : '—', inline: true }
-              )
-              .setFooter({ text: `Sales Bot · on-chain-all-stars · ${new Date(sale.sale_ts).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})} at ${new Date(sale.sale_ts).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true})}` });
+
+            // Fetch traits from DB for this token
+            let tokenTraits = [];
+            try{
+              const tqs = new URLSearchParams({ key: API_SECRET||'' });
+              const tr = await fetch(`${RAILWAY_URL}/db/token/${sale.token_id}?${tqs}`);
+              if(tr.ok){
+                const tj = await tr.json();
+                if(tj.ok && tj.token?.traits){
+                  tokenTraits = Object.entries(tj.token.traits).map(([k,v])=>({ trait_type:k, value:v }));
+                }
+              }
+            }catch(e){ /* non-fatal — just show without traits */ }
+
+            // Build a synthetic sale object that matches what buildSaleEmbed expects
+            const cfg = {...config, slug};
+            const syntheticSale = {
+              nft: {
+                identifier: String(sale.token_id),
+                name: `#${sale.token_id}`,
+                traits: tokenTraits,
+              },
+              buyer:  sale.buyer  || 'unknown',
+              seller: sale.seller || 'unknown',
+              payment: {
+                symbol: (sale.currency||'ETH'),
+                token_address: (sale.currency||'ETH').toUpperCase()==='WETH' ? '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2' : '',
+                quantity: sale.price_eth != null ? String(BigInt(Math.round(sale.price_eth * 1e18))) : '0',
+                decimals: 18,
+              },
+              event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
+              // Attach price so buildSaleEmbed can format it
+              _price_eth: sale.price_eth,
+            };
+
+            // Patch formatEth to read _price_eth for DB sales
+            const embed = await buildSaleEmbed(syntheticSale, cfg);
             await sendEmbed(interaction.channel, embed);
-            await new Promise(r=>setTimeout(r,600));
+            await new Promise(r=>setTimeout(r,800));
             shown++;
           }
           return;
