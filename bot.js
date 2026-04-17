@@ -757,17 +757,69 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     return;
   }
 
-  // /traitfind
+  // /traitfind — search sales history by trait. Tries Railway DB first (full history),
+  // falls back to OpenSea pagination (capped ~1500 sales) if DB not configured.
   if(commandName==='traitfind'){
-    const slug=interaction.options.getString('collection')||config.slug;
-    const trait=interaction.options.getString('trait').toLowerCase().trim();
-    const value=interaction.options.getString('value').toLowerCase().trim();
-    const want=Math.min(interaction.options.getInteger('count')||5,10);
+    const slug  = interaction.options.getString('collection') || config.slug;
+    const trait = interaction.options.getString('trait').trim();
+    const value = interaction.options.getString('value').trim();
+    const want  = Math.min(interaction.options.getInteger('count') || 5, 25);
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
+
+    const RAILWAY_URL = process.env.RAILWAY_API_URL;
+    const API_SECRET  = process.env.API_SECRET;
+
     try{
+      // ── Path A: Railway DB (full 15k+ sale history, instant) ──────────────
+      if(RAILWAY_URL){
+        await interaction.editReply(`🔍 Searching **${trait}: ${value}** in full sales history...`);
+        const qs = new URLSearchParams({ trait, value, limit: String(Math.min(want, 200)), sort: 'desc' });
+        if(API_SECRET) qs.set('key', API_SECRET);
+        const r = await fetch(`${RAILWAY_URL}/db/trait-sales?${qs}`);
+        if(r.ok){
+          const j = await r.json();
+          if(!j.ok) throw new Error(j.error || 'DB error');
+          const sales = j.sales || [];
+          if(!sales.length){
+            await interaction.editReply(`No sales found in DB for **${trait}: ${value}** (searched ${j.count ?? 'all'} records).`);
+            return;
+          }
+          // Format how many total exist vs how many we're showing
+          const totalNote = j.count > want ? ` (showing ${want} of ${j.count} total)` : '';
+          await interaction.editReply(`Found **${j.count}** sale${j.count===1?'':'s'} with **${trait}: ${value}**${totalNote}:`);
+          let shown = 0;
+          for(const sale of sales){
+            if(shown >= want) break;
+            const priceStr = sale.price_eth != null ? `Ξ ${Number(sale.price_eth) >= 1 ? Number(sale.price_eth).toFixed(3) : Number(sale.price_eth).toFixed(4)}` : '—';
+            const curr     = (sale.currency||'ETH').toUpperCase() === 'WETH' ? ' WETH' : '';
+            const date     = sale.sale_ts ? new Date(sale.sale_ts).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}) : '—';
+            const embed = {
+              color: (sale.currency||'ETH').toUpperCase() === 'WETH' ? 0x9B59B6 : 0x2dd4bf,
+              title: `#${sale.token_id} — ${priceStr}${curr}`,
+              description: `**Trait:** ${trait}: ${value}`,
+              fields: [
+                { name: 'Date', value: date, inline: true },
+                { name: 'Buyer',  value: sale.buyer  ? sale.buyer.slice(0,8)+'…'  : '—', inline: true },
+                { name: 'Seller', value: sale.seller ? sale.seller.slice(0,8)+'…' : '—', inline: true },
+              ],
+              footer: { text: 'TraitView DB · Full history' }
+            };
+            await sendEmbed(interaction.channel, { embeds:[embed] });
+            await new Promise(r=>setTimeout(r,600));
+            shown++;
+          }
+          return;
+        }
+        // DB call failed — fall through to OpenSea
+        console.warn('[traitfind] Railway DB call failed, falling back to OpenSea');
+      }
+
+      // ── Path B: OpenSea pagination fallback (capped ~1500 sales) ──────────
+      await interaction.editReply(`🔍 Searching OpenSea sales for **${trait}: ${value}**...`);
+      const traitLow = trait.toLowerCase();
+      const valueLow = value.toLowerCase();
       const matched=[];let cursor=null;let pages=0;
-      await interaction.editReply(`Searching sales for **${trait}: ${value}**...`);
       while(matched.length<want&&pages<15){
         const qs=new URLSearchParams({event_type:'sale',limit:'100'});
         if(cursor) qs.set('next',cursor);
@@ -776,13 +828,18 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const j=await r.json();const sales=j.asset_events||[];if(!sales.length) break;
         for(const sale of sales){
           if(matched.length>=want) break;
-          const lookup={};for(const t of (sale.nft?.traits||[])) lookup[t.trait_type?.toLowerCase()]=String(t.value).toLowerCase();
-          if(lookup[trait]===value) matched.push(sale);
+          const lookup={};
+          for(const t of (sale.nft?.traits||[])) lookup[t.trait_type?.toLowerCase()]=String(t.value).toLowerCase();
+          if(lookup[traitLow]===valueLow) matched.push(sale);
         }
         cursor=j.next||null;if(!cursor) break;pages++;
       }
-      if(!matched.length){await interaction.editReply(`No sales found with **${trait}: ${value}** in the last ${pages*100} sales.`);return;}
-      await interaction.editReply(`Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait}: ${value}**:`);
+      if(!matched.length){
+        await interaction.editReply(`No sales found with **${trait}: ${value}** in the last ~${pages*100} sales.
+_Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
+        return;
+      }
+      await interaction.editReply(`Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait}: ${value}** (OpenSea, last ~${pages*100}):`);
       const cfg={...config,slug};
       for(const sale of matched){const embed=await buildSaleEmbed(sale,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
     }catch(e){await interaction.editReply('Error: '+e.message);}
