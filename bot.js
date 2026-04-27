@@ -37,62 +37,130 @@ const sharp = require('sharp');
 const fs    = require('fs');
 const path  = require('path');
 
-// ── Supabase client (free tier — persists config across Railway redeploys) ────
-let supabase = null;
-if(process.env.SUPABASE_URL && process.env.SUPABASE_KEY){
-  const { createClient } = require('@supabase/supabase-js');
-  supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-  console.log('[DB] Supabase connected');
-} else {
-  console.warn('[DB] No Supabase config — using local file storage (config lost on redeploy)');
-}
-
 // ── Config ────────────────────────────────────────────────────────────────────
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const OPENSEA_KEY   = process.env.OPENSEA_KEY || '';
 const POLL_MS       = parseInt(process.env.POLL_MS || '30000', 10);
-const SERVER_FILE = path.join(__dirname, 'server-configs.json');
-const ALERTS_FILE = path.join(__dirname, 'user-alerts.json');
+const SERVER_FILE   = path.join(__dirname, 'server-configs.json');
+const ALERTS_FILE   = path.join(__dirname, 'user-alerts.json');
 
-// ── Persistence ───────────────────────────────────────────────────────────────
+// ── Railway Postgres pool (same DB as api.js) ─────────────────────────────────
+const { Pool } = require('pg');
+const pgPool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('railway.internal')
+    ? false
+    : { rejectUnauthorized: false },
+  max: 3,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+pgPool.on('error', e => console.error('[PG bot]', e.message));
+
+// ── Create bot_state table if it doesn't exist ───────────────────────────────
+async function ensureBotStateTable(){
+  try{
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS bot_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    console.log('[DB] bot_state table ready');
+  }catch(e){ console.error('[DB] ensureBotStateTable error:', e.message); }
+}
+
+// ── Persistence helpers ───────────────────────────────────────────────────────
 function loadJson(file){ try{ return JSON.parse(fs.readFileSync(file,'utf8')); }catch{ return {}; } }
-function saveJson(file, data){ try{ fs.writeFileSync(file, JSON.stringify(data, null, 2)); }catch{} }
+function saveJson(file, data){ try{ fs.writeFileSync(file, JSON.stringify(data,null,2)); }catch{} }
 
-// ── Supabase helpers — load/save entire config table as single JSON row ───────
 async function dbLoad(key){
-  if(!supabase) return null;
   try{
-    const {data,error} = await supabase.from('bot_config').select('value').eq('key',key).single();
-    if(error||!data) return null;
-    return typeof data.value === 'string' ? JSON.parse(data.value) : data.value;
-  }catch(e){ console.warn('[DB] load error',e.message); return null; }
-}
-async function dbSave(key, value){
-  if(!supabase) return;
-  try{
-    await supabase.from('bot_config').upsert({key, value: JSON.stringify(value)},{onConflict:'key'});
-  }catch(e){ console.warn('[DB] save error',e.message); }
+    const r = await pgPool.query('SELECT value FROM bot_state WHERE key=$1', [key]);
+    if(!r.rows.length) return null;
+    return JSON.parse(r.rows[0].value);
+  }catch(e){ console.warn('[DB] load error', key, e.message); return null; }
 }
 
-// ── Config helpers — use Supabase if available, else local file ───────────────
+async function dbSave(key, value){
+  try{
+    await pgPool.query(
+      `INSERT INTO bot_state(key,value,updated_at) VALUES($1,$2,NOW())
+       ON CONFLICT(key) DO UPDATE SET value=$2, updated_at=NOW()`,
+      [key, JSON.stringify(value)]
+    );
+  }catch(e){ console.warn('[DB] save error', key, e.message); }
+}
+
+// ── Config helpers ────────────────────────────────────────────────────────────
 async function loadAllConfigs(){
-  const db = await dbLoad('server_configs');
-  if(db){ serverConfigs = db; console.log('[Config] Loaded '+Object.keys(db).length+' server(s) from Supabase'); return; }
+  // Try Railway Postgres first, then Supabase fallback, then local file
+  let db = await dbLoad('server_configs');
+  if(db){ serverConfigs = db; console.log('[Config] Loaded '+Object.keys(db).length+' server(s) from Railway DB'); return; }
+  // Supabase fallback — migrate data to Railway DB on first load
+  if(process.env.SUPABASE_URL && process.env.SUPABASE_KEY){
+    try{
+      const { createClient } = require('@supabase/supabase-js');
+      const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+      const {data} = await sb.from('bot_config').select('value').eq('key','server_configs').single();
+      if(data?.value){
+        const parsed = typeof data.value==='string' ? JSON.parse(data.value) : data.value;
+        serverConfigs = parsed;
+        await dbSave('server_configs', serverConfigs); // migrate to Railway DB
+        console.log('[Config] Migrated '+Object.keys(parsed).length+' server(s) from Supabase → Railway DB');
+        return;
+      }
+    }catch(e){ console.warn('[Config] Supabase fallback failed:', e.message); }
+  }
   serverConfigs = loadJson(SERVER_FILE);
   console.log('[Config] Loaded from local file ('+Object.keys(serverConfigs).length+' servers)');
 }
+
 async function saveAllConfigs(){
-  saveJson(SERVER_FILE, serverConfigs); // always save locally too as backup
+  saveJson(SERVER_FILE, serverConfigs);
   await dbSave('server_configs', serverConfigs);
 }
+
 async function loadAllAlerts(){
-  const db = await dbLoad('user_alerts');
-  if(db){ userAlerts = db; return; }
+  let db = await dbLoad('user_alerts');
+  if(db){ userAlerts = db; console.log('[Alerts] Loaded from Railway DB'); return; }
+  if(process.env.SUPABASE_URL && process.env.SUPABASE_KEY){
+    try{
+      const { createClient } = require('@supabase/supabase-js');
+      const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+      const {data} = await sb.from('bot_config').select('value').eq('key','user_alerts').single();
+      if(data?.value){
+        const parsed = typeof data.value==='string' ? JSON.parse(data.value) : data.value;
+        userAlerts = parsed;
+        await dbSave('user_alerts', userAlerts);
+        console.log('[Alerts] Migrated from Supabase → Railway DB');
+        return;
+      }
+    }catch(e){ console.warn('[Alerts] Supabase fallback failed:', e.message); }
+  }
   userAlerts = loadJson(ALERTS_FILE);
 }
+
 async function saveAllAlerts(){
   saveJson(ALERTS_FILE, userAlerts);
   await dbSave('user_alerts', userAlerts);
+}
+
+// ── Sale cursor persistence — survives restarts ───────────────────────────────
+async function loadSaleCursors(){
+  const db = await dbLoad('sale_cursors');
+  if(db){ for(const [k,v] of Object.entries(db)) lastSaleIds.set(k,v); console.log('[Cursors] Loaded sale cursors from Railway DB'); }
+}
+async function loadListingCursors(){
+  const db = await dbLoad('listing_cursors');
+  if(db){ for(const [k,v] of Object.entries(db)) lastListingIds.set(k,v); console.log('[Cursors] Loaded listing cursors from Railway DB'); }
+}
+async function saveSaleCursors(){
+  await dbSave('sale_cursors', Object.fromEntries(lastSaleIds));
+}
+async function saveListingCursors(){
+  await dbSave('listing_cursors', Object.fromEntries(lastListingIds));
 }
 
 let serverConfigs = {}; // loaded from Supabase or local file on startup
@@ -462,6 +530,7 @@ async function pollSales(){
 
       if(!newSales.length) continue;
       lastSaleIds.set(guildId,String(newSales[0].id||newSales[0].event_timestamp));
+      saveSaleCursors().catch(()=>{});
 
       const channel=client.channels.cache.get(config.channelId);
       if(!channel) continue;
@@ -569,6 +638,7 @@ async function pollListings(){
 
       if(!newListings.length) continue;
       lastListingIds.set(guildId,String(newListings[0].id||newListings[0].event_timestamp));
+      saveListingCursors().catch(()=>{});
 
       const channel=client.channels.cache.get(config.listingsChannelId);
       if(!channel) continue;
@@ -1252,14 +1322,20 @@ client.on('guildCreate', async (guild)=>{
 client.once('clientReady', async ()=>{
   console.log('Bot online as '+client.user.tag);
   console.log('OpenSea key: '+(OPENSEA_KEY?'set':'NOT SET'));
-  // Load config from Supabase first (survives Railway redeploys)
+  // Init Railway DB table, then load all persisted state
+  await ensureBotStateTable();
   await loadAllConfigs();
   await loadAllAlerts();
+  await loadSaleCursors();
+  await loadListingCursors();
   console.log('Servers configured: '+Object.keys(serverConfigs).length);
   pollSales();
   pollListings();
   setInterval(pollSales, POLL_MS);
   setInterval(pollListings, POLL_MS);
+  // Persist cursors every 60s so restarts lose at most 1 min of cursor progress
+  setInterval(saveSaleCursors, 60_000);
+  setInterval(saveListingCursors, 60_000);
 });
 
 client.on('error',e=>console.error('[Discord]',e.message));
