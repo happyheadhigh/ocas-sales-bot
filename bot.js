@@ -105,10 +105,68 @@ function setAlert(userId, updates){ userAlerts[userId] = { ...(userAlerts[userId
 function deleteAlert(userId){ delete userAlerts[userId]; saveAllAlerts(); }
 
 // ── Cursors (not persisted) ───────────────────────────────────────────────────
-const lastSaleIds    = new Map(); // guildId → last sale id
-const lastListingIds = new Map();
-const alertedEventIds = new Set(); // dedup personal DM alerts across multiple servers // guildId → last listing id
-const imageCache     = new Map(); // "contract:tokenId" → resolved image
+const lastSaleIds     = new Map(); // guildId → last sale id
+const lastListingIds  = new Map(); // guildId → last listing id
+const alertedEventIds = new Set(); // dedup personal DM alerts across multiple servers
+const imageCache      = new Map(); // "contract:tokenId" → resolved image
+
+// ── Sweep detection ───────────────────────────────────────────────────────────
+// Groups sales by buyer + tx hash within a poll batch.
+// When a group hits 5+ tokens, marks each sale with _isSweep=true and fires
+// a summary embed after the last sale in the sweep is posted.
+
+async function fetchFloorEth(slug) {
+  try {
+    const r = await fetch(
+      `https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}/stats`,
+      { headers: osHeaders() }
+    );
+    if (!r.ok) return null;
+    const j = await r.json();
+    return j?.total?.floor_price ?? j?.stats?.floor_price ?? null;
+  } catch { return null; }
+}
+
+async function fireSweepAlert(sweepSales, floorBefore, config, channel) {
+  const buyer    = sweepSales[0].buyer || 'unknown';
+  const count    = sweepSales.length;
+  const total    = sweepSales.reduce((sum, s) => sum + (parseFloat(formatEth(s)) || 0), 0);
+  const avg      = total / count;
+  const floorNow = await fetchFloorEth(config.slug);
+
+  const fmt = n => (n != null && n > 0) ? (n >= 1 ? n.toFixed(3) : n.toFixed(4)) : '—';
+  const buyerLink = buyer !== 'unknown'
+    ? `[${shortAddr(buyer)}](https://opensea.io/${buyer})`
+    : 'unknown';
+
+  let floorField = '—';
+  if (floorBefore != null && floorNow != null) {
+    floorField = `${fmt(floorBefore)} → ${fmt(floorNow)} ETH`;
+  } else if (floorNow != null) {
+    floorField = `${fmt(floorNow)} ETH`;
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🧹 Sweep Alert`)
+    .setColor(0xf59e0b)
+    .addFields(
+      { name: 'Buyer',        value: buyerLink,           inline: true },
+      { name: 'Swept',        value: `${count} OCAS`,     inline: true },
+      { name: '​',       value: '​',             inline: true },
+      { name: 'Total Spent',  value: `${fmt(total)} ETH`, inline: true },
+      { name: 'Avg Buy',      value: `${fmt(avg)} ETH`,   inline: true },
+      { name: 'Floor Impact', value: floorField,           inline: true },
+    )
+    .setFooter({ text: `Sales Bot · ${config.slug}` })
+    .setTimestamp();
+
+  try {
+    await channel.send({ embeds: [embed] });
+    console.log(`[Sweep] ${count} tokens by ${shortAddr(buyer)} in ${config.slug}`);
+  } catch(e) {
+    console.error('[Sweep alert post]', e.message);
+  }
+}
 
 // ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -257,8 +315,9 @@ async function buildSaleEmbed(sale, config){
   const currencySymbol = isWeth ? 'WETH' : 'ETH';
   const saleType     = sale.event_type === 'offer_accepted' ? 'Offer Accepted' : 'Listed Sale';
 
+  const sweepPrefix = sale._isSweep ? '🧹 ' : '';
   const embed=new EmbedBuilder()
-    .setTitle(`${eth?eth+' '+currencySymbol:'--'} — ${name} sold`)
+    .setTitle(`${sweepPrefix}${eth?eth+' '+currencySymbol:'--'} — ${name} sold`)
     .setColor(isWeth ? 0x9b59b6 : 0x2dd4bf)  // purple for WETH, teal for ETH
     .setURL(osUrl)
     .setFooter({text:`Sales Bot - ${slug}${timeStr?' - '+timeStr:''}`})
@@ -417,11 +476,61 @@ async function pollSales(){
           .map(sale=>buildSaleEmbed(sale,config).catch(e=>{console.error('[Build sale]',e.message);return null;}))
       );
 
-      // Post with a small stagger to avoid Discord rate limits (not 800ms — just 300ms)
-      for(const embed of embeds){
+      // Detect sweeps: group by buyer+tx, mark sweep sales, fire summary after last
+      // We do this BEFORE posting so sweep embeds include the 🧹
+      const sweepCounts = new Map(); // buyer+tx → count
+      for (const sale of toPost) {
+        const buyer  = sale.buyer || '';
+        const txHash = sale.transaction || sale.order_hash || sale.id || '';
+        if (!buyer || buyer === 'unknown') continue;
+        const key = txHash
+          ? `${buyer}:${txHash}`
+          : `${buyer}:${Math.floor((sale.event_timestamp||Date.now()/1000)/5)}`;
+        sweepCounts.set(key, (sweepCounts.get(key) || 0) + 1);
+      }
+      // Mark each sale that belongs to a 5+ sweep
+      for (const sale of toPost) {
+        const buyer  = sale.buyer || '';
+        const txHash = sale.transaction || sale.order_hash || sale.id || '';
+        const key    = txHash
+          ? `${buyer}:${txHash}`
+          : `${buyer}:${Math.floor((sale.event_timestamp||Date.now()/1000)/5)}`;
+        if ((sweepCounts.get(key) || 0) >= 5) sale._isSweep = true;
+      }
+
+      // Rebuild embeds with sweep flags applied (rebuild only sweep ones)
+      const filteredSales = toPost.filter(sale=>matchesFilters(sale.nft?.traits,config.salesFilters));
+      const taggedEmbeds = await Promise.all(
+        filteredSales.map(sale=>buildSaleEmbed(sale,config).catch(e=>{console.error('[Build sale]',e.message);return null;}))
+      );
+
+      // Post with a small stagger to avoid Discord rate limits
+      const sweepPosted = new Set(); // track which sweep keys already had their summary fired
+      for(let i=0; i<taggedEmbeds.length; i++){
+        const embed = taggedEmbeds[i];
+        const sale  = filteredSales[i];
         if(!embed) continue;
         try{ await sendEmbed(channel,embed); }catch(e){ console.error('[Sale post]',e.message); }
         await new Promise(r=>setTimeout(r,300));
+
+        // After posting a sweep sale, check if it was the LAST in that sweep group
+        if(sale._isSweep){
+          const buyer  = sale.buyer || '';
+          const txHash = sale.transaction || sale.order_hash || sale.id || '';
+          const key    = txHash
+            ? `${buyer}:${txHash}`
+            : `${buyer}:${Math.floor((sale.event_timestamp||Date.now()/1000)/5)}`;
+          const sweepSales = filteredSales.filter(s => s._isSweep && (
+            (s.transaction || s.order_hash || s.id || '') === txHash && s.buyer === buyer
+          ));
+          const lastSweepSale = sweepSales[sweepSales.length - 1];
+          if(sale === lastSweepSale && !sweepPosted.has(key)){
+            sweepPosted.add(key);
+            // Fire sweep summary
+            const floorBefore = await fetchFloorEth(config.slug);
+            await fireSweepAlert({ sales: sweepSales, floorBefore, config }, channel);
+          }
+        }
       }
 
       // Personal DM alerts (run after channel posts so channel isn't blocked)
