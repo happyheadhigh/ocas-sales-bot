@@ -183,6 +183,8 @@ const imageCache      = new Map(); // "contract:tokenId" → resolved image
 // When a group hits 5+ tokens, marks each sale with _isSweep=true and fires
 // a summary embed after the last sale in the sweep is posted.
 
+const cachedFloors = new Map(); // guildId → floor ETH at start of poll cycle
+
 async function fetchFloorEth(slug) {
   try {
     const r = await fetch(
@@ -494,6 +496,10 @@ async function pollSales(){
   for(const [guildId,config] of Object.entries(serverConfigs)){
     if(!config.channelId||!config.slug||config.paused) continue;
     try{
+      // Snapshot floor BEFORE processing this batch — used for sweep "before" price
+      const floorSnap = await fetchFloorEth(config.slug);
+      if(floorSnap != null) cachedFloors.set(guildId, floorSnap);
+
       const lastId=lastSaleIds.get(guildId);
       const newSales=[];
       let cursor=null;
@@ -587,7 +593,9 @@ async function pollSales(){
           const lastSweepSale = sweepSales[sweepSales.length - 1];
           if(sale === lastSweepSale && !sweepPosted.has(key)){
             sweepPosted.add(key);
-            const floorBefore = await fetchFloorEth(config.slug);
+            // Use the floor snapshot taken at the START of this poll cycle
+            // (before any of these sales were processed) for accurate before price
+            const floorBefore = cachedFloors.get(guildId) ?? null;
             await fireSweepAlert({ sales: sweepSales, floorBefore, config }, channel);
           }
         }
