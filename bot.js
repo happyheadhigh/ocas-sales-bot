@@ -25,6 +25,11 @@
  *   /myalertclear        — Remove your personal DM alert
  *   /myalertstatus       — See your current alert settings
  *   /help
+ *   /rankfilter       — Show listed tokens by OS/TraitView rank range
+ *
+ * SERVER ADMIN COMMANDS (continued):
+ *   /setrankalert     — Alert when a top-rank token gets listed
+ *   /clearrankalert   — Remove rank alert
  */
 
 require('dotenv').config();
@@ -828,6 +833,41 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // /clearfilters
+  // /setrankalert — configure rank-based listing alerts (admin)
+  if(commandName==='setrankalert'){
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
+    const rankMin  = interaction.options.getInteger('min') ?? 1;
+    const rankMax  = interaction.options.getInteger('max') ?? 100;
+    const rankType = interaction.options.getString('rank_type') || 'os';
+    const channel  = interaction.options.getChannel('channel');
+    setConfig(guildId, { rankAlert: {
+      min: rankMin, max: rankMax,
+      rankType,
+      channelId: channel?.id || null
+    }});
+    const rankLabel = rankType === 'obs' ? 'TraitView' : 'OpenSea';
+    await interaction.reply({
+      embeds:[new EmbedBuilder()
+        .setTitle('🏆 Rank Alert Set')
+        .setColor(0xf59e0b)
+        .setDescription(`Will alert when a token with **${rankLabel} rank #${rankMin}–#${rankMax}** gets listed.`)
+        .addFields(
+          { name:'Rank Range', value:`#${rankMin} – #${rankMax}`, inline:true },
+          { name:'Rank System', value:rankLabel, inline:true },
+          { name:'Alert Channel', value: channel ? `<#${channel.id}>` : 'Same as listings', inline:true }
+        )]
+    });
+    return;
+  }
+
+  // /clearrankalert — remove rank alert config
+  if(commandName==='clearrankalert'){
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
+    setConfig(guildId, { rankAlert: null });
+    await interaction.reply({ content:'Rank alert cleared.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
   if(commandName==='clearfilters'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     setConfig(guildId,{salesFilters:{},listingFilters:{}});
@@ -1196,6 +1236,62 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
   }
 
   // /help
+  // /rankfilter — show currently listed tokens filtered by OS rank range
+  if(commandName==='rankfilter'){
+    const rankMin  = interaction.options.getInteger('min') ?? 1;
+    const rankMax  = interaction.options.getInteger('max') ?? 100;
+    const rankType = interaction.options.getString('rank_type') || 'os';
+    const RAILWAY_URL = process.env.RAILWAY_API_URL;
+    const API_SECRET  = process.env.API_SECRET;
+
+    if(!RAILWAY_URL){
+      return interaction.reply({ content: 'RAILWAY_API_URL not configured.', flags: MessageFlags.Ephemeral });
+    }
+    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax){
+      return interaction.reply({ content: 'Invalid rank range. Use min:1 max:10000.', flags: MessageFlags.Ephemeral });
+    }
+
+    await interaction.deferReply();
+    try{
+      const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, rank_type: rankType, limit: '20' });
+      if(API_SECRET) qs.set('key', API_SECRET);
+      const r = await fetch(`${RAILWAY_URL}/db/rank-listings?${qs}`);
+      if(!r.ok) throw new Error(`API HTTP ${r.status}`);
+      const j = await r.json();
+      if(!j.ok) throw new Error(j.error || 'API error');
+
+      const listings = j.listings || [];
+      const rankLabel = rankType === 'obs' ? 'TraitView' : 'OpenSea';
+
+      if(!listings.length){
+        await interaction.editReply(`No listings found with ${rankLabel} rank **#${rankMin}–#${rankMax}**.`);
+        return;
+      }
+
+      // Build compact embed listing
+      const lines = listings.map(l => {
+        const rank = rankType === 'obs' ? l.obs_rank : l.os_rank;
+        const priceStr = l.price_eth >= 1
+          ? l.price_eth.toFixed(3)
+          : l.price_eth.toFixed(4);
+        return `**#${l.token_id}** · ${rankLabel} Rank #${rank ?? '?'} · Ξ ${priceStr} · [OpenSea](${l.url})`;
+      });
+
+      const embed = new EmbedBuilder()
+        .setTitle(`🏆 ${rankLabel} Rank #${rankMin}–#${rankMax} — Listed Tokens`)
+        .setColor(0xf59e0b)
+        .setDescription(lines.join('
+'))
+        .setFooter({ text: `${listings.length} listing${listings.length===1?'':'s'} · sorted cheapest first · on-chain-all-stars` })
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [embed] });
+    }catch(e){
+      await interaction.editReply('Error: ' + e.message);
+    }
+    return;
+  }
+
   if(commandName==='help'){
     const adminCmds=[
       '`/setup` - Configure sales channel + collection',

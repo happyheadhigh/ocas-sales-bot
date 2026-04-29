@@ -115,7 +115,7 @@ app.get('/db/token/:id', auth, async (req, res) => {
     }
 
     const [tokenRes, traitsRes] = await Promise.all([
-      pool.query(`SELECT id, obs_rank, rarity_score, trait_count FROM tokens WHERE id = $1`, [tokenId]),
+      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count FROM tokens WHERE id = $1`, [tokenId]),
       pool.query(`SELECT trait_name, trait_value FROM token_traits WHERE token_id = $1 ORDER BY trait_name`, [tokenId])
     ]);
 
@@ -131,6 +131,8 @@ app.get('/db/token/:id', auth, async (req, res) => {
       token: {
         id: parseInt(t.id),
         obs_rank: parseInt(t.obs_rank),
+        os_rank:  t.os_rank  ? parseInt(t.os_rank)    : null,
+        os_score: t.os_score ? parseFloat(t.os_score) : null,
         rarity_score: parseFloat(t.rarity_score),
         trait_count: parseInt(t.trait_count),
         traits
@@ -449,6 +451,56 @@ app.get('/db/floor-before-sweep', auth, async (req, res) => {
     res.json({ ok: true, floor_before, floor_after, swept_count: sweptIds.length });
   } catch(e) {
     console.error('/db/floor-before-sweep error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+// ── GET /db/rank-listings ─────────────────────────────────────────────────────
+// Currently listed tokens filtered by OS rank range, sorted by price.
+// Query params:
+//   rank_min — minimum OS rank (e.g. 1)
+//   rank_max — maximum OS rank (e.g. 100)
+//   rank_type — "os" (default) or "obs" (TraitView rank)
+//   limit    — default 25, max 100
+// Returns: { ok, listings: [{token_id, os_rank, obs_rank, price_eth, url}], count }
+app.get('/db/rank-listings', auth, async (req, res) => {
+  try {
+    const rankMin  = req.query.rank_min ? parseInt(req.query.rank_min) : 1;
+    const rankMax  = req.query.rank_max ? parseInt(req.query.rank_max) : 100;
+    const rankType = req.query.rank_type === 'obs' ? 'obs' : 'os';
+    const limit    = Math.min(parseInt(req.query.limit || '25'), 100);
+    const rankCol  = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
+
+    const result = await pool.query(
+      `SELECT t.id AS token_id, t.obs_rank, t.os_rank, t.os_score,
+              l.price_eth, l.url
+       FROM tokens t
+       JOIN listings l ON l.token_id = t.id
+       WHERE ${rankCol} >= $1 AND ${rankCol} <= $2
+       ORDER BY l.price_eth ASC
+       LIMIT $3`,
+      [rankMin, rankMax, limit]
+    );
+
+    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    res.json({
+      ok: true,
+      rank_type: rankType,
+      rank_min: rankMin,
+      rank_max: rankMax,
+      listings: result.rows.map(r => ({
+        token_id:  parseInt(r.token_id),
+        obs_rank:  parseInt(r.obs_rank),
+        os_rank:   r.os_rank  ? parseInt(r.os_rank)    : null,
+        os_score:  r.os_score ? parseFloat(r.os_score) : null,
+        price_eth: parseFloat(r.price_eth),
+        url:       r.url,
+      })),
+      count: result.rows.length
+    });
+  } catch(e) {
+    console.error('/db/rank-listings error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });

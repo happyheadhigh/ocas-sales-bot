@@ -119,6 +119,30 @@ const commands = [
 
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 
+  // ── Rank filter & alerts ───────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('rankfilter').setDescription('Show currently listed tokens in a rank range')
+    .addIntegerOption(o=>o.setName('min').setDescription('Minimum rank (e.g. 1)').setRequired(false).setMinValue(1).setMaxValue(10000))
+    .addIntegerOption(o=>o.setName('max').setDescription('Maximum rank (e.g. 100)').setRequired(false).setMinValue(1).setMaxValue(10000))
+    .addStringOption(o=>o.setName('rank_type').setDescription('Which ranking system to use (default: OpenSea)').setRequired(false)
+      .addChoices(
+        {name:'OpenSea Rank', value:'os'},
+        {name:'TraitView Rank', value:'obs'},
+      )),
+
+  new SlashCommandBuilder().setName('setrankalert').setDescription('Alert when a top-rank token gets listed')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addIntegerOption(o=>o.setName('min').setDescription('Minimum rank (e.g. 1)').setRequired(true).setMinValue(1).setMaxValue(10000))
+    .addIntegerOption(o=>o.setName('max').setDescription('Maximum rank (e.g. 100)').setRequired(true).setMinValue(1).setMaxValue(10000))
+    .addStringOption(o=>o.setName('rank_type').setDescription('Which ranking system to use (default: OpenSea)').setRequired(false)
+      .addChoices(
+        {name:'OpenSea Rank', value:'os'},
+        {name:'TraitView Rank', value:'obs'},
+      ))
+    .addChannelOption(o=>o.setName('channel').setDescription('Channel to post rank alerts in (defaults to listings channel)').setRequired(false)),
+
+  new SlashCommandBuilder().setName('clearrankalert').setDescription('Remove the rank listing alert')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
 ].map(c=>c.toJSON());
 
 const rest = new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
