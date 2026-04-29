@@ -197,12 +197,11 @@ async function fetchFloorEth(slug) {
   } catch { return null; }
 }
 
-async function fireSweepAlert(sweepSales, floorBefore, config, channel) {
-  const buyer    = sweepSales[0].buyer || 'unknown';
-  const count    = sweepSales.length;
-  const total    = sweepSales.reduce((sum, s) => sum + (parseFloat(formatEth(s)) || 0), 0);
-  const avg      = total / count;
-  const floorNow = await fetchFloorEth(config.slug);
+async function fireSweepAlert({ sales: sweepSales, floorBefore, floorAfter, config }, channel) {
+  const buyer = sweepSales[0].buyer || 'unknown';
+  const count = sweepSales.length;
+  const total = sweepSales.reduce((sum, s) => sum + (parseFloat(formatEth(s)) || 0), 0);
+  const avg   = total / count;
 
   const fmt = n => (n != null && n > 0) ? (n >= 1 ? n.toFixed(3) : n.toFixed(4)) : '—';
   const buyerLink = buyer !== 'unknown'
@@ -210,10 +209,10 @@ async function fireSweepAlert(sweepSales, floorBefore, config, channel) {
     : 'unknown';
 
   let floorField = '—';
-  if (floorBefore != null && floorNow != null) {
-    floorField = `${fmt(floorBefore)} → ${fmt(floorNow)} ETH`;
-  } else if (floorNow != null) {
-    floorField = `${fmt(floorNow)} ETH`;
+  if (floorBefore != null && floorAfter != null) {
+    floorField = `${fmt(floorBefore)} → ${fmt(floorAfter)} ETH`;
+  } else if (floorBefore != null) {
+    floorField = `${fmt(floorBefore)} ETH (after unavailable)`;
   }
 
   const embed = new EmbedBuilder()
@@ -496,10 +495,6 @@ async function pollSales(){
   for(const [guildId,config] of Object.entries(serverConfigs)){
     if(!config.channelId||!config.slug||config.paused) continue;
     try{
-      // Snapshot floor BEFORE processing this batch — used for sweep "before" price
-      const floorSnap = await fetchFloorEth(config.slug);
-      if(floorSnap != null) cachedFloors.set(guildId, floorSnap);
-
       const lastId=lastSaleIds.get(guildId);
       const newSales=[];
       let cursor=null;
@@ -593,10 +588,24 @@ async function pollSales(){
           const lastSweepSale = sweepSales[sweepSales.length - 1];
           if(sale === lastSweepSale && !sweepPosted.has(key)){
             sweepPosted.add(key);
-            // Use the floor snapshot taken at the START of this poll cycle
-            // (before any of these sales were processed) for accurate before price
-            const floorBefore = cachedFloors.get(guildId) ?? null;
-            await fireSweepAlert({ sales: sweepSales, floorBefore, config }, channel);
+            // Get accurate floor before/after from DB listing book
+            // DB has the current listing state; we exclude swept IDs to get floor_after
+            const sweptIds = sweepSales.map(s => s.nft?.identifier || s.nft?.token_id).filter(Boolean);
+            let floorBefore = null, floorAfter = null;
+            try {
+              const RAILWAY_URL = process.env.RAILWAY_API_URL;
+              const API_SECRET  = process.env.API_SECRET;
+              if(RAILWAY_URL && sweptIds.length){
+                const qs = new URLSearchParams({ swept_ids: sweptIds.join(',') });
+                if(API_SECRET) qs.set('key', API_SECRET);
+                const fr = await fetch(`${RAILWAY_URL}/db/floor-before-sweep?${qs}`);
+                if(fr.ok){
+                  const fj = await fr.json();
+                  if(fj.ok){ floorBefore = fj.floor_before; floorAfter = fj.floor_after; }
+                }
+              }
+            } catch(e){ console.warn('[Sweep] floor DB call failed:', e.message); }
+            await fireSweepAlert({ sales: sweepSales, floorBefore, floorAfter, config }, channel);
           }
         }
       }

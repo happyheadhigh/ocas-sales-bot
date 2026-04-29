@@ -367,6 +367,92 @@ app.get('/db/trait-sales', auth, async (req, res) => {
   }
 });
 
+
+// ── GET /db/floor-history ─────────────────────────────────────────────────────
+// Floor price timeline — used for 24h change on TraitView.
+// Query params:
+//   hours  — look back window, default 48, max 168 (7 days)
+// Returns: { ok, history: [{floor_eth, token_id, recorded_at}], current, ref_24h }
+app.get('/db/floor-history', auth, async (req, res) => {
+  try {
+    const hours = Math.min(parseInt(req.query.hours || '48'), 168);
+    const result = await pool.query(
+      `SELECT floor_eth, token_id, recorded_at
+       FROM floor_history
+       WHERE recorded_at > NOW() - ($1 || ' hours')::INTERVAL
+       ORDER BY recorded_at DESC`,
+      [hours]
+    );
+    const rows = result.rows.map(r => ({
+      floor_eth:   parseFloat(r.floor_eth),
+      token_id:    r.token_id ? parseInt(r.token_id) : null,
+      recorded_at: r.recorded_at,
+    }));
+
+    // Current floor = most recent entry
+    const current = rows.length ? rows[0].floor_eth : null;
+
+    // Floor 24h ago = most recent entry at or before NOW()-24h
+    const ref24hResult = await pool.query(
+      `SELECT floor_eth FROM floor_history
+       WHERE recorded_at <= NOW() - INTERVAL '24 hours'
+       ORDER BY recorded_at DESC LIMIT 1`
+    );
+    const ref_24h = ref24hResult.rows.length
+      ? parseFloat(ref24hResult.rows[0].floor_eth)
+      : null;
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({ ok: true, history: rows, current, ref_24h, count: rows.length });
+  } catch(e) {
+    console.error('/db/floor-history error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/floor-before-sweep ────────────────────────────────────────────────
+// Returns the true floor BEFORE and AFTER removing swept token IDs.
+// Used by the Discord bot for accurate sweep floor impact.
+// Query params:
+//   swept_ids — comma-separated token IDs that were swept
+// Returns: { ok, floor_before, floor_after, swept_count }
+app.get('/db/floor-before-sweep', auth, async (req, res) => {
+  try {
+    const sweptParam = (req.query.swept_ids || '').trim();
+    if (!sweptParam) {
+      return res.status(400).json({ ok: false, error: 'swept_ids required' });
+    }
+    const sweptIds = sweptParam.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    if (!sweptIds.length) {
+      return res.status(400).json({ ok: false, error: 'no valid token IDs' });
+    }
+
+    // Floor before = current minimum across ALL active listings
+    const beforeResult = await pool.query(
+      `SELECT MIN(price_eth) AS floor_eth FROM listings`
+    );
+    const floor_before = beforeResult.rows[0]?.floor_eth
+      ? parseFloat(beforeResult.rows[0].floor_eth)
+      : null;
+
+    // Floor after = minimum excluding swept token IDs
+    const afterResult = await pool.query(
+      `SELECT MIN(price_eth) AS floor_eth FROM listings
+       WHERE token_id != ALL($1::int[])`,
+      [sweptIds]
+    );
+    const floor_after = afterResult.rows[0]?.floor_eth
+      ? parseFloat(afterResult.rows[0].floor_eth)
+      : null;
+
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, floor_before, floor_after, swept_count: sweptIds.length });
+  } catch(e) {
+    console.error('/db/floor-before-sweep error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);

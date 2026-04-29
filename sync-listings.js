@@ -36,6 +36,24 @@ const pool = new Pool({
   max: 3,
 });
 
+// ── Ensure floor_history table exists ─────────────────────────────────────────
+async function ensureFloorHistoryTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS floor_history (
+        id          SERIAL PRIMARY KEY,
+        floor_eth   NUMERIC(18,8) NOT NULL,
+        token_id    INTEGER,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS floor_history_recorded_at_idx ON floor_history(recorded_at DESC)
+    `);
+  } catch(e) { console.error('[sync] ensureFloorHistoryTable error:', e.message); }
+}
+ensureFloorHistoryTable();
+
 async function syncListings() {
   const startTime = Date.now();
   console.log(`[sync] Starting listings sync at ${new Date().toISOString()}`);
@@ -152,6 +170,35 @@ async function syncListings() {
       await client.query('COMMIT');
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       console.log(`[sync] ✓ Upserted ${entries.length} listings in ${elapsed}s`);
+
+      // ── Write floor_history entry if floor has changed ─────────────────────
+      // Only writes when MIN(price_eth) changes vs last recorded value.
+      // This gives us a true floor timeline for 24h change calculations.
+      try {
+        const floorResult = await pool.query(
+          `SELECT MIN(price_eth) AS floor_eth, token_id
+           FROM listings
+           WHERE price_eth = (SELECT MIN(price_eth) FROM listings)
+           LIMIT 1`
+        );
+        if (floorResult.rows.length && floorResult.rows[0].floor_eth) {
+          const newFloor = parseFloat(floorResult.rows[0].floor_eth);
+          const tokenId  = floorResult.rows[0].token_id;
+          // Check last recorded floor
+          const lastRow = await pool.query(
+            `SELECT floor_eth FROM floor_history ORDER BY recorded_at DESC LIMIT 1`
+          );
+          const lastFloor = lastRow.rows.length ? parseFloat(lastRow.rows[0].floor_eth) : null;
+          // Write if floor changed by more than 0.00001 ETH (float tolerance)
+          if (lastFloor === null || Math.abs(newFloor - lastFloor) > 0.00001) {
+            await pool.query(
+              `INSERT INTO floor_history (floor_eth, token_id, recorded_at) VALUES ($1, $2, NOW())`,
+              [newFloor, tokenId]
+            );
+            console.log(`[sync] Floor history: ${lastFloor ?? 'none'} → ${newFloor} ETH (token #${tokenId})`);
+          }
+        }
+      } catch(e) { console.error('[sync] floor_history write error:', e.message); }
 
     } catch (e) {
       await client.query('ROLLBACK');
