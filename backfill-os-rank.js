@@ -27,7 +27,7 @@ const path      = require('path');
 
 const CONTRACT      = '0x078be86f3104a32313a47815792230a3808642cc';
 const TOTAL_TOKENS  = 10000;
-const DELAY_MS      = 200;   // ms between normal requests
+const DELAY_MS      = 500;   // ms between normal requests
 const CHECKPOINT_FILE = path.join(__dirname, 'backfill-progress.json');
 
 const OPENSEA_KEY   = process.env.OPENSEA_KEY || process.env.OPENSEA_API_KEY;
@@ -67,10 +67,10 @@ async function fetchOsRank(tokenId, retries = 0) {
     });
 
     if (r.status === 429) {
-      const wait = Math.min(2000 * Math.pow(2, retries), 60000);
+      const wait = Math.min(5000 * Math.pow(2, retries), 120000);
       console.log(`  [429] Rate limited on #${tokenId}, waiting ${wait/1000}s...`);
       await sleep(wait);
-      return fetchOsRank(tokenId, retries + 1);
+      return fetchOsRank(tokenId, Math.min(retries + 1, 4));
     }
 
     if (r.status === 404) return { tokenId, rank: null, score: null, notFound: true };
