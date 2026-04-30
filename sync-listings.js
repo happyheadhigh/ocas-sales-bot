@@ -176,9 +176,9 @@ async function syncListings() {
       // This gives us a true floor timeline for 24h change calculations.
       try {
         const floorResult = await pool.query(
-          `SELECT MIN(price_eth) AS floor_eth, token_id
+          `SELECT price_eth AS floor_eth, token_id
            FROM listings
-           WHERE price_eth = (SELECT MIN(price_eth) FROM listings)
+           ORDER BY price_eth ASC
            LIMIT 1`
         );
         if (floorResult.rows.length && floorResult.rows[0].floor_eth) {

@@ -1280,8 +1280,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       const embed = new EmbedBuilder()
         .setTitle(`🏆 ${rankLabel} Rank #${rankMin}–#${rankMax} — Listed Tokens`)
         .setColor(0xf59e0b)
-        .setDescription(lines.join('
-'))
+        .setDescription(lines.join('\n'))
         .setFooter({ text: `${listings.length} listing${listings.length===1?'':'s'} · sorted cheapest first · on-chain-all-stars` })
         .setTimestamp();
 
