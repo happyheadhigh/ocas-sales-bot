@@ -1357,9 +1357,10 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
           const traitStr = tokenTraits.slice(0,8).map(t=>`**${t.trait_type}:** ${t.value}`).join('\n');
           embed.setDescription(traitStr);
         }
-        // Resolve image
+        // Resolve image — pass nft object with identifier, use contract from config
         try{
-          const imgResult = await resolveImage(String(l.token_id), cfg.contract||'', cfg.slug||'');
+          const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+          const imgResult = await resolveImage({ identifier: String(l.token_id) }, contract, 'ethereum');
           embed._imageResult = imgResult;
         }catch(e){}
         return embed;
