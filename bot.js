@@ -221,8 +221,9 @@ function buildNavRow(index, total) {
 // Post a slideshow or individual embeds depending on count
 async function postEmbeds(interaction, embeds, headerText) {
   if(embeds.length === 0) return;
-  if(embeds.length < 10) {
-    // Under 10 — post all individually
+
+  if(embeds.length <= 5) {
+    // 5 or fewer — post all individually
     await interaction.editReply(headerText);
     for(const embed of embeds) {
       if(!embed) continue;
@@ -230,25 +231,37 @@ async function postEmbeds(interaction, embeds, headerText) {
       await new Promise(r => setTimeout(r, 600));
     }
   } else {
-    // 10+ — slideshow
-    const first = embeds[0];
-    const ir = first._imageResult; delete first._imageResult;
-    const files = ir?.type === 'buffer' ? [new AttachmentBuilder(ir.buffer, {name: ir.filename})] : [];
-    if(ir?.type === 'buffer') first.setThumbnail(`attachment://${ir.filename}`);
-    else if(ir?.type === 'url') first.setThumbnail(ir.url);
-    const row = buildNavRow(0, embeds.length);
-    const msg = await interaction.editReply({
-      content: headerText,
-      embeds: [first],
-      components: [row],
-      files
+    // 6+ — post first 5 individually, then a "Show More" button for the rest
+    await interaction.editReply(headerText);
+    const first5 = embeds.slice(0, 5);
+    const remaining = embeds.slice(5);
+
+    for(const embed of first5) {
+      if(!embed) continue;
+      await sendEmbed(interaction.channel, embed);
+      await new Promise(r => setTimeout(r, 600));
+    }
+
+    // Post "Show More" button for remaining results
+    const showMoreRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('show_more')
+        .setLabel(`Show More (${remaining.length} remaining)`)
+        .setStyle(ButtonStyle.Primary)
+        .setEmoji('▶️')
+    );
+    const moreMsg = await interaction.channel.send({
+      content: `_${remaining.length} more result${remaining.length===1?'':'s'} — click to browse:_`,
+      components: [showMoreRow]
     });
-    // Store session — expires after 15 min
-    slideshowSessions.set(msg.id, {
-      embeds,
+
+    // Store remaining embeds as a slideshow session keyed to this message
+    slideshowSessions.set(moreMsg.id, {
+      embeds: remaining,
       index: 0,
       userId: interaction.user.id,
-      expiresAt: Date.now() + 15 * 60 * 1000
+      expiresAt: Date.now() + 15 * 60 * 1000,
+      isShowMore: true  // flag so we know to open slideshow on first click
     });
   }
 }
@@ -790,6 +803,29 @@ async function sendPersonalAlerts(event, type, config){
 // ── Slash commands ────────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction)=>{
   // ── Slideshow button handler ───────────────────────────────────────────────
+  // ── Show More button — opens slideshow of remaining results ──────────────
+  if(interaction.isButton() && interaction.customId === 'show_more'){
+    const session = slideshowSessions.get(interaction.message.id);
+    if(!session){ await interaction.reply({content:'Session expired.', flags: MessageFlags.Ephemeral}); return; }
+    // Convert show_more button to full slideshow navigation
+    const embed = session.embeds[0];
+    const ir = embed._imageResult;
+    const row = buildNavRow(0, session.embeds.length);
+    try{
+      if(ir?.type === 'buffer'){
+        const att = new AttachmentBuilder(ir.buffer, {name: ir.filename});
+        embed.setThumbnail(`attachment://${ir.filename}`);
+        await interaction.update({ content: null, embeds: [embed], components: [row], files: [att] });
+      } else {
+        if(ir?.type === 'url') embed.setThumbnail(ir.url);
+        await interaction.update({ content: null, embeds: [embed], components: [row], files: [] });
+      }
+      // Re-key session to same message (already stored)
+      session.isShowMore = false;
+    }catch(e){ console.error('[ShowMore]', e.message); }
+    return;
+  }
+
   if(interaction.isButton() && ['slide_prev','slide_next'].includes(interaction.customId)){
     const session = slideshowSessions.get(interaction.message.id);
     if(!session){ await interaction.reply({content:'Session expired.', flags: MessageFlags.Ephemeral}); return; }
