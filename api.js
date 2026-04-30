@@ -505,6 +505,28 @@ app.get('/db/rank-listings', auth, async (req, res) => {
   }
 });
 
+
+// ── GET /db/os-ranks ──────────────────────────────────────────────────────────
+// Lightweight endpoint — returns os_rank for all tokens.
+// Used by TraitView to populate OS_RANK_MAP on init.
+// Returns: { ok, ranks: [[id, os_rank], ...] }  (compact array format)
+app.get('/db/os-ranks', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, os_rank FROM tokens WHERE os_rank IS NOT NULL ORDER BY os_rank ASC`
+    );
+    res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+    res.json({
+      ok: true,
+      ranks: result.rows.map(r => [parseInt(r.id), parseInt(r.os_rank)]),
+      count: result.rows.length
+    });
+  } catch(e) {
+    console.error('/db/os-ranks error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
