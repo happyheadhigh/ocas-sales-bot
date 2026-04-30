@@ -55,12 +55,12 @@ const commands = [
     .addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Type)').setRequired(true))
     .addStringOption(o=>o.setName('value').setDescription('Trait value (e.g. Zombie)').setRequired(true)),
 
-  new SlashCommandBuilder().setName('listingfilter').setDescription('Only auto-post listings where a trait matches')
+  new SlashCommandBuilder().setName('traitlistingfilter').setDescription('Only auto-post listings where a trait matches')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Background)').setRequired(true))
     .addStringOption(o=>o.setName('value').setDescription('Trait value (e.g. Blue)').setRequired(true)),
 
-  new SlashCommandBuilder().setName('clearfilters').setDescription('Clear all server-level sales and listing filters')
+  new SlashCommandBuilder().setName('clearallfilters').setDescription('Clear all trait filters and rank alert')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder().setName('pause').setDescription('Pause all auto-posts')
@@ -100,7 +100,7 @@ const commands = [
     .addBooleanOption(o=>o.setName('listings').setDescription('DM me for listings? (default: true)').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
 
-  new SlashCommandBuilder().setName('removefilter').setDescription('Remove a single value from a sales or listing filter')
+  new SlashCommandBuilder().setName('removetraitfilter').setDescription('Remove a specific trait value from a sales or listing filter')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('type').setDescription('Which filter to modify').setRequired(true)
       .addChoices({name:'Sales',value:'sales'},{name:'Listings',value:'listings'}))
@@ -129,14 +129,17 @@ const commands = [
         {name:'Best rank first', value:'rank'},
       )),
 
-  new SlashCommandBuilder().setName('setrankalert').setDescription('Alert when a top OS-rank token gets listed')
+  new SlashCommandBuilder().setName('ranklistingfilter').setDescription('Alert when a token in an OS rank range gets listed')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addIntegerOption(o=>o.setName('min').setDescription('Minimum OS rank (e.g. 1)').setRequired(true).setMinValue(1).setMaxValue(10000))
     .addIntegerOption(o=>o.setName('max').setDescription('Maximum OS rank (e.g. 100)').setRequired(true).setMinValue(1).setMaxValue(10000))
     .addChannelOption(o=>o.setName('channel').setDescription('Channel to post rank alerts in (defaults to listings channel)').setRequired(false)),
 
-  new SlashCommandBuilder().setName('clearrankalert').setDescription('Remove the rank listing alert')
+  new SlashCommandBuilder().setName('removerankfilter').setDescription('Remove the rank listing alert')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder().setName('ocas').setDescription('Show a random or specific OCAS token')
+    .addIntegerOption(o=>o.setName('token').setDescription('Token ID (leave blank for random)').setRequired(false).setMinValue(1).setMaxValue(10000)),
 
 ].map(c=>c.toJSON());
 

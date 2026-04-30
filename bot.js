@@ -182,7 +182,18 @@ function deleteAlert(userId){ delete userAlerts[userId]; saveAllAlerts(); }
 const lastSaleIds     = new Map(); // guildId → last sale id
 const lastListingIds  = new Map(); // guildId → last listing id
 const alertedEventIds = new Set(); // dedup personal DM alerts across multiple servers
-const imageCache      = new Map(); // "contract:tokenId" → resolved image
+const imageCache      = new Map(); // "contract:tokenId" → {result, ts}
+const IMAGE_CACHE_TTL = 60 * 60 * 1000; // 1 hour TTL
+
+function getCachedImage(key){
+  const entry = imageCache.get(key);
+  if(!entry) return null;
+  if(Date.now() - entry.ts > IMAGE_CACHE_TTL){ imageCache.delete(key); return null; }
+  return entry.result;
+}
+function setCachedImage(key, result){
+  imageCache.set(key, { result, ts: Date.now() });
+}
 
 // ── Slideshow sessions ────────────────────────────────────────────────────────
 // Stores paginated embed sessions keyed by message ID.
@@ -943,7 +954,7 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // /listingfilter
-  if(commandName==='listingfilter'){
+  if(commandName==='traitlistingfilter'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const trait=interaction.options.getString('trait').toLowerCase().trim();
     const value=interaction.options.getString('value').toLowerCase().trim();
@@ -962,7 +973,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   // /clearfilters
   // /setrankalert — configure rank-based listing alerts (admin)
-  if(commandName==='setrankalert'){
+  if(commandName==='ranklistingfilter'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const rankMin  = interaction.options.getInteger('min') ?? 1;
     const rankMax  = interaction.options.getInteger('max') ?? 100;
@@ -989,22 +1000,22 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // /clearrankalert — remove rank alert config
-  if(commandName==='clearrankalert'){
+  if(commandName==='removerankfilter'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     setConfig(guildId, { rankAlert: null });
     await interaction.reply({ content:'Rank alert cleared.', flags: MessageFlags.Ephemeral });
     return;
   }
 
-  if(commandName==='clearfilters'){
+    if(commandName==='clearallfilters'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    setConfig(guildId,{salesFilters:{},listingFilters:{}});
-    await interaction.reply({content:'All server filters cleared.', flags: MessageFlags.Ephemeral});
+    setConfig(guildId,{salesFilters:{}, listingFilters:{}, rankAlert: null});
+    await interaction.reply({content:'All filters cleared (trait filters + rank alert).', flags:MessageFlags.Ephemeral});
     return;
   }
 
   // /removefilter — remove a single value from an existing filter
-  if(commandName==='removefilter'){
+  if(commandName==='removetraitfilter'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const filterType=interaction.options.getString('type'); // 'sales' or 'listings'
     const trait=interaction.options.getString('trait').toLowerCase().trim();
@@ -1049,16 +1060,22 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   // /status
   if(commandName==='status'){
     const fmtFilter=f=>Object.keys(f||{}).length===0?'none':Object.entries(f).map(([k,v])=>`${k}=${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
-    const sf=fmtFilter(config.salesFilters);
-    const lf=fmtFilter(config.listingFilters);
+    const sf  = fmtFilter(config.salesFilters);
+    const lf  = fmtFilter(config.listingFilters);
+    const ra  = config.rankAlert
+      ? `◆ OS Rank #${config.rankAlert.min}–#${config.rankAlert.max}${config.rankAlert.channelId ? ` → <#${config.rankAlert.channelId}>` : ''}`
+      : 'none';
     await interaction.reply({embeds:[new EmbedBuilder().setTitle('Bot Status').setColor(0x7aa2ff)
       .addFields(
-        {name:'Collection',value:config.slug||'not set',inline:true},
-        {name:'Paused',value:config.paused?'Yes':'No',inline:true},
-        {name:'Sales Channel',value:config.channelId?`<#${config.channelId}>`:'not set',inline:true},
-        {name:'Listings Channel',value:config.listingsChannelId?`<#${config.listingsChannelId}>`:'not set',inline:true},
-        {name:'Sales Filters',value:sf,inline:true},
-        {name:'Listing Filters',value:lf,inline:true},
+        {name:'Collection',        value:config.slug||'not set',                                            inline:true},
+        {name:'Paused',            value:config.paused?'Yes':'No',                                          inline:true},
+        {name:'​',            value:'​',                                                           inline:true},
+        {name:'Sales Channel',     value:config.channelId?`<#${config.channelId}>`:'not set',               inline:true},
+        {name:'Listings Channel',  value:config.listingsChannelId?`<#${config.listingsChannelId}>`:'not set', inline:true},
+        {name:'​',            value:'​',                                                           inline:true},
+        {name:'Sales Filters',     value:sf,                                                                 inline:true},
+        {name:'Listing Filters',   value:lf,                                                                 inline:true},
+        {name:'Rank Alert',        value:ra,                                                                 inline:true},
       )], flags: MessageFlags.Ephemeral});
     return;
   }
@@ -1409,6 +1426,42 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
     }catch(e){
       await interaction.editReply('Error: ' + e.message);
     }
+    return;
+  }
+
+  // /ocas — show a random or specific OCAS token (art + links only)
+  if(commandName==='ocas'){
+    const tokenInput = interaction.options.getInteger('token');
+    const tokenId    = tokenInput ? tokenInput : Math.floor(Math.random() * 10000) + 1;
+    const contract   = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+    const slug       = config.slug || 'on-chain-all-stars';
+    await interaction.deferReply();
+    try{
+      const nftObj = { identifier: String(tokenId) };
+      let imgResult = getCachedImage(`${contract}:${tokenId}`);
+      if(!imgResult){
+        imgResult = await resolveImage(nftObj, contract, 'ethereum');
+        if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
+      }
+      const osUrl  = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+      const tvUrl  = `https://traitview.com/?token=${tokenId}`;
+      const embed  = new EmbedBuilder()
+        .setTitle(`OCAS #${tokenId}`)
+        .setColor(0x2dd4bf)
+        .setDescription(`[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
+      if(imgResult?.type === 'buffer'){
+        const att = new AttachmentBuilder(imgResult.buffer, { name: imgResult.filename });
+        embed.setImage(`attachment://${imgResult.filename}`);
+        await interaction.editReply({ embeds:[embed], files:[att] });
+      } else if(imgResult?.type === 'url'){
+        embed.setImage(imgResult.url);
+        await interaction.editReply({ embeds:[embed] });
+      } else {
+        embed.setDescription(`[OpenSea](${osUrl}) · [TraitView](${tvUrl})
+_Image unavailable_`);
+        await interaction.editReply({ embeds:[embed] });
+      }
+    }catch(e){ await interaction.editReply('Error: ' + e.message); }
     return;
   }
 
