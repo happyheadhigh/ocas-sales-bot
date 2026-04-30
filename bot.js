@@ -35,6 +35,7 @@
 require('dotenv').config();
 const {
   Client, GatewayIntentBits, REST, Routes,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
   EmbedBuilder, AttachmentBuilder, PermissionFlagsBits, MessageFlags,
 } = require('discord.js');
 const fetch = require('node-fetch');
@@ -182,6 +183,75 @@ const lastSaleIds     = new Map(); // guildId → last sale id
 const lastListingIds  = new Map(); // guildId → last listing id
 const alertedEventIds = new Set(); // dedup personal DM alerts across multiple servers
 const imageCache      = new Map(); // "contract:tokenId" → resolved image
+
+// ── Slideshow sessions ────────────────────────────────────────────────────────
+// Stores paginated embed sessions keyed by message ID.
+// Each session: { embeds: [], index: 0, userId, expiresAt }
+const slideshowSessions = new Map();
+
+// Clean up expired sessions every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for(const [id, s] of slideshowSessions) {
+    if(s.expiresAt < now) slideshowSessions.delete(id);
+  }
+}, 5 * 60 * 1000);
+
+// Build navigation row
+function buildNavRow(index, total) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('slide_prev')
+      .setLabel('◀')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(index === 0),
+    new ButtonBuilder()
+      .setCustomId('slide_pos')
+      .setLabel(`${index + 1} / ${total}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true),
+    new ButtonBuilder()
+      .setCustomId('slide_next')
+      .setLabel('▶')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(index === total - 1)
+  );
+}
+
+// Post a slideshow or individual embeds depending on count
+async function postEmbeds(interaction, embeds, headerText) {
+  if(embeds.length === 0) return;
+  if(embeds.length < 10) {
+    // Under 10 — post all individually
+    await interaction.editReply(headerText);
+    for(const embed of embeds) {
+      if(!embed) continue;
+      await sendEmbed(interaction.channel, embed);
+      await new Promise(r => setTimeout(r, 600));
+    }
+  } else {
+    // 10+ — slideshow
+    const first = embeds[0];
+    const ir = first._imageResult; delete first._imageResult;
+    const files = ir?.type === 'buffer' ? [new AttachmentBuilder(ir.buffer, {name: ir.filename})] : [];
+    if(ir?.type === 'buffer') first.setThumbnail(`attachment://${ir.filename}`);
+    else if(ir?.type === 'url') first.setThumbnail(ir.url);
+    const row = buildNavRow(0, embeds.length);
+    const msg = await interaction.editReply({
+      content: headerText,
+      embeds: [first],
+      components: [row],
+      files
+    });
+    // Store session — expires after 15 min
+    slideshowSessions.set(msg.id, {
+      embeds,
+      index: 0,
+      userId: interaction.user.id,
+      expiresAt: Date.now() + 15 * 60 * 1000
+    });
+  }
+}
 
 // ── Sweep detection ───────────────────────────────────────────────────────────
 // Groups sales by buyer + tx hash within a poll batch.
@@ -719,6 +789,28 @@ async function sendPersonalAlerts(event, type, config){
 
 // ── Slash commands ────────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction)=>{
+  // ── Slideshow button handler ───────────────────────────────────────────────
+  if(interaction.isButton() && ['slide_prev','slide_next'].includes(interaction.customId)){
+    const session = slideshowSessions.get(interaction.message.id);
+    if(!session){ await interaction.reply({content:'Session expired.', flags: MessageFlags.Ephemeral}); return; }
+    if(interaction.customId === 'slide_prev') session.index = Math.max(0, session.index - 1);
+    if(interaction.customId === 'slide_next') session.index = Math.min(session.embeds.length - 1, session.index + 1);
+    const embed = session.embeds[session.index];
+    const ir = embed._imageResult;
+    const row = buildNavRow(session.index, session.embeds.length);
+    try{
+      if(ir?.type === 'buffer'){
+        const att = new AttachmentBuilder(ir.buffer, {name: ir.filename});
+        embed.setThumbnail(`attachment://${ir.filename}`);
+        await interaction.update({ embeds: [embed], components: [row], files: [att] });
+      } else {
+        if(ir?.type === 'url') embed.setThumbnail(ir.url);
+        await interaction.update({ embeds: [embed], components: [row], files: [] });
+      }
+    }catch(e){ console.error('[Slideshow]', e.message); }
+    return;
+  }
+
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
   const config=getConfig(guildId);
@@ -956,7 +1048,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   // /recentsales
   if(commandName==='recentsales'){
     const slug=interaction.options.getString('collection')||config.slug;
-    const count=Math.min(interaction.options.getInteger('count')||5,10);
+    const count=Math.min(interaction.options.getInteger('count')||5,20);
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
@@ -964,9 +1056,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const sales=(await r.json()).asset_events||[];
       if(!sales.length){await interaction.editReply('No sales found.');return;}
-      await interaction.editReply(`Last ${sales.length} sales for **${slug}**:`);
       const cfg={...config,slug};
-      for(const sale of sales.reverse()){const embed=await buildSaleEmbed(sale,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
+      const embeds=await Promise.all(sales.reverse().map(s=>buildSaleEmbed(s,cfg).catch(()=>null)));
+      await postEmbeds(interaction, embeds.filter(Boolean), `Last ${sales.length} sales for **${slug}**:`);
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
   }
@@ -1021,53 +1113,27 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             await interaction.editReply(`No sales found in DB for **${trait}: ${value}** (searched ${j.count ?? 'all'} records).`);
             return;
           }
-          // Format how many total exist vs how many we're showing
-          const totalNote = j.count > want ? ` (showing ${want} of ${j.count} total)` : '';
-          await interaction.editReply(`Found **${j.count}** sale${j.count===1?'':'s'} with **${trait}: ${value}**${totalNote}:`);
-          let shown = 0;
-          for(const sale of sales){
-            if(shown >= want) break;
-
-            // Fetch traits from DB for this token
+          // Build synthetic sale objects and embeds
+          const cfg = {...config, slug};
+          const toShow = sales.slice(0, want);
+          const traitfindEmbeds = await Promise.all(toShow.map(async sale => {
             let tokenTraits = [];
             try{
               const tqs = new URLSearchParams({ key: API_SECRET||'' });
               const tr = await fetch(`${RAILWAY_URL}/db/token/${sale.token_id}?${tqs}`);
-              if(tr.ok){
-                const tj = await tr.json();
-                if(tj.ok && tj.token?.traits){
-                  tokenTraits = Object.entries(tj.token.traits).map(([k,v])=>({ trait_type:k, value:v }));
-                }
-              }
-            }catch(e){ /* non-fatal — just show without traits */ }
-
-            // Build a synthetic sale object that matches what buildSaleEmbed expects
-            const cfg = {...config, slug};
+              if(tr.ok){ const tj = await tr.json(); if(tj.ok && tj.token?.traits) tokenTraits = Object.entries(tj.token.traits).map(([k,v])=>({ trait_type:k, value:v })); }
+            }catch(e){}
             const syntheticSale = {
-              nft: {
-                identifier: String(sale.token_id),
-                name: `#${sale.token_id}`,
-                traits: tokenTraits,
-              },
-              buyer:  sale.buyer  || 'unknown',
-              seller: sale.seller || 'unknown',
-              payment: {
-                symbol: (sale.currency||'ETH'),
-                token_address: (sale.currency||'ETH').toUpperCase()==='WETH' ? '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2' : '',
-                quantity: sale.price_eth != null ? String(BigInt(Math.round(sale.price_eth * 1e18))) : '0',
-                decimals: 18,
-              },
+              nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
+              buyer: sale.buyer || 'unknown', seller: sale.seller || 'unknown',
+              payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH' ? '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2' : '', quantity: sale.price_eth != null ? String(BigInt(Math.round(sale.price_eth * 1e18))) : '0', decimals: 18 },
               event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
-              // Attach price so buildSaleEmbed can format it
-              _price_eth: sale.price_eth,
             };
-
-            // Patch formatEth to read _price_eth for DB sales
-            const embed = await buildSaleEmbed(syntheticSale, cfg);
-            await sendEmbed(interaction.channel, embed);
-            await new Promise(r=>setTimeout(r,800));
-            shown++;
-          }
+            return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+          }));
+          const totalNote = j.count > want ? ` (showing ${want} of ${j.count} total)` : '';
+          await postEmbeds(interaction, traitfindEmbeds.filter(Boolean),
+            `Found **${j.count}** sale${j.count===1?'':'s'} with **${trait}: ${value}**${totalNote}:`);
           return;
         }
         // DB call failed — fall through to OpenSea
@@ -1108,7 +1174,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
   // /listings
   if(commandName==='listings'){
     const slug=interaction.options.getString('collection')||config.slug;
-    const count=Math.min(interaction.options.getInteger('count')||5,10);
+    const count=Math.min(interaction.options.getInteger('count')||5,20);
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
@@ -1116,9 +1182,9 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const listings=(await r.json()).asset_events||[];
       if(!listings.length){await interaction.editReply('No listings found.');return;}
-      await interaction.editReply(`${listings.length} recent listings for **${slug}**:`);
       const cfg={...config,slug};
-      for(const l of listings.reverse()){const embed=await buildListingEmbed(l,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
+      const embeds=await Promise.all(listings.reverse().map(l=>buildListingEmbed(l,cfg).catch(()=>null)));
+      await postEmbeds(interaction, embeds.filter(Boolean), `${listings.length} recent listings for **${slug}**:`);
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
   }
@@ -1238,53 +1304,70 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
   // /help
   // /rankfilter — show currently listed tokens filtered by OS rank range
   if(commandName==='rankfilter'){
-    const rankMin  = interaction.options.getInteger('min') ?? 1;
-    const rankMax  = interaction.options.getInteger('max') ?? 100;
-    const rankType = interaction.options.getString('rank_type') || 'os';
+    const rankMin    = interaction.options.getInteger('min') ?? 1;
+    const rankMax    = interaction.options.getInteger('max') ?? 100;
+    const sortBy     = interaction.options.getString('sort') || 'price'; // 'price' or 'rank'
     const RAILWAY_URL = process.env.RAILWAY_API_URL;
     const API_SECRET  = process.env.API_SECRET;
 
-    if(!RAILWAY_URL){
-      return interaction.reply({ content: 'RAILWAY_API_URL not configured.', flags: MessageFlags.Ephemeral });
-    }
-    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax){
-      return interaction.reply({ content: 'Invalid rank range. Use min:1 max:10000.', flags: MessageFlags.Ephemeral });
-    }
+    if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured.', flags: MessageFlags.Ephemeral });
+    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range.', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
     try{
-      const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, rank_type: rankType, limit: '20' });
+      const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
       if(API_SECRET) qs.set('key', API_SECRET);
       const r = await fetch(`${RAILWAY_URL}/db/rank-listings?${qs}`);
       if(!r.ok) throw new Error(`API HTTP ${r.status}`);
       const j = await r.json();
       if(!j.ok) throw new Error(j.error || 'API error');
 
-      const listings = j.listings || [];
-      const rankLabel = rankType === 'obs' ? 'TraitView' : 'OpenSea';
-
+      let listings = j.listings || [];
       if(!listings.length){
-        await interaction.editReply(`No listings found with ${rankLabel} rank **#${rankMin}–#${rankMax}**.`);
+        await interaction.editReply(`No listings found with OS rank **◆ #${rankMin}–#${rankMax}**.`);
         return;
       }
 
-      // Build compact embed listing
-      const lines = listings.map(l => {
-        const rank = rankType === 'obs' ? l.obs_rank : l.os_rank;
-        const priceStr = l.price_eth >= 1
-          ? l.price_eth.toFixed(3)
-          : l.price_eth.toFixed(4);
-        return `**#${l.token_id}** · ${rankLabel} Rank #${rank ?? '?'} · Ξ ${priceStr} · [OpenSea](${l.url})`;
-      });
+      // Sort by rank if requested
+      if(sortBy === 'rank') listings.sort((a,b) => (a.os_rank??9999) - (b.os_rank??9999));
 
-      const embed = new EmbedBuilder()
-        .setTitle(`🏆 ${rankLabel} Rank #${rankMin}–#${rankMax} — Listed Tokens`)
-        .setColor(0xf59e0b)
-        .setDescription(lines.join('\n'))
-        .setFooter({ text: `${listings.length} listing${listings.length===1?'':'s'} · sorted cheapest first · on-chain-all-stars` })
-        .setTimestamp();
+      // Build full embeds for each listing (same style as sale/listing embeds)
+      const cfg = {...config};
+      const rankEmbeds = await Promise.all(listings.map(async l => {
+        // Fetch token data for traits + image
+        let tokenTraits = []; let imageUrl = null;
+        try{
+          const tqs = new URLSearchParams({ key: API_SECRET||'' });
+          const tr = await fetch(`${RAILWAY_URL}/db/token/${l.token_id}?${tqs}`);
+          if(tr.ok){ const tj = await tr.json(); if(tj.ok && tj.token?.traits) tokenTraits = Object.entries(tj.token.traits).map(([k,v])=>({ trait_type:k, value:v })); }
+        }catch(e){}
+        const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
+        const embed = new EmbedBuilder()
+          .setColor(0xf59e0b)
+          .setTitle(`◆ OS #${l.os_rank ?? '?'} — #${l.token_id} listed for Ξ ${priceStr}`)
+          .setURL(l.url)
+          .addFields(
+            { name: 'OS Rank', value: `◆ #${l.os_rank ?? '?'}`, inline: true },
+            { name: 'Price',   value: `Ξ ${priceStr}`,              inline: true },
+          )
+          .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · sorted by ${sortBy}` })
+          .setTimestamp();
+        // Add traits if available
+        if(tokenTraits.length){
+          const traitStr = tokenTraits.slice(0,8).map(t=>`**${t.trait_type}:** ${t.value}`).join('\n');
+          embed.setDescription(traitStr);
+        }
+        // Resolve image
+        try{
+          const imgResult = await resolveImage(String(l.token_id), cfg.contract||'', cfg.slug||'');
+          embed._imageResult = imgResult;
+        }catch(e){}
+        return embed;
+      }));
 
-      await interaction.editReply({ embeds: [embed] });
+      const sortLabel = sortBy === 'rank' ? 'best rank first' : 'cheapest first';
+      await postEmbeds(interaction, rankEmbeds.filter(Boolean),
+        `🏆 **OS Rank ◆ #${rankMin}–#${rankMax}** — ${listings.length} listing${listings.length===1?'':'s'} (${sortLabel}):`);
     }catch(e){
       await interaction.editReply('Error: ' + e.message);
     }

@@ -76,7 +76,7 @@ const commands = [
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
 
   new SlashCommandBuilder().setName('recentsales').setDescription('Show the last N sales')
-    .addIntegerOption(o=>o.setName('count').setDescription('Number of sales (max 10, default 5)').setRequired(false).setMinValue(1).setMaxValue(10))
+    .addIntegerOption(o=>o.setName('count').setDescription('Number of sales (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
 
   new SlashCommandBuilder().setName('sale').setDescription('Show the last sale for a specific token')
@@ -86,11 +86,11 @@ const commands = [
   new SlashCommandBuilder().setName('traitfind').setDescription('Search recent sales history for a specific trait')
     .addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Type)').setRequired(true))
     .addStringOption(o=>o.setName('value').setDescription('Trait value (e.g. Zombie)').setRequired(true))
-    .addIntegerOption(o=>o.setName('count').setDescription('How many to find (max 10, default 5)').setRequired(false).setMinValue(1).setMaxValue(10))
+    .addIntegerOption(o=>o.setName('count').setDescription('How many to find (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
 
   new SlashCommandBuilder().setName('listings').setDescription('Show recent new listings')
-    .addIntegerOption(o=>o.setName('count').setDescription('Number of listings (max 10, default 5)').setRequired(false).setMinValue(1).setMaxValue(10))
+    .addIntegerOption(o=>o.setName('count').setDescription('Number of listings (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
 
   new SlashCommandBuilder().setName('myalert').setDescription('Get personal DMs when matching sales or listings happen')
@@ -120,24 +120,19 @@ const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 
   // ── Rank filter & alerts ───────────────────────────────────────────────────
-  new SlashCommandBuilder().setName('rankfilter').setDescription('Show currently listed tokens in a rank range')
-    .addIntegerOption(o=>o.setName('min').setDescription('Minimum rank (e.g. 1)').setRequired(false).setMinValue(1).setMaxValue(10000))
-    .addIntegerOption(o=>o.setName('max').setDescription('Maximum rank (e.g. 100)').setRequired(false).setMinValue(1).setMaxValue(10000))
-    .addStringOption(o=>o.setName('rank_type').setDescription('Which ranking system to use (default: OpenSea)').setRequired(false)
+  new SlashCommandBuilder().setName('rankfilter').setDescription('Show currently listed tokens by OS rarity rank range')
+    .addIntegerOption(o=>o.setName('min').setDescription('Minimum OS rank (e.g. 1)').setRequired(false).setMinValue(1).setMaxValue(10000))
+    .addIntegerOption(o=>o.setName('max').setDescription('Maximum OS rank (e.g. 100)').setRequired(false).setMinValue(1).setMaxValue(10000))
+    .addStringOption(o=>o.setName('sort').setDescription('Sort order (default: cheapest first)').setRequired(false)
       .addChoices(
-        {name:'OpenSea Rank', value:'os'},
-        {name:'TraitView Rank', value:'obs'},
+        {name:'Cheapest first', value:'price'},
+        {name:'Best rank first', value:'rank'},
       )),
 
-  new SlashCommandBuilder().setName('setrankalert').setDescription('Alert when a top-rank token gets listed')
+  new SlashCommandBuilder().setName('setrankalert').setDescription('Alert when a top OS-rank token gets listed')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addIntegerOption(o=>o.setName('min').setDescription('Minimum rank (e.g. 1)').setRequired(true).setMinValue(1).setMaxValue(10000))
-    .addIntegerOption(o=>o.setName('max').setDescription('Maximum rank (e.g. 100)').setRequired(true).setMinValue(1).setMaxValue(10000))
-    .addStringOption(o=>o.setName('rank_type').setDescription('Which ranking system to use (default: OpenSea)').setRequired(false)
-      .addChoices(
-        {name:'OpenSea Rank', value:'os'},
-        {name:'TraitView Rank', value:'obs'},
-      ))
+    .addIntegerOption(o=>o.setName('min').setDescription('Minimum OS rank (e.g. 1)').setRequired(true).setMinValue(1).setMaxValue(10000))
+    .addIntegerOption(o=>o.setName('max').setDescription('Maximum OS rank (e.g. 100)').setRequired(true).setMinValue(1).setMaxValue(10000))
     .addChannelOption(o=>o.setName('channel').setDescription('Channel to post rank alerts in (defaults to listings channel)').setRequired(false)),
 
   new SlashCommandBuilder().setName('clearrankalert').setDescription('Remove the rank listing alert')
