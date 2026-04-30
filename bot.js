@@ -1346,10 +1346,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
           .setColor(0xf59e0b)
           .setTitle(`◆ OS #${l.os_rank ?? '?'} — #${l.token_id} listed for Ξ ${priceStr}`)
           .setURL(l.url)
-          .addFields(
-            { name: 'OS Rank', value: `◆ #${l.os_rank ?? '?'}`, inline: true },
-            { name: 'Price',   value: `Ξ ${priceStr}`,              inline: true },
-          )
+
           .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · sorted by ${sortBy}` })
           .setTimestamp();
         // Add traits + links
