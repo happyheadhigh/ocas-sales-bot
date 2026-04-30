@@ -1352,10 +1352,14 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
           )
           .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · sorted by ${sortBy}` })
           .setTimestamp();
-        // Add traits if available
+        // Add traits + links
+        const tvUrl = `https://traitview.com/?token=${l.token_id}`;
+        const linkLine = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
         if(tokenTraits.length){
           const traitStr = tokenTraits.slice(0,8).map(t=>`**${t.trait_type}:** ${t.value}`).join('\n');
-          embed.setDescription(traitStr);
+          embed.setDescription(traitStr + '\n\n**Links**\n' + linkLine);
+        } else {
+          embed.setDescription('**Links**\n' + linkLine);
         }
         // Resolve image — pass nft object with identifier, use contract from config
         try{
