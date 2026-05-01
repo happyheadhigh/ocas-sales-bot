@@ -296,7 +296,7 @@ async function fetchFloorEth(slug) {
   } catch { return null; }
 }
 
-async function fireSweepAlert({ sales: sweepSales, config }, channel) {
+async function fireSweepAlert({ sales: sweepSales, floorBefore, floorAfter, config }, channel) {
   const buyer = sweepSales[0].buyer || 'unknown';
   const count = sweepSales.length;
   const total = sweepSales.reduce((sum, s) => sum + (parseFloat(formatEth(s)) || 0), 0);
@@ -307,15 +307,23 @@ async function fireSweepAlert({ sales: sweepSales, config }, channel) {
     ? `[${shortAddr(buyer)}](https://opensea.io/${buyer})`
     : 'unknown';
 
+  let floorField = '—';
+  if (floorBefore != null && floorAfter != null) {
+    floorField = `${fmt(floorBefore)} → ${fmt(floorAfter)} ETH`;
+  } else if (floorBefore != null) {
+    floorField = `${fmt(floorBefore)} ETH (after unavailable)`;
+  }
+
   const embed = new EmbedBuilder()
     .setTitle(`🧹 Sweep Alert`)
     .setColor(0xf59e0b)
     .addFields(
-      { name: 'Buyer',       value: buyerLink,           inline: true },
-      { name: 'Swept',       value: `${count} OCAS`,     inline: true },
-      { name: '​',      value: '​',             inline: true },
-      { name: 'Total Spent', value: `${fmt(total)} ETH`, inline: true },
-      { name: 'Avg Buy',     value: `${fmt(avg)} ETH`,   inline: true },
+      { name: 'Buyer',        value: buyerLink,           inline: true },
+      { name: 'Swept',        value: `${count} OCAS`,     inline: true },
+      { name: '​',       value: '​',             inline: true },
+      { name: 'Total Spent',  value: `${fmt(total)} ETH`, inline: true },
+      { name: 'Avg Buy',      value: `${fmt(avg)} ETH`,   inline: true },
+      { name: 'Floor Impact', value: floorField,           inline: true },
     )
     .setFooter({ text: `Sales Bot · ${config.slug}` })
     .setTimestamp();
@@ -679,7 +687,24 @@ async function pollSales(){
           const lastSweepSale = sweepSales[sweepSales.length - 1];
           if(sale === lastSweepSale && !sweepPosted.has(key)){
             sweepPosted.add(key);
-            await fireSweepAlert({ sales: sweepSales, config }, channel);
+            // Get accurate floor before/after from DB listing book
+            // DB has the current listing state; we exclude swept IDs to get floor_after
+            const sweptIds = sweepSales.map(s => s.nft?.identifier || s.nft?.token_id).filter(Boolean);
+            let floorBefore = null, floorAfter = null;
+            try {
+              const RAILWAY_URL = process.env.RAILWAY_API_URL;
+              const API_SECRET  = process.env.API_SECRET;
+              if(RAILWAY_URL && sweptIds.length){
+                const qs = new URLSearchParams({ swept_ids: sweptIds.join(',') });
+                if(API_SECRET) qs.set('key', API_SECRET);
+                const fr = await fetch(`${RAILWAY_URL}/db/floor-before-sweep?${qs}`);
+                if(fr.ok){
+                  const fj = await fr.json();
+                  if(fj.ok){ floorBefore = fj.floor_before; floorAfter = fj.floor_after; }
+                }
+              }
+            } catch(e){ console.warn('[Sweep] floor DB call failed:', e.message); }
+            await fireSweepAlert({ sales: sweepSales, floorBefore, floorAfter, config }, channel);
           }
         }
       }
@@ -737,9 +762,9 @@ async function pollListings(){
       console.log('['+config.slug+'] Posting '+newListings.length+' new listing(s)');
 
       const toPost=newListings.reverse();
+      const toPostListings = toPost.filter(l=>matchesFilters((l.asset&&l.asset.traits)||[],config.listingFilters));
       const embeds=await Promise.all(
-        toPost
-          .filter(l=>matchesFilters((l.asset&&l.asset.traits)||[],config.listingFilters))
+        toPostListings
           .map(l=>buildListingEmbed(l,config).catch(e=>{console.error('[Build listing]',e.message);return null;}))
       );
 
@@ -747,6 +772,67 @@ async function pollListings(){
         if(!embed) continue;
         try{ await sendEmbed(channel,embed); }catch(e){ console.error('[Listing post]',e.message); }
         await new Promise(r=>setTimeout(r,300));
+      }
+
+      // ── Rank listing alert ────────────────────────────────────────────────
+      const rankAlertCfg = config.rankAlert;
+      if(rankAlertCfg?.min && rankAlertCfg?.max){
+        const RAILWAY_URL = process.env.RAILWAY_API_URL;
+        const API_SECRET  = process.env.API_SECRET;
+        if(RAILWAY_URL){
+          for(const listing of toPostListings){
+            const id = parseInt(
+              (listing.asset?.token_id) ||
+              (listing.asset?.identifier) ||
+              (listing.criteria?.encoded_token_ids) ||
+              (listing.nft?.identifier) || 0
+            );
+            if(!id) continue;
+            try{
+              const tqs = new URLSearchParams({ key: API_SECRET||'' });
+              const tr = await fetch(`${RAILWAY_URL}/db/token/${id}?${tqs}`);
+              if(!tr.ok) continue;
+              const tj = await tr.json();
+              if(!tj.ok) continue;
+              const osRank = tj.token?.os_rank;
+              if(!osRank) continue;
+              if(osRank >= rankAlertCfg.min && osRank <= rankAlertCfg.max){
+                const alertChannel = client.channels.cache.get(
+                  rankAlertCfg.channelId || config.listingsChannelId || config.channelId
+                );
+                if(!alertChannel) continue;
+                const eth = formatListingEth(listing);
+                const priceStr = eth ? `Ξ ${eth}` : '—';
+                const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+                const osUrl = `https://opensea.io/assets/ethereum/${contract}/${id}`;
+                const tvUrl = `https://traitview.com/?token=${id}`;
+                const alertEmbed = new EmbedBuilder()
+                  .setTitle(`🏆 Rank Alert — #${id} listed`)
+                  .setColor(0xf59e0b)
+                  .setDescription(`**◆ OS Rank #${osRank}** token just listed for **${priceStr}**
+
+[OpenSea](${osUrl}) · [TraitView](${tvUrl})`)
+                  .setFooter({ text: `on-chain-all-stars · rank alert #${rankAlertCfg.min}–#${rankAlertCfg.max}` })
+                  .setTimestamp();
+                // Resolve image
+                try{
+                  const imgResult = await resolveImage({ identifier: String(id) }, contract, 'ethereum');
+                  if(imgResult?.type === 'buffer'){
+                    const att = new AttachmentBuilder(imgResult.buffer, {name: imgResult.filename});
+                    alertEmbed.setThumbnail(`attachment://${imgResult.filename}`);
+                    await alertChannel.send({ embeds:[alertEmbed], files:[att] });
+                  } else {
+                    if(imgResult?.type === 'url') alertEmbed.setThumbnail(imgResult.url);
+                    await alertChannel.send({ embeds:[alertEmbed] });
+                  }
+                }catch(e){
+                  await alertChannel.send({ embeds:[alertEmbed] });
+                }
+                console.log(`[Rank Alert] #${id} OS Rank #${osRank} listed at ${priceStr}`);
+              }
+            }catch(e){ console.warn('[Rank alert]', e.message); }
+          }
+        }
       }
 
       for(const l of toPost) await sendPersonalAlerts(l,'listing',config);
@@ -1405,13 +1491,43 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
   }
 
   // /ocas — show a random or specific OCAS token (art + links only)
+  // Optional: trait filter to pull a random token with matching trait(s)
   if(commandName==='ocas'){
     const tokenInput = interaction.options.getInteger('token');
-    const tokenId    = tokenInput ? tokenInput : Math.floor(Math.random() * 10000) + 1;
+    const trait1     = interaction.options.getString('trait')?.trim();
+    const value1     = interaction.options.getString('value')?.trim();
+    const trait2     = interaction.options.getString('trait2')?.trim();
+    const value2     = interaction.options.getString('value2')?.trim();
     const contract   = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
     const slug       = config.slug || 'on-chain-all-stars';
+    const RAILWAY_URL = process.env.RAILWAY_API_URL;
+    const API_SECRET  = process.env.API_SECRET;
+
     await interaction.deferReply();
     try{
+      let tokenId = tokenInput;
+
+      // If trait filter specified, query DB for matching tokens and pick random
+      if(!tokenId && trait1 && value1 && RAILWAY_URL){
+        const traits = { [trait1]: [value1] };
+        if(trait2 && value2) traits[trait2] = [value2];
+        const qs = new URLSearchParams({ traits: JSON.stringify(traits), limit: '10000' });
+        if(API_SECRET) qs.set('key', API_SECRET);
+        const tr = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
+        if(tr.ok){
+          const tj = await tr.json();
+          const ids = tj.tokens?.map(t => t.id) || [];
+          if(!ids.length){
+            await interaction.editReply(`No tokens found with **${trait1}: ${value1}**${trait2 ? ` + ${trait2}: ${value2}` : ''}.`);
+            return;
+          }
+          tokenId = ids[Math.floor(Math.random() * ids.length)];
+        }
+      }
+
+      // Fallback to fully random if no trait filter or DB unavailable
+      if(!tokenId) tokenId = Math.floor(Math.random() * 10000) + 1;
+
       const nftObj = { identifier: String(tokenId) };
       let imgResult = getCachedImage(`${contract}:${tokenId}`);
       if(!imgResult){
