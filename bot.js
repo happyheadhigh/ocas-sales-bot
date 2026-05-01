@@ -296,7 +296,7 @@ async function fetchFloorEth(slug) {
   } catch { return null; }
 }
 
-async function fireSweepAlert({ sales: sweepSales, floorBefore, floorAfter, config }, channel) {
+async function fireSweepAlert({ sales: sweepSales, config }, channel) {
   const buyer = sweepSales[0].buyer || 'unknown';
   const count = sweepSales.length;
   const total = sweepSales.reduce((sum, s) => sum + (parseFloat(formatEth(s)) || 0), 0);
@@ -307,23 +307,15 @@ async function fireSweepAlert({ sales: sweepSales, floorBefore, floorAfter, conf
     ? `[${shortAddr(buyer)}](https://opensea.io/${buyer})`
     : 'unknown';
 
-  let floorField = '—';
-  if (floorBefore != null && floorAfter != null) {
-    floorField = `${fmt(floorBefore)} → ${fmt(floorAfter)} ETH`;
-  } else if (floorBefore != null) {
-    floorField = `${fmt(floorBefore)} ETH (after unavailable)`;
-  }
-
   const embed = new EmbedBuilder()
     .setTitle(`🧹 Sweep Alert`)
     .setColor(0xf59e0b)
     .addFields(
-      { name: 'Buyer',        value: buyerLink,           inline: true },
-      { name: 'Swept',        value: `${count} OCAS`,     inline: true },
-      { name: '​',       value: '​',             inline: true },
-      { name: 'Total Spent',  value: `${fmt(total)} ETH`, inline: true },
-      { name: 'Avg Buy',      value: `${fmt(avg)} ETH`,   inline: true },
-      { name: 'Floor Impact', value: floorField,           inline: true },
+      { name: 'Buyer',       value: buyerLink,           inline: true },
+      { name: 'Swept',       value: `${count} OCAS`,     inline: true },
+      { name: '​',      value: '​',             inline: true },
+      { name: 'Total Spent', value: `${fmt(total)} ETH`, inline: true },
+      { name: 'Avg Buy',     value: `${fmt(avg)} ETH`,   inline: true },
     )
     .setFooter({ text: `Sales Bot · ${config.slug}` })
     .setTimestamp();
@@ -687,24 +679,7 @@ async function pollSales(){
           const lastSweepSale = sweepSales[sweepSales.length - 1];
           if(sale === lastSweepSale && !sweepPosted.has(key)){
             sweepPosted.add(key);
-            // Get accurate floor before/after from DB listing book
-            // DB has the current listing state; we exclude swept IDs to get floor_after
-            const sweptIds = sweepSales.map(s => s.nft?.identifier || s.nft?.token_id).filter(Boolean);
-            let floorBefore = null, floorAfter = null;
-            try {
-              const RAILWAY_URL = process.env.RAILWAY_API_URL;
-              const API_SECRET  = process.env.API_SECRET;
-              if(RAILWAY_URL && sweptIds.length){
-                const qs = new URLSearchParams({ swept_ids: sweptIds.join(',') });
-                if(API_SECRET) qs.set('key', API_SECRET);
-                const fr = await fetch(`${RAILWAY_URL}/db/floor-before-sweep?${qs}`);
-                if(fr.ok){
-                  const fj = await fr.json();
-                  if(fj.ok){ floorBefore = fj.floor_before; floorAfter = fj.floor_after; }
-                }
-              }
-            } catch(e){ console.warn('[Sweep] floor DB call failed:', e.message); }
-            await fireSweepAlert({ sales: sweepSales, floorBefore, floorAfter, config }, channel);
+            await fireSweepAlert({ sales: sweepSales, config }, channel);
           }
         }
       }
