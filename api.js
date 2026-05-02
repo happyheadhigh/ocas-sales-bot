@@ -472,12 +472,19 @@ app.get('/db/rank-listings', auth, async (req, res) => {
     const limit    = Math.min(parseInt(req.query.limit || '25'), 100);
     const rankCol  = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
 
+    // Include traits so the Discord bot doesn't need extra /db/token calls per result
     const result = await pool.query(
-      `SELECT t.id AS token_id, t.obs_rank, t.os_rank, t.os_score,
-              l.price_eth, l.url
+      `SELECT t.id AS token_id, t.obs_rank, t.os_rank, t.os_score, t.trait_count,
+              l.price_eth, l.url,
+              COALESCE(
+                json_object_agg(tt.trait_name, tt.trait_value) FILTER (WHERE tt.trait_name IS NOT NULL),
+                '{}'::json
+              ) AS traits
        FROM tokens t
        JOIN listings l ON l.token_id = t.id
+       LEFT JOIN token_traits tt ON tt.token_id = t.id
        WHERE ${rankCol} >= $1 AND ${rankCol} <= $2
+       GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.trait_count, l.price_eth, l.url
        ORDER BY l.price_eth ASC
        LIMIT $3`,
       [rankMin, rankMax, limit]
@@ -490,12 +497,14 @@ app.get('/db/rank-listings', auth, async (req, res) => {
       rank_min: rankMin,
       rank_max: rankMax,
       listings: result.rows.map(r => ({
-        token_id:  parseInt(r.token_id),
-        obs_rank:  parseInt(r.obs_rank),
-        os_rank:   r.os_rank  ? parseInt(r.os_rank)    : null,
-        os_score:  r.os_score ? parseFloat(r.os_score) : null,
-        price_eth: parseFloat(r.price_eth),
-        url:       r.url,
+        token_id:    parseInt(r.token_id),
+        obs_rank:    parseInt(r.obs_rank),
+        os_rank:     r.os_rank     ? parseInt(r.os_rank)    : null,
+        os_score:    r.os_score    ? parseFloat(r.os_score) : null,
+        trait_count: r.trait_count ? parseInt(r.trait_count) : null,
+        price_eth:   parseFloat(r.price_eth),
+        url:         r.url,
+        traits:      r.traits || {},
       })),
       count: result.rows.length
     });
@@ -523,6 +532,46 @@ app.get('/db/os-ranks', auth, async (req, res) => {
     });
   } catch(e) {
     console.error('/db/os-ranks error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+// ── GET /db/trait-count-floor ─────────────────────────────────────────────────
+// Cheapest listed token with a specific trait count.
+// One DB query — no bot-side scanning needed.
+// Query params: trait_count (required)
+// Returns: { ok, floor: {token_id, price_eth, url, trait_count, os_rank, obs_rank} | null }
+app.get('/db/trait-count-floor', auth, async (req, res) => {
+  try {
+    const traitCount = parseInt(req.query.trait_count);
+    if (!traitCount || isNaN(traitCount)) {
+      return res.status(400).json({ ok: false, error: 'trait_count is required' });
+    }
+    const result = await pool.query(`
+      SELECT l.token_id, l.price_eth, l.url,
+             t.trait_count, t.os_rank, t.obs_rank
+      FROM listings l
+      JOIN tokens t ON t.id = l.token_id
+      WHERE t.trait_count = $1
+      ORDER BY l.price_eth ASC
+      LIMIT 1
+    `, [traitCount]);
+
+    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    res.json({
+      ok: true,
+      floor: result.rows.length ? {
+        token_id:    parseInt(result.rows[0].token_id),
+        price_eth:   parseFloat(result.rows[0].price_eth),
+        url:         result.rows[0].url,
+        trait_count: parseInt(result.rows[0].trait_count),
+        os_rank:     result.rows[0].os_rank  ? parseInt(result.rows[0].os_rank)  : null,
+        obs_rank:    result.rows[0].obs_rank ? parseInt(result.rows[0].obs_rank) : null,
+      } : null
+    });
+  } catch(e) {
+    console.error('/db/trait-count-floor error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
