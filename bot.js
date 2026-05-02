@@ -63,79 +63,6 @@ const pgPool = new Pool({
 });
 pgPool.on('error', e => console.error('[PG bot]', e.message));
 
-// ── OCAS Trait Index (phrase-aware multi-trait search) ────────────────────────
-// Queries token_traits table directly for all distinct name+value pairs.
-// Cached in memory, warmed at startup, refreshed every 6 hours.
-let _TRAIT_INDEX     = null;   // Map<lowerCaseValue, [{traitName, traitValue}]>
-let _TRAIT_INDEX_TS  = 0;
-const _TRAIT_INDEX_TTL = 6 * 60 * 60 * 1000;
-
-async function getTraitIndex() {
-  if (_TRAIT_INDEX && Date.now() - _TRAIT_INDEX_TS < _TRAIT_INDEX_TTL) return _TRAIT_INDEX;
-  try {
-    const r = await pgPool.query(
-      `SELECT DISTINCT trait_name, trait_value FROM token_traits ORDER BY trait_name, trait_value`
-    );
-    const idx = new Map();
-    for (const { trait_name, trait_value } of r.rows) {
-      const k = trait_value.toLowerCase();
-      if (!idx.has(k)) idx.set(k, []);
-      idx.get(k).push({ traitName: trait_name, traitValue: trait_value });
-    }
-    _TRAIT_INDEX    = idx;
-    _TRAIT_INDEX_TS = Date.now();
-    console.log(`[TraitIndex] Built: ${idx.size} unique values across ${r.rows.length} trait rows`);
-  } catch(e) {
-    console.warn('[TraitIndex] Build failed:', e.message);
-    if (!_TRAIT_INDEX) _TRAIT_INDEX = new Map();
-  }
-  return _TRAIT_INDEX;
-}
-
-/**
- * Greedy phrase-aware trait parser.
- * Sorts all known trait values longest-first so "Gold Chain" matches before "Gold".
- * Returns:
- *   matched   — [{traitName, traitValue}] unambiguous matches
- *   ambiguous — [{phrase, options:[{traitName,traitValue}]}] value found in multiple trait categories
- *   unmatched — string[] words not recognised as any trait value
- */
-async function parseTraitQuery(input) {
-  const idx = await getTraitIndex();
-
-  // Sort longest phrase first for greedy matching
-  const sortedValues = [...idx.keys()].sort((a, b) => {
-    const wd = b.split(' ').length - a.split(' ').length;
-    return wd !== 0 ? wd : b.length - a.length;
-  });
-
-  // Pad with spaces for reliable whole-word boundary matching
-  let remaining = ' ' + input.toLowerCase().trim() + ' ';
-  const matched   = [];
-  const ambiguous = [];
-
-  for (const lv of sortedValues) {
-    const escaped = lv.replace(/[-.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp(`(?<=\s)${escaped}(?=\s)`, 'i');
-    if (re.test(remaining)) {
-      remaining = remaining.replace(re, ' ').replace(/\s+/g, ' ');
-      const candidates = idx.get(lv);
-      if (candidates.length === 1) {
-        matched.push(candidates[0]);
-      } else {
-        ambiguous.push({ phrase: lv, options: candidates });
-      }
-    }
-  }
-
-  // Strip stop-words from leftovers
-  const STOP = new Set(['and','with','a','the','floor','random','show','find','get','or','plus']);
-  const unmatched = remaining.trim().split(/\s+/).filter(w => w && !STOP.has(w.toLowerCase()));
-
-  return { matched, unmatched, ambiguous };
-}
-
-
 // ── Create bot_state table if it doesn't exist ───────────────────────────────
 async function ensureBotStateTable(){
   try{
@@ -1536,7 +1463,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
   }
 
 
-  // /ocas — smart search (random or specific OCAS token)
+  // /ocas — smart search (random, token ID, rank, trait count, or phrase-aware trait combos)
   if(commandName==='ocas'){
     const tokenInput = interaction.options.getInteger('token');
     const rawSearch  = (interaction.options.getString('search') || '').trim();
@@ -1546,131 +1473,201 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
 
     await interaction.deferReply();
     try{
-      const fmtTrait = s => s.split(' ').map(w => w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' ');
+      const normalizePhrase = (s) => String(s || '')
+        .toLowerCase()
+        .replace(/&/g, ' and ')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const titleCase = (s) => String(s || '').split(' ').map(w => w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' ');
+      const formatPrice = (n) => n == null ? '—' : (n >= 1 ? Number(n).toFixed(3) : Number(n).toFixed(4));
+      const matchedLabel = (groups) => groups.map(g => {
+        if(g.length === 1) return `${g[0].trait_name}: ${g[0].trait_value}`;
+        const values = [...new Set(g.map(x => x.trait_value))].join(' / ');
+        const names = [...new Set(g.map(x => x.trait_name))].join(' or ');
+        return `${names}: ${values}`;
+      }).join(' + ');
+
+      async function getTraitIndex(){
+        const now = Date.now();
+        if(global.__ocasTraitIndexCache && now - global.__ocasTraitIndexCache.ts < 60*60*1000){
+          return global.__ocasTraitIndexCache.items;
+        }
+        if(!RAILWAY_URL) return [];
+        const qs = new URLSearchParams({ key: API_SECRET || '' });
+        const r = await fetch(`${RAILWAY_URL}/db/trait-index?${qs}`);
+        if(!r.ok) throw new Error(`trait-index API HTTP ${r.status}`);
+        const j = await r.json();
+        if(!j.ok) throw new Error(j.error || 'trait-index API error');
+        const items = (j.traits || [])
+          .map(t => ({
+            trait_name: t.trait_name,
+            trait_value: t.trait_value,
+            token_count: Number(t.token_count || 0),
+            norm: normalizePhrase(t.trait_value),
+          }))
+          .filter(t => t.norm)
+          .sort((a,b) => {
+            const aw = a.norm.split(' ').length, bw = b.norm.split(' ').length;
+            if(bw !== aw) return bw - aw;
+            if(b.norm.length !== a.norm.length) return b.norm.length - a.norm.length;
+            return (b.token_count || 0) - (a.token_count || 0);
+          });
+        global.__ocasTraitIndexCache = { ts: now, items };
+        return items;
+      }
+
+      function chooseTraitGroupsFromQuery(search, traitIndex){
+        let remaining = ` ${normalizePhrase(search)} `;
+        const groups = [];
+        const unmatched = [];
+        const seenNorms = new Set();
+
+        // Group trait values by normalized phrase. One phrase can exist in multiple categories/slots.
+        const byNorm = new Map();
+        for(const item of traitIndex){
+          if(!byNorm.has(item.norm)) byNorm.set(item.norm, []);
+          byNorm.get(item.norm).push(item);
+        }
+        const phrases = [...byNorm.keys()].sort((a,b) => {
+          const aw = a.split(' ').length, bw = b.split(' ').length;
+          if(bw !== aw) return bw - aw;
+          return b.length - a.length;
+        });
+
+        for(const phrase of phrases){
+          if(seenNorms.has(phrase)) continue;
+          const re = new RegExp(`(^|\\s)${phrase.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?=\\s|$)`, 'i');
+          if(re.test(remaining)){
+            const alternatives = byNorm.get(phrase)
+              .sort((a,b) => (b.token_count || 0) - (a.token_count || 0))
+              .map(x => ({ trait_name: x.trait_name, trait_value: x.trait_value }));
+            groups.push(alternatives);
+            seenNorms.add(phrase);
+            remaining = remaining.replace(re, ' ').replace(/\s+/g, ' ');
+          }
+        }
+
+        let leftover = normalizePhrase(remaining)
+          .split(' ')
+          .filter(Boolean)
+          .filter(w => !['and','with','plus'].includes(w));
+
+        // Helpful fallback: if a user types a single broad word like "hoodie",
+        // match trait values that contain that word (e.g. "Red Hoodie"), but avoid
+        // silently using extremely broad words like "gold" when there are tons of matches.
+        for(const word of leftover.slice()){
+          if(word.length < 3) continue;
+          const re = new RegExp(`(^|\\s)${word.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?=\\s|$)`, 'i');
+          const alternatives = traitIndex
+            .filter(x => re.test(x.norm))
+            .slice(0, 25);
+          if(alternatives.length && alternatives.length <= 12){
+            groups.push(alternatives.map(x => ({ trait_name: x.trait_name, trait_value: x.trait_value })));
+            leftover = leftover.filter(w => w !== word);
+          }
+        }
+
+        unmatched.push(...leftover);
+        return { groups, unmatched };
+      }
 
       let tokenId    = tokenInput || null;
       let traitCount = null;
       let rankMin    = null, rankMax = null;
-      let traitSearch = null;
       let floorPrice  = null;
+      let matchedGroups = [];
+      let searchForTraits = '';
 
-      // Detect "floor" keyword — works anywhere: "zombie floor", "floor zombie", "15 traits floor"
-      const wantFloor   = /(?:^|\s)floor(?:\s|$)/i.test(rawSearch);
-      const cleanSearch = rawSearch.replace(/(?:^|\s)floor(?:\s|$)/gi, ' ').trim();
+      // Detect floor anywhere: "zombie floor", "floor zombie", "gold chain floor"
+      const wantFloor = /(?:^|\s)floor(?:\s|$)/i.test(rawSearch);
+      let workingSearch = rawSearch.replace(/(?:^|\s)floor(?:\s|$)/gi, ' ').trim();
 
-      if(!tokenId && cleanSearch){
-        const s = cleanSearch.toLowerCase().trim();
-
-        // 1. Pure number → token ID
-        if(/^\d+$/.test(s) && +s >= 1 && +s <= 10000){
-          tokenId = +s;
-
-        // 2. Trait count: "15 traits", "15 trait", "trait count 15"
-        } else if(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i.test(cleanSearch)){
-          const m = cleanSearch.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
-          traitCount = parseInt(m[1] || m[2]);
-
-        // 3. Rank: "rank 1-100", "top 100", "rank 500"
-        } else if(/rank|top\s*\d/i.test(s)){
-          const range = s.match(/(\d+)\s*[-–to]+\s*(\d+)/);
-          const top   = s.match(/top\s*(\d+)/i);
-          const single = s.match(/rank\s*(\d+)/i);
-          if(range){ rankMin = +range[1]; rankMax = +range[2]; }
-          else if(top){ rankMin = 1; rankMax = +top[1]; }
-          else if(single){ rankMin = 1; rankMax = +single[1]; }
-
-        // 4. Free text → trait value
-        } else {
-          traitSearch = cleanSearch;
-        }
+      // Extract trait count but keep any remaining trait words, e.g. "zombie 15 traits".
+      const countMatch = workingSearch.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
+      if(countMatch){
+        traitCount = parseInt(countMatch[1] || countMatch[2]);
+        workingSearch = workingSearch.replace(countMatch[0], ' ').trim();
       }
 
-      // ── Rank range ────────────────────────────────────────────────────────
-      if(rankMin && rankMax && RAILWAY_URL){
-        const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '100', key: API_SECRET||'' });
-        const r = await fetch(`${RAILWAY_URL}/db/rank-listings?${qs}`);
-        if(r.ok){
-          const j = await r.json();
-          const listings = (j.listings||[]).sort((a,b)=>a.price_eth-b.price_eth);
-          if(!listings.length){ await interaction.editReply(`No listings in OS rank **#${rankMin}–#${rankMax}**.`); return; }
-          const rankPick = wantFloor ? listings[0] : listings[Math.floor(Math.random()*listings.length)];
-          tokenId = rankPick.token_id;
-          if(wantFloor) floorPrice = rankPick.price_eth;
-        }
+      // Extract rank range but keep any remaining trait words, e.g. "zombie hoodie rank 1-500".
+      const lowerWorking = workingSearch.toLowerCase();
+      const rangeMatch = lowerWorking.match(/rank\s*(\d+)\s*(?:-|–|to)\s*(\d+)/i) || lowerWorking.match(/(\d+)\s*(?:-|–|to)\s*(\d+)\s*rank/i);
+      const topMatch = lowerWorking.match(/top\s*(\d+)/i);
+      const singleRankMatch = lowerWorking.match(/rank\s*(\d+)/i);
+      if(rangeMatch){
+        rankMin = parseInt(rangeMatch[1]); rankMax = parseInt(rangeMatch[2]);
+        workingSearch = workingSearch.replace(new RegExp(rangeMatch[0].replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'i'), ' ').trim();
+      } else if(topMatch){
+        rankMin = 1; rankMax = parseInt(topMatch[1]);
+        workingSearch = workingSearch.replace(new RegExp(topMatch[0].replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'i'), ' ').trim();
+      } else if(singleRankMatch){
+        rankMin = 1; rankMax = parseInt(singleRankMatch[1]);
+        workingSearch = workingSearch.replace(new RegExp(singleRankMatch[0].replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'i'), ' ').trim();
       }
 
+      // Pure token ID, but only when no other filters were supplied.
+      if(!tokenId && /^\d+$/.test(workingSearch.trim()) && +workingSearch >= 1 && +workingSearch <= 10000 && traitCount === null && !rankMin){
+        tokenId = +workingSearch.trim();
+        workingSearch = '';
+      }
 
-      // ── Trait value search (phrase-aware, multi-trait AND) ────────────────
-      if(!tokenId && traitSearch && RAILWAY_URL){
-        // Parse query into matched trait pairs using greedy phrase matching
-        const { matched, unmatched, ambiguous } = await parseTraitQuery(traitSearch);
+      searchForTraits = workingSearch
+        .replace(/[,+]/g, ' ')
+        .replace(/\b(and|with|plus)\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
 
-        // Resolve ambiguous matches: same value in multiple trait categories.
-        // Pick the first candidate (most-specific by DB ordering).
-        // TODO: upgrade to Discord buttons for user disambiguation.
-        const resolvedMatches = [...matched];
-        for(const amb of ambiguous) resolvedMatches.push(amb.options[0]);
+      // Resolve phrase-aware multi-trait search. Longest trait values win:
+      // "gold chain diamond choker" → "Gold Chain" + "Diamond Choker".
+      if(!tokenId && searchForTraits && RAILWAY_URL){
+        const traitIndex = await getTraitIndex();
+        const resolved = chooseTraitGroupsFromQuery(searchForTraits, traitIndex);
+        matchedGroups = resolved.groups;
 
-        if(!resolvedMatches.length){
-          const hint = unmatched.length ? ` (not recognised: ${unmatched.join(', ')})` : '';
-          await interaction.editReply(
-            `No trait matches found for **"${traitSearch}"**${hint}.\n` +
-            `Try: "Zombie", "Gold Chain", "Skeleton", "15 traits", "rank 1-100".`
-          );
+        if(!matchedGroups.length){
+          await interaction.editReply(`I couldn't match **"${searchForTraits}"** to any known OCAS trait value. Try a more exact trait value like **Zombie**, **Gold Chain**, or **Diamond Choker**.`);
           return;
         }
-
-        // Build AND filter: { TraitName: [value, ...], ... }
-        const traitFilter = {};
-        for(const { traitName, traitValue } of resolvedMatches){
-          if(!traitFilter[traitName]) traitFilter[traitName] = [];
-          if(!traitFilter[traitName].includes(traitValue)) traitFilter[traitName].push(traitValue);
+        if(resolved.unmatched.length){
+          await interaction.editReply(`I matched **${matchedLabel(matchedGroups)}**, but couldn't understand: **${resolved.unmatched.join(' ')}**. Try the exact trait phrase, like **gold chain diamond choker**.`);
+          return;
         }
-        const traitDesc = Object.entries(traitFilter).map(([k,v])=>`${k}: ${v.join('/')}`).join(' + ');
-
-        if(wantFloor){
-          // Single DB query via new multi-trait-floor endpoint
-          const fqs = new URLSearchParams({ traits: JSON.stringify(traitFilter), key: API_SECRET||'' });
-          const fr = await fetch(`${RAILWAY_URL}/db/multi-trait-floor?${fqs}`);
-          if(fr.ok){
-            const fj = await fr.json();
-            if(fj.ok && fj.floor){ tokenId = fj.floor.token_id; floorPrice = fj.floor.price_eth; }
-            else{ await interaction.editReply(`No listed tokens with **${traitDesc}**.`); return; }
-          }
-        } else {
-          // Random token with all traits — single /db/tokens call
-          const qs = new URLSearchParams({ traits: JSON.stringify(traitFilter), limit: '10000', key: API_SECRET||'' });
-          const r = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
-          if(r.ok){
-            const j = await r.json();
-            const ids = (j.tokens||[]).map(t=>t.id);
-            if(!ids.length){ await interaction.editReply(`No tokens with **${traitDesc}**.`); return; }
-            tokenId = ids[Math.floor(Math.random()*ids.length)];
-          }
-        }
-
-        // Warn about unrecognised words (non-blocking)
-        if(unmatched.length) interaction._ocasWarn = `⚠️ Not recognised: ${unmatched.join(', ')}`;
       }
 
-      // ── Trait count ───────────────────────────────────────────────────────
-      if(!tokenId && traitCount !== null && RAILWAY_URL){
+      // ── Combined trait/rank/trait-count search through Railway/Postgres ───
+      if(!tokenId && RAILWAY_URL && (matchedGroups.length || traitCount !== null || (rankMin && rankMax))){
+        const qs = new URLSearchParams({ key: API_SECRET || '' });
+        if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
+        if(traitCount !== null) qs.set('trait_count', String(traitCount));
+        if(rankMin && rankMax){ qs.set('rank_min', String(rankMin)); qs.set('rank_max', String(rankMax)); qs.set('rank_type', 'os'); }
+
         if(wantFloor){
-          // Cheapest listed token with this trait count
-          const qs = new URLSearchParams({ trait_count: String(traitCount), key:API_SECRET||'' });
-          const r = await fetch(`${RAILWAY_URL}/db/trait-count-floor?${qs}`);
-          if(r.ok){ const j=await r.json(); if(j.ok&&j.floor){ tokenId=j.floor.token_id; floorPrice=j.floor.price_eth; } else { await interaction.editReply(`No listed tokens with **${traitCount} traits**.`); return; } }
-        } else {
-          // Random token with this trait count
-          const qs = new URLSearchParams({ trait_count: String(traitCount), limit:'10000', key:API_SECRET||'' });
-          const r = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
-          if(r.ok){ const j=await r.json(); const ids=(j.tokens||[]).map(t=>t.id); if(ids.length){ tokenId=ids[Math.floor(Math.random()*ids.length)]; } }
-          if(!tokenId){
-            // Fallback: floor token if random unavailable
-            const qs2 = new URLSearchParams({ trait_count: String(traitCount), key:API_SECRET||'' });
-            const r2 = await fetch(`${RAILWAY_URL}/db/trait-count-floor?${qs2}`);
-            if(r2.ok){ const j2=await r2.json(); if(j2.ok&&j2.floor) tokenId=j2.floor.token_id; else { await interaction.editReply(`No tokens with **${traitCount} traits**.`); return; } }
+          const r = await fetch(`${RAILWAY_URL}/db/multi-trait-floor?${qs}`);
+          if(!r.ok) throw new Error(`multi-trait-floor API HTTP ${r.status}`);
+          const j = await r.json();
+          if(!j.ok) throw new Error(j.error || 'multi-trait-floor API error');
+          if(!j.floor){
+            const label = matchedGroups.length ? matchedLabel(matchedGroups) : `${traitCount} traits`;
+            await interaction.editReply(`No listed OCAS found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
+            return;
           }
+          tokenId = j.floor.token_id;
+          floorPrice = j.floor.price_eth;
+        } else {
+          qs.set('limit', '10000');
+          const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
+          if(!r.ok) throw new Error(`multi-trait-tokens API HTTP ${r.status}`);
+          const j = await r.json();
+          if(!j.ok) throw new Error(j.error || 'multi-trait-tokens API error');
+          const tokens = j.tokens || [];
+          if(!tokens.length){
+            const label = matchedGroups.length ? matchedLabel(matchedGroups) : `${traitCount} traits`;
+            await interaction.editReply(`No OCAS tokens found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
+            return;
+          }
+          const picked = tokens[Math.floor(Math.random() * tokens.length)];
+          tokenId = picked.id;
         }
       }
 
@@ -1679,17 +1676,33 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
 
       // ── Fetch + post image ────────────────────────────────────────────────
       let imgResult = getCachedImage(`${contract}:${tokenId}`);
-      if(!imgResult){ imgResult = await resolveImage({identifier:String(tokenId)}, contract, 'ethereum'); if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult); }
+      if(!imgResult){
+        imgResult = await resolveImage({identifier:String(tokenId)}, contract, 'ethereum');
+        if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
+      }
       const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
-      const priceTag = (wantFloor && floorPrice != null)
-        ? `\nΞ ${floorPrice >= 1 ? floorPrice.toFixed(3) : floorPrice.toFixed(4)}  ·  `
-        : '';
-      const embed = new EmbedBuilder().setTitle(`OCAS #${tokenId}`).setColor(0x2dd4bf).setDescription(`${priceTag}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
-      if(imgResult?.type==='buffer'){ const att=new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename}); embed.setImage(`attachment://${imgResult.filename}`); await interaction.editReply({embeds:[embed],files:[att]}); }
-      else if(imgResult?.type==='url'){ embed.setImage(imgResult.url); await interaction.editReply({embeds:[embed]}); }
-      else { embed.setDescription(`[OpenSea](${osUrl}) · [TraitView](${tvUrl})
-_Image unavailable_`); await interaction.editReply({embeds:[embed]}); }
+      const filters = [];
+      if(matchedGroups.length) filters.push(matchedLabel(matchedGroups));
+      if(traitCount !== null) filters.push(`${traitCount} traits`);
+      if(rankMin && rankMax) filters.push(`OS rank #${rankMin}–#${rankMax}`);
+      const priceLine = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${formatPrice(floorPrice)}\n` : '';
+      const filterLine = filters.length ? `**Matched:** ${filters.join(' + ')}\n` : '';
+      const embed = new EmbedBuilder()
+        .setTitle(`OCAS #${tokenId}`)
+        .setColor(0x2dd4bf)
+        .setDescription(`${priceLine}${filterLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
+      if(imgResult?.type==='buffer'){
+        const att=new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename});
+        embed.setImage(`attachment://${imgResult.filename}`);
+        await interaction.editReply({embeds:[embed],files:[att]});
+      } else if(imgResult?.type==='url'){
+        embed.setImage(imgResult.url);
+        await interaction.editReply({embeds:[embed]});
+      } else {
+        embed.setDescription(`${priceLine}${filterLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})\n_Image unavailable_`);
+        await interaction.editReply({embeds:[embed]});
+      }
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
@@ -1844,8 +1857,6 @@ client.once('clientReady', async ()=>{
   await loadSaleCursors();
   await loadListingCursors();
   console.log('Servers configured: '+Object.keys(serverConfigs).length);
-  // Warm trait index so first /ocas search is instant
-  getTraitIndex().catch(e => console.warn('[TraitIndex] Warmup failed:', e.message));
   pollSales();
   pollListings();
   setInterval(pollSales, POLL_MS);

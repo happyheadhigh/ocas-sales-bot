@@ -458,6 +458,216 @@ app.get('/db/floor-before-sweep', auth, async (req, res) => {
 });
 
 
+
+// ── GET /db/trait-index ──────────────────────────────────────────────────────
+// Full trait value index used by the Discord bot for phrase-aware /ocas search.
+// Returns: { ok, traits: [{trait_name, trait_value, token_count}] }
+app.get('/db/trait-index', auth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT trait_name, trait_value, COUNT(*)::int AS token_count
+      FROM token_traits
+      WHERE trait_name IS NOT NULL
+        AND trait_value IS NOT NULL
+        AND TRIM(trait_value) <> ''
+      GROUP BY trait_name, trait_value
+      ORDER BY LENGTH(trait_value) DESC, trait_value ASC
+    `);
+
+    res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+    res.json({
+      ok: true,
+      traits: result.rows.map(r => ({
+        trait_name:  r.trait_name,
+        trait_value: r.trait_value,
+        token_count: parseInt(r.token_count)
+      })),
+      count: result.rows.length
+    });
+  } catch(e) {
+    console.error('/db/trait-index error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+function parseTraitMatchesParam(req) {
+  if (req.query.matches) {
+    const parsed = JSON.parse(req.query.matches);
+    if (!Array.isArray(parsed)) throw new Error('matches must be an array');
+    return parsed
+      .map(m => ({ trait_name: String(m.trait_name || '').trim(), trait_value: String(m.trait_value || '').trim() }))
+      .filter(m => m.trait_name && m.trait_value);
+  }
+
+  // Backwards-compatible object format: {"Type":["Zombie"],"Clothes":["Hoodie"]}
+  if (req.query.traits) {
+    const obj = JSON.parse(req.query.traits);
+    const out = [];
+    for (const [name, vals] of Object.entries(obj || {})) {
+      const arr = Array.isArray(vals) ? vals : [vals];
+      for (const value of arr) {
+        if (name && value) out.push({ trait_name: String(name).trim(), trait_value: String(value).trim() });
+      }
+    }
+    return out;
+  }
+
+  return [];
+}
+
+function parseTraitGroupsParam(req) {
+  if (req.query.groups) {
+    const parsed = JSON.parse(req.query.groups);
+    if (!Array.isArray(parsed)) throw new Error('groups must be an array');
+    return parsed.map(group => {
+      const arr = Array.isArray(group) ? group : [group];
+      return arr
+        .map(m => ({ trait_name: String(m.trait_name || '').trim(), trait_value: String(m.trait_value || '').trim() }))
+        .filter(m => m.trait_name && m.trait_value);
+    }).filter(group => group.length);
+  }
+  const matches = parseTraitMatchesParam(req);
+  return matches.map(m => [m]);
+}
+
+// ── GET /db/multi-trait-tokens ───────────────────────────────────────────────
+// Tokens matching multiple exact trait pairs using AND logic, even if trait names repeat.
+// Query params:
+//   matches     — JSON array: [{trait_name, trait_value}, ...]
+//   traits      — optional legacy JSON object
+//   listed      — "1" for active listings only
+//   trait_count — optional exact trait count
+//   rank_min/rank_max/rank_type — optional rank filter
+//   limit       — default 100, max 10000
+app.get('/db/multi-trait-tokens', auth, async (req, res) => {
+  try {
+    const groups = parseTraitGroupsParam(req);
+    const matches = groups.flat();
+    const listedOnly = req.query.listed === '1';
+    const traitCount = req.query.trait_count ? parseInt(req.query.trait_count) : null;
+    const rankMin = req.query.rank_min ? parseInt(req.query.rank_min) : null;
+    const rankMax = req.query.rank_max ? parseInt(req.query.rank_max) : null;
+    const rankType = req.query.rank_type === 'obs' ? 'obs' : 'os';
+    const rankCol = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
+    const limit = Math.min(parseInt(req.query.limit || '100'), 10000);
+
+    if (!matches.length && !traitCount && rankMin === null && rankMax === null) {
+      return res.status(400).json({ ok: false, error: 'provide matches, trait_count, or rank filter' });
+    }
+
+    let query = `SELECT t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count`;
+    if (listedOnly) query += `, l.price_eth, l.url`;
+    query += ` FROM tokens t`;
+
+    const params = [];
+    let p = 1;
+    if (listedOnly) query += ` JOIN listings l ON l.token_id = t.id`;
+
+    const conditions = [];
+    groups.forEach((group, i) => {
+      const ors = [];
+      group.forEach(m => {
+        ors.push(`(LOWER(g${i}.trait_name) = LOWER($${p++}) AND LOWER(g${i}.trait_value) = LOWER($${p++}))`);
+        params.push(m.trait_name, m.trait_value);
+      });
+      conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND (${ors.join(' OR ')}))`);
+    });
+    if (traitCount !== null && !isNaN(traitCount)) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCount); }
+    if (rankMin !== null && !isNaN(rankMin)) { conditions.push(`${rankCol} >= $${p++}`); params.push(rankMin); }
+    if (rankMax !== null && !isNaN(rankMax)) { conditions.push(`${rankCol} <= $${p++}`); params.push(rankMax); }
+    if (conditions.length) query += ` WHERE ${conditions.join(' AND ')}`;
+
+    query += listedOnly ? ` ORDER BY l.price_eth ASC, t.obs_rank ASC` : ` ORDER BY t.obs_rank ASC`;
+    query += ` LIMIT $${p++}`;
+    params.push(limit);
+
+    const result = await pool.query(query, params);
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      matches,
+      groups,
+      tokens: result.rows.map(r => ({
+        id: parseInt(r.id),
+        obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
+        os_rank: r.os_rank ? parseInt(r.os_rank) : null,
+        os_score: r.os_score ? parseFloat(r.os_score) : null,
+        rarity_score: r.rarity_score ? parseFloat(r.rarity_score) : null,
+        trait_count: r.trait_count ? parseInt(r.trait_count) : null,
+        price_eth: r.price_eth != null ? parseFloat(r.price_eth) : null,
+        url: r.url || null,
+      })),
+      count: result.rows.length
+    });
+  } catch(e) {
+    console.error('/db/multi-trait-tokens error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/multi-trait-floor ────────────────────────────────────────────────
+// Cheapest listed token matching multiple exact trait pairs using AND logic.
+// Query params: matches JSON array or legacy traits JSON object, optional trait_count/rank filters.
+app.get('/db/multi-trait-floor', auth, async (req, res) => {
+  try {
+    const groups = parseTraitGroupsParam(req);
+    const matches = groups.flat();
+    const traitCount = req.query.trait_count ? parseInt(req.query.trait_count) : null;
+    const rankMin = req.query.rank_min ? parseInt(req.query.rank_min) : null;
+    const rankMax = req.query.rank_max ? parseInt(req.query.rank_max) : null;
+    const rankType = req.query.rank_type === 'obs' ? 'obs' : 'os';
+    const rankCol = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
+
+    if (!matches.length && !traitCount && rankMin === null && rankMax === null) {
+      return res.status(400).json({ ok: false, error: 'provide matches, trait_count, or rank filter' });
+    }
+
+    let query = `SELECT l.token_id, l.price_eth, l.url,
+                        t.trait_count, t.os_rank, t.obs_rank, t.os_score, t.rarity_score
+                 FROM listings l
+                 JOIN tokens t ON t.id = l.token_id`;
+    const params = [];
+    let p = 1;
+
+    const conditions = [];
+    groups.forEach((group, i) => {
+      const ors = [];
+      group.forEach(m => {
+        ors.push(`(LOWER(g${i}.trait_name) = LOWER($${p++}) AND LOWER(g${i}.trait_value) = LOWER($${p++}))`);
+        params.push(m.trait_name, m.trait_value);
+      });
+      conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND (${ors.join(' OR ')}))`);
+    });
+    if (traitCount !== null && !isNaN(traitCount)) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCount); }
+    if (rankMin !== null && !isNaN(rankMin)) { conditions.push(`${rankCol} >= $${p++}`); params.push(rankMin); }
+    if (rankMax !== null && !isNaN(rankMax)) { conditions.push(`${rankCol} <= $${p++}`); params.push(rankMax); }
+    if (conditions.length) query += ` WHERE ${conditions.join(' AND ')}`;
+    query += ` ORDER BY l.price_eth ASC LIMIT 1`;
+
+    const result = await pool.query(query, params);
+    const r = result.rows[0];
+    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    res.json({
+      ok: true,
+      matches,
+      groups,
+      floor: r ? {
+        token_id: parseInt(r.token_id),
+        price_eth: parseFloat(r.price_eth),
+        url: r.url,
+        trait_count: r.trait_count ? parseInt(r.trait_count) : null,
+        os_rank: r.os_rank ? parseInt(r.os_rank) : null,
+        obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
+        os_score: r.os_score ? parseFloat(r.os_score) : null,
+        rarity_score: r.rarity_score ? parseFloat(r.rarity_score) : null,
+      } : null
+    });
+  } catch(e) {
+    console.error('/db/multi-trait-floor error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/rank-listings ─────────────────────────────────────────────────────
 // Currently listed tokens filtered by OS rank range, sorted by price.
 // Query params:
@@ -574,64 +784,6 @@ app.get('/db/trait-count-floor', auth, async (req, res) => {
     });
   } catch(e) {
     console.error('/db/trait-count-floor error:', e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-
-// ── GET /db/multi-trait-floor ─────────────────────────────────────────────────
-// Cheapest listed token matching ALL supplied trait name/value pairs (AND logic).
-// Query params: traits — JSON object { TraitName: [value, ...], ... }
-// Returns: { ok, floor: {token_id, price_eth, url, obs_rank, os_rank} | null, count }
-app.get('/db/multi-trait-floor', auth, async (req, res) => {
-  try {
-    const traitFilters = req.query.traits ? JSON.parse(req.query.traits) : {};
-    const traitEntries = Object.entries(traitFilters).filter(([, vals]) => vals?.length > 0);
-    if (!traitEntries.length) {
-      return res.status(400).json({ ok: false, error: 'traits param required' });
-    }
-
-    // Build a query that JOINs token_traits once per trait name (AND across names, OR within values)
-    // then joins listings to get price, ordered cheapest first.
-    let query = `SELECT l.token_id, l.price_eth, l.url, t.obs_rank, t.os_rank FROM listings l JOIN tokens t ON t.id = l.token_id`;
-    const params = [];
-    let p = 1;
-    traitEntries.forEach(([name, vals], i) => {
-      query += ` JOIN token_traits tt${i} ON tt${i}.token_id = l.token_id`
-             + ` AND tt${i}.trait_name = $${p++}`
-             + ` AND tt${i}.trait_value = ANY($${p++}::text[])`;
-      params.push(name, Array.isArray(vals) ? vals : [vals]);
-    });
-    query += ` ORDER BY l.price_eth ASC LIMIT 1`;
-
-    const result = await pool.query(query, params);
-
-    // Also get total match count (listed tokens only) for context
-    let countQuery = `SELECT COUNT(*) FROM listings l`;
-    const countParams = [];
-    let cp = 1;
-    traitEntries.forEach(([name, vals], i) => {
-      countQuery += ` JOIN token_traits tt${i} ON tt${i}.token_id = l.token_id`
-                 + ` AND tt${i}.trait_name = $${cp++}`
-                 + ` AND tt${i}.trait_value = ANY($${cp++}::text[])`;
-      countParams.push(name, Array.isArray(vals) ? vals : [vals]);
-    });
-    const countResult = await pool.query(countQuery, countParams);
-
-    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
-    res.json({
-      ok: true,
-      floor: result.rows.length ? {
-        token_id:  parseInt(result.rows[0].token_id),
-        price_eth: parseFloat(result.rows[0].price_eth),
-        url:       result.rows[0].url,
-        obs_rank:  result.rows[0].obs_rank ? parseInt(result.rows[0].obs_rank) : null,
-        os_rank:   result.rows[0].os_rank  ? parseInt(result.rows[0].os_rank)  : null,
-      } : null,
-      listed_count: parseInt(countResult.rows[0].count)
-    });
-  } catch(e) {
-    console.error('/db/multi-trait-floor error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
