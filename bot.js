@@ -1664,30 +1664,32 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
 
       // ── Handle trait count ────────────────────────────────────────────────
       if(!tokenId && traitCount !== null && RAILWAY_URL){
-        const qs = new URLSearchParams({ traits: JSON.stringify({}), limit: '10000' });
-        if(API_SECRET) qs.set('key', API_SECRET);
-        // Use /db/tokens — filter by trait_count client-side
-        // TODO: add trait_count filter to /db/tokens endpoint for efficiency
-        // For now query all and filter
-        const r = await fetch(`${RAILWAY_URL}/db/tokens?${new URLSearchParams({limit:'10000', key: API_SECRET||''})}`);
-        if(r.ok){
-          const j = await r.json();
-          // Note: /db/tokens doesn't return trait_count, so use /db/trait-count-floor just to get a valid token
-          // Actually use trait-count-floor to get the floor token, then randomise from listings
-          // TODO: add /db/tokens?trait_count=X for random (not just floor)
-        }
-        // Best available: get floor token for this trait count (accurate, fast)
-        // trait-count-floor always returns cheapest listed — perfect for floor mode too
-        const qs2 = new URLSearchParams({ trait_count: String(traitCount), key: API_SECRET||'' });
-        const r2 = await fetch(`${RAILWAY_URL}/db/trait-count-floor?${qs2}`);
-        if(r2.ok){
-          const j2 = await r2.json();
-          if(j2.ok && j2.floor){
-            tokenId = j2.floor.token_id;
-          } else {
-            await interaction.editReply(`No ${wantFloor ? 'listed ' : ''}tokens found with **${traitCount} traits**.`);
-            return;
+        if(wantFloor){
+          // Floor = cheapest listed token with this trait count
+          const qs = new URLSearchParams({ trait_count: String(traitCount), key: API_SECRET||'' });
+          const r = await fetch(`${RAILWAY_URL}/db/trait-count-floor?${qs}`);
+          if(r.ok){
+            const j = await r.json();
+            if(j.ok && j.floor){ tokenId = j.floor.token_id; }
+            else { await interaction.editReply(`No listed tokens found with **${traitCount} traits**.`); return; }
           }
+        } else {
+          // Random = any token with this trait count (not just listed)
+          // Uses /db/tokens?trait_count=X — needs api.js support, falls back to floor token
+          const qs = new URLSearchParams({ trait_count: String(traitCount), limit: '10000', key: API_SECRET||'' });
+          const r = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
+          if(r.ok){
+            const j = await r.json();
+            const ids = (j.tokens || []).map(t => t.id);
+            if(ids.length){ tokenId = ids[Math.floor(Math.random() * ids.length)]; }
+          }
+          // Fallback if endpoint doesn't support trait_count yet
+          if(!tokenId){
+            const qs2 = new URLSearchParams({ trait_count: String(traitCount), key: API_SECRET||'' });
+            const r2 = await fetch(`${RAILWAY_URL}/db/trait-count-floor?${qs2}`);
+            if(r2.ok){ const j2 = await r2.json(); if(j2.ok && j2.floor) tokenId = j2.floor.token_id; }
+          }
+          if(!tokenId){ await interaction.editReply(`No tokens found with **${traitCount} traits**.`); return; }
         }
       }
 

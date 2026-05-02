@@ -69,6 +69,7 @@ app.get('/db/tokens', auth, async (req, res) => {
     const limit     = Math.min(parseInt(req.query.limit || '10000'), 10000);
 
     const traitEntries = Object.entries(traitFilters).filter(([, vals]) => vals?.length > 0);
+    const traitCountFilter = req.query.trait_count ? parseInt(req.query.trait_count) : null;
 
     let query = `SELECT t.id, t.obs_rank FROM tokens t`;
     const params = [];
@@ -87,6 +88,7 @@ app.get('/db/tokens', auth, async (req, res) => {
     const conditions = [];
     if (rankMin !== null) { conditions.push(`t.obs_rank >= $${p++}`); params.push(rankMin); }
     if (rankMax !== null) { conditions.push(`t.obs_rank <= $${p++}`); params.push(rankMax); }
+    if (traitCountFilter !== null) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCountFilter); }
     if (conditions.length) query += ` WHERE ${conditions.join(' AND ')}`;
 
     query += ` ORDER BY t.obs_rank LIMIT $${p++}`;
