@@ -1687,7 +1687,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       if(traitCount !== null) filters.push(`${traitCount} traits`);
       if(rankMin && rankMax) filters.push(`OS rank #${rankMin}–#${rankMax}`);
       const priceLine = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${formatPrice(floorPrice)}\n` : '';
-      const filterLine = filters.length ? `**Matched:** ${filters.join(' + ')}\n` : '';
+      const filterLine = '';
       const embed = new EmbedBuilder()
         .setTitle(`OCAS #${tokenId}`)
         .setColor(0x2dd4bf)
