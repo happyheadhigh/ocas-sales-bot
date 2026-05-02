@@ -1479,6 +1479,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       let traitCount = null;
       let rankMin    = null, rankMax = null;
       let traitSearch = null;
+      let floorPrice  = null;
 
       // Detect "floor" keyword — works anywhere: "zombie floor", "floor zombie", "15 traits floor"
       const wantFloor   = /(?:^|\s)floor(?:\s|$)/i.test(rawSearch);
@@ -1519,7 +1520,9 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
           const j = await r.json();
           const listings = (j.listings||[]).sort((a,b)=>a.price_eth-b.price_eth);
           if(!listings.length){ await interaction.editReply(`No listings in OS rank **#${rankMin}–#${rankMax}**.`); return; }
-          tokenId = wantFloor ? listings[0].token_id : listings[Math.floor(Math.random()*listings.length)].token_id;
+          const rankPick = wantFloor ? listings[0] : listings[Math.floor(Math.random()*listings.length)];
+          tokenId = rankPick.token_id;
+          if(wantFloor) floorPrice = rankPick.price_eth;
         }
       }
 
@@ -1539,7 +1542,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
         if(wantFloor && matchedTrait){
           const fqs = new URLSearchParams({ trait_name: matchedTrait, trait_value: tv, key:API_SECRET||'' });
           const fr = await fetch(`${RAILWAY_URL}/db/trait-floor?${fqs}`);
-          if(fr.ok){ const fj=await fr.json(); if(fj.ok&&fj.floor){ tokenId=fj.floor.token_id; } else { await interaction.editReply(`No listed **${traitSearch}** tokens found.`); return; } }
+          if(fr.ok){ const fj=await fr.json(); if(fj.ok&&fj.floor){ tokenId=fj.floor.token_id; floorPrice=fj.floor.price_eth; } else { await interaction.editReply(`No listed **${traitSearch}** tokens found.`); return; } }
         } else {
           tokenId = matchIds[Math.floor(Math.random()*matchIds.length)];
         }
@@ -1551,7 +1554,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
           // Cheapest listed token with this trait count
           const qs = new URLSearchParams({ trait_count: String(traitCount), key:API_SECRET||'' });
           const r = await fetch(`${RAILWAY_URL}/db/trait-count-floor?${qs}`);
-          if(r.ok){ const j=await r.json(); if(j.ok&&j.floor){ tokenId=j.floor.token_id; } else { await interaction.editReply(`No listed tokens with **${traitCount} traits**.`); return; } }
+          if(r.ok){ const j=await r.json(); if(j.ok&&j.floor){ tokenId=j.floor.token_id; floorPrice=j.floor.price_eth; } else { await interaction.editReply(`No listed tokens with **${traitCount} traits**.`); return; } }
         } else {
           // Random token with this trait count
           const qs = new URLSearchParams({ trait_count: String(traitCount), limit:'10000', key:API_SECRET||'' });
@@ -1574,7 +1577,10 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       if(!imgResult){ imgResult = await resolveImage({identifier:String(tokenId)}, contract, 'ethereum'); if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult); }
       const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
-      const embed = new EmbedBuilder().setTitle(`OCAS #${tokenId}`).setColor(0x2dd4bf).setDescription(`[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
+      const priceTag = (wantFloor && floorPrice != null)
+        ? `\nΞ ${floorPrice >= 1 ? floorPrice.toFixed(3) : floorPrice.toFixed(4)}  ·  `
+        : '';
+      const embed = new EmbedBuilder().setTitle(`OCAS #${tokenId}`).setColor(0x2dd4bf).setDescription(`${priceTag}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
       if(imgResult?.type==='buffer'){ const att=new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename}); embed.setImage(`attachment://${imgResult.filename}`); await interaction.editReply({embeds:[embed],files:[att]}); }
       else if(imgResult?.type==='url'){ embed.setImage(imgResult.url); await interaction.editReply({embeds:[embed]}); }
       else { embed.setDescription(`[OpenSea](${osUrl}) · [TraitView](${tvUrl})
