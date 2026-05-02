@@ -138,12 +138,9 @@ const commands = [
   new SlashCommandBuilder().setName('removerankfilter').setDescription('Remove the rank listing alert')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
-  new SlashCommandBuilder().setName('ocas').setDescription('Show a random or specific OCAS token')
-    .addIntegerOption(o=>o.setName('token').setDescription('Token ID (leave blank for random)').setRequired(false).setMinValue(1).setMaxValue(10000))
-    .addStringOption(o=>o.setName('trait').setDescription('Trait name to filter by (e.g. Type)').setRequired(false))
-    .addStringOption(o=>o.setName('value').setDescription('Trait value (e.g. Zombie)').setRequired(false))
-    .addStringOption(o=>o.setName('trait2').setDescription('Second trait name (optional)').setRequired(false))
-    .addStringOption(o=>o.setName('value2').setDescription('Second trait value (optional)').setRequired(false)),
+  new SlashCommandBuilder().setName('ocas').setDescription('Show a random OCAS — search by trait, count, rank, or token ID')
+    .addIntegerOption(o=>o.setName('token').setDescription('Specific token ID (e.g. 1234)').setRequired(false).setMinValue(1).setMaxValue(10000))
+    .addStringOption(o=>o.setName('search').setDescription('Search: "zombie", "15 traits", "rank 1-100", or a token number').setRequired(false)),
 
   new SlashCommandBuilder().setName('traitfloor').setDescription('Show the floor price for a specific trait or trait count')
     .addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Type)').setRequired(false))
