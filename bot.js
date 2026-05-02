@@ -1462,89 +1462,8 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
     return;
   }
 
-  // /ocas — show a random or specific OCAS token (art + links only)
-  // Optional: trait filter to pull a random token with matching trait(s)
 
-
-  // /traitfloor — show the floor price for a specific trait value or trait count
-  if(commandName==='traitfloor'){
-    const trait      = interaction.options.getString('trait')?.trim();
-    const value      = interaction.options.getString('value')?.trim();
-    const traitCount = interaction.options.getInteger('trait_count');
-    const RAILWAY_URL = process.env.RAILWAY_API_URL;
-    const API_SECRET  = process.env.API_SECRET;
-
-    if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured.', flags: MessageFlags.Ephemeral });
-    if(!trait && !traitCount) return interaction.reply({ content: 'Provide a trait+value or a trait_count.', flags: MessageFlags.Ephemeral });
-    if(trait && !value) return interaction.reply({ content: 'Please also provide a value for the trait.', flags: MessageFlags.Ephemeral });
-
-    await interaction.deferReply();
-    try{
-      const contract = '0x078be86f3104a32313a47815792230a3808642cc';
-
-      if(traitCount !== null && traitCount !== undefined){
-        // ── Trait count floor — single DB query via dedicated endpoint ────────
-        const qs = new URLSearchParams({ trait_count: String(traitCount), key: API_SECRET||'' });
-        const r = await fetch(`${RAILWAY_URL}/db/trait-count-floor?${qs}`);
-        if(!r.ok) throw new Error(`API HTTP ${r.status}`);
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error);
-        if(!j.floor){
-          await interaction.editReply(`No listed tokens found with **${traitCount} traits**.`);
-          return;
-        }
-        const f = j.floor;
-        const priceStr = f.price_eth >= 1 ? f.price_eth.toFixed(3) : f.price_eth.toFixed(4);
-        const osUrl = f.url || `https://opensea.io/assets/ethereum/${contract}/${f.token_id}`;
-        const tvUrl = `https://traitview.com/?token=${f.token_id}`;
-        const embed = new EmbedBuilder()
-          .setTitle(`Floor for ${traitCount}-trait OCAS — Ξ ${priceStr}`)
-          .setColor(0x2dd4bf)
-          .setDescription(`**Token:** #${f.token_id}\n**Traits:** ${traitCount}\n**Price:** Ξ ${priceStr}\n\n[OpenSea](${osUrl}) · [TraitView](${tvUrl})`)
-          .setFooter({ text: 'on-chain-all-stars · trait count floor' })
-          .setTimestamp();
-        try{
-          const imgResult = await resolveImage({ identifier: String(f.token_id) }, contract, 'ethereum');
-          if(imgResult?.type === 'buffer'){ const att = new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename}); embed.setThumbnail(`attachment://${imgResult.filename}`); await interaction.editReply({embeds:[embed],files:[att]}); }
-          else { if(imgResult?.type==='url') embed.setThumbnail(imgResult.url); await interaction.editReply({embeds:[embed]}); }
-        }catch(e){ await interaction.editReply({embeds:[embed]}); }
-
-      } else {
-        // ── Trait value floor — single DB query via /db/trait-floor ──────────
-        // Try exact case then title case to handle user input like "zombie" or "Zombie"
-        const fmtTrait = s => s.split(' ').map(w => w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' ');
-        let f = null;
-        for(const [tn, tv] of [[trait, value], [fmtTrait(trait), fmtTrait(value)]]){
-          const qs = new URLSearchParams({ trait_name: tn, trait_value: tv, key: API_SECRET||'' });
-          const r = await fetch(`${RAILWAY_URL}/db/trait-floor?${qs}`);
-          if(r.ok){ const j = await r.json(); if(j.ok && j.floor){ f = j.floor; break; } }
-        }
-        if(!f){
-          await interaction.editReply(`No listings found for **${trait}: ${value}**. Check spelling.`);
-          return;
-        }
-        const priceStr = f.price_eth >= 1 ? f.price_eth.toFixed(3) : f.price_eth.toFixed(4);
-        const osUrl = f.url || `https://opensea.io/assets/ethereum/${contract}/${f.token_id}`;
-        const tvUrl = `https://traitview.com/?token=${f.token_id}`;
-        const embed = new EmbedBuilder()
-          .setTitle(`Floor for ${trait}: ${value} — Ξ ${priceStr}`)
-          .setColor(0x2dd4bf)
-          .setDescription(`**Token:** #${f.token_id}\n**Price:** Ξ ${priceStr}\n\n[OpenSea](${osUrl}) · [TraitView](${tvUrl})`)
-          .setFooter({ text: 'on-chain-all-stars · trait floor' })
-          .setTimestamp();
-        try{
-          const imgResult = await resolveImage({ identifier: String(f.token_id) }, contract, 'ethereum');
-          if(imgResult?.type === 'buffer'){ const att = new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename}); embed.setThumbnail(`attachment://${imgResult.filename}`); await interaction.editReply({embeds:[embed],files:[att]}); }
-          else { if(imgResult?.type==='url') embed.setThumbnail(imgResult.url); await interaction.editReply({embeds:[embed]}); }
-        }catch(e){ await interaction.editReply({embeds:[embed]}); }
-      }
-    }catch(e){ await interaction.editReply('Error: ' + e.message); }
-    return;
-  }
-
-
-  // /ocas — smart search for OCAS tokens
-  // Supports: token ID, "zombie", "15 traits", "rank 1-100", random
+  // /ocas — smart search (random or specific OCAS token)
   if(commandName==='ocas'){
     const tokenInput = interaction.options.getInteger('token');
     const rawSearch  = (interaction.options.getString('search') || '').trim();
@@ -1556,172 +1475,111 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
     try{
       const fmtTrait = s => s.split(' ').map(w => w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' ');
 
-      // ── Parse search intent ──────────────────────────────────────────────
-      let tokenId      = tokenInput || null;
-      let traitCount   = null;
-      let rankMin      = null, rankMax = null;
-      let traitSearch  = null; // free-text trait value to search
+      let tokenId    = tokenInput || null;
+      let traitCount = null;
+      let rankMin    = null, rankMax = null;
+      let traitSearch = null;
 
-      // Detect "floor" modifier anywhere in search
-      const wantFloor = /floor/i.test(rawSearch);
-      const cleanSearch = rawSearch.replace(/floor/gi, '').trim();
+      // Detect "floor" keyword — works anywhere: "zombie floor", "floor zombie", "15 traits floor"
+      const wantFloor   = /(?:^|\s)floor(?:\s|$)/i.test(rawSearch);
+      const cleanSearch = rawSearch.replace(/(?:^|\s)floor(?:\s|$)/gi, ' ').trim();
 
       if(!tokenId && cleanSearch){
         const s = cleanSearch.toLowerCase().trim();
 
         // 1. Pure number → token ID
-        if(/^\d+$/.test(s) && parseInt(s) >= 1 && parseInt(s) <= 10000){
-          tokenId = parseInt(s);
+        if(/^\d+$/.test(s) && +s >= 1 && +s <= 10000){
+          tokenId = +s;
 
-        // 2. Trait count patterns: "15 traits", "15 trait", "trait count 15", "traits: 15"
-        } else if(/(?:trait\s*count\s*[:\-]?\s*(\d+)|(\d+)\s*traits?)/i.test(cleanSearch)){
-          const m = cleanSearch.match(/(?:trait\s*count\s*[:\-]?\s*(\d+)|(\d+)\s*traits?)/i);
+        // 2. Trait count: "15 traits", "15 trait", "trait count 15"
+        } else if(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i.test(cleanSearch)){
+          const m = cleanSearch.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
           traitCount = parseInt(m[1] || m[2]);
 
-        // 3. Rank range: "rank 1-100", "rank 1 to 100", "top 100"
-        } else if(/rank/i.test(s) || /top\s*\d+/i.test(s)){
-          const rangeMatch = s.match(/(\d+)\s*[-–to]+\s*(\d+)/);
-          const topMatch   = s.match(/top\s*(\d+)/i);
-          if(rangeMatch){
-            rankMin = parseInt(rangeMatch[1]);
-            rankMax = parseInt(rangeMatch[2]);
-          } else if(topMatch){
-            rankMin = 1;
-            rankMax = parseInt(topMatch[1]);
-          }
+        // 3. Rank: "rank 1-100", "top 100", "rank 500"
+        } else if(/rank|top\s*\d/i.test(s)){
+          const range = s.match(/(\d+)\s*[-–to]+\s*(\d+)/);
+          const top   = s.match(/top\s*(\d+)/i);
+          const single = s.match(/rank\s*(\d+)/i);
+          if(range){ rankMin = +range[1]; rankMax = +range[2]; }
+          else if(top){ rankMin = 1; rankMax = +top[1]; }
+          else if(single){ rankMin = 1; rankMax = +single[1]; }
 
-        // 4. Free text → trait value search
+        // 4. Free text → trait value
         } else {
           traitSearch = cleanSearch;
         }
       }
 
-      // ── Handle rank range ────────────────────────────────────────────────
+      // ── Rank range ────────────────────────────────────────────────────────
       if(rankMin && rankMax && RAILWAY_URL){
-        const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '100' });
-        if(API_SECRET) qs.set('key', API_SECRET);
+        const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '100', key: API_SECRET||'' });
         const r = await fetch(`${RAILWAY_URL}/db/rank-listings?${qs}`);
         if(r.ok){
           const j = await r.json();
-          const listings = j.listings || [];
-          if(!listings.length){
-            await interaction.editReply(`No listings found with OS rank **#${rankMin}–#${rankMax}**.`);
-            return;
-          }
-          // floor = cheapest, otherwise random
-          const pick = wantFloor
-            ? listings.sort((a,b) => a.price_eth - b.price_eth)[0]
-            : listings[Math.floor(Math.random() * listings.length)];
-          tokenId = pick.token_id;
+          const listings = (j.listings||[]).sort((a,b)=>a.price_eth-b.price_eth);
+          if(!listings.length){ await interaction.editReply(`No listings in OS rank **#${rankMin}–#${rankMax}**.`); return; }
+          tokenId = wantFloor ? listings[0].token_id : listings[Math.floor(Math.random()*listings.length)].token_id;
         }
       }
 
-      // ── Handle trait value search ─────────────────────────────────────────
+      // ── Trait value search ────────────────────────────────────────────────
       if(!tokenId && traitSearch && RAILWAY_URL){
-        // Search DB for tokens matching this value across ALL trait names
-        // Use /db/tokens with a broad search — try title-cased value
         const tv = fmtTrait(traitSearch);
-        // Query all trait names that have this value via a dedicated search
-        // TODO: add /db/trait-search?value=X endpoint for efficiency
-        // Fallback: try common trait names with this value
         const commonTraits = ['Type','Hair','Hat Hair','Eye Wear','Eyes','Clothes0','Clothes1',
           'Headwear','Facial Hair','Angel','Ape Teeth','Jewellery0','Jewellery1','Tattoos',
           'Teeth','Smoking','Special 1s'];
-        let matchIds = [];
-        let matchedTrait = null;
-        // Try each trait name — stop at first match with results
+        let matchIds = [], matchedTrait = null;
         for(const tn of commonTraits){
-          const qs = new URLSearchParams({ traits: JSON.stringify({ [tn]: [tv] }), limit: '10000' });
-          if(API_SECRET) qs.set('key', API_SECRET);
+          const qs = new URLSearchParams({ traits: JSON.stringify({[tn]:[tv]}), limit:'10000', key:API_SECRET||'' });
           const r = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
-          if(r.ok){
-            const j = await r.json();
-            if(j.tokens?.length){
-              matchIds = j.tokens.map(t => t.id);
-              matchedTrait = tn;
-              break;
-            }
-          }
+          if(r.ok){ const j=await r.json(); if(j.tokens?.length){ matchIds=j.tokens.map(t=>t.id); matchedTrait=tn; break; } }
         }
-        if(!matchIds.length){
-          await interaction.editReply(`No tokens found matching **"${traitSearch}"**. Try a specific trait value like "Zombie", "Skeleton", or "15 traits".`);
-          return;
-        }
-        if(wantFloor && matchedTrait && RAILWAY_URL){
-          // Floor = cheapest listed token with this trait
-          const tv2 = fmtTrait(traitSearch);
-          const fqs = new URLSearchParams({ trait_name: matchedTrait, trait_value: tv2, key: API_SECRET||'' });
+        if(!matchIds.length){ await interaction.editReply(`No tokens matching **"${traitSearch}"**. Try: "Zombie", "Skeleton", "15 traits", "rank 1-100".`); return; }
+        if(wantFloor && matchedTrait){
+          const fqs = new URLSearchParams({ trait_name: matchedTrait, trait_value: tv, key:API_SECRET||'' });
           const fr = await fetch(`${RAILWAY_URL}/db/trait-floor?${fqs}`);
-          if(fr.ok){
-            const fj = await fr.json();
-            if(fj.ok && fj.floor){ tokenId = fj.floor.token_id; }
-            else { await interaction.editReply(`No listed **${traitSearch}** tokens found.`); return; }
-          }
+          if(fr.ok){ const fj=await fr.json(); if(fj.ok&&fj.floor){ tokenId=fj.floor.token_id; } else { await interaction.editReply(`No listed **${traitSearch}** tokens found.`); return; } }
         } else {
-          tokenId = matchIds[Math.floor(Math.random() * matchIds.length)];
+          tokenId = matchIds[Math.floor(Math.random()*matchIds.length)];
         }
       }
 
-      // ── Handle trait count ────────────────────────────────────────────────
+      // ── Trait count ───────────────────────────────────────────────────────
       if(!tokenId && traitCount !== null && RAILWAY_URL){
         if(wantFloor){
-          // Floor = cheapest listed token with this trait count
-          const qs = new URLSearchParams({ trait_count: String(traitCount), key: API_SECRET||'' });
+          // Cheapest listed token with this trait count
+          const qs = new URLSearchParams({ trait_count: String(traitCount), key:API_SECRET||'' });
           const r = await fetch(`${RAILWAY_URL}/db/trait-count-floor?${qs}`);
-          if(r.ok){
-            const j = await r.json();
-            if(j.ok && j.floor){ tokenId = j.floor.token_id; }
-            else { await interaction.editReply(`No listed tokens found with **${traitCount} traits**.`); return; }
-          }
+          if(r.ok){ const j=await r.json(); if(j.ok&&j.floor){ tokenId=j.floor.token_id; } else { await interaction.editReply(`No listed tokens with **${traitCount} traits**.`); return; } }
         } else {
-          // Random = any token with this trait count (not just listed)
-          // Uses /db/tokens?trait_count=X — needs api.js support, falls back to floor token
-          const qs = new URLSearchParams({ trait_count: String(traitCount), limit: '10000', key: API_SECRET||'' });
+          // Random token with this trait count
+          const qs = new URLSearchParams({ trait_count: String(traitCount), limit:'10000', key:API_SECRET||'' });
           const r = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
-          if(r.ok){
-            const j = await r.json();
-            const ids = (j.tokens || []).map(t => t.id);
-            if(ids.length){ tokenId = ids[Math.floor(Math.random() * ids.length)]; }
-          }
-          // Fallback if endpoint doesn't support trait_count yet
+          if(r.ok){ const j=await r.json(); const ids=(j.tokens||[]).map(t=>t.id); if(ids.length){ tokenId=ids[Math.floor(Math.random()*ids.length)]; } }
           if(!tokenId){
-            const qs2 = new URLSearchParams({ trait_count: String(traitCount), key: API_SECRET||'' });
+            // Fallback: floor token if random unavailable
+            const qs2 = new URLSearchParams({ trait_count: String(traitCount), key:API_SECRET||'' });
             const r2 = await fetch(`${RAILWAY_URL}/db/trait-count-floor?${qs2}`);
-            if(r2.ok){ const j2 = await r2.json(); if(j2.ok && j2.floor) tokenId = j2.floor.token_id; }
+            if(r2.ok){ const j2=await r2.json(); if(j2.ok&&j2.floor) tokenId=j2.floor.token_id; else { await interaction.editReply(`No tokens with **${traitCount} traits**.`); return; } }
           }
-          if(!tokenId){ await interaction.editReply(`No tokens found with **${traitCount} traits**.`); return; }
         }
       }
 
-      // ── Fallback to random ────────────────────────────────────────────────
-      if(!tokenId) tokenId = Math.floor(Math.random() * 10000) + 1;
+      // ── Random fallback ───────────────────────────────────────────────────
+      if(!tokenId) tokenId = Math.floor(Math.random()*10000)+1;
 
-      // ── Fetch and post image ──────────────────────────────────────────────
-      const nftObj = { identifier: String(tokenId) };
+      // ── Fetch + post image ────────────────────────────────────────────────
       let imgResult = getCachedImage(`${contract}:${tokenId}`);
-      if(!imgResult){
-        imgResult = await resolveImage(nftObj, contract, 'ethereum');
-        if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
-      }
+      if(!imgResult){ imgResult = await resolveImage({identifier:String(tokenId)}, contract, 'ethereum'); if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult); }
       const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
-      const embed = new EmbedBuilder()
-        .setTitle(`OCAS #${tokenId}`)
-        .setColor(0x2dd4bf)
-        .setDescription(`[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
-      if(imgResult?.type === 'buffer'){
-        const att = new AttachmentBuilder(imgResult.buffer, { name: imgResult.filename });
-        embed.setImage(`attachment://${imgResult.filename}`);
-        await interaction.editReply({ embeds:[embed], files:[att] });
-      } else if(imgResult?.type === 'url'){
-        embed.setImage(imgResult.url);
-        await interaction.editReply({ embeds:[embed] });
-      } else {
-        embed.setDescription(`[OpenSea](${osUrl}) · [TraitView](${tvUrl})
-_Image unavailable_`);
-        await interaction.editReply({ embeds:[embed] });
-      }
-    }catch(e){ await interaction.editReply('Error: ' + e.message); }
+      const embed = new EmbedBuilder().setTitle(`OCAS #${tokenId}`).setColor(0x2dd4bf).setDescription(`[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
+      if(imgResult?.type==='buffer'){ const att=new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename}); embed.setImage(`attachment://${imgResult.filename}`); await interaction.editReply({embeds:[embed],files:[att]}); }
+      else if(imgResult?.type==='url'){ embed.setImage(imgResult.url); await interaction.editReply({embeds:[embed]}); }
+      else { embed.setDescription(`[OpenSea](${osUrl}) · [TraitView](${tvUrl})
+_Image unavailable_`); await interaction.editReply({embeds:[embed]}); }
+    }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
 
@@ -1737,35 +1595,19 @@ _Image unavailable_`);
       '`/pause` / `/resume` - Pause/resume auto-posts',
       '`/status` - Show server config'
     ].join('\n');
-    const ocasGuide = [
-      '`/ocas` - Random OCAS token',
-      '`/ocas token:1234` - Specific token',
-      '`/ocas search:zombie` - Random Zombie',
-      '`/ocas search:zombie floor` - Cheapest listed Zombie',
-      '`/ocas search:15 traits` - Random 15-trait token',
-      '`/ocas search:15 traits floor` - Cheapest listed 15-trait token',
-      '`/ocas search:rank 1-100` - Random listed top-100 ranked token',
-      '`/ocas search:rank 1-100 floor` - Cheapest listed top-100 ranked token',
-    ].join('\n');
     const publicCmds=[
       '`/lastsale` - Most recent sale',
       '`/recentsales count:10` - Last N sales',
       '`/sale token:1234` - Specific token last sale',
       '`/traitfind trait:Type value:Zombie` - Search sales by trait',
       '`/listings count:5` - Recent new listings',
-      '`/rankfilter min:1 max:100` - Cheapest listed tokens by OS rank',
-      '`/traitfloor trait:Type value:Zombie` - Floor price for a trait',
-      '`/traitfloor trait_count:15` - Floor price for trait count',
-      '`/myalert trait:Type value:Zombie` - Personal DM alerts',
+      '`/myalert trait:Type value:Zombie sales:true listings:true` - Get DMs for matching events',
       '`/myalertclear` - Remove your DM alert',
       '`/myalertstatus` - See your alert settings',
+      '`/help` - This message'
     ].join('\n');
     await interaction.reply({embeds:[new EmbedBuilder().setTitle('NFT Sales Bot - Commands').setColor(0x7aa2ff)
-      .addFields(
-        {name:'🎨 /ocas — Smart Search', value:ocasGuide, inline:false},
-        {name:'Public Commands', value:publicCmds, inline:false},
-        {name:'Admin Commands (Manage Server required)', value:adminCmds, inline:false},
-      )], flags: MessageFlags.Ephemeral});
+      .addFields({name:'Admin Commands (Manage Server required)',value:adminCmds,inline:false},{name:'Public Commands',value:publicCmds,inline:false})], flags: MessageFlags.Ephemeral});
     return;
   }
 });
