@@ -63,6 +63,79 @@ const pgPool = new Pool({
 });
 pgPool.on('error', e => console.error('[PG bot]', e.message));
 
+// ── OCAS Trait Index (phrase-aware multi-trait search) ────────────────────────
+// Queries token_traits table directly for all distinct name+value pairs.
+// Cached in memory, warmed at startup, refreshed every 6 hours.
+let _TRAIT_INDEX     = null;   // Map<lowerCaseValue, [{traitName, traitValue}]>
+let _TRAIT_INDEX_TS  = 0;
+const _TRAIT_INDEX_TTL = 6 * 60 * 60 * 1000;
+
+async function getTraitIndex() {
+  if (_TRAIT_INDEX && Date.now() - _TRAIT_INDEX_TS < _TRAIT_INDEX_TTL) return _TRAIT_INDEX;
+  try {
+    const r = await pgPool.query(
+      `SELECT DISTINCT trait_name, trait_value FROM token_traits ORDER BY trait_name, trait_value`
+    );
+    const idx = new Map();
+    for (const { trait_name, trait_value } of r.rows) {
+      const k = trait_value.toLowerCase();
+      if (!idx.has(k)) idx.set(k, []);
+      idx.get(k).push({ traitName: trait_name, traitValue: trait_value });
+    }
+    _TRAIT_INDEX    = idx;
+    _TRAIT_INDEX_TS = Date.now();
+    console.log(`[TraitIndex] Built: ${idx.size} unique values across ${r.rows.length} trait rows`);
+  } catch(e) {
+    console.warn('[TraitIndex] Build failed:', e.message);
+    if (!_TRAIT_INDEX) _TRAIT_INDEX = new Map();
+  }
+  return _TRAIT_INDEX;
+}
+
+/**
+ * Greedy phrase-aware trait parser.
+ * Sorts all known trait values longest-first so "Gold Chain" matches before "Gold".
+ * Returns:
+ *   matched   — [{traitName, traitValue}] unambiguous matches
+ *   ambiguous — [{phrase, options:[{traitName,traitValue}]}] value found in multiple trait categories
+ *   unmatched — string[] words not recognised as any trait value
+ */
+async function parseTraitQuery(input) {
+  const idx = await getTraitIndex();
+
+  // Sort longest phrase first for greedy matching
+  const sortedValues = [...idx.keys()].sort((a, b) => {
+    const wd = b.split(' ').length - a.split(' ').length;
+    return wd !== 0 ? wd : b.length - a.length;
+  });
+
+  // Pad with spaces for reliable whole-word boundary matching
+  let remaining = ' ' + input.toLowerCase().trim() + ' ';
+  const matched   = [];
+  const ambiguous = [];
+
+  for (const lv of sortedValues) {
+    const escaped = lv.replace(/[-.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?<=\s)${escaped}(?=\s)`, 'i');
+    if (re.test(remaining)) {
+      remaining = remaining.replace(re, ' ').replace(/\s+/g, ' ');
+      const candidates = idx.get(lv);
+      if (candidates.length === 1) {
+        matched.push(candidates[0]);
+      } else {
+        ambiguous.push({ phrase: lv, options: candidates });
+      }
+    }
+  }
+
+  // Strip stop-words from leftovers
+  const STOP = new Set(['and','with','a','the','floor','random','show','find','get','or','plus']);
+  const unmatched = remaining.trim().split(/\s+/).filter(w => w && !STOP.has(w.toLowerCase()));
+
+  return { matched, unmatched, ambiguous };
+}
+
+
 // ── Create bot_state table if it doesn't exist ───────────────────────────────
 async function ensureBotStateTable(){
   try{
@@ -1526,60 +1599,58 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
         }
       }
 
-      // ── Trait value search (supports multi-term intersection) ─────────────
+
+      // ── Trait value search (phrase-aware, multi-trait AND) ────────────────
       if(!tokenId && traitSearch && RAILWAY_URL){
-        const commonTraits = ['Type','Hair','Hat Hair','Eye Wear','Eyes','Clothes0','Clothes1',
-          'Headwear','Facial Hair','Angel','Ape Teeth','Jewellery0','Jewellery1','Tattoos',
-          'Teeth','Smoking','Special 1s'];
+        // Parse query into matched trait pairs using greedy phrase matching
+        const { matched, unmatched, ambiguous } = await parseTraitQuery(traitSearch);
 
-        // Split into terms: comma-separated or each space-separated word
-        // "zombie hoodie" → ["Zombie", "Hoodie"]
-        // "zombie, gold chain" → ["Zombie", "Gold Chain"]
-        const rawTerms = traitSearch.split(/\s*,\s*/).map(t => t.trim()).filter(Boolean);
-        const terms = rawTerms.length > 1
-          ? rawTerms.map(fmtTrait)
-          : traitSearch.split(/\s+/).map(fmtTrait);
+        // Resolve ambiguous matches: same value in multiple trait categories.
+        // Pick the first candidate (most-specific by DB ordering).
+        // TODO: upgrade to Discord buttons for user disambiguation.
+        const resolvedMatches = [...matched];
+        for(const amb of ambiguous) resolvedMatches.push(amb.options[0]);
 
-        // For each term, find all matching token IDs (trying every trait name)
-        const termResults = [];
-        for(const tv of terms){
-          let termIds = null;
-          for(const tn of commonTraits){
-            const qs = new URLSearchParams({ traits: JSON.stringify({[tn]:[tv]}), limit:'10000', key:API_SECRET||'' });
-            const r = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
-            if(r.ok){ const j=await r.json(); if(j.tokens?.length){ termIds = new Set(j.tokens.map(t=>t.id)); break; } }
-          }
-          if(termIds) termResults.push({ term: tv, ids: termIds });
+        if(!resolvedMatches.length){
+          const hint = unmatched.length ? ` (not recognised: ${unmatched.join(', ')})` : '';
+          await interaction.editReply(
+            `No trait matches found for **"${traitSearch}"**${hint}.\n` +
+            `Try: "Zombie", "Gold Chain", "Skeleton", "15 traits", "rank 1-100".`
+          );
+          return;
         }
 
-        if(termResults.length === 0){
-          await interaction.editReply(`No tokens matching **"${traitSearch}"**. Try: "Zombie", "Skeleton", "15 traits", "rank 1-100".`); return;
+        // Build AND filter: { TraitName: [value, ...], ... }
+        const traitFilter = {};
+        for(const { traitName, traitValue } of resolvedMatches){
+          if(!traitFilter[traitName]) traitFilter[traitName] = [];
+          if(!traitFilter[traitName].includes(traitValue)) traitFilter[traitName].push(traitValue);
         }
-
-        // Intersect all term sets (AND logic — must have ALL traits)
-        termResults.sort((a,b) => a.ids.size - b.ids.size);
-        let intersected = termResults[0].ids;
-        for(let i=1; i<termResults.length; i++){
-          intersected = new Set([...intersected].filter(id => termResults[i].ids.has(id)));
-        }
-        let matchIds = [...intersected];
-
-        if(!matchIds.length){
-          const foundTerms = termResults.map(t => `"${t.term}"`).join(' + ');
-          await interaction.editReply(`No tokens matching ${foundTerms} together. Try fewer traits or check spelling.`); return;
-        }
+        const traitDesc = Object.entries(traitFilter).map(([k,v])=>`${k}: ${v.join('/')}`).join(' + ');
 
         if(wantFloor){
-          const r = await fetch(`${RAILWAY_URL}/db/listings?${new URLSearchParams({ key:API_SECRET||'' })}`);
-          if(r.ok){
-            const j = await r.json();
-            const listed = (j.listings||[]).filter(l => matchIds.includes(l.token_id)).sort((a,b)=>a.price_eth-b.price_eth);
-            if(!listed.length){ await interaction.editReply(`No listed tokens matching **"${traitSearch}"**.`); return; }
-            tokenId = listed[0].token_id; floorPrice = listed[0].price_eth;
+          // Single DB query via new multi-trait-floor endpoint
+          const fqs = new URLSearchParams({ traits: JSON.stringify(traitFilter), key: API_SECRET||'' });
+          const fr = await fetch(`${RAILWAY_URL}/db/multi-trait-floor?${fqs}`);
+          if(fr.ok){
+            const fj = await fr.json();
+            if(fj.ok && fj.floor){ tokenId = fj.floor.token_id; floorPrice = fj.floor.price_eth; }
+            else{ await interaction.editReply(`No listed tokens with **${traitDesc}**.`); return; }
           }
         } else {
-          tokenId = matchIds[Math.floor(Math.random()*matchIds.length)];
+          // Random token with all traits — single /db/tokens call
+          const qs = new URLSearchParams({ traits: JSON.stringify(traitFilter), limit: '10000', key: API_SECRET||'' });
+          const r = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
+          if(r.ok){
+            const j = await r.json();
+            const ids = (j.tokens||[]).map(t=>t.id);
+            if(!ids.length){ await interaction.editReply(`No tokens with **${traitDesc}**.`); return; }
+            tokenId = ids[Math.floor(Math.random()*ids.length)];
+          }
         }
+
+        // Warn about unrecognised words (non-blocking)
+        if(unmatched.length) interaction._ocasWarn = `⚠️ Not recognised: ${unmatched.join(', ')}`;
       }
 
       // ── Trait count ───────────────────────────────────────────────────────
@@ -1773,6 +1844,8 @@ client.once('clientReady', async ()=>{
   await loadSaleCursors();
   await loadListingCursors();
   console.log('Servers configured: '+Object.keys(serverConfigs).length);
+  // Warm trait index so first /ocas search is instant
+  getTraitIndex().catch(e => console.warn('[TraitIndex] Warmup failed:', e.message));
   pollSales();
   pollListings();
   setInterval(pollSales, POLL_MS);

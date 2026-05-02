@@ -578,6 +578,64 @@ app.get('/db/trait-count-floor', auth, async (req, res) => {
   }
 });
 
+
+// ── GET /db/multi-trait-floor ─────────────────────────────────────────────────
+// Cheapest listed token matching ALL supplied trait name/value pairs (AND logic).
+// Query params: traits — JSON object { TraitName: [value, ...], ... }
+// Returns: { ok, floor: {token_id, price_eth, url, obs_rank, os_rank} | null, count }
+app.get('/db/multi-trait-floor', auth, async (req, res) => {
+  try {
+    const traitFilters = req.query.traits ? JSON.parse(req.query.traits) : {};
+    const traitEntries = Object.entries(traitFilters).filter(([, vals]) => vals?.length > 0);
+    if (!traitEntries.length) {
+      return res.status(400).json({ ok: false, error: 'traits param required' });
+    }
+
+    // Build a query that JOINs token_traits once per trait name (AND across names, OR within values)
+    // then joins listings to get price, ordered cheapest first.
+    let query = `SELECT l.token_id, l.price_eth, l.url, t.obs_rank, t.os_rank FROM listings l JOIN tokens t ON t.id = l.token_id`;
+    const params = [];
+    let p = 1;
+    traitEntries.forEach(([name, vals], i) => {
+      query += ` JOIN token_traits tt${i} ON tt${i}.token_id = l.token_id`
+             + ` AND tt${i}.trait_name = $${p++}`
+             + ` AND tt${i}.trait_value = ANY($${p++}::text[])`;
+      params.push(name, Array.isArray(vals) ? vals : [vals]);
+    });
+    query += ` ORDER BY l.price_eth ASC LIMIT 1`;
+
+    const result = await pool.query(query, params);
+
+    // Also get total match count (listed tokens only) for context
+    let countQuery = `SELECT COUNT(*) FROM listings l`;
+    const countParams = [];
+    let cp = 1;
+    traitEntries.forEach(([name, vals], i) => {
+      countQuery += ` JOIN token_traits tt${i} ON tt${i}.token_id = l.token_id`
+                 + ` AND tt${i}.trait_name = $${cp++}`
+                 + ` AND tt${i}.trait_value = ANY($${cp++}::text[])`;
+      countParams.push(name, Array.isArray(vals) ? vals : [vals]);
+    });
+    const countResult = await pool.query(countQuery, countParams);
+
+    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    res.json({
+      ok: true,
+      floor: result.rows.length ? {
+        token_id:  parseInt(result.rows[0].token_id),
+        price_eth: parseFloat(result.rows[0].price_eth),
+        url:       result.rows[0].url,
+        obs_rank:  result.rows[0].obs_rank ? parseInt(result.rows[0].obs_rank) : null,
+        os_rank:   result.rows[0].os_rank  ? parseInt(result.rows[0].os_rank)  : null,
+      } : null,
+      listed_count: parseInt(countResult.rows[0].count)
+    });
+  } catch(e) {
+    console.error('/db/multi-trait-floor error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
