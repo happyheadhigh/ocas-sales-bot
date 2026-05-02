@@ -1550,17 +1550,22 @@ _Image unavailable_`);
         // Instead, use /db/tokens with rank filter won't work — need trait_count filter
         // Use a different approach: get all listed tokens, filter by trait_count
         const listings = j.listings || [];
-        // Fetch token data for cheapest listings to find trait_count match
-        let found = null;
+        if(!listings.length){
+          await interaction.editReply(`No listings currently available.`);
+          return;
+        }
+        // Sort by price, then find first one matching trait_count via DB
         const sorted = listings.slice().sort((a,b) => a.price_eth - b.price_eth);
-        for(const l of sorted.slice(0, 50)){
+        let found = null;
+        // Check in batches of 5 to avoid too many sequential requests
+        for(let i = 0; i < Math.min(sorted.length, 200) && !found; i++){
+          const l = sorted[i];
           const tqs = new URLSearchParams({ key: API_SECRET||'' });
           const tr = await fetch(`${RAILWAY_URL}/db/token/${l.token_id}?${tqs}`);
           if(!tr.ok) continue;
           const tj = await tr.json();
           if(tj.ok && tj.token?.trait_count === traitCount){
             found = { ...l, trait_count: tj.token.trait_count, os_rank: tj.token.os_rank, obs_rank: tj.token.obs_rank };
-            break;
           }
         }
         if(!found){
@@ -1595,15 +1600,59 @@ _Image unavailable_`);
 
       } else {
         // Floor for a specific trait value — use /db/trait-floor endpoint
-        const qs = new URLSearchParams({ trait_name: trait, trait_value: value, key: API_SECRET||'' });
-        const r = await fetch(`${RAILWAY_URL}/db/trait-floor?${qs}`);
-        if(!r.ok) throw new Error(`API HTTP ${r.status}`);
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error);
-        if(!j.floor){
+        // Use rank-listings style query — get all listings, filter by trait via /db/tokens
+        // First get matching token IDs from DB (case-insensitive)
+        const tqs2 = new URLSearchParams({ traits: JSON.stringify({ [trait]: [value] }), listed: '1', limit: '10000' });
+        if(API_SECRET) tqs2.set('key', API_SECRET);
+        const tr2 = await fetch(`${RAILWAY_URL}/db/tokens?${tqs2}`);
+        if(!tr2.ok) throw new Error(`API HTTP ${tr2.status}`);
+        const tj2 = await tr2.json();
+        const matchingIds = new Set((tj2.tokens || []).map(t => t.id));
+        if(!matchingIds.size){
+          // Fallback: try /db/trait-floor with original case and title case
+          const titleTrait = trait.charAt(0).toUpperCase() + trait.slice(1).toLowerCase();
+          const titleValue = value.charAt(0).toUpperCase() + value.slice(1).toLowerCase();
+          const qs = new URLSearchParams({ trait_name: titleTrait, trait_value: titleValue, key: API_SECRET||'' });
+          const r = await fetch(`${RAILWAY_URL}/db/trait-floor?${qs}`);
+          if(r.ok){
+            const j = await r.json();
+            if(j.ok && j.floor){
+              // Use this floor result
+              const f = j.floor;
+              const priceStr = f.price_eth >= 1 ? f.price_eth.toFixed(3) : f.price_eth.toFixed(4);
+              const osUrl = f.url || `https://opensea.io/assets/ethereum/${contract}/${f.token_id}`;
+              const tvUrl = `https://traitview.com/?token=${f.token_id}`;
+              const embed = new EmbedBuilder()
+                .setTitle(`Floor for ${trait}: ${value} — Ξ ${priceStr}`)
+                .setColor(0x2dd4bf)
+                .setDescription(`**Token:** #${f.token_id}
+**Price:** Ξ ${priceStr}
+
+[OpenSea](${osUrl}) · [TraitView](${tvUrl})`)
+                .setFooter({ text: 'on-chain-all-stars · trait floor' })
+                .setTimestamp();
+              try{
+                const imgResult = await resolveImage({ identifier: String(f.token_id) }, contract, 'ethereum');
+                if(imgResult?.type === 'buffer'){ const att = new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename}); embed.setThumbnail(`attachment://${imgResult.filename}`); await interaction.editReply({embeds:[embed],files:[att]}); }
+                else { if(imgResult?.type==='url') embed.setThumbnail(imgResult.url); await interaction.editReply({embeds:[embed]}); }
+              }catch(e){ await interaction.editReply({embeds:[embed]}); }
+              return;
+            }
+          }
+          await interaction.editReply(`No listings found for **${trait}: ${value}**. Check trait name and value spelling.`);
+          return;
+        }
+        // Get all listings and find cheapest matching token
+        const lqs = new URLSearchParams({ key: API_SECRET||'' });
+        const lr = await fetch(`${RAILWAY_URL}/db/listings?${lqs}`);
+        if(!lr.ok) throw new Error(`Listings API HTTP ${lr.status}`);
+        const lj = await lr.json();
+        const allListings = (lj.listings || []).filter(l => matchingIds.has(l.token_id)).sort((a,b) => a.price_eth - b.price_eth);
+        if(!allListings.length){
           await interaction.editReply(`No listings found for **${trait}: ${value}**.`);
           return;
         }
+        const j = { floor: { token_id: allListings[0].token_id, price_eth: allListings[0].price_eth, url: allListings[0].url } };
         const f = j.floor;
         const priceStr = f.price_eth >= 1 ? f.price_eth.toFixed(3) : f.price_eth.toFixed(4);
         const osUrl = f.url || `https://opensea.io/assets/ethereum/${contract}/${f.token_id}`;
