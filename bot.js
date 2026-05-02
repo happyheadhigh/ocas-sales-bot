@@ -892,12 +892,13 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
-  // ── Show Traits button — ephemeral reply with full token traits ──────────
+  // ── Show Traits button — ephemeral, only visible to clicker ─────────────
   if(interaction.isButton() && interaction.customId.startsWith('ocas_traits:')){
     const tokenId = parseInt(interaction.customId.split(':')[1]);
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      // Check cache first (5 min TTL)
+      const RAILWAY_URL = process.env.RAILWAY_API_URL;
+      const API_SECRET  = process.env.API_SECRET;
       let traits = null;
       const cached = ocasTraitsCache.get(tokenId);
       if(cached && Date.now() < cached.expires){
@@ -1710,7 +1711,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
 
-      // ── Description: trait values + count + rank, no labels ──────────────
+      // Description: trait values + count + rank only, no category labels
       const descParts = [];
       if(matchedGroups.length){
         const vals = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
@@ -1719,10 +1720,9 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       if(traitCount !== null) descParts.push(`${traitCount} traits`);
       if(rankMin && rankMax) descParts.push(`rank #${rankMin}–#${rankMax}`);
 
-      const priceLine  = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${formatPrice(floorPrice)}\n` : '';
+      const priceLine   = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${formatPrice(floorPrice)}\n` : '';
       const contextLine = descParts.length ? `${descParts.join(' · ')}\n` : '';
 
-      // ── Show Traits button ────────────────────────────────────────────────
       const traitsRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`ocas_traits:${tokenId}`)
