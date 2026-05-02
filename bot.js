@@ -199,6 +199,7 @@ function setCachedImage(key, result){
 // Stores paginated embed sessions keyed by message ID.
 // Each session: { embeds: [], index: 0, userId, expiresAt }
 const slideshowSessions = new Map();
+const ocasTraitsCache = new Map(); // tokenId → {traits, expires}
 
 // Clean up expired sessions every 5 minutes
 setInterval(() => {
@@ -888,6 +889,32 @@ client.on('interactionCreate', async (interaction)=>{
         await interaction.update({ embeds: [embed], components: [row], files: [] });
       }
     }catch(e){ console.error('[Slideshow]', e.message); }
+    return;
+  }
+
+  // ── Show Traits button — ephemeral reply with full token traits ──────────
+  if(interaction.isButton() && interaction.customId.startsWith('ocas_traits:')){
+    const tokenId = parseInt(interaction.customId.split(':')[1]);
+    try {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      // Check cache first (5 min TTL)
+      let traits = null;
+      const cached = ocasTraitsCache.get(tokenId);
+      if(cached && Date.now() < cached.expires){
+        traits = cached.traits;
+      } else {
+        const tqs = new URLSearchParams({ key: API_SECRET||'' });
+        const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
+        if(tr.ok){ const tj = await tr.json(); if(tj.ok && tj.token?.traits) traits = tj.token.traits; }
+        if(traits) ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+      }
+      if(!traits){ await interaction.editReply({ content: 'Could not load traits.' }); return; }
+      const traitLines = Object.entries(traits).map(([k,v]) => `**${k}:** ${v}`).join('\n');
+      await interaction.editReply({ content: `**OCAS #${tokenId} Traits**\n${traitLines}` });
+    } catch(e) {
+      console.error('[ShowTraits]', e.message);
+      try { await interaction.editReply({ content: 'Error loading traits.' }); } catch(_){}
+    }
     return;
   }
 
@@ -1682,26 +1709,42 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       }
       const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
-      const filters = [];
-      if(matchedGroups.length) filters.push(matchedLabel(matchedGroups));
-      if(traitCount !== null) filters.push(`${traitCount} traits`);
-      if(rankMin && rankMax) filters.push(`OS rank #${rankMin}–#${rankMax}`);
-      const priceLine = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${formatPrice(floorPrice)}\n` : '';
-      const filterLine = '';
+
+      // ── Description: trait values + count + rank, no labels ──────────────
+      const descParts = [];
+      if(matchedGroups.length){
+        const vals = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
+        descParts.push(vals.join(' · '));
+      }
+      if(traitCount !== null) descParts.push(`${traitCount} traits`);
+      if(rankMin && rankMax) descParts.push(`rank #${rankMin}–#${rankMax}`);
+
+      const priceLine  = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${formatPrice(floorPrice)}\n` : '';
+      const contextLine = descParts.length ? `${descParts.join(' · ')}\n` : '';
+
+      // ── Show Traits button ────────────────────────────────────────────────
+      const traitsRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ocas_traits:${tokenId}`)
+          .setLabel('Show Traits')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
       const embed = new EmbedBuilder()
         .setTitle(`OCAS #${tokenId}`)
         .setColor(0x2dd4bf)
-        .setDescription(`${priceLine}${filterLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
+        .setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
+
       if(imgResult?.type==='buffer'){
         const att=new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename});
         embed.setImage(`attachment://${imgResult.filename}`);
-        await interaction.editReply({embeds:[embed],files:[att]});
+        await interaction.editReply({embeds:[embed],files:[att],components:[traitsRow]});
       } else if(imgResult?.type==='url'){
         embed.setImage(imgResult.url);
-        await interaction.editReply({embeds:[embed]});
+        await interaction.editReply({embeds:[embed],components:[traitsRow]});
       } else {
-        embed.setDescription(`${priceLine}${filterLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})\n_Image unavailable_`);
-        await interaction.editReply({embeds:[embed]});
+        embed.setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})\n_Image unavailable_`);
+        await interaction.editReply({embeds:[embed],components:[traitsRow]});
       }
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
