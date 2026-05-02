@@ -1526,23 +1526,57 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
         }
       }
 
-      // ── Trait value search ────────────────────────────────────────────────
+      // ── Trait value search (supports multi-term intersection) ─────────────
       if(!tokenId && traitSearch && RAILWAY_URL){
-        const tv = fmtTrait(traitSearch);
         const commonTraits = ['Type','Hair','Hat Hair','Eye Wear','Eyes','Clothes0','Clothes1',
           'Headwear','Facial Hair','Angel','Ape Teeth','Jewellery0','Jewellery1','Tattoos',
           'Teeth','Smoking','Special 1s'];
-        let matchIds = [], matchedTrait = null;
-        for(const tn of commonTraits){
-          const qs = new URLSearchParams({ traits: JSON.stringify({[tn]:[tv]}), limit:'10000', key:API_SECRET||'' });
-          const r = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
-          if(r.ok){ const j=await r.json(); if(j.tokens?.length){ matchIds=j.tokens.map(t=>t.id); matchedTrait=tn; break; } }
+
+        // Split into terms: comma-separated or each space-separated word
+        // "zombie hoodie" → ["Zombie", "Hoodie"]
+        // "zombie, gold chain" → ["Zombie", "Gold Chain"]
+        const rawTerms = traitSearch.split(/\s*,\s*/).map(t => t.trim()).filter(Boolean);
+        const terms = rawTerms.length > 1
+          ? rawTerms.map(fmtTrait)
+          : traitSearch.split(/\s+/).map(fmtTrait);
+
+        // For each term, find all matching token IDs (trying every trait name)
+        const termResults = [];
+        for(const tv of terms){
+          let termIds = null;
+          for(const tn of commonTraits){
+            const qs = new URLSearchParams({ traits: JSON.stringify({[tn]:[tv]}), limit:'10000', key:API_SECRET||'' });
+            const r = await fetch(`${RAILWAY_URL}/db/tokens?${qs}`);
+            if(r.ok){ const j=await r.json(); if(j.tokens?.length){ termIds = new Set(j.tokens.map(t=>t.id)); break; } }
+          }
+          if(termIds) termResults.push({ term: tv, ids: termIds });
         }
-        if(!matchIds.length){ await interaction.editReply(`No tokens matching **"${traitSearch}"**. Try: "Zombie", "Skeleton", "15 traits", "rank 1-100".`); return; }
-        if(wantFloor && matchedTrait){
-          const fqs = new URLSearchParams({ trait_name: matchedTrait, trait_value: tv, key:API_SECRET||'' });
-          const fr = await fetch(`${RAILWAY_URL}/db/trait-floor?${fqs}`);
-          if(fr.ok){ const fj=await fr.json(); if(fj.ok&&fj.floor){ tokenId=fj.floor.token_id; floorPrice=fj.floor.price_eth; } else { await interaction.editReply(`No listed **${traitSearch}** tokens found.`); return; } }
+
+        if(termResults.length === 0){
+          await interaction.editReply(`No tokens matching **"${traitSearch}"**. Try: "Zombie", "Skeleton", "15 traits", "rank 1-100".`); return;
+        }
+
+        // Intersect all term sets (AND logic — must have ALL traits)
+        termResults.sort((a,b) => a.ids.size - b.ids.size);
+        let intersected = termResults[0].ids;
+        for(let i=1; i<termResults.length; i++){
+          intersected = new Set([...intersected].filter(id => termResults[i].ids.has(id)));
+        }
+        let matchIds = [...intersected];
+
+        if(!matchIds.length){
+          const foundTerms = termResults.map(t => `"${t.term}"`).join(' + ');
+          await interaction.editReply(`No tokens matching ${foundTerms} together. Try fewer traits or check spelling.`); return;
+        }
+
+        if(wantFloor){
+          const r = await fetch(`${RAILWAY_URL}/db/listings?${new URLSearchParams({ key:API_SECRET||'' })}`);
+          if(r.ok){
+            const j = await r.json();
+            const listed = (j.listings||[]).filter(l => matchIds.includes(l.token_id)).sort((a,b)=>a.price_eth-b.price_eth);
+            if(!listed.length){ await interaction.editReply(`No listed tokens matching **"${traitSearch}"**.`); return; }
+            tokenId = listed[0].token_id; floorPrice = listed[0].price_eth;
+          }
         } else {
           tokenId = matchIds[Math.floor(Math.random()*matchIds.length)];
         }
