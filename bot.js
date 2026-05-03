@@ -268,6 +268,38 @@ function chooseTraitGroupsFromQuery(search, traitIndex){
   return { groups, unmatched };
 }
 
+function getSweepTokenId(item){
+  return item?.token_id ?? item?.id ?? item?.identifier ?? item?.tokenId ?? item?.tokenID ?? null;
+}
+
+function normalizeSweepListing(item){
+  const tokenId = getSweepTokenId(item);
+  return {
+    token_id: tokenId ? parseInt(tokenId) : null,
+    price_eth: item?.price_eth != null ? parseFloat(item.price_eth) : null,
+    url: item?.url || null,
+    os_rank: item?.os_rank ? parseInt(item.os_rank) : null,
+    obs_rank: item?.obs_rank ? parseInt(item.obs_rank) : null,
+    trait_count: item?.trait_count ? parseInt(item.trait_count) : null
+  };
+}
+
+function sweepTokenUrl(item){
+  const tokenId = getSweepTokenId(item);
+  const contract = '0x078be86f3104a32313a47815792230a3808642cc';
+  return tokenId ? ('https://opensea.io/assets/ethereum/' + contract + '/' + tokenId) : 'https://opensea.io/collection/on-chain-all-stars';
+}
+
+function formatSweepTokenLine(item){
+  const tokenId = getSweepTokenId(item);
+  const rank = item?.os_rank ? ('◆' + Number(item.os_rank).toLocaleString()) : (item?.obs_rank ? ('◆' + Number(item.obs_rank).toLocaleString()) : null);
+  const row = ['[#' + tokenId + '](' + sweepTokenUrl(item) + ')'];
+  if(rank) row.push(rank);
+  row.push('Ξ ' + parseFloat(item.price_eth).toFixed(4));
+  return row.join(' — ');
+}
+
+
 // Clean up expired sessions every 5 minutes
 setInterval(() => {
   const now = Date.now();
@@ -978,19 +1010,12 @@ client.on('interactionCreate', async (interaction)=>{
       await interaction.deferUpdate();
     }
     const PAGE_SIZE = 8;
-    const listings = session.listings;
-    const totalPages = Math.ceil(listings.length / PAGE_SIZE);
+    const listings = session.listings.map(normalizeSweepListing).filter(l => l.token_id && l.price_eth != null);
+    const totalPages = Math.max(1, Math.ceil(listings.length / PAGE_SIZE));
     const page = Math.max(0, Math.min(session.page, totalPages - 1));
+    session.page = page;
     const slice = listings.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-    const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
-    const tokenLines = slice.map(l => {
-      const rank = l.os_rank ? ('◆' + l.os_rank.toLocaleString()) : (l.obs_rank ? ('◆' + l.obs_rank.toLocaleString()) : null);
-      const osUrl = l.url || ('https://opensea.io/assets/ethereum/' + OCAS_CONTRACT + '/' + l.token_id);
-      const row = ['[#' + l.token_id + '](' + osUrl + ')'];
-      if(rank) row.push(rank);
-      row.push('Ξ ' + parseFloat(l.price_eth).toFixed(4));
-      return row.join(' — ');
-    });
+    const tokenLines = slice.map(formatSweepTokenLine);
     const navRow = new ActionRowBuilder();
     if(page > 0)            navRow.addComponents(new ButtonBuilder().setCustomId('sweep:prev:' + sessionId).setLabel('← Prev').setStyle(ButtonStyle.Secondary));
     if(page < totalPages-1) navRow.addComponents(new ButtonBuilder().setCustomId('sweep:next:' + sessionId).setLabel('Next →').setStyle(ButtonStyle.Secondary));
@@ -998,7 +1023,11 @@ client.on('interactionCreate', async (interaction)=>{
     const header = totalPages > 1
       ? ('Page ' + (page+1) + '/' + totalPages + ' · ' + listings.length + ' tokens')
       : (listings.length + ' tokens');
-    await interaction.editReply({ content: '**' + header + '**\n' + tokenLines.join('\n'), components });
+    const embed = new EmbedBuilder()
+      .setTitle(header)
+      .setColor(0x2dd4bf)
+      .setDescription(tokenLines.join('\n') || 'No tokens found.');
+    await interaction.editReply({ content: null, embeds: [embed], components });
     return;
   }
 
@@ -1868,7 +1897,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
         const j = await r.json();
         console.log('[/sweep] tokens returned:', j.tokens?.length);
         if(!j.ok) throw new Error(j.error||'API error');
-        allFetched = (j.tokens||[]).filter(t => t.price_eth != null);
+        allFetched = (j.tokens||[]).map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
       }
       const sweepListings = allFetched.slice(0, sweepCount);
       const postSweepToken = allFetched[sweepCount] || null;
@@ -1898,35 +1927,22 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       desc += '**Highest included:** Ξ ' + fmt(highest) + '\n';
       if(floorAfter) desc += '**New floor after sweep:** Ξ ' + fmt(floorAfter) + '\n';
 
-      // ── Token list (keep public embed short enough for Discord limits) ───
-      const SHOW_MAX = 8;
-      const toShow = sweepListings.slice(0, SHOW_MAX);
-      const tokenLines = toShow.map(t => {
-        const rank = t.os_rank ? ('◆' + Number(t.os_rank).toLocaleString()) : (t.obs_rank ? ('◆' + Number(t.obs_rank).toLocaleString()) : null);
-        const osUrl = t.url || ('https://opensea.io/assets/ethereum/0x078be86f3104a32313a47815792230a3808642cc/' + t.token_id);
-        const row = ['[#' + t.token_id + '](' + osUrl + ')'];
-        if(rank) row.push(rank);
-        row.push('Ξ ' + parseFloat(t.price_eth).toFixed(4));
-        return row.join(' — ');
-      });
-      desc += '\n**Tokens**\n' + tokenLines.join('\n');
-      if(available > SHOW_MAX) desc += '\n_Showing first ' + SHOW_MAX + ' of ' + available + ' included._';
+      desc += '\n_Click **Show All Tokens** to view the full clickable token list._';
 
       const embed = new EmbedBuilder()
         .setTitle(title)
         .setColor(0x2dd4bf)
         .setDescription(desc.slice(0, 4090));
 
-      // ── Show All button if more than SHOW_MAX tokens ─────────────────────
+      // ── All tokens live behind the private Show All Tokens button ────────
       const components = [];
-      if(available > SHOW_MAX){
-        const sessionId = interaction.id;
-        sweepSessions.set(sessionId, { listings: sweepListings, page: 0 });
-        setTimeout(() => sweepSessions.delete(sessionId), 30 * 60 * 1000);
-        components.push(new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('sweep:showall:' + sessionId).setLabel('Show All Tokens').setStyle(ButtonStyle.Secondary)
-        ));
-      }
+      const sessionId = interaction.id;
+      const cleanSweepListings = sweepListings.map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
+      sweepSessions.set(sessionId, { listings: cleanSweepListings, page: 0 });
+      setTimeout(() => sweepSessions.delete(sessionId), 30 * 60 * 1000);
+      components.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('sweep:showall:' + sessionId).setLabel('Show All Tokens').setStyle(ButtonStyle.Secondary)
+      ));
 
       await interaction.editReply({ embeds: [embed], components });
 
