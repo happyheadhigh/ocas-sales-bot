@@ -138,13 +138,12 @@ const commands = [
   new SlashCommandBuilder().setName('removerankfilter').setDescription('Remove the rank listing alert')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
-
-  new SlashCommandBuilder().setName('sweep').setDescription('Calculate exact ETH cost to sweep current OCAS listings')
-    .addStringOption(o=>o.setName('search').setDescription('Examples: "10", "10 zombies", "10 zombie hoodie", "10 15 traits"').setRequired(true)),
-
   new SlashCommandBuilder().setName('ocas').setDescription('Show a random OCAS — search by trait, count, rank, or token ID')
     .addIntegerOption(o=>o.setName('token').setDescription('Specific token ID (e.g. 1234)').setRequired(false).setMinValue(1).setMaxValue(10000))
     .addStringOption(o=>o.setName('search').setDescription('Search: "zombie", "15 traits", "rank 1-100", or a token number').setRequired(false)),
+
+  new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep cheapest listed OCAS')
+    .addStringOption(o=>o.setName('search').setDescription('e.g. "10", "10 zombie", "zombie hoodie", "10 zombie 15 traits"').setRequired(false)),
 
   new SlashCommandBuilder().setName('traitfloor').setDescription('Show the floor price for a specific trait or trait count')
     .addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Type)').setRequired(false))

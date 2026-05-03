@@ -199,17 +199,80 @@ function setCachedImage(key, result){
 // Stores paginated embed sessions keyed by message ID.
 // Each session: { embeds: [], index: 0, userId, expiresAt }
 const slideshowSessions = new Map();
-const sweepSessions = new Map();
 const ocasTraitsCache = new Map(); // tokenId → {traits, expires}
+
+// ── Hoisted trait parser helpers (shared by /ocas and /sweep) ───────────────
+const sweepSessions = new Map(); // sessionId → { listings, page }
+
+function normalizePhrase(s){
+  return String(s||"").toLowerCase().replace(/&/g," and ").replace(/[^a-z0-9]+/g," ").replace(/\s+/g," ").trim();
+}
+
+async function getTraitIndex(RAILWAY_URL, API_SECRET){
+  const now = Date.now();
+  if(global.__ocasTraitIndexCache && now - global.__ocasTraitIndexCache.ts < 60*60*1000)
+    return global.__ocasTraitIndexCache.items;
+  if(!RAILWAY_URL) return [];
+  const qs = new URLSearchParams({ key: API_SECRET||"" });
+  const r = await fetch(`${RAILWAY_URL}/db/trait-index?${qs}`);
+  if(!r.ok) throw new Error(`trait-index API HTTP ${r.status}`);
+  const j = await r.json();
+  if(!j.ok) throw new Error(j.error||"trait-index API error");
+  const items = (j.traits||[])
+    .map(t => ({ trait_name:t.trait_name, trait_value:t.trait_value, token_count:Number(t.token_count||0), norm:normalizePhrase(t.trait_value) }))
+    .filter(t => t.norm)
+    .sort((a,b) => {
+      const aw=a.norm.split(" ").length, bw=b.norm.split(" ").length;
+      if(bw!==aw) return bw-aw;
+      if(b.norm.length!==a.norm.length) return b.norm.length-a.norm.length;
+      return (b.token_count||0)-(a.token_count||0);
+    });
+  global.__ocasTraitIndexCache = { ts:now, items };
+  return items;
+}
+
+function chooseTraitGroupsFromQuery(search, traitIndex){
+  let remaining = ` ${normalizePhrase(search)} `;
+  const groups=[], unmatched=[], seenNorms=new Set();
+  const byNorm = new Map();
+  for(const item of traitIndex){
+    if(!byNorm.has(item.norm)) byNorm.set(item.norm,[]);
+    byNorm.get(item.norm).push(item);
+  }
+  const phrases = [...byNorm.keys()].sort((a,b)=>{
+    const aw=a.split(" ").length, bw=b.split(" ").length;
+    if(bw!==aw) return bw-aw;
+    return b.length-a.length;
+  });
+  for(const phrase of phrases){
+    if(seenNorms.has(phrase)) continue;
+    const re = new RegExp(`(^|\\s)${phrase.replace(/[.*+?^${}()|[\\]\\]/g,"\\$&")}(?=\\s|$)`,"i");
+    if(re.test(remaining)){
+      const alts = byNorm.get(phrase).sort((a,b)=>(b.token_count||0)-(a.token_count||0)).map(x=>({trait_name:x.trait_name,trait_value:x.trait_value}));
+      groups.push(alts);
+      seenNorms.add(phrase);
+      remaining = remaining.replace(re," ").replace(/\s+/g," ");
+    }
+  }
+  let leftover = normalizePhrase(remaining).split(" ").filter(Boolean).filter(w=>!["and","with","plus"].includes(w));
+  for(const word of leftover.slice()){
+    if(word.length<3) continue;
+    const re = new RegExp(`(^|\\s)${word.replace(/[.*+?^${}()|[\\]\\]/g,"\\$&")}(?=\\s|$)`,"i");
+    const alts = traitIndex.filter(x=>re.test(x.norm)).slice(0,25);
+    if(alts.length && alts.length<=12){
+      groups.push(alts.map(x=>({trait_name:x.trait_name,trait_value:x.trait_value})));
+      leftover = leftover.filter(w=>w!==word);
+    }
+  }
+  unmatched.push(...leftover);
+  return { groups, unmatched };
+}
 
 // Clean up expired sessions every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for(const [id, s] of slideshowSessions) {
     if(s.expiresAt < now) slideshowSessions.delete(id);
-  }
-  for(const [id, s] of sweepSessions) {
-    if(s.expiresAt < now) sweepSessions.delete(id);
   }
 }, 5 * 60 * 1000);
 
@@ -231,54 +294,6 @@ function buildNavRow(index, total) {
       .setLabel('▶')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(index === total - 1)
-  );
-}
-
-
-function fmtSweepEth(n){
-  if(n == null || !isFinite(Number(n))) return '—';
-  const v = Number(n);
-  return v >= 1 ? v.toFixed(3).replace(/0+$/,'').replace(/\.$/,'') : v.toFixed(4).replace(/0+$/,'').replace(/\.$/,'');
-}
-function formatSweepTokenLine(item, contract){
-  const tokenId = item.token_id || item.id;
-  const url = item.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
-  const rank = item.os_rank || item.obs_rank;
-  const rankPart = rank ? ` — ◆${Number(rank).toLocaleString('en-US')}` : '';
-  return `[#${tokenId}](${url})${rankPart} — Ξ ${fmtSweepEth(item.price_eth)}`;
-}
-function buildSweepPageEmbed(session){
-  const perPage = session.perPage || 15;
-  const totalPages = Math.max(1, Math.ceil(session.listings.length / perPage));
-  const page = Math.min(Math.max(session.page || 0, 0), totalPages - 1);
-  session.page = page;
-  const start = page * perPage;
-  const shown = session.listings.slice(start, start + perPage);
-  const lines = shown.map(l => formatSweepTokenLine(l, session.contract));
-  const embed = new EmbedBuilder()
-    .setTitle(`${session.title} — tokens ${start + 1}–${start + shown.length} of ${session.listings.length}`)
-    .setColor(0xf59e0b)
-    .setDescription(lines.join('\n') || 'No tokens to show.')
-    .setFooter({ text: `Page ${page + 1} / ${totalPages}` });
-  return embed;
-}
-function buildSweepNavRow(sessionId, page, totalPages){
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`sweep_nav:${sessionId}:prev`)
-      .setLabel('◀ Prev')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(page <= 0),
-    new ButtonBuilder()
-      .setCustomId(`sweep_pos:${sessionId}`)
-      .setLabel(`${page + 1} / ${totalPages}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(true),
-    new ButtonBuilder()
-      .setCustomId(`sweep_nav:${sessionId}:next`)
-      .setLabel('Next ▶')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(page >= totalPages - 1)
   );
 }
 
@@ -944,29 +959,46 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
-  // ── Sweep token list buttons — ephemeral/private pagination ─────────
-  if(interaction.isButton() && interaction.customId.startsWith('sweep_open:')){
-    const sessionId = interaction.customId.split(':')[1];
+  // ── Sweep pagination buttons ─────────────────────────────────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('sweep:')){
+    const parts = interaction.customId.split(':');
+    const action = parts[1];
+    const sessionId = parts[2];
     const session = sweepSessions.get(sessionId);
-    if(!session){ await interaction.reply({ content:'Sweep session expired.', flags: MessageFlags.Ephemeral }); return; }
-    session.page = 0;
-    const totalPages = Math.max(1, Math.ceil(session.listings.length / session.perPage));
-    const embed = buildSweepPageEmbed(session);
-    const row = buildSweepNavRow(sessionId, session.page, totalPages);
-    await interaction.reply({ embeds:[embed], components:[row], flags: MessageFlags.Ephemeral });
-    return;
-  }
-
-  if(interaction.isButton() && interaction.customId.startsWith('sweep_nav:')){
-    const [, sessionId, dir] = interaction.customId.split(':');
-    const session = sweepSessions.get(sessionId);
-    if(!session){ await interaction.reply({ content:'Sweep session expired.', flags: MessageFlags.Ephemeral }); return; }
-    const totalPages = Math.max(1, Math.ceil(session.listings.length / session.perPage));
-    if(dir === 'prev') session.page = Math.max(0, (session.page || 0) - 1);
-    if(dir === 'next') session.page = Math.min(totalPages - 1, (session.page || 0) + 1);
-    const embed = buildSweepPageEmbed(session);
-    const row = buildSweepNavRow(sessionId, session.page, totalPages);
-    await interaction.update({ embeds:[embed], components:[row] });
+    if(!session){
+      await interaction.reply({ content: 'Session expired. Run /sweep again.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if(action === 'showall'){
+      session.page = 0;
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    } else {
+      if(action === 'next') session.page++;
+      if(action === 'prev') session.page--;
+      await interaction.deferUpdate();
+    }
+    const PAGE_SIZE = 15;
+    const listings = session.listings;
+    const totalPages = Math.ceil(listings.length / PAGE_SIZE);
+    const page = Math.max(0, Math.min(session.page, totalPages - 1));
+    const slice = listings.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+    const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
+    const tokenLines = slice.map(l => {
+      const rank = l.os_rank ? ('◆' + l.os_rank.toLocaleString()) : (l.obs_rank ? ('◆' + l.obs_rank.toLocaleString()) : null);
+      const osUrl = l.url || ('https://opensea.io/assets/ethereum/' + OCAS_CONTRACT + '/' + l.token_id);
+      const row = ['[#' + l.token_id + '](' + osUrl + ')'];
+      if(rank) row.push(rank);
+      row.push('Ξ ' + parseFloat(l.price_eth).toFixed(4));
+      return row.join(' — ');
+    });
+    const navRow = new ActionRowBuilder();
+    if(page > 0)            navRow.addComponents(new ButtonBuilder().setCustomId('sweep:prev:' + sessionId).setLabel('← Prev').setStyle(ButtonStyle.Secondary));
+    if(page < totalPages-1) navRow.addComponents(new ButtonBuilder().setCustomId('sweep:next:' + sessionId).setLabel('Next →').setStyle(ButtonStyle.Secondary));
+    const components = navRow.components.length ? [navRow] : [];
+    const header = totalPages > 1
+      ? ('Page ' + (page+1) + '/' + totalPages + ' · ' + listings.length + ' tokens')
+      : (listings.length + ' tokens');
+    await interaction.editReply({ content: '**' + header + '**\n' + tokenLines.join('\n'), components });
     return;
   }
 
@@ -1569,199 +1601,6 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
   }
 
 
-
-  // /sweep — calculate exact ETH to sweep cheapest listed OCAS by count/traits
-  if(commandName==='sweep'){
-    const rawSearch = (interaction.options.getString('search') || '').trim();
-    const contract   = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
-    const RAILWAY_URL = process.env.RAILWAY_API_URL;
-    const API_SECRET  = process.env.API_SECRET;
-
-    await interaction.deferReply();
-    try{
-      if(!RAILWAY_URL){ await interaction.editReply('Railway API is not configured.'); return; }
-      const normalizePhrase = (s) => String(s || '')
-        .toLowerCase()
-        .replace(/&/g, ' and ')
-        .replace(/[^a-z0-9]+/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-      const singularVariants = (word) => {
-        const out = [word];
-        if(word.endsWith('ies') && word.length > 4) out.push(word.slice(0,-3)+'y');
-        if(word.endsWith('es') && word.length > 3) out.push(word.slice(0,-2));
-        if(word.endsWith('s') && word.length > 3) out.push(word.slice(0,-1));
-        return [...new Set(out)];
-      };
-      async function getTraitIndex(){
-        const now = Date.now();
-        if(global.__ocasTraitIndexCache && now - global.__ocasTraitIndexCache.ts < 60*60*1000){
-          return global.__ocasTraitIndexCache.items;
-        }
-        const qs = new URLSearchParams({ key: API_SECRET || '' });
-        const r = await fetch(`${RAILWAY_URL}/db/trait-index?${qs}`);
-        if(!r.ok) throw new Error(`trait-index API HTTP ${r.status}`);
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error || 'trait-index API error');
-        const items = (j.traits || [])
-          .map(t => ({ trait_name:t.trait_name, trait_value:t.trait_value, token_count:Number(t.token_count || 0), norm:normalizePhrase(t.trait_value) }))
-          .filter(t => t.norm)
-          .sort((a,b) => {
-            const aw=a.norm.split(' ').length, bw=b.norm.split(' ').length;
-            if(bw !== aw) return bw - aw;
-            if(b.norm.length !== a.norm.length) return b.norm.length - a.norm.length;
-            return (b.token_count || 0) - (a.token_count || 0);
-          });
-        global.__ocasTraitIndexCache = { ts: now, items };
-        return items;
-      }
-      function chooseTraitGroupsFromQuery(search, traitIndex){
-        let remaining = ` ${normalizePhrase(search)} `;
-        const groups = [];
-        const seenNorms = new Set();
-        const byNorm = new Map();
-        for(const item of traitIndex){
-          if(!byNorm.has(item.norm)) byNorm.set(item.norm, []);
-          byNorm.get(item.norm).push(item);
-        }
-        const phrases = [...byNorm.keys()].sort((a,b) => {
-          const aw=a.split(' ').length, bw=b.split(' ').length;
-          if(bw !== aw) return bw - aw;
-          return b.length - a.length;
-        });
-        for(const phrase of phrases){
-          if(seenNorms.has(phrase)) continue;
-          const re = new RegExp(`(^|\\s)${phrase.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?=\\s|$)`, 'i');
-          if(re.test(remaining)){
-            const alternatives = byNorm.get(phrase)
-              .sort((a,b) => (b.token_count || 0) - (a.token_count || 0))
-              .map(x => ({ trait_name:x.trait_name, trait_value:x.trait_value }));
-            groups.push(alternatives);
-            seenNorms.add(phrase);
-            remaining = remaining.replace(re, ' ').replace(/\s+/g, ' ');
-          }
-        }
-        let leftover = normalizePhrase(remaining).split(' ').filter(Boolean).filter(w => !['and','with','plus','ocAS'.toLowerCase()].includes(w));
-        for(const word of leftover.slice()){
-          if(word.length < 3) continue;
-          let alternatives = [];
-          for(const variant of singularVariants(word)){
-            const re = new RegExp(`(^|\\s)${variant.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?=\\s|$)`, 'i');
-            alternatives = traitIndex.filter(x => re.test(x.norm)).slice(0, 25);
-            if(alternatives.length) break;
-          }
-          if(alternatives.length && alternatives.length <= 12){
-            groups.push(alternatives.map(x => ({ trait_name:x.trait_name, trait_value:x.trait_value })));
-            leftover = leftover.filter(w => w !== word);
-          }
-        }
-        return { groups, unmatched:leftover };
-      }
-      const cleanGroupLabel = (groups) => groups.map(g => [...new Set(g.map(x => x.trait_value))][0]).join(' • ');
-
-      let working = rawSearch || '10';
-      let traitCount = null;
-      const traitCountMatch = working.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
-      if(traitCountMatch){
-        traitCount = parseInt(traitCountMatch[1] || traitCountMatch[2]);
-        working = working.replace(traitCountMatch[0], ' ').trim();
-      }
-
-      let requested = 10;
-      const countMatch = working.match(/\b(\d{1,3})\b/);
-      if(countMatch){
-        requested = Math.min(Math.max(parseInt(countMatch[1]), 1), 100);
-        working = working.replace(countMatch[0], ' ').trim();
-      }
-
-      const traitSearch = working.replace(/[,+]/g, ' ').replace(/\b(and|with|plus|sweep|floor|listed|listings|tokens|token|ocas)\b/gi, ' ').replace(/\s+/g, ' ').trim();
-      let matchedGroups = [];
-      if(traitSearch){
-        const traitIndex = await getTraitIndex();
-        const resolved = chooseTraitGroupsFromQuery(traitSearch, traitIndex);
-        matchedGroups = resolved.groups;
-        if(!matchedGroups.length){
-          await interaction.editReply(`I couldn't match **"${traitSearch}"** to any known OCAS trait value. Try **zombie**, **gold chain**, or **diamond choker**.`);
-          return;
-        }
-        if(resolved.unmatched.length){
-          const understood = cleanGroupLabel(matchedGroups) || 'some traits';
-          await interaction.editReply(`I understood **${understood}**, but couldn't understand: **${resolved.unmatched.join(' ')}**.`);
-          return;
-        }
-      }
-
-      const qs = new URLSearchParams({ key: API_SECRET || '', count: String(requested) });
-      if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
-      if(traitCount !== null) qs.set('trait_count', String(traitCount));
-      const r = await fetch(`${RAILWAY_URL}/db/sweep-cost?${qs}`);
-      if(!r.ok) throw new Error(`sweep-cost API HTTP ${r.status}`);
-      const j = await r.json();
-      if(!j.ok) throw new Error(j.error || 'sweep-cost API error');
-
-      const labelParts = [];
-      if(matchedGroups.length) labelParts.push(cleanGroupLabel(matchedGroups));
-      if(traitCount !== null) labelParts.push(`${traitCount} traits`);
-      const label = labelParts.length ? labelParts.join(' • ') : 'OCAS';
-      const sweepCount = j.sweep_count || 0;
-      const listings = j.listings || [];
-      if(!sweepCount){
-        await interaction.editReply(`No listed OCAS found for **${label}**.`);
-        return;
-      }
-      const lines = [];
-      if(j.available < requested) lines.push(`**Only ${j.available} listed**`);
-      lines.push(`**Total${sweepCount < requested ? ` for ${sweepCount}` : ''}:** Ξ ${fmtSweepEth(j.total_eth)}`);
-      lines.push(`**Average:** Ξ ${fmtSweepEth(j.avg_eth)}`);
-      lines.push(`**Cheapest:** Ξ ${fmtSweepEth(j.cheapest_eth)}`);
-      lines.push(`**Highest included:** Ξ ${fmtSweepEth(j.highest_included_eth)}`);
-      if(j.floor_after != null) lines.push(`**New floor after sweep:** Ξ ${fmtSweepEth(j.floor_after)}`);
-      else lines.push(`**New floor after sweep:** none listed`);
-      lines.push('');
-      const visible = listings.slice(0, 15);
-      lines.push('**Tokens**');
-      lines.push(...visible.map(l => formatSweepTokenLine(l, contract)));
-      if(listings.length > visible.length){
-        lines.push(`_Showing first ${visible.length} of ${listings.length} included._`);
-      }
-
-      const embed = new EmbedBuilder()
-        .setTitle(`Sweep ${requested} ${label}`)
-        .setColor(0xf59e0b)
-        .setDescription(lines.join('\n'))
-        .setFooter({ text: `Sweep math uses current listings from TraitView/Railway` })
-        .setTimestamp();
-
-      const components = [];
-      let replyMsg = null;
-      if(listings.length > 15){
-        const sessionId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2,7)}`;
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`sweep_open:${sessionId}`)
-            .setLabel(`Show All Tokens (${listings.length})`)
-            .setStyle(ButtonStyle.Secondary)
-        );
-        components.push(row);
-        replyMsg = await interaction.editReply({ embeds:[embed], components });
-        sweepSessions.set(sessionId, {
-          title: `Sweep ${requested} ${label}`,
-          listings,
-          contract,
-          perPage: 15,
-          page: 0,
-          expiresAt: Date.now() + 30 * 60 * 1000,
-        });
-      } else {
-        replyMsg = await interaction.editReply({ embeds:[embed] });
-      }
-    }catch(e){
-      console.error('[Sweep command]', e.message);
-      await interaction.editReply('Error: '+e.message);
-    }
-    return;
-  }
-
   // /ocas — smart search (random, token ID, rank, trait count, or phrase-aware trait combos)
   if(commandName==='ocas'){
     const tokenInput = interaction.options.getInteger('token');
@@ -1772,105 +1611,8 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
 
     await interaction.deferReply();
     try{
-      const normalizePhrase = (s) => String(s || '')
-        .toLowerCase()
-        .replace(/&/g, ' and ')
-        .replace(/[^a-z0-9]+/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-      const titleCase = (s) => String(s || '').split(' ').map(w => w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' ');
-      const formatPrice = (n) => n == null ? '—' : (n >= 1 ? Number(n).toFixed(3) : Number(n).toFixed(4));
-      const matchedLabel = (groups) => groups.map(g => {
-        if(g.length === 1) return `${g[0].trait_name}: ${g[0].trait_value}`;
-        const values = [...new Set(g.map(x => x.trait_value))].join(' / ');
-        const names = [...new Set(g.map(x => x.trait_name))].join(' or ');
-        return `${names}: ${values}`;
-      }).join(' + ');
-
-      async function getTraitIndex(){
-        const now = Date.now();
-        if(global.__ocasTraitIndexCache && now - global.__ocasTraitIndexCache.ts < 60*60*1000){
-          return global.__ocasTraitIndexCache.items;
-        }
-        if(!RAILWAY_URL) return [];
-        const qs = new URLSearchParams({ key: API_SECRET || '' });
-        const r = await fetch(`${RAILWAY_URL}/db/trait-index?${qs}`);
-        if(!r.ok) throw new Error(`trait-index API HTTP ${r.status}`);
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error || 'trait-index API error');
-        const items = (j.traits || [])
-          .map(t => ({
-            trait_name: t.trait_name,
-            trait_value: t.trait_value,
-            token_count: Number(t.token_count || 0),
-            norm: normalizePhrase(t.trait_value),
-          }))
-          .filter(t => t.norm)
-          .sort((a,b) => {
-            const aw = a.norm.split(' ').length, bw = b.norm.split(' ').length;
-            if(bw !== aw) return bw - aw;
-            if(b.norm.length !== a.norm.length) return b.norm.length - a.norm.length;
-            return (b.token_count || 0) - (a.token_count || 0);
-          });
-        global.__ocasTraitIndexCache = { ts: now, items };
-        return items;
-      }
-
-      function chooseTraitGroupsFromQuery(search, traitIndex){
-        let remaining = ` ${normalizePhrase(search)} `;
-        const groups = [];
-        const unmatched = [];
-        const seenNorms = new Set();
-
-        // Group trait values by normalized phrase. One phrase can exist in multiple categories/slots.
-        const byNorm = new Map();
-        for(const item of traitIndex){
-          if(!byNorm.has(item.norm)) byNorm.set(item.norm, []);
-          byNorm.get(item.norm).push(item);
-        }
-        const phrases = [...byNorm.keys()].sort((a,b) => {
-          const aw = a.split(' ').length, bw = b.split(' ').length;
-          if(bw !== aw) return bw - aw;
-          return b.length - a.length;
-        });
-
-        for(const phrase of phrases){
-          if(seenNorms.has(phrase)) continue;
-          const re = new RegExp(`(^|\\s)${phrase.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?=\\s|$)`, 'i');
-          if(re.test(remaining)){
-            const alternatives = byNorm.get(phrase)
-              .sort((a,b) => (b.token_count || 0) - (a.token_count || 0))
-              .map(x => ({ trait_name: x.trait_name, trait_value: x.trait_value }));
-            groups.push(alternatives);
-            seenNorms.add(phrase);
-            remaining = remaining.replace(re, ' ').replace(/\s+/g, ' ');
-          }
-        }
-
-        let leftover = normalizePhrase(remaining)
-          .split(' ')
-          .filter(Boolean)
-          .filter(w => !['and','with','plus'].includes(w));
-
-        // Helpful fallback: if a user types a single broad word like "hoodie",
-        // match trait values that contain that word (e.g. "Red Hoodie"), but avoid
-        // silently using extremely broad words like "gold" when there are tons of matches.
-        for(const word of leftover.slice()){
-          if(word.length < 3) continue;
-          const re = new RegExp(`(^|\\s)${word.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?=\\s|$)`, 'i');
-          const alternatives = traitIndex
-            .filter(x => re.test(x.norm))
-            .slice(0, 25);
-          if(alternatives.length && alternatives.length <= 12){
-            groups.push(alternatives.map(x => ({ trait_name: x.trait_name, trait_value: x.trait_value })));
-            leftover = leftover.filter(w => w !== word);
-          }
-        }
-
-        unmatched.push(...leftover);
-        return { groups, unmatched };
-      }
-
+      // normalizePhrase / getTraitIndex / chooseTraitGroupsFromQuery
+      // are hoisted to module scope — shared with /sweep.
       let tokenId    = tokenInput || null;
       let traitCount = null;
       let rankMin    = null, rankMax = null;
@@ -1920,7 +1662,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       // Resolve phrase-aware multi-trait search. Longest trait values win:
       // "gold chain diamond choker" → "Gold Chain" + "Diamond Choker".
       if(!tokenId && searchForTraits && RAILWAY_URL){
-        const traitIndex = await getTraitIndex();
+        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
         const resolved = chooseTraitGroupsFromQuery(searchForTraits, traitIndex);
         matchedGroups = resolved.groups;
 
@@ -2018,6 +1760,143 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
         await interaction.editReply({embeds:[embed],components:[traitsRow]});
       }
     }catch(e){ await interaction.editReply('Error: '+e.message); }
+    return;
+  }
+
+  // ── /sweep ──────────────────────────────────────────────────────────────
+  if(commandName==='sweep'){
+    const RAILWAY_URL = process.env.RAILWAY_API_URL;
+    const API_SECRET  = process.env.API_SECRET;
+    const rawSearch   = (interaction.options.getString('search')||''). trim();
+    await interaction.deferReply();
+    try{
+
+      // ── Extract sweep count (first standalone number in search) ─────────
+      let sweepCount = 10;
+      let workingSearch = rawSearch;
+      const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
+      if(numMatch){
+        const n = parseInt(numMatch[1]);
+        if(n > 0 && n <= 500){ sweepCount = n; workingSearch = workingSearch.replace(numMatch[0], ' ').trim(); }
+      }
+
+      // ── Extract trait count e.g. "15 traits" ────────────────────────────
+      let traitCount = null;
+      const tcMatch = workingSearch.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
+      if(tcMatch){
+        traitCount = parseInt(tcMatch[1] || tcMatch[2]);
+        workingSearch = workingSearch.replace(tcMatch[0], ' ').trim();
+      }
+
+      // ── Simple depluralize (Zombies→Zombie, skip Teeth/Tattoos) ─────────
+      const SKIP_DEPLURAL = new Set(['teeth','tattoos','traits']);
+      workingSearch = workingSearch.split(' ').map(w => {
+        const lw = w.toLowerCase();
+        if(SKIP_DEPLURAL.has(lw)) return w;
+        if(lw.endsWith('ies') && lw.length > 4) return w.slice(0,-3)+'y';
+        if(lw.endsWith('s') && lw.length > 3) return w.slice(0,-1);
+        return w;
+      }).join(' ').trim();
+
+      // ── Phrase-aware trait matching ──────────────────────────────────────
+      let matchedGroups = [];
+      workingSearch = workingSearch.replace(/[,+]/g,' ').replace(/\b(and|with|plus)\b/gi,' ').replace(/\s+/g,' ').trim();
+
+      if(workingSearch && RAILWAY_URL){
+        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
+        const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
+        matchedGroups = resolved.groups;
+        if(resolved.unmatched.length && !matchedGroups.length){
+          await interaction.editReply(`I couldn't match **"${workingSearch}"** to any known trait. Try: "zombie", "gold chain", "15 traits".`);
+          return;
+        }
+        if(resolved.unmatched.length){
+          await interaction.editReply(`I matched some traits but couldn't understand: **${resolved.unmatched.join(' ')}**. Try exact trait phrases.`);
+          return;
+        }
+      }
+
+      // ── Build title ──────────────────────────────────────────────────────
+      const labelParts = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
+      if(traitCount !== null) labelParts.push(traitCount + ' traits');
+      const traitLabel = labelParts.length ? labelParts.join(' · ') : 'OCAS';
+      const title = 'Sweep ' + sweepCount + ' ' + traitLabel;
+
+      // ── Fetch cheapest listed tokens from Railway ────────────────────────
+      // Fetch count+1 so we can compute the post-sweep floor
+      const qs = new URLSearchParams({ listed:'1', limit: String(sweepCount+1), key: API_SECRET||'' });
+      if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
+      if(traitCount !== null) qs.set('trait_count', String(traitCount));
+      const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
+      if(!r.ok) throw new Error('multi-trait-tokens HTTP ' + r.status);
+      const j = await r.json();
+      if(!j.ok) throw new Error(j.error||'API error');
+
+      const allFetched = (j.tokens||[]).filter(t => t.price_eth != null);
+      const sweepListings = allFetched.slice(0, sweepCount);
+      const postSweepToken = allFetched[sweepCount] || null;
+
+      if(!sweepListings.length){
+        await interaction.editReply('No listed tokens found for **' + traitLabel + '**.');
+        return;
+      }
+
+      // ── Compute stats ────────────────────────────────────────────────────
+      const available = sweepListings.length;
+      const short = available < sweepCount;
+      const prices = sweepListings.map(t => parseFloat(t.price_eth));
+      const totalEth = prices.reduce((a,b)=>a+b,0);
+      const avgEth   = totalEth / prices.length;
+      const cheapest = prices[0];
+      const highest  = prices[prices.length-1];
+      const floorAfter = postSweepToken ? parseFloat(postSweepToken.price_eth) : null;
+      const fmt = n => n.toFixed(4);
+
+      // ── Build embed description ──────────────────────────────────────────
+      let desc = '';
+      if(short) desc += '⚠️ Only ' + available + ' listed\n\n';
+      desc += '**Total:** Ξ ' + fmt(totalEth) + '\n';
+      desc += '**Average:** Ξ ' + fmt(avgEth) + '\n';
+      desc += '**Cheapest:** Ξ ' + fmt(cheapest) + '\n';
+      desc += '**Highest included:** Ξ ' + fmt(highest) + '\n';
+      if(floorAfter) desc += '**New floor after sweep:** Ξ ' + fmt(floorAfter) + '\n';
+
+      // ── Token list (cap at 15 in the public embed) ───────────────────────
+      const SHOW_MAX = 15;
+      const toShow = sweepListings.slice(0, SHOW_MAX);
+      const tokenLines = toShow.map(t => {
+        const rank = t.os_rank ? ('◆' + t.os_rank.toLocaleString()) : (t.obs_rank ? ('◆' + t.obs_rank.toLocaleString()) : null);
+        const osUrl = t.url || ('https://opensea.io/assets/ethereum/0x078be86f3104a32313a47815792230a3808642cc/' + t.token_id);
+        const row = ['[#' + t.token_id + '](' + osUrl + ')'];
+        if(rank) row.push(rank);
+        row.push('Ξ ' + parseFloat(t.price_eth).toFixed(4));
+        return row.join(' — ');
+      });
+      if(available > SHOW_MAX) tokenLines.push('_Showing first ' + SHOW_MAX + ' of ' + available + ' included._');
+
+      const embed = new EmbedBuilder()
+        .setTitle(title)
+        .setColor(0x2dd4bf)
+        .setDescription(desc)
+        .addFields({ name: 'Tokens', value: tokenLines.join('\n'), inline: false });
+
+      // ── Show All button if more than SHOW_MAX tokens ─────────────────────
+      const components = [];
+      if(available > SHOW_MAX){
+        const sessionId = interaction.id;
+        sweepSessions.set(sessionId, { listings: sweepListings, page: 0 });
+        setTimeout(() => sweepSessions.delete(sessionId), 30 * 60 * 1000);
+        components.push(new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('sweep:showall:' + sessionId).setLabel('Show All Tokens').setStyle(ButtonStyle.Secondary)
+        ));
+      }
+
+      await interaction.editReply({ embeds: [embed], components });
+
+    }catch(e){
+      console.error('[/sweep]', e.message);
+      try{ await interaction.editReply('Something went wrong. Please try again.'); }catch(_){}
+    }
     return;
   }
 
