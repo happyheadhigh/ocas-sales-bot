@@ -199,6 +199,7 @@ function setCachedImage(key, result){
 // Stores paginated embed sessions keyed by message ID.
 // Each session: { embeds: [], index: 0, userId, expiresAt }
 const slideshowSessions = new Map();
+const sweepSessions = new Map();
 const ocasTraitsCache = new Map(); // tokenId → {traits, expires}
 
 // Clean up expired sessions every 5 minutes
@@ -206,6 +207,9 @@ setInterval(() => {
   const now = Date.now();
   for(const [id, s] of slideshowSessions) {
     if(s.expiresAt < now) slideshowSessions.delete(id);
+  }
+  for(const [id, s] of sweepSessions) {
+    if(s.expiresAt < now) sweepSessions.delete(id);
   }
 }, 5 * 60 * 1000);
 
@@ -227,6 +231,54 @@ function buildNavRow(index, total) {
       .setLabel('▶')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(index === total - 1)
+  );
+}
+
+
+function fmtSweepEth(n){
+  if(n == null || !isFinite(Number(n))) return '—';
+  const v = Number(n);
+  return v >= 1 ? v.toFixed(3).replace(/0+$/,'').replace(/\.$/,'') : v.toFixed(4).replace(/0+$/,'').replace(/\.$/,'');
+}
+function formatSweepTokenLine(item, contract){
+  const tokenId = item.token_id || item.id;
+  const url = item.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+  const rank = item.os_rank || item.obs_rank;
+  const rankPart = rank ? ` — ◆${Number(rank).toLocaleString('en-US')}` : '';
+  return `[#${tokenId}](${url})${rankPart} — Ξ ${fmtSweepEth(item.price_eth)}`;
+}
+function buildSweepPageEmbed(session){
+  const perPage = session.perPage || 15;
+  const totalPages = Math.max(1, Math.ceil(session.listings.length / perPage));
+  const page = Math.min(Math.max(session.page || 0, 0), totalPages - 1);
+  session.page = page;
+  const start = page * perPage;
+  const shown = session.listings.slice(start, start + perPage);
+  const lines = shown.map(l => formatSweepTokenLine(l, session.contract));
+  const embed = new EmbedBuilder()
+    .setTitle(`${session.title} — tokens ${start + 1}–${start + shown.length} of ${session.listings.length}`)
+    .setColor(0xf59e0b)
+    .setDescription(lines.join('\n') || 'No tokens to show.')
+    .setFooter({ text: `Page ${page + 1} / ${totalPages}` });
+  return embed;
+}
+function buildSweepNavRow(sessionId, page, totalPages){
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`sweep_nav:${sessionId}:prev`)
+      .setLabel('◀ Prev')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(`sweep_pos:${sessionId}`)
+      .setLabel(`${page + 1} / ${totalPages}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true),
+    new ButtonBuilder()
+      .setCustomId(`sweep_nav:${sessionId}:next`)
+      .setLabel('Next ▶')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= totalPages - 1)
   );
 }
 
@@ -892,6 +944,32 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
+  // ── Sweep token list buttons — ephemeral/private pagination ─────────
+  if(interaction.isButton() && interaction.customId.startsWith('sweep_open:')){
+    const sessionId = interaction.customId.split(':')[1];
+    const session = sweepSessions.get(sessionId);
+    if(!session){ await interaction.reply({ content:'Sweep session expired.', flags: MessageFlags.Ephemeral }); return; }
+    session.page = 0;
+    const totalPages = Math.max(1, Math.ceil(session.listings.length / session.perPage));
+    const embed = buildSweepPageEmbed(session);
+    const row = buildSweepNavRow(sessionId, session.page, totalPages);
+    await interaction.reply({ embeds:[embed], components:[row], flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('sweep_nav:')){
+    const [, sessionId, dir] = interaction.customId.split(':');
+    const session = sweepSessions.get(sessionId);
+    if(!session){ await interaction.reply({ content:'Sweep session expired.', flags: MessageFlags.Ephemeral }); return; }
+    const totalPages = Math.max(1, Math.ceil(session.listings.length / session.perPage));
+    if(dir === 'prev') session.page = Math.max(0, (session.page || 0) - 1);
+    if(dir === 'next') session.page = Math.min(totalPages - 1, (session.page || 0) + 1);
+    const embed = buildSweepPageEmbed(session);
+    const row = buildSweepNavRow(sessionId, session.page, totalPages);
+    await interaction.update({ embeds:[embed], components:[row] });
+    return;
+  }
+
   // ── Show Traits button — ephemeral, only visible to clicker ─────────────
   if(interaction.isButton() && interaction.customId.startsWith('ocas_traits:')){
     const tokenId = parseInt(interaction.customId.split(':')[1]);
@@ -1490,6 +1568,199 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
     return;
   }
 
+
+
+  // /sweep — calculate exact ETH to sweep cheapest listed OCAS by count/traits
+  if(commandName==='sweep'){
+    const rawSearch = (interaction.options.getString('search') || '').trim();
+    const contract   = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+    const RAILWAY_URL = process.env.RAILWAY_API_URL;
+    const API_SECRET  = process.env.API_SECRET;
+
+    await interaction.deferReply();
+    try{
+      if(!RAILWAY_URL){ await interaction.editReply('Railway API is not configured.'); return; }
+      const normalizePhrase = (s) => String(s || '')
+        .toLowerCase()
+        .replace(/&/g, ' and ')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const singularVariants = (word) => {
+        const out = [word];
+        if(word.endsWith('ies') && word.length > 4) out.push(word.slice(0,-3)+'y');
+        if(word.endsWith('es') && word.length > 3) out.push(word.slice(0,-2));
+        if(word.endsWith('s') && word.length > 3) out.push(word.slice(0,-1));
+        return [...new Set(out)];
+      };
+      async function getTraitIndex(){
+        const now = Date.now();
+        if(global.__ocasTraitIndexCache && now - global.__ocasTraitIndexCache.ts < 60*60*1000){
+          return global.__ocasTraitIndexCache.items;
+        }
+        const qs = new URLSearchParams({ key: API_SECRET || '' });
+        const r = await fetch(`${RAILWAY_URL}/db/trait-index?${qs}`);
+        if(!r.ok) throw new Error(`trait-index API HTTP ${r.status}`);
+        const j = await r.json();
+        if(!j.ok) throw new Error(j.error || 'trait-index API error');
+        const items = (j.traits || [])
+          .map(t => ({ trait_name:t.trait_name, trait_value:t.trait_value, token_count:Number(t.token_count || 0), norm:normalizePhrase(t.trait_value) }))
+          .filter(t => t.norm)
+          .sort((a,b) => {
+            const aw=a.norm.split(' ').length, bw=b.norm.split(' ').length;
+            if(bw !== aw) return bw - aw;
+            if(b.norm.length !== a.norm.length) return b.norm.length - a.norm.length;
+            return (b.token_count || 0) - (a.token_count || 0);
+          });
+        global.__ocasTraitIndexCache = { ts: now, items };
+        return items;
+      }
+      function chooseTraitGroupsFromQuery(search, traitIndex){
+        let remaining = ` ${normalizePhrase(search)} `;
+        const groups = [];
+        const seenNorms = new Set();
+        const byNorm = new Map();
+        for(const item of traitIndex){
+          if(!byNorm.has(item.norm)) byNorm.set(item.norm, []);
+          byNorm.get(item.norm).push(item);
+        }
+        const phrases = [...byNorm.keys()].sort((a,b) => {
+          const aw=a.split(' ').length, bw=b.split(' ').length;
+          if(bw !== aw) return bw - aw;
+          return b.length - a.length;
+        });
+        for(const phrase of phrases){
+          if(seenNorms.has(phrase)) continue;
+          const re = new RegExp(`(^|\\s)${phrase.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?=\\s|$)`, 'i');
+          if(re.test(remaining)){
+            const alternatives = byNorm.get(phrase)
+              .sort((a,b) => (b.token_count || 0) - (a.token_count || 0))
+              .map(x => ({ trait_name:x.trait_name, trait_value:x.trait_value }));
+            groups.push(alternatives);
+            seenNorms.add(phrase);
+            remaining = remaining.replace(re, ' ').replace(/\s+/g, ' ');
+          }
+        }
+        let leftover = normalizePhrase(remaining).split(' ').filter(Boolean).filter(w => !['and','with','plus','ocAS'.toLowerCase()].includes(w));
+        for(const word of leftover.slice()){
+          if(word.length < 3) continue;
+          let alternatives = [];
+          for(const variant of singularVariants(word)){
+            const re = new RegExp(`(^|\\s)${variant.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?=\\s|$)`, 'i');
+            alternatives = traitIndex.filter(x => re.test(x.norm)).slice(0, 25);
+            if(alternatives.length) break;
+          }
+          if(alternatives.length && alternatives.length <= 12){
+            groups.push(alternatives.map(x => ({ trait_name:x.trait_name, trait_value:x.trait_value })));
+            leftover = leftover.filter(w => w !== word);
+          }
+        }
+        return { groups, unmatched:leftover };
+      }
+      const cleanGroupLabel = (groups) => groups.map(g => [...new Set(g.map(x => x.trait_value))][0]).join(' • ');
+
+      let working = rawSearch || '10';
+      let traitCount = null;
+      const traitCountMatch = working.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
+      if(traitCountMatch){
+        traitCount = parseInt(traitCountMatch[1] || traitCountMatch[2]);
+        working = working.replace(traitCountMatch[0], ' ').trim();
+      }
+
+      let requested = 10;
+      const countMatch = working.match(/\b(\d{1,3})\b/);
+      if(countMatch){
+        requested = Math.min(Math.max(parseInt(countMatch[1]), 1), 100);
+        working = working.replace(countMatch[0], ' ').trim();
+      }
+
+      const traitSearch = working.replace(/[,+]/g, ' ').replace(/\b(and|with|plus|sweep|floor|listed|listings|tokens|token|ocas)\b/gi, ' ').replace(/\s+/g, ' ').trim();
+      let matchedGroups = [];
+      if(traitSearch){
+        const traitIndex = await getTraitIndex();
+        const resolved = chooseTraitGroupsFromQuery(traitSearch, traitIndex);
+        matchedGroups = resolved.groups;
+        if(!matchedGroups.length){
+          await interaction.editReply(`I couldn't match **"${traitSearch}"** to any known OCAS trait value. Try **zombie**, **gold chain**, or **diamond choker**.`);
+          return;
+        }
+        if(resolved.unmatched.length){
+          const understood = cleanGroupLabel(matchedGroups) || 'some traits';
+          await interaction.editReply(`I understood **${understood}**, but couldn't understand: **${resolved.unmatched.join(' ')}**.`);
+          return;
+        }
+      }
+
+      const qs = new URLSearchParams({ key: API_SECRET || '', count: String(requested) });
+      if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
+      if(traitCount !== null) qs.set('trait_count', String(traitCount));
+      const r = await fetch(`${RAILWAY_URL}/db/sweep-cost?${qs}`);
+      if(!r.ok) throw new Error(`sweep-cost API HTTP ${r.status}`);
+      const j = await r.json();
+      if(!j.ok) throw new Error(j.error || 'sweep-cost API error');
+
+      const labelParts = [];
+      if(matchedGroups.length) labelParts.push(cleanGroupLabel(matchedGroups));
+      if(traitCount !== null) labelParts.push(`${traitCount} traits`);
+      const label = labelParts.length ? labelParts.join(' • ') : 'OCAS';
+      const sweepCount = j.sweep_count || 0;
+      const listings = j.listings || [];
+      if(!sweepCount){
+        await interaction.editReply(`No listed OCAS found for **${label}**.`);
+        return;
+      }
+      const lines = [];
+      if(j.available < requested) lines.push(`**Only ${j.available} listed**`);
+      lines.push(`**Total${sweepCount < requested ? ` for ${sweepCount}` : ''}:** Ξ ${fmtSweepEth(j.total_eth)}`);
+      lines.push(`**Average:** Ξ ${fmtSweepEth(j.avg_eth)}`);
+      lines.push(`**Cheapest:** Ξ ${fmtSweepEth(j.cheapest_eth)}`);
+      lines.push(`**Highest included:** Ξ ${fmtSweepEth(j.highest_included_eth)}`);
+      if(j.floor_after != null) lines.push(`**New floor after sweep:** Ξ ${fmtSweepEth(j.floor_after)}`);
+      else lines.push(`**New floor after sweep:** none listed`);
+      lines.push('');
+      const visible = listings.slice(0, 15);
+      lines.push('**Tokens**');
+      lines.push(...visible.map(l => formatSweepTokenLine(l, contract)));
+      if(listings.length > visible.length){
+        lines.push(`_Showing first ${visible.length} of ${listings.length} included._`);
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle(`Sweep ${requested} ${label}`)
+        .setColor(0xf59e0b)
+        .setDescription(lines.join('\n'))
+        .setFooter({ text: `Sweep math uses current listings from TraitView/Railway` })
+        .setTimestamp();
+
+      const components = [];
+      let replyMsg = null;
+      if(listings.length > 15){
+        const sessionId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2,7)}`;
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`sweep_open:${sessionId}`)
+            .setLabel(`Show All Tokens (${listings.length})`)
+            .setStyle(ButtonStyle.Secondary)
+        );
+        components.push(row);
+        replyMsg = await interaction.editReply({ embeds:[embed], components });
+        sweepSessions.set(sessionId, {
+          title: `Sweep ${requested} ${label}`,
+          listings,
+          contract,
+          perPage: 15,
+          page: 0,
+          expiresAt: Date.now() + 30 * 60 * 1000,
+        });
+      } else {
+        replyMsg = await interaction.editReply({ embeds:[embed] });
+      }
+    }catch(e){
+      console.error('[Sweep command]', e.message);
+      await interaction.editReply('Error: '+e.message);
+    }
+    return;
+  }
 
   // /ocas — smart search (random, token ID, rank, trait count, or phrase-aware trait combos)
   if(commandName==='ocas'){
