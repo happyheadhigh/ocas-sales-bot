@@ -882,27 +882,41 @@ async function pollListings(){
                 const eth = formatListingEth(listing);
                 const priceStr = eth ? `Ξ ${eth}` : '—';
                 const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
-                const osUrl = `https://opensea.io/assets/ethereum/${contract}/${id}`;
-                const tvUrl = `https://traitview.com/?token=${id}`;
-                const alertEmbed = new EmbedBuilder()
-                  .setTitle(`🏆 Rank Alert — #${id} listed`)
-                  .setColor(0xf59e0b)
-                  .setDescription(`**◆ OS Rank #${osRank}** token just listed for **${priceStr}**
 
-[OpenSea](${osUrl}) · [TraitView](${tvUrl})`)
-                  .setFooter({ text: `on-chain-all-stars · rank alert #${rankAlertCfg.min}–#${rankAlertCfg.max}` })
-                  .setTimestamp();
-                try{
-                  const imgResult = await resolveImage({ identifier: String(id) }, contract, 'ethereum');
-                  if(imgResult?.type === 'buffer'){
-                    const att = new AttachmentBuilder(imgResult.buffer, {name: imgResult.filename});
-                    alertEmbed.setThumbnail(`attachment://${imgResult.filename}`);
-                    await alertChannel.send({ embeds:[alertEmbed], files:[att] });
-                  } else {
-                    if(imgResult?.type === 'url') alertEmbed.setThumbnail(imgResult.url);
-                    await alertChannel.send({ embeds:[alertEmbed] });
+                // Build rank alerts using the SAME card layout as normal listing posts.
+                // OpenSea listing events for OCAS often have asset=null, so hydrate traits from Railway.
+                const dbTraits = tj.token?.traits || {};
+                const hydratedTraits = Object.entries(dbTraits).map(([trait_type, value]) => ({ trait_type, value }));
+                const listingForEmbed = {
+                  ...listing,
+                  asset: {
+                    ...(listing.asset || {}),
+                    token_id: String(id),
+                    identifier: String(id),
+                    name: `#${id}`,
+                    traits: hydratedTraits,
+                    image_url: listing.asset?.image_url || null,
+                    display_image_url: listing.asset?.display_image_url || null,
+                    image_preview_url: listing.asset?.image_preview_url || null,
+                  },
+                  criteria: {
+                    ...(listing.criteria || {}),
+                    encoded_token_ids: String(id),
+                    contract: { address: contract }
                   }
-                }catch(e){ await alertChannel.send({ embeds:[alertEmbed] }); }
+                };
+
+                const alertEmbed = await buildListingEmbed(listingForEmbed, config);
+                alertEmbed
+                  .setColor(0xf59e0b)
+                  .setFooter({ text: `Listings Bot - ${config.slug || 'on-chain-all-stars'} • Rank Alert ◆${Number(osRank).toLocaleString()}` });
+
+                try{
+                  await sendEmbed(alertChannel, alertEmbed);
+                }catch(e){
+                  console.error('[Rank alert post]', e.message);
+                  await alertChannel.send({ embeds:[alertEmbed] }).catch(()=>{});
+                }
                 console.log(`[Rank Alert] #${id} OS Rank #${osRank} listed at ${priceStr}`);
               }
             }catch(e){ console.warn('[Rank alert]', e.message); }
