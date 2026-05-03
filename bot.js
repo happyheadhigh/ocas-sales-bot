@@ -293,10 +293,11 @@ function sweepTokenUrl(item){
 function formatSweepTokenLine(item){
   const tokenId = getSweepTokenId(item);
   const rank = item?.os_rank ? ('◆' + Number(item.os_rank).toLocaleString()) : (item?.obs_rank ? ('◆' + Number(item.obs_rank).toLocaleString()) : null);
-  const row = ['[#' + tokenId + '](' + sweepTokenUrl(item) + ')'];
-  if(rank) row.push(rank);
-  row.push('Ξ ' + parseFloat(item.price_eth).toFixed(4));
-  return row.join(' — ');
+  const tokenLink = '[#' + tokenId + '](' + sweepTokenUrl(item) + ')';
+  const price = 'Ξ ' + parseFloat(item.price_eth).toFixed(4);
+  // Clean compact row: clickable token ID · rank · price
+  // Avoid long hyphen separators so the private sweep list reads cleaner on mobile.
+  return [tokenLink, rank, price].filter(Boolean).join('  ·  ');
 }
 
 
@@ -1774,7 +1775,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
 
       const embed = new EmbedBuilder()
         .setTitle(`OCAS #${tokenId}`)
-        .setColor(0x2dd4bf)
+        .setColor(0x8b5cf6)
         .setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
 
       if(imgResult?.type==='buffer'){
