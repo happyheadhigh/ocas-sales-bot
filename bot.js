@@ -856,7 +856,9 @@ async function pollListings(){
         const RAILWAY_URL = process.env.RAILWAY_API_URL;
         const API_SECRET  = process.env.API_SECRET;
         if(RAILWAY_URL){
-          for(const listing of toPostListings){
+          // Rank alerts should check ALL new listings, not only listings that passed trait filters.
+          // Normal listing posts can stay trait-filtered, but OS rank alerts must be independent.
+          for(const listing of toPost){
             const id = parseInt(
               (listing.asset?.token_id) ||
               (listing.asset?.identifier) ||
