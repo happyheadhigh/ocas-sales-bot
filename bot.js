@@ -977,7 +977,7 @@ client.on('interactionCreate', async (interaction)=>{
       if(action === 'prev') session.page--;
       await interaction.deferUpdate();
     }
-    const PAGE_SIZE = 15;
+    const PAGE_SIZE = 8;
     const listings = session.listings;
     const totalPages = Math.ceil(listings.length / PAGE_SIZE);
     const page = Math.max(0, Math.min(session.page, totalPages - 1));
@@ -1789,10 +1789,19 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
         workingSearch = workingSearch.replace(tcMatch[0], ' ').trim();
       }
 
-      // ── Simple depluralize (Zombies→Zombie, skip Teeth/Tattoos) ─────────
-      const SKIP_DEPLURAL = new Set(['teeth','tattoos','traits']);
+      // ── Simple depluralize (Zombies→Zombie, Hoodies→Hoodie, skip exact trait words) ─────────
+      const PLURAL_OVERRIDES = {
+        zombies: 'zombie',
+        hoodies: 'hoodie',
+        skeletons: 'skeleton',
+        apes: 'ape',
+        aliens: 'alien',
+        robots: 'robot'
+      };
+      const SKIP_DEPLURAL = new Set(['teeth','tattoos','traits','clothes','glasses']);
       workingSearch = workingSearch.split(' ').map(w => {
         const lw = w.toLowerCase();
+        if(PLURAL_OVERRIDES[lw]) return PLURAL_OVERRIDES[lw];
         if(SKIP_DEPLURAL.has(lw)) return w;
         if(lw.endsWith('ies') && lw.length > 4) return w.slice(0,-3)+'y';
         if(lw.endsWith('s') && lw.length > 3) return w.slice(0,-1);
@@ -1823,20 +1832,44 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       const traitLabel = labelParts.length ? labelParts.join(' · ') : 'OCAS';
       const title = 'Sweep ' + sweepCount + ' ' + traitLabel;
 
-      // ── Fetch cheapest listed tokens from Railway ────────────────────────
-      // Fetch count+1 so we can compute the post-sweep floor
-      const qs = new URLSearchParams({ listed:'1', limit: String(sweepCount+1), key: API_SECRET||'' });
-      if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
-      if(traitCount !== null) qs.set('trait_count', String(traitCount));
-      console.log('[/sweep] fetching multi-trait-tokens, groups:', matchedGroups.length, 'traitCount:', traitCount, 'sweepCount:', sweepCount);
-      const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
-      console.log('[/sweep] response status:', r.status);
-      if(!r.ok){ const txt = await r.text(); throw new Error('multi-trait-tokens HTTP ' + r.status + ': ' + txt.slice(0,200)); }
-      const j = await r.json();
-      console.log('[/sweep] tokens returned:', j.tokens?.length);
-      if(!j.ok) throw new Error(j.error||'API error');
-
-      const allFetched = (j.tokens||[]).filter(t => t.price_eth != null);
+      // ── Fetch cheapest listed tokens ────────────────────────────────────
+      // Fetch count+1 so we can compute the post-sweep floor.
+      // If no trait/count/rank filter was provided, do a plain collection floor sweep
+      // directly from Postgres. /db/multi-trait-tokens intentionally rejects empty filters.
+      let allFetched = [];
+      if(!matchedGroups.length && traitCount === null){
+        console.log('[/sweep] plain sweep from DB, sweepCount:', sweepCount);
+        const dbRes = await pgPool.query(
+          `SELECT l.token_id, l.price_eth, l.url, t.os_rank, t.obs_rank, t.trait_count
+           FROM listings l
+           LEFT JOIN tokens t ON t.id = l.token_id
+           ORDER BY l.price_eth ASC
+           LIMIT $1`,
+          [sweepCount + 1]
+        );
+        allFetched = dbRes.rows.map(r => ({
+          token_id: parseInt(r.token_id),
+          price_eth: parseFloat(r.price_eth),
+          url: r.url,
+          os_rank: r.os_rank ? parseInt(r.os_rank) : null,
+          obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
+          trait_count: r.trait_count ? parseInt(r.trait_count) : null
+        }));
+        console.log('[/sweep] plain sweep tokens returned:', allFetched.length);
+      } else {
+        if(!RAILWAY_URL) throw new Error('RAILWAY_API_URL is required for trait/count sweeps.');
+        const qs = new URLSearchParams({ listed:'1', limit: String(sweepCount+1), key: API_SECRET||'' });
+        if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
+        if(traitCount !== null) qs.set('trait_count', String(traitCount));
+        console.log('[/sweep] fetching multi-trait-tokens, groups:', matchedGroups.length, 'traitCount:', traitCount, 'sweepCount:', sweepCount);
+        const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
+        console.log('[/sweep] response status:', r.status);
+        if(!r.ok){ const txt = await r.text(); throw new Error('multi-trait-tokens HTTP ' + r.status + ': ' + txt.slice(0,200)); }
+        const j = await r.json();
+        console.log('[/sweep] tokens returned:', j.tokens?.length);
+        if(!j.ok) throw new Error(j.error||'API error');
+        allFetched = (j.tokens||[]).filter(t => t.price_eth != null);
+      }
       const sweepListings = allFetched.slice(0, sweepCount);
       const postSweepToken = allFetched[sweepCount] || null;
 
@@ -1865,24 +1898,24 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       desc += '**Highest included:** Ξ ' + fmt(highest) + '\n';
       if(floorAfter) desc += '**New floor after sweep:** Ξ ' + fmt(floorAfter) + '\n';
 
-      // ── Token list (cap at 15 in the public embed) ───────────────────────
-      const SHOW_MAX = 15;
+      // ── Token list (keep public embed short enough for Discord limits) ───
+      const SHOW_MAX = 8;
       const toShow = sweepListings.slice(0, SHOW_MAX);
       const tokenLines = toShow.map(t => {
-        const rank = t.os_rank ? ('◆' + t.os_rank.toLocaleString()) : (t.obs_rank ? ('◆' + t.obs_rank.toLocaleString()) : null);
+        const rank = t.os_rank ? ('◆' + Number(t.os_rank).toLocaleString()) : (t.obs_rank ? ('◆' + Number(t.obs_rank).toLocaleString()) : null);
         const osUrl = t.url || ('https://opensea.io/assets/ethereum/0x078be86f3104a32313a47815792230a3808642cc/' + t.token_id);
         const row = ['[#' + t.token_id + '](' + osUrl + ')'];
         if(rank) row.push(rank);
         row.push('Ξ ' + parseFloat(t.price_eth).toFixed(4));
         return row.join(' — ');
       });
-      if(available > SHOW_MAX) tokenLines.push('_Showing first ' + SHOW_MAX + ' of ' + available + ' included._');
+      desc += '\n**Tokens**\n' + tokenLines.join('\n');
+      if(available > SHOW_MAX) desc += '\n_Showing first ' + SHOW_MAX + ' of ' + available + ' included._';
 
       const embed = new EmbedBuilder()
         .setTitle(title)
         .setColor(0x2dd4bf)
-        .setDescription(desc)
-        .addFields({ name: 'Tokens', value: tokenLines.join('\n'), inline: false });
+        .setDescription(desc.slice(0, 4090));
 
       // ── Show All button if more than SHOW_MAX tokens ─────────────────────
       const components = [];
