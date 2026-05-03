@@ -592,7 +592,7 @@ function traitObjectToArray(traitsObj){
 }
 
 function osRankBadge(osRank){
-  return osRank ? `▲${Number(osRank).toLocaleString()}` : '';
+  return osRank ? `♦${Number(osRank).toLocaleString()}` : '';
 }
 
 function titleTokenId(tokenId, fallbackName){
