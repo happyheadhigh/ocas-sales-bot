@@ -554,6 +554,51 @@ async function sendEmbed(target, embed){
   return target.send({embeds:[embed]});
 }
 
+
+// ── Token DB metadata helper — OS rank + traits for listing/sale cards ──────
+const tokenMetaCache = new Map(); // tokenId → { meta, expires }
+async function fetchTokenMetaFromDb(tokenId){
+  const id = parseInt(tokenId);
+  if(!id) return null;
+  const cached = tokenMetaCache.get(id);
+  if(cached && Date.now() < cached.expires) return cached.meta;
+
+  const RAILWAY_URL = process.env.RAILWAY_API_URL;
+  const API_SECRET  = process.env.API_SECRET;
+  if(!RAILWAY_URL) return null;
+
+  try{
+    const qs = new URLSearchParams({ key: API_SECRET || '' });
+    const r = await fetch(`${RAILWAY_URL}/db/token/${id}?${qs}`);
+    if(!r.ok) return null;
+    const j = await r.json();
+    if(!j.ok || !j.token) return null;
+    const meta = {
+      os_rank: j.token.os_rank ? parseInt(j.token.os_rank) : null,
+      traits:  j.token.traits || null,
+      trait_count: j.token.trait_count ? parseInt(j.token.trait_count) : null,
+    };
+    tokenMetaCache.set(id, { meta, expires: Date.now() + 5 * 60 * 1000 });
+    return meta;
+  }catch(e){
+    console.warn('[Token meta]', id, e.message);
+    return null;
+  }
+}
+
+function traitObjectToArray(traitsObj){
+  if(!traitsObj || typeof traitsObj !== 'object') return [];
+  return Object.entries(traitsObj).map(([trait_type, value]) => ({ trait_type, value }));
+}
+
+function osRankBadge(osRank){
+  return osRank ? `▲${Number(osRank).toLocaleString()}` : '';
+}
+
+function titleTokenId(tokenId, fallbackName){
+  return tokenId ? `#${tokenId}` : (fallbackName || 'Unknown');
+}
+
 // ── Build SALE embed ──────────────────────────────────────────────────────────
 async function buildSaleEmbed(sale, config){
   const id=sale.nft?.identifier;
@@ -574,28 +619,34 @@ async function buildSaleEmbed(sale, config){
   const WETH_ADDR    = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
   const isWeth       = paymentAddr === WETH_ADDR || paymentToken.toLowerCase() === 'weth';
   const currencySymbol = isWeth ? 'WETH' : 'ETH';
-  const saleType     = sale.event_type === 'offer_accepted' ? 'Offer Accepted' : 'Listed Sale';
 
+  const dbMeta = id ? await fetchTokenMetaFromDb(id) : null;
+  const osRank = dbMeta?.os_rank || sale.nft?.os_rank || null;
+  const rankPart = osRankBadge(osRank);
   const sweepPrefix = sale._isSweep ? '🧹 ' : '';
+  const tokenLabel = titleTokenId(id, name);
+  const embedTitle = `${sweepPrefix}${eth ? eth+' '+currencySymbol : '--'} • ${tokenLabel}${rankPart ? ' '+rankPart : ''} Sold`;
+
+  const footerBits = ['Sales Bot', slug];
+  if(timeStr) footerBits.push(timeStr);
   const embed=new EmbedBuilder()
-    .setTitle(`${sweepPrefix}${eth?eth+' '+currencySymbol:'--'} — ${name} sold`)
+    .setTitle(embedTitle)
     .setColor(isWeth ? 0x9b59b6 : 0x2dd4bf)  // purple for WETH, teal for ETH
     .setURL(osUrl)
-    .setFooter({text:`Sales Bot - ${slug}${timeStr?' - '+timeStr:''}`})
+    .setFooter({text:footerBits.filter(Boolean).join(' • ')})
     .setTimestamp();
 
   embed._imageResult=await resolveImage(sale.nft,contract,config.chain||'ethereum');
 
-  // Buyer + Seller on same row (inline), then Traits full-width, then Links
-  // This eliminates dead space that was caused by tall Traits column next to thumbnail
+  // Buyer + Seller on same row, then Traits stacked underneath.
   embed.addFields(
     {name:'Buyer',  value:buyerLink,  inline:true},
     {name:'Seller', value:sellerLink, inline:true},
-    {name:'​',   value:'​',        inline:true}, // blank field to complete the 3-col row
+    {name:'​',   value:'​',        inline:true},
   );
-  const traits=sale.nft?.traits||[];
+  let traits=sale.nft?.traits||[];
+  if((!traits || traits.length===0) && dbMeta?.traits) traits = traitObjectToArray(dbMeta.traits);
   if(traits.length>0){
-    // Two columns of traits side by side
     const traitLines = traits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`);
     const half = Math.ceil(traitLines.length/2);
     const col1 = traitLines.slice(0,half).join('\n');
@@ -605,7 +656,7 @@ async function buildSaleEmbed(sale, config){
       {name:'​',  value:col2||'​', inline:true},
     );
   }
-  embed.addFields({name:'Links',value:`[OpenSea](${osUrl}) - [TraitView](${tvUrl})`,inline:false});
+  embed.addFields({name:'Links',value:`[OpenSea](${osUrl}) • [TraitView](${tvUrl})`,inline:false});
   return embed;
 }
 
@@ -633,6 +684,8 @@ async function buildListingEmbed(listing, config){
     asset.token_id ||
     asset.identifier ||
     criteria.encoded_token_ids ||
+    listing.token_id ||
+    listing.identifier ||
     ''
   );
 
@@ -640,20 +693,27 @@ async function buildListingEmbed(listing, config){
   const contract = config.contract ||
     (asset.asset_contract && asset.asset_contract.address) ||
     (criteria.contract && criteria.contract.address) ||
-    '';
+    '0x078be86f3104a32313a47815792230a3808642cc';
 
-  const name   = asset.name || (id ? '#'+id : 'Unknown');
   const osUrl  = (contract && id) ? 'https://opensea.io/assets/'+chain+'/'+contract+'/'+id : 'https://opensea.io/collection/'+slug;
   const tvUrl  = id ? 'https://traitview.com/?jump='+id : '';
 
-  const sellerAddr = (typeof listing.maker === 'string' ? listing.maker : (listing.maker && listing.maker.address)) || '';
+  const sellerAddr = (typeof listing.maker === 'string' ? listing.maker : (listing.maker && listing.maker.address)) || listing.seller || '';
   const sellerLink = sellerAddr ? '['+shortAddr(sellerAddr)+'](https://opensea.io/'+sellerAddr+')' : 'unknown';
 
+  const dbMeta = listing._dbToken || (id ? await fetchTokenMetaFromDb(id) : null);
+  const osRank = dbMeta?.os_rank || listing.os_rank || asset.os_rank || null;
+  const rankPart = osRankBadge(osRank);
+  const tokenLabel = titleTokenId(id, asset.name);
+  const embedTitle = `${eth ? eth+' ETH' : '--'} • ${tokenLabel}${rankPart ? ' '+rankPart : ''} Listed`;
+
+  const footerBits = ['Listings Bot', slug];
+  if(config._rankAlert) footerBits.push('Rank Alert');
   const embed = new EmbedBuilder()
-    .setTitle(`${eth ? eth+' ETH' : '--'} — ${name} listed`)
-    .setColor(0x7aa2ff)
+    .setTitle(embedTitle)
+    .setColor(config._rankAlert ? 0xf59e0b : 0x7aa2ff)
     .setURL(osUrl)
-    .setFooter({text:'Listings Bot - '+slug})
+    .setFooter({text:footerBits.filter(Boolean).join(' • ')})
     .setTimestamp();
 
   // resolveImage fetches from OpenSea NFT endpoint using the token ID
@@ -666,19 +726,29 @@ async function buildListingEmbed(listing, config){
   };
   embed._imageResult = id ? await resolveImage(nftLike, contract, chain) : null;
 
+  // Seller + Buy Now on same row, then Traits stacked underneath like sale cards.
   embed.addFields(
     {name:'Seller',  value: sellerLink,             inline:true},
     {name:'Buy Now', value: '[OpenSea]('+osUrl+')', inline:true},
+    {name:'​',  value:'​', inline:true},
   );
 
-  const traits = asset.traits || [];
+  let traits = asset.traits || [];
+  if((!traits || traits.length === 0) && dbMeta?.traits) traits = traitObjectToArray(dbMeta.traits);
   if(traits.length > 0){
-    embed.addFields({name:'Traits', value:traits.slice(0,12).map(function(t){return '**'+t.trait_type+'**: '+t.value;}).join('\n'), inline:true});
+    const traitLines = traits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`);
+    const half = Math.ceil(traitLines.length/2);
+    const col1 = traitLines.slice(0,half).join('\n');
+    const col2 = traitLines.slice(half).join('\n');
+    embed.addFields(
+      {name:'Traits', value:col1, inline:true},
+      {name:'​', value:col2||'​', inline:true},
+    );
   }
 
   const linkParts = ['[OpenSea]('+osUrl+')'];
   if(tvUrl) linkParts.push('[TraitView]('+tvUrl+')');
-  embed.addFields({name:'Links', value:linkParts.join(' - '), inline:false});
+  embed.addFields({name:'Links', value:linkParts.join(' • '), inline:false});
   return embed;
 }
 
@@ -850,14 +920,13 @@ async function pollListings(){
         await new Promise(r=>setTimeout(r,300));
       }
 
-      // ── Rank listing alert ────────────────────────────────────────────────
+      // ── OS Rank listing alert ─────────────────────────────────────────────
+      // Rank alerts intentionally check ALL new listings, not just the ones that
+      // passed trait listing filters. Bot uses OS rank only.
       const rankAlertCfg = config.rankAlert;
       if(rankAlertCfg?.min && rankAlertCfg?.max){
         const RAILWAY_URL = process.env.RAILWAY_API_URL;
-        const API_SECRET  = process.env.API_SECRET;
         if(RAILWAY_URL){
-          // Rank alerts should check ALL new listings, not only listings that passed trait filters.
-          // Normal listing posts can stay trait-filtered, but OS rank alerts must be independent.
           for(const listing of toPost){
             const id = parseInt(
               (listing.asset?.token_id) ||
@@ -867,57 +936,21 @@ async function pollListings(){
             );
             if(!id) continue;
             try{
-              const tqs = new URLSearchParams({ key: API_SECRET||'' });
-              const tr = await fetch(`${RAILWAY_URL}/db/token/${id}?${tqs}`);
-              if(!tr.ok) continue;
-              const tj = await tr.json();
-              if(!tj.ok) continue;
-              const osRank = tj.token?.os_rank;
+              const dbMeta = await fetchTokenMetaFromDb(id);
+              const osRank = dbMeta?.os_rank;
               if(!osRank) continue;
               if(osRank >= rankAlertCfg.min && osRank <= rankAlertCfg.max){
                 const alertChannel = client.channels.cache.get(
                   rankAlertCfg.channelId || config.listingsChannelId || config.channelId
                 );
                 if(!alertChannel) continue;
-                const eth = formatListingEth(listing);
-                const priceStr = eth ? `Ξ ${eth}` : '—';
-                const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
-
-                // Build rank alerts using the SAME card layout as normal listing posts.
-                // OpenSea listing events for OCAS often have asset=null, so hydrate traits from Railway.
-                const dbTraits = tj.token?.traits || {};
-                const hydratedTraits = Object.entries(dbTraits).map(([trait_type, value]) => ({ trait_type, value }));
-                const listingForEmbed = {
-                  ...listing,
-                  asset: {
-                    ...(listing.asset || {}),
-                    token_id: String(id),
-                    identifier: String(id),
-                    name: `#${id}`,
-                    traits: hydratedTraits,
-                    image_url: listing.asset?.image_url || null,
-                    display_image_url: listing.asset?.display_image_url || null,
-                    image_preview_url: listing.asset?.image_preview_url || null,
-                  },
-                  criteria: {
-                    ...(listing.criteria || {}),
-                    encoded_token_ids: String(id),
-                    contract: { address: contract }
-                  }
-                };
-
-                const alertEmbed = await buildListingEmbed(listingForEmbed, config);
-                alertEmbed
-                  .setColor(0xf59e0b)
-                  .setFooter({ text: `Listings Bot - ${config.slug || 'on-chain-all-stars'} • Rank Alert ◆${Number(osRank).toLocaleString()}` });
-
-                try{
-                  await sendEmbed(alertChannel, alertEmbed);
-                }catch(e){
-                  console.error('[Rank alert post]', e.message);
-                  await alertChannel.send({ embeds:[alertEmbed] }).catch(()=>{});
-                }
-                console.log(`[Rank Alert] #${id} OS Rank #${osRank} listed at ${priceStr}`);
+                const alertEmbed = await buildListingEmbed(
+                  { ...listing, _dbToken: dbMeta },
+                  { ...config, _rankAlert: true }
+                );
+                try{ await sendEmbed(alertChannel, alertEmbed); }
+                catch(e){ console.error('[Rank alert post]', e.message); }
+                console.log(`[Rank Alert] #${id} OS Rank #${osRank} listed`);
               }
             }catch(e){ console.warn('[Rank alert]', e.message); }
           }
