@@ -1767,7 +1767,8 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
   if(commandName==='sweep'){
     const RAILWAY_URL = process.env.RAILWAY_API_URL;
     const API_SECRET  = process.env.API_SECRET;
-    const rawSearch   = (interaction.options.getString('search')||''). trim();
+    const rawSearch   = (interaction.options.getString('search')||'').trim();
+    console.log('[/sweep] RAILWAY_URL set:', !!RAILWAY_URL, 'search:', rawSearch);
     await interaction.deferReply();
     try{
 
@@ -1827,9 +1828,12 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       const qs = new URLSearchParams({ listed:'1', limit: String(sweepCount+1), key: API_SECRET||'' });
       if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
       if(traitCount !== null) qs.set('trait_count', String(traitCount));
+      console.log('[/sweep] fetching multi-trait-tokens, groups:', matchedGroups.length, 'traitCount:', traitCount, 'sweepCount:', sweepCount);
       const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
-      if(!r.ok) throw new Error('multi-trait-tokens HTTP ' + r.status);
+      console.log('[/sweep] response status:', r.status);
+      if(!r.ok){ const txt = await r.text(); throw new Error('multi-trait-tokens HTTP ' + r.status + ': ' + txt.slice(0,200)); }
       const j = await r.json();
+      console.log('[/sweep] tokens returned:', j.tokens?.length);
       if(!j.ok) throw new Error(j.error||'API error');
 
       const allFetched = (j.tokens||[]).filter(t => t.price_eth != null);
@@ -1894,8 +1898,8 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       await interaction.editReply({ embeds: [embed], components });
 
     }catch(e){
-      console.error('[/sweep]', e.message);
-      try{ await interaction.editReply('Something went wrong. Please try again.'); }catch(_){}
+      console.error('[/sweep] ERROR:', e.message, e.stack);
+      try{ await interaction.editReply('Error: ' + e.message); }catch(_){}
     }
     return;
   }
