@@ -302,7 +302,7 @@ function sweepTokenUrl(item){
 
 function formatSweepTokenLine(item){
   const tokenId = getSweepTokenId(item);
-  const rank = item?.os_rank ? ('⬥' + Number(item.os_rank).toLocaleString()) : (item?.obs_rank ? ('⬥' + Number(item.obs_rank).toLocaleString()) : null);
+  const rank = item?.os_rank ? ('◆' + Number(item.os_rank).toLocaleString()) : (item?.obs_rank ? ('◆' + Number(item.obs_rank).toLocaleString()) : null);
   const tokenLink = '[#' + tokenId + '](' + sweepTokenUrl(item) + ')';
   const price = 'Ξ ' + parseFloat(item.price_eth).toFixed(4);
   // Clean compact row: clickable token ID · rank · price
@@ -602,7 +602,7 @@ function traitObjectToArray(traitsObj){
 }
 
 function osRankBadge(osRank){
-  return osRank ? `⬥${Number(osRank).toLocaleString()}` : '';
+  return osRank ? `◆${Number(osRank).toLocaleString()}` : '';
 }
 
 function titleTokenId(tokenId, fallbackName){
@@ -990,17 +990,6 @@ async function sendPersonalAlerts(event, type, config){
       if(type==='listing'&&!alert.alertListings) continue;
       const traits=type==='sale'?(event.nft?.traits||[]):(event.asset?.traits||event.item?.traits||event.nft?.traits||[]);
       if(!matchesFilters(traits,alert.traitFilters)) continue;
-      // Rank filter: if user set rank_min/rank_max, only DM if token is in range
-      if(alert.rankAlertMin || alert.rankAlertMax){
-        const RAILWAY_URL = process.env.RAILWAY_API_URL;
-        const API_SECRET  = process.env.API_SECRET;
-        const tokenId = type==='sale' ? event.nft?.identifier : (event.asset?.token_id||event.asset?.identifier||event.criteria?.encoded_token_ids||event.token_id);
-        const meta = tokenId ? await fetchTokenMetaFromDb(tokenId) : null;
-        const osRank = meta?.os_rank;
-        if(!osRank) continue; // no rank data, skip to be safe
-        if(alert.rankAlertMin && osRank < alert.rankAlertMin) continue;
-        if(alert.rankAlertMax && osRank > alert.rankAlertMax) continue;
-      }
       // Skip if already sent this event to this user
       const dedupKey = `${userId}:${type}:${event.id||event.event_timestamp}`;
       if(alertedEventIds.has(dedupKey)) continue;
@@ -1250,7 +1239,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   // /clearfilters
   // /setrankalert — configure rank-based listing alerts (admin)
-  if(commandName==='ranklistings'){
+  if(commandName==='ranklistingfilter'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const rankMin  = interaction.options.getInteger('min') ?? 1;
     const rankMax  = interaction.options.getInteger('max') ?? 100;
@@ -1277,7 +1266,7 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // /clearrankalert — remove rank alert config
-  if(commandName==='clearranklisting'){
+  if(commandName==='removerankfilter'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     setConfig(guildId, { rankAlert: null });
     await interaction.reply({ content:'Rank alert cleared.', flags: MessageFlags.Ephemeral });
@@ -1418,20 +1407,70 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   // /traitfind — search sales history by trait. Tries Railway DB first (full history),
   // falls back to OpenSea pagination (capped ~1500 sales) if DB not configured.
   if(commandName==='traitfind'){
-    const slug  = interaction.options.getString('collection') || config.slug;
-    const trait = interaction.options.getString('trait').trim();
-    const value = interaction.options.getString('value').trim();
-    const want  = Math.min(interaction.options.getInteger('count') || 5, 25);
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    await interaction.deferReply();
-
+    const slug       = interaction.options.getString('collection') || config.slug;
+    const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = process.env.RAILWAY_API_URL;
     const API_SECRET  = process.env.API_SECRET;
 
+    // Detect mode: listings or sales (default)
+    const wantListings = /\blistings?\b/i.test(rawSearch);
+    const wantSales    = !wantListings; // sales is default
+    let workingSearch = rawSearch.replace(/\b(listings?|sales?)\b/gi, ' ').trim();
+
+    // Parse count: first standalone number (default 5)
+    let want = 5;
+    const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
+    if(numMatch){ const n=parseInt(numMatch[1]); if(n>0&&n<=25){ want=n; workingSearch=workingSearch.replace(numMatch[0],' ').trim(); } }
+
+    // Resolve trait name+value using phrase-aware parser
+    let trait = '', value = '';
+    if(workingSearch && RAILWAY_URL){
+      try{
+        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
+        const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
+        if(resolved.groups.length){ trait = resolved.groups[0][0].trait_name; value = resolved.groups[0][0].trait_value; }
+      }catch(e){ console.warn('[traitfind] parser error:', e.message); }
+    }
+    if(!trait && workingSearch){ trait=''; value=workingSearch; }
+
+    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
+    if(!value) return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie` or `/traitfind search:gold chain listings`', flags: MessageFlags.Ephemeral});
+    await interaction.deferReply();
+
     try{
-      // ── Path A: Railway DB (full 15k+ sale history, instant) ──────────────
+      // ── Listings mode ──────────────────────────────────────────────────────
+      if(wantListings && RAILWAY_URL){
+        await interaction.editReply(`🔍 Searching listed tokens with **${trait ? trait+': ' : ''}${value}**...`);
+        // Use multi-trait-tokens with listed=1 — build a single-group filter
+        const groups = [[{ trait_name: trait || '_any', trait_value: value }]];
+        // For single known trait, use groups param; otherwise fall back to trait-sales endpoint
+        const qs = new URLSearchParams({ listed:'1', limit: String(want), key: API_SECRET||'' });
+        if(trait) qs.set('groups', JSON.stringify([[{ trait_name: trait, trait_value: value }]]));
+        const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
+        if(r.ok){
+          const j = await r.json();
+          if(!j.ok) throw new Error(j.error || 'API error');
+          const tokens = j.tokens || [];
+          if(!tokens.length){ await interaction.editReply(`No listed tokens found with **${trait ? trait+': ' : ''}${value}**.`); return; }
+          const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+          const listEmbeds = await Promise.all(tokens.map(async t => {
+            const dbMeta = await fetchTokenMetaFromDb(t.token_id).catch(()=>null);
+            const fakeListingObj = {
+              token_id: t.token_id, price_eth: t.price_eth, url: t.url,
+              asset: { token_id: String(t.token_id), traits: dbMeta?.traits ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v})) : [] },
+              _dbToken: dbMeta,
+            };
+            return buildListingEmbed(fakeListingObj, {...config, slug}).catch(()=>null);
+          }));
+          await postEmbeds(interaction, listEmbeds.filter(Boolean),
+            `Found **${tokens.length}** listing${tokens.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (cheapest first):`);
+          return;
+        }
+      }
+
+      // ── Sales mode (default) ───────────────────────────────────────────────
       if(RAILWAY_URL){
-        await interaction.editReply(`🔍 Searching **${trait}: ${value}** in full sales history...`);
+        await interaction.editReply(`🔍 Searching **${trait ? trait+': ' : ''}${value}** in full sales history...`);
         const qs = new URLSearchParams({ trait, value, limit: String(Math.min(want, 200)), sort: 'desc' });
         if(API_SECRET) qs.set('key', API_SECRET);
         const r = await fetch(`${RAILWAY_URL}/db/trait-sales?${qs}`);
@@ -1439,41 +1478,31 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           const j = await r.json();
           if(!j.ok) throw new Error(j.error || 'DB error');
           const sales = j.sales || [];
-          if(!sales.length){
-            await interaction.editReply(`No sales found in DB for **${trait}: ${value}** (searched ${j.count ?? 'all'} records).`);
-            return;
-          }
-          // Build synthetic sale objects and embeds
+          if(!sales.length){ await interaction.editReply(`No sales found for **${trait ? trait+': ' : ''}${value}** (searched ${j.count ?? 'all'} records).`); return; }
           const cfg = {...config, slug};
           const toShow = sales.slice(0, want);
-          const traitfindEmbeds = await Promise.all(toShow.map(async sale => {
-            let tokenTraits = [];
-            try{
-              const tqs = new URLSearchParams({ key: API_SECRET||'' });
-              const tr = await fetch(`${RAILWAY_URL}/db/token/${sale.token_id}?${tqs}`);
-              if(tr.ok){ const tj = await tr.json(); if(tj.ok && tj.token?.traits) tokenTraits = Object.entries(tj.token.traits).map(([k,v])=>({ trait_type:k, value:v })); }
-            }catch(e){}
+          const saleEmbeds = await Promise.all(toShow.map(async sale => {
+            const dbMeta = await fetchTokenMetaFromDb(sale.token_id).catch(()=>null);
+            const tokenTraits = dbMeta?.traits ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v})) : [];
             const syntheticSale = {
               nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
-              buyer: sale.buyer || 'unknown', seller: sale.seller || 'unknown',
-              payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH' ? '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2' : '', quantity: sale.price_eth != null ? String(BigInt(Math.round(sale.price_eth * 1e18))) : '0', decimals: 18 },
+              buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
+              payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH'?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
               event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
             };
             return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
           }));
           const totalNote = j.count > want ? ` (showing ${want} of ${j.count} total)` : '';
-          await postEmbeds(interaction, traitfindEmbeds.filter(Boolean),
-            `Found **${j.count}** sale${j.count===1?'':'s'} with **${trait}: ${value}**${totalNote}:`);
+          await postEmbeds(interaction, saleEmbeds.filter(Boolean),
+            `Found **${j.count}** sale${j.count===1?'':'s'} with **${trait ? trait+': ' : ''}${value}**${totalNote}:`);
           return;
         }
-        // DB call failed — fall through to OpenSea
         console.warn('[traitfind] Railway DB call failed, falling back to OpenSea');
       }
 
-      // ── Path B: OpenSea pagination fallback (capped ~1500 sales) ──────────
-      await interaction.editReply(`🔍 Searching OpenSea sales for **${trait}: ${value}**...`);
-      const traitLow = trait.toLowerCase();
-      const valueLow = value.toLowerCase();
+      // ── OpenSea fallback (sales only) ──────────────────────────────────────
+      await interaction.editReply(`🔍 Searching OpenSea sales for **${trait ? trait+': ' : ''}${value}**...`);
+      const traitLow=trait.toLowerCase(), valueLow=value.toLowerCase();
       const matched=[];let cursor=null;let pages=0;
       while(matched.length<want&&pages<15){
         const qs=new URLSearchParams({event_type:'sale',limit:'100'});
@@ -1489,13 +1518,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         }
         cursor=j.next||null;if(!cursor) break;pages++;
       }
-      if(!matched.length){
-        await interaction.editReply(`No sales found with **${trait}: ${value}** in the last ~${pages*100} sales.
-_Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
-        return;
-      }
-      await interaction.editReply(`Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait}: ${value}** (OpenSea, last ~${pages*100}):`);
+      if(!matched.length){ await interaction.editReply(`No sales found with **${trait ? trait+': ' : ''}${value}** in the last ~${pages*100} sales.`); return; }
       const cfg={...config,slug};
+      await interaction.editReply(`Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (OpenSea, last ~${pages*100}):`);
       for(const sale of matched){const embed=await buildSaleEmbed(sale,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
@@ -1556,8 +1581,6 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
     const alertSales=interaction.options.getBoolean('sales')??true;
     const alertListings=interaction.options.getBoolean('listings')??true;
     const slug=interaction.options.getString('collection')||config.slug;
-    const rankMin=interaction.options.getInteger('rank_min')??null;
-    const rankMax=interaction.options.getInteger('rank_max')??null;
     if(!slug) return interaction.reply({content:'Provide a collection or run `/setup` in a configured server first.', flags: MessageFlags.Ephemeral});
 
     const existing=getAlert(interaction.user.id)||{};
@@ -1571,24 +1594,18 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       else filters[trait]=current===value?current:[current,value];
     }
 
-    // Merge rank range — only update if explicitly provided
-    const rankAlertMin = rankMin ?? existing.rankAlertMin ?? null;
-    const rankAlertMax = rankMax ?? existing.rankAlertMax ?? null;
-
-    setAlert(interaction.user.id,{slug,traitFilters:filters,alertSales,alertListings,rankAlertMin,rankAlertMax});
+    setAlert(interaction.user.id,{slug,traitFilters:filters,alertSales,alertListings});
 
     const fmtF=f=>Object.keys(f||{}).length===0?'none (all)':Object.entries(f).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
     const filterStr=fmtF(filters);
-    const rankStr=rankAlertMin&&rankAlertMax?`⬥${rankAlertMin}–⬥${rankAlertMax}`:'none';
     const lines=[
       `Personal alert set for **${slug}**!`,
-      `Trait filters: ${filterStr}`,
-      `Rank filter: ${rankStr}`,
+      `Filters: ${filterStr}`,
       `Sales DMs: ${alertSales?'on':'off'}`,
       `Listing DMs: ${alertListings?'on':'off'}`,
       '',
       'You will receive DMs when matching events happen.',
-      'Use `/myalert` again to add more filters.',
+      'Use `/myalert` again to add more trait filters.',
       'Use `/myalertclear` to remove your alert.'
     ].join('\n');
 
@@ -1641,71 +1658,91 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
 
   // /help
   // /rankfilter — show currently listed tokens filtered by OS rank range
-  if(commandName==='rankfilter'){
-    const rankMin    = interaction.options.getInteger('min') ?? 1;
-    const rankMax    = interaction.options.getInteger('max') ?? 100;
-    const sortBy     = interaction.options.getString('sort') || 'price'; // 'price' or 'rank'
+  if(commandName==='rankfind'){
+    const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = process.env.RAILWAY_API_URL;
     const API_SECRET  = process.env.API_SECRET;
 
+    // Detect mode: sales or listings (default)
+    const wantSales    = /\bsales?\b/i.test(rawSearch);
+    const wantListings = !wantSales;
+    let workingSearch = rawSearch.replace(/\b(listings?|sales?)\b/gi, ' ').trim();
+
+    // Parse range: "1-100", "1 to 100"
+    let rankMin = 1, rankMax = 100;
+    const rangeMatch = workingSearch.match(/(\d+)\s*(?:-|to|–)\s*(\d+)/);
+    if(rangeMatch){ rankMin = parseInt(rangeMatch[1]); rankMax = parseInt(rangeMatch[2]); }
+    else { const numMatch = workingSearch.match(/(\d+)/); if(numMatch) rankMax = parseInt(numMatch[1]); }
+
+    // Parse sort for listings mode: 'rank'/'best' or default 'price'/'cheapest'
+    const sortBy = /\b(rank|best)\b/i.test(workingSearch) ? 'rank' : 'price';
+
     if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured.', flags: MessageFlags.Ephemeral });
-    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range.', flags: MessageFlags.Ephemeral });
+    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. Try: "1-100" or "1-500 rank"', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
+    const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
     try{
+
+      // ── Sales mode ─────────────────────────────────────────────────────────
+      if(wantSales){
+        const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, limit: '20', sort: 'desc' });
+        if(API_SECRET) qs.set('key', API_SECRET);
+        const r = await fetch(`${RAILWAY_URL}/db/rank-sales?${qs}`);
+        if(!r.ok) throw new Error(`rank-sales API HTTP ${r.status}`);
+        const j = await r.json();
+        if(!j.ok) throw new Error(j.error || 'API error');
+        const sales = j.sales || [];
+        if(!sales.length){ await interaction.editReply(`No sales found for OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
+        const cfg = {...config};
+        const saleEmbeds = await Promise.all(sales.map(async sale => {
+          const tokenTraits = sale.traits && typeof sale.traits==='object'
+            ? Object.entries(sale.traits).map(([k,v])=>({trait_type:k,value:v}))
+            : [];
+          const syntheticSale = {
+            nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
+            buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
+            payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH'?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
+            event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
+          };
+          return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+        }));
+        await postEmbeds(interaction, saleEmbeds.filter(Boolean),
+          `📊 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${sales.length} recent sale${sales.length===1?'':'s'}:`);
+        return;
+      }
+
+      // ── Listings mode (default) ────────────────────────────────────────────
       const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
       if(API_SECRET) qs.set('key', API_SECRET);
       const r = await fetch(`${RAILWAY_URL}/db/rank-listings?${qs}`);
       if(!r.ok) throw new Error(`API HTTP ${r.status}`);
       const j = await r.json();
       if(!j.ok) throw new Error(j.error || 'API error');
-
       let listings = j.listings || [];
-      if(!listings.length){
-        await interaction.editReply(`No listings found with OS rank **⬥ #${rankMin}–#${rankMax}**.`);
-        return;
-      }
-
-      // Sort by rank if requested
+      if(!listings.length){ await interaction.editReply(`No listings found with OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
       if(sortBy === 'rank') listings.sort((a,b) => (a.os_rank??9999) - (b.os_rank??9999));
-
-      // Build full embeds for each listing (same style as sale/listing embeds)
-      const cfg = {...config};
       const rankEmbeds = await Promise.all(listings.map(async l => {
-        // Traits come directly from /db/rank-listings — no extra fetch needed
-        let tokenTraits = [];
-        if(l.traits && typeof l.traits === 'object'){
-          tokenTraits = Object.entries(l.traits).map(([k,v]) => ({ trait_type: k, value: v }));
-        }
+        const tokenTraits = l.traits && typeof l.traits==='object' ? Object.entries(l.traits).map(([k,v])=>({trait_type:k,value:v})) : [];
         const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
+        const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
+        const tvUrl = `https://traitview.com/?token=${l.token_id}`;
         const embed = new EmbedBuilder()
           .setColor(0xf59e0b)
-          .setTitle(`${priceStr} ETH • #${l.token_id}${l.os_rank ? ' ⬥'+Number(l.os_rank).toLocaleString() : ''} Listed`)
+          .setTitle(`${priceStr} ETH • #${l.token_id}${rankBadge} Listed`)
           .setURL(l.url)
-
-          .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · sorted by ${sortBy}` })
+          .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
           .setTimestamp();
-        // Add traits + links
-        const tvUrl = `https://traitview.com/?token=${l.token_id}`;
-        const linkLine = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
+        const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
         if(tokenTraits.length){
-          const traitStr = tokenTraits.slice(0,8).map(t=>`**${t.trait_type}:** ${t.value}`).join('\n');
-          embed.setDescription(traitStr + '\n\n**Links**\n' + linkLine);
-        } else {
-          embed.setDescription('**Links**\n' + linkLine);
-        }
-        // Resolve image — pass nft object with identifier, use contract from config
-        try{
-          const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
-          const imgResult = await resolveImage({ identifier: String(l.token_id) }, contract, 'ethereum');
-          embed._imageResult = imgResult;
-        }catch(e){}
+          embed.setDescription(tokenTraits.slice(0,8).map(t=>`**${t.trait_type}:** ${t.value}`).join('\n') + '\n\n**Links**\n' + tvLink);
+        } else { embed.setDescription('**Links**\n' + tvLink); }
+        try{ embed._imageResult = await resolveImage({ identifier: String(l.token_id) }, contract, 'ethereum'); }catch(e){}
         return embed;
       }));
-
-      const sortLabel = sortBy === 'rank' ? 'best rank first' : 'cheapest first';
+      const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
       await postEmbeds(interaction, rankEmbeds.filter(Boolean),
-        `🏆 **OS Rank ◆ #${rankMin}–#${rankMax}** — ${listings.length} listing${listings.length===1?'':'s'} (${sortLabel}):`);
+        `🏆 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${listings.length} listing${listings.length===1?'':'s'} (${sortLabel}):`);
     }catch(e){
       await interaction.editReply('Error: ' + e.message);
     }
@@ -2036,50 +2073,30 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
   }
 
   if(commandName==='help'){
-    const marketCmds=[
-      '`/ocas search:zombie hoodie` — Random or searched OCAS token',
-      '`/ocas search:gold chain floor` — Cheapest listed with that trait',
-      '`/sweep search:10` — Cost to sweep 10 cheapest listed',
-      '`/sweep search:10 zombie hoodie` — Sweep cheapest 10 with traits',
-      '`/rankfilter min:1 max:100` — Listed tokens by OS rank range',
-      '`/traitfloor trait:Type value:Zombie` — Floor price for a trait',
-    ].join('\n');
-    const salesCmds=[
-      '`/lastsale` — Most recent sale',
-      '`/recentsales count:10` — Last N sales',
-      '`/sale token:1234` — Last sale for a specific token',
-      '`/traitfind trait:Type value:Zombie` — Sales history by trait',
-      '`/listings count:5` — Recent new listings',
-    ].join('\n');
-    const alertCmds=[
-      '`/myalert trait:Type value:Zombie` — DM when a Zombie sells or lists',
-      '`/myalert rank_min:1 rank_max:100` — DM when a top-100 token lists',
-      '`/myalert trait:Type value:Zombie rank_min:1 rank_max:500` — Combined',
-      '`/myalertstatus` — See your current alert settings',
-      '`/myalertclear` — Remove your DM alert',
-    ].join('\n');
     const adminCmds=[
-      '`/setup` — Configure sales channel + collection',
-      '`/setuphere` — Mobile-friendly setup in current channel',
-      '`/setlistings` / `/setlistingshere` — Set listings channel',
-      '`/salesfilter` — Filter auto-posted sales by trait',
-      '`/traitlistingfilter` — Filter auto-posted listings by trait',
-      '`/ranklistings` — Auto-post listings for a rank range',
-      '`/clearranklisting` — Remove rank listing filter',
-      '`/clearallfilters` — Clear all server filters',
-      '`/pause` / `/resume` — Pause/resume auto-posts',
-      '`/status` — Show server config',
+      '`/setup` - Configure sales channel + collection',
+      '`/setlistings` - Set the listings channel',
+      '`/setchannel` - Change sales channel',
+      '`/setcollection` - Change collection',
+      '`/salesfilter` - Filter auto-posted sales by trait',
+      '`/listingfilter` - Filter auto-posted listings by trait',
+      '`/clearfilters` - Clear all server filters',
+      '`/pause` / `/resume` - Pause/resume auto-posts',
+      '`/status` - Show server config'
     ].join('\n');
-    await interaction.reply({embeds:[new EmbedBuilder()
-      .setTitle('OCAS Market Bot')
-      .setColor(0x2dd4bf)
-      .setDescription('Your OCAS market assistant. Search tokens, track sales, sweep floors, and set personal alerts.')
-      .addFields(
-        {name:'🔍 Market & Search', value:marketCmds, inline:false},
-        {name:'📈 Sales & Listings', value:salesCmds, inline:false},
-        {name:'🔔 Personal DM Alerts', value:alertCmds, inline:false},
-        {name:'⚙️ Admin (Manage Server)', value:adminCmds, inline:false},
-      )], flags: MessageFlags.Ephemeral});
+    const publicCmds=[
+      '`/lastsale` - Most recent sale',
+      '`/recentsales count:10` - Last N sales',
+      '`/sale token:1234` - Specific token last sale',
+      '`/traitfind trait:Type value:Zombie` - Search sales by trait',
+      '`/listings count:5` - Recent new listings',
+      '`/myalert trait:Type value:Zombie sales:true listings:true` - Get DMs for matching events',
+      '`/myalertclear` - Remove your DM alert',
+      '`/myalertstatus` - See your alert settings',
+      '`/help` - This message'
+    ].join('\n');
+    await interaction.reply({embeds:[new EmbedBuilder().setTitle('NFT Sales Bot - Commands').setColor(0x7aa2ff)
+      .addFields({name:'Admin Commands (Manage Server required)',value:adminCmds,inline:false},{name:'Public Commands',value:publicCmds,inline:false})], flags: MessageFlags.Ephemeral});
     return;
   }
 });

@@ -83,10 +83,8 @@ const commands = [
     .addStringOption(o=>o.setName('token').setDescription('Token ID (e.g. 7370)').setRequired(true))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
 
-  new SlashCommandBuilder().setName('traitfind').setDescription('Search recent sales history for a specific trait')
-    .addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Type)').setRequired(true))
-    .addStringOption(o=>o.setName('value').setDescription('Trait value (e.g. Zombie)').setRequired(true))
-    .addIntegerOption(o=>o.setName('count').setDescription('How many to find (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20))
+  new SlashCommandBuilder().setName('traitfind').setDescription('Find sales or listings by trait — e.g. "zombie", "gold chain listings", "zombie 10"')
+    .addStringOption(o=>o.setName('search').setDescription('Trait + optional mode/count e.g. "zombie", "gold chain listings", "zombie 10 sales"').setRequired(true))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
 
   new SlashCommandBuilder().setName('listings').setDescription('Show recent new listings')
@@ -96,8 +94,6 @@ const commands = [
   new SlashCommandBuilder().setName('myalert').setDescription('Get personal DMs when matching sales or listings happen')
     .addStringOption(o=>o.setName('trait').setDescription('Trait name to filter by (e.g. Type)').setRequired(false))
     .addStringOption(o=>o.setName('value').setDescription('Trait value to filter by (e.g. Zombie)').setRequired(false))
-    .addIntegerOption(o=>o.setName('rank_min').setDescription('Minimum OS rank for DM alerts (e.g. 1)').setRequired(false).setMinValue(1).setMaxValue(10000))
-    .addIntegerOption(o=>o.setName('rank_max').setDescription('Maximum OS rank for DM alerts (e.g. 100)').setRequired(false).setMinValue(1).setMaxValue(10000))
     .addBooleanOption(o=>o.setName('sales').setDescription('DM me for sales? (default: true)').setRequired(false))
     .addBooleanOption(o=>o.setName('listings').setDescription('DM me for listings? (default: true)').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
@@ -122,22 +118,16 @@ const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 
   // ── Rank filter & alerts ───────────────────────────────────────────────────
-  new SlashCommandBuilder().setName('rankfilter').setDescription('Show currently listed tokens by OS rarity rank range')
-    .addIntegerOption(o=>o.setName('min').setDescription('Minimum OS rank (e.g. 1)').setRequired(false).setMinValue(1).setMaxValue(10000))
-    .addIntegerOption(o=>o.setName('max').setDescription('Maximum OS rank (e.g. 100)').setRequired(false).setMinValue(1).setMaxValue(10000))
-    .addStringOption(o=>o.setName('sort').setDescription('Sort order (default: cheapest first)').setRequired(false)
-      .addChoices(
-        {name:'Cheapest first', value:'price'},
-        {name:'Best rank first', value:'rank'},
-      )),
+  new SlashCommandBuilder().setName('rankfind').setDescription('Find listings or sales by OS rank range — e.g. "1-100", "1-100 sales"')
+    .addStringOption(o=>o.setName('search').setDescription('Range + optional mode e.g. "1-100", "1-100 sales", "1-500 rank"').setRequired(false)),
 
-  new SlashCommandBuilder().setName('ranklistings').setDescription('Auto-post to channel when a token in an OS rank range gets listed')
+  new SlashCommandBuilder().setName('ranklistingfilter').setDescription('Alert when a token in an OS rank range gets listed')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addIntegerOption(o=>o.setName('min').setDescription('Minimum OS rank (e.g. 1)').setRequired(true).setMinValue(1).setMaxValue(10000))
     .addIntegerOption(o=>o.setName('max').setDescription('Maximum OS rank (e.g. 100)').setRequired(true).setMinValue(1).setMaxValue(10000))
     .addChannelOption(o=>o.setName('channel').setDescription('Channel to post rank alerts in (defaults to listings channel)').setRequired(false)),
 
-  new SlashCommandBuilder().setName('clearranklisting').setDescription('Remove the rank listing channel filter')
+  new SlashCommandBuilder().setName('removerankfilter').setDescription('Remove the rank listing alert')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder().setName('ocas').setDescription('Show a random OCAS — search by trait, count, rank, or token ID')
@@ -147,10 +137,6 @@ const commands = [
   new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep cheapest listed OCAS')
     .addStringOption(o=>o.setName('search').setDescription('e.g. "10", "10 zombie", "zombie hoodie", "10 zombie 15 traits"').setRequired(false)),
 
-  new SlashCommandBuilder().setName('traitfloor').setDescription('Show the floor price for a specific trait or trait count')
-    .addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Type)').setRequired(false))
-    .addStringOption(o=>o.setName('value').setDescription('Trait value (e.g. Zombie)').setRequired(false))
-    .addIntegerOption(o=>o.setName('trait_count').setDescription('Number of traits (e.g. 16)').setRequired(false).setMinValue(1).setMaxValue(30)),
 
 ].map(c=>c.toJSON());
 

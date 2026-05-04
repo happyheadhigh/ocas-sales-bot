@@ -668,6 +668,62 @@ app.get('/db/multi-trait-floor', auth, async (req, res) => {
   }
 });
 
+
+// ── GET /db/rank-sales ────────────────────────────────────────────────────────
+// Sales history filtered by OS rank range.
+// Query params:
+//   rank_min — minimum OS rank (default 1)
+//   rank_max — maximum OS rank (default 100)
+//   limit    — default 25, max 100
+//   sort     — "desc" newest first (default) or "asc"
+// Returns: { ok, rank_min, rank_max, sales: [{token_id, os_rank, price_eth, currency, sale_ts, buyer, seller}], count }
+app.get('/db/rank-sales', auth, async (req, res) => {
+  try {
+    const rankMin = req.query.rank_min ? parseInt(req.query.rank_min) : 1;
+    const rankMax = req.query.rank_max ? parseInt(req.query.rank_max) : 100;
+    const limit   = Math.min(parseInt(req.query.limit || '25'), 100);
+    const sort    = req.query.sort === 'asc' ? 'ASC' : 'DESC';
+
+    const result = await pool.query(
+      `SELECT s.token_id, t.os_rank, t.obs_rank, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller,
+              COALESCE(
+                json_object_agg(tt.trait_name, tt.trait_value) FILTER (WHERE tt.trait_name IS NOT NULL),
+                '{}'::json
+              ) AS traits
+       FROM sales s
+       JOIN tokens t ON t.id = s.token_id
+       LEFT JOIN token_traits tt ON tt.token_id = s.token_id
+       WHERE t.os_rank >= $1 AND t.os_rank <= $2
+       GROUP BY s.token_id, t.os_rank, t.obs_rank, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller
+       ORDER BY s.sale_ts ${sort}
+       LIMIT $3`,
+      [rankMin, rankMax, limit]
+    );
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      rank_min: rankMin,
+      rank_max: rankMax,
+      sales: result.rows.map(r => ({
+        token_id:  parseInt(r.token_id),
+        os_rank:   r.os_rank   ? parseInt(r.os_rank)   : null,
+        obs_rank:  r.obs_rank  ? parseInt(r.obs_rank)  : null,
+        price_eth: parseFloat(r.price_eth),
+        currency:  r.currency || 'ETH',
+        sale_ts:   r.sale_ts,
+        buyer:     r.buyer  || null,
+        seller:    r.seller || null,
+        traits:    r.traits || {},
+      })),
+      count: result.rows.length
+    });
+  } catch(e) {
+    console.error('/db/rank-sales error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/rank-listings ─────────────────────────────────────────────────────
 // Currently listed tokens filtered by OS rank range, sorted by price.
 // Query params:
