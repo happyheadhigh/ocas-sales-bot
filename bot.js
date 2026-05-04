@@ -50,6 +50,24 @@ const POLL_MS       = parseInt(process.env.POLL_MS || '30000', 10);
 const SERVER_FILE   = path.join(__dirname, 'server-configs.json');
 const ALERTS_FILE   = path.join(__dirname, 'user-alerts.json');
 
+// ── Brand colors ──────────────────────────────────────────────────────────────
+const COLORS = {
+  OCAS_BG:       0x4C6464,
+  OCAS_GREEN:    0x1CFFAF,
+  OPENSEA_BLUE:  0x0786FF,
+  RANK_TOP_100:  0xF59E0B,
+  RANK_TOP_1000: 0xC758FF,
+  WETH_ROSE:     0xF43F5E,
+};
+
+function getRankTierColor(osRank){
+  const n = Number(osRank);
+  if(!n || !Number.isFinite(n)) return null;
+  if(n >= 1 && n <= 100)  return COLORS.RANK_TOP_100;
+  if(n >= 101 && n <= 1000) return COLORS.RANK_TOP_1000;
+  return null;
+}
+
 // ── Railway Postgres pool (same DB as api.js) ─────────────────────────────────
 const { Pool } = require('pg');
 const pgPool = new Pool({
@@ -302,12 +320,10 @@ function sweepTokenUrl(item){
 
 function formatSweepTokenLine(item){
   const tokenId = getSweepTokenId(item);
-  const rank = item?.os_rank ? ('◆' + Number(item.os_rank).toLocaleString()) : (item?.obs_rank ? ('◆' + Number(item.obs_rank).toLocaleString()) : null);
+  const rank = item?.os_rank ? ('⬥' + Number(item.os_rank).toLocaleString()) : (item?.obs_rank ? ('⬥' + Number(item.obs_rank).toLocaleString()) : null);
   const tokenLink = '[#' + tokenId + '](' + sweepTokenUrl(item) + ')';
   const price = 'Ξ ' + parseFloat(item.price_eth).toFixed(4);
-  // Clean compact row: clickable token ID · rank · price
-  // Avoid long hyphen separators so the private sweep list reads cleaner on mobile.
-  return [tokenLink, rank, price].filter(Boolean).join('  ·  ');
+  return [tokenLink, rank, price].filter(Boolean).join(' · ');
 }
 
 
@@ -602,7 +618,7 @@ function traitObjectToArray(traitsObj){
 }
 
 function osRankBadge(osRank){
-  return osRank ? `◆${Number(osRank).toLocaleString()}` : '';
+  return osRank ? `⬥${Number(osRank).toLocaleString()}` : '';
 }
 
 function titleTokenId(tokenId, fallbackName){
@@ -635,13 +651,18 @@ async function buildSaleEmbed(sale, config){
   const rankPart = osRankBadge(osRank);
   const sweepPrefix = sale._isSweep ? '🧹 ' : '';
   const tokenLabel = titleTokenId(id, name);
-  const embedTitle = `${sweepPrefix}${eth ? eth+' '+currencySymbol : '--'} • ${tokenLabel}${rankPart ? ' '+rankPart : ''} Sold`;
+  const embedTitle = `${sweepPrefix}${eth ? eth+' '+currencySymbol : '--'} • ${tokenLabel}${rankPart ? ' '+rankPart : ''} • Sold`;
 
   const footerBits = ['Sales Bot', slug];
   if(timeStr) footerBits.push(timeStr);
+
+  // Sale color: rank tier first, then WETH rose, then OCAS green
+  const rankTierColor = getRankTierColor(osRank);
+  const saleColor = rankTierColor ?? (isWeth ? COLORS.WETH_ROSE : COLORS.OCAS_GREEN);
+
   const embed=new EmbedBuilder()
     .setTitle(embedTitle)
-    .setColor(isWeth ? 0x9b59b6 : 0x2dd4bf)  // purple for WETH, teal for ETH
+    .setColor(saleColor)
     .setURL(osUrl)
     .setFooter({text:footerBits.filter(Boolean).join(' • ')})
     .setTimestamp();
@@ -715,13 +736,18 @@ async function buildListingEmbed(listing, config){
   const osRank = dbMeta?.os_rank || listing.os_rank || asset.os_rank || null;
   const rankPart = osRankBadge(osRank);
   const tokenLabel = titleTokenId(id, asset.name);
-  const embedTitle = `${eth ? eth+' ETH' : '--'} • ${tokenLabel}${rankPart ? ' '+rankPart : ''} Listed`;
+  const embedTitle = `${eth ? eth+' ETH' : '--'} • ${tokenLabel}${rankPart ? ' '+rankPart : ''} • Listed`;
 
   const footerBits = ['Listings Bot', slug];
   if(config._rankAlert) footerBits.push('Rank Alert');
+
+  // Listing color: rank tier first, then OpenSea blue
+  const rankTierColor = getRankTierColor(osRank);
+  const listingColor = rankTierColor ?? COLORS.OPENSEA_BLUE;
+
   const embed = new EmbedBuilder()
     .setTitle(embedTitle)
-    .setColor(config._rankAlert ? 0xf59e0b : 0x7aa2ff)
+    .setColor(listingColor)
     .setURL(osUrl)
     .setFooter({text:footerBits.filter(Boolean).join(' • ')})
     .setTimestamp();
@@ -1091,7 +1117,7 @@ client.on('interactionCreate', async (interaction)=>{
       : (listings.length + ' tokens');
     const embed = new EmbedBuilder()
       .setTitle(header)
-      .setColor(0x2dd4bf)
+      .setColor(COLORS.OCAS_GREEN)
       .setDescription(tokenLines.join('\n') || 'No tokens found.');
     await interaction.editReply({ content: null, embeds: [embed], components });
     return;
@@ -1329,7 +1355,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     const sf  = fmtFilter(config.salesFilters);
     const lf  = fmtFilter(config.listingFilters);
     const ra  = config.rankAlert
-      ? `◆ OS Rank #${config.rankAlert.min}–#${config.rankAlert.max}${config.rankAlert.channelId ? ` → <#${config.rankAlert.channelId}>` : ''}`
+      ? `⬥ OS Rank #${config.rankAlert.min}–#${config.rankAlert.max}${config.rankAlert.channelId ? ` → <#${config.rankAlert.channelId}>` : ''}`
       : 'none';
     await interaction.reply({embeds:[new EmbedBuilder().setTitle('Bot Status').setColor(0x7aa2ff)
       .addFields(
@@ -1454,11 +1480,12 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           if(!tokens.length){ await interaction.editReply(`No listed tokens found with **${trait ? trait+': ' : ''}${value}**.`); return; }
           const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
           const listEmbeds = await Promise.all(tokens.map(async t => {
-            const dbMeta = await fetchTokenMetaFromDb(t.token_id).catch(()=>null);
+            const tokenId = t.token_id ?? t.id ?? t.identifier;
+            const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
             const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
             const fakeListingObj = {
-              token_id: t.token_id,
-              asset: { token_id: String(t.token_id), identifier: String(t.token_id), name: '#'+t.token_id,
+              token_id: tokenId,
+              asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
                        traits: dbMeta?.traits ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v})) : [] },
               payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
               maker: t.seller || '',
@@ -1704,10 +1731,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           const tokenTraits = sale.traits && typeof sale.traits==='object'
             ? Object.entries(sale.traits).map(([k,v])=>({trait_type:k,value:v}))
             : [];
+          const isWethSale = (sale.currency||'ETH').toUpperCase() === 'WETH';
           const syntheticSale = {
-            nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
+            nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits, os_rank: sale.os_rank },
             buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
-            payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH'?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
+            payment: { symbol: (sale.currency||'ETH'), token_address: isWethSale?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
             event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
           };
           return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
@@ -1732,9 +1760,10 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
         const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
         const tvUrl = `https://traitview.com/?token=${l.token_id}`;
+        const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
         const embed = new EmbedBuilder()
-          .setColor(0xf59e0b)
-          .setTitle(`${priceStr} ETH • #${l.token_id}${rankBadge} Listed`)
+          .setColor(rankColor)
+          .setTitle(`${priceStr} ETH • #${l.token_id}${rankBadge} • Listed`)
           .setURL(l.url)
           .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
           .setTimestamp();
@@ -1899,7 +1928,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
       const embed = new EmbedBuilder()
         .setTitle(`OCAS #${tokenId}`)
-        .setColor(0x8b5cf6)
+        .setColor(COLORS.OCAS_BG)
         .setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
 
       if(imgResult?.type==='buffer'){
@@ -1926,16 +1955,44 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
 
-      // ── Extract sweep count (first standalone number in search) ─────────
-      let sweepCount = 10;
+      // ── Parse sweep mode ──────────────────────────────────────────────────
+      let sweepMode   = 'count';
+      let sweepCount  = 10;
+      let budget      = null;
+      let targetFloor = null;
       let workingSearch = rawSearch;
-      const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
-      if(numMatch){
-        const n = parseInt(numMatch[1]);
-        if(n > 0 && n <= 500){ sweepCount = n; workingSearch = workingSearch.replace(numMatch[0], ' ').trim(); }
+
+      // Budget mode: "2eth", "1eth zombie", "0.5eth zombie hoodie"
+      const budgetMatch = workingSearch.match(/(?:^|\s)([\d.]+)\s*eth(?=\s|$)/i);
+      if(budgetMatch){
+        sweepMode = 'budget';
+        budget = parseFloat(budgetMatch[1]);
+        workingSearch = workingSearch.replace(budgetMatch[0], ' ').trim();
       }
 
-      // ── Extract trait count e.g. "15 traits" ────────────────────────────
+      // Target-floor mode: "0.05 floor", "0.1 floor zombie"
+      if(sweepMode === 'count'){
+        const floorNumMatch = workingSearch.match(/(?:^|\s)([\d.]+)\s+floor(?=\s|$)/i);
+        if(floorNumMatch){
+          sweepMode   = 'floor';
+          targetFloor = parseFloat(floorNumMatch[1]);
+          workingSearch = workingSearch.replace(floorNumMatch[0], ' ').trim();
+        } else {
+          // Strip stray "floor" keyword if no number preceded it
+          workingSearch = workingSearch.replace(/(?:^|\s)floor(?=\s|$)/gi, ' ').trim();
+        }
+      }
+
+      // Count mode: extract standalone integer
+      if(sweepMode === 'count'){
+        const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
+        if(numMatch){
+          const n = parseInt(numMatch[1]);
+          if(n > 0 && n <= 500){ sweepCount = n; workingSearch = workingSearch.replace(numMatch[0], ' ').trim(); }
+        }
+      }
+
+      // ── Extract trait count e.g. "15 traits" ──────────────────────────────
       let traitCount = null;
       const tcMatch = workingSearch.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
       if(tcMatch){
@@ -1943,14 +2000,10 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         workingSearch = workingSearch.replace(tcMatch[0], ' ').trim();
       }
 
-      // ── Simple depluralize (Zombies→Zombie, Hoodies→Hoodie, skip exact trait words) ─────────
+      // ── Simple depluralize ────────────────────────────────────────────────
       const PLURAL_OVERRIDES = {
-        zombies: 'zombie',
-        hoodies: 'hoodie',
-        skeletons: 'skeleton',
-        apes: 'ape',
-        aliens: 'alien',
-        robots: 'robot'
+        zombies: 'zombie', hoodies: 'hoodie', skeletons: 'skeleton',
+        apes: 'ape', aliens: 'alien', robots: 'robot'
       };
       const SKIP_DEPLURAL = new Set(['teeth','tattoos','traits','clothes','glasses']);
       workingSearch = workingSearch.split(' ').map(w => {
@@ -1962,7 +2015,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         return w;
       }).join(' ').trim();
 
-      // ── Phrase-aware trait matching ──────────────────────────────────────
+      // ── Phrase-aware trait matching ────────────────────────────────────────
       let matchedGroups = [];
       workingSearch = workingSearch.replace(/[,+]/g,' ').replace(/\b(and|with|plus)\b/gi,' ').replace(/\s+/g,' ').trim();
 
@@ -1980,26 +2033,30 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         }
       }
 
-      // ── Build title ──────────────────────────────────────────────────────
+      // ── Build label + title ────────────────────────────────────────────────
       const labelParts = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
       if(traitCount !== null) labelParts.push(traitCount + ' traits');
       const traitLabel = labelParts.length ? labelParts.join(' · ') : 'OCAS';
-      const title = 'Sweep ' + sweepCount + ' ' + traitLabel;
 
-      // ── Fetch cheapest listed tokens ────────────────────────────────────
-      // Fetch count+1 so we can compute the post-sweep floor.
-      // If no trait/count/rank filter was provided, do a plain collection floor sweep
-      // directly from Postgres. /db/multi-trait-tokens intentionally rejects empty filters.
+      let modeTitle;
+      if(sweepMode === 'budget') modeTitle = `Budget Sweep Ξ${budget} · ${traitLabel}`;
+      else if(sweepMode === 'floor') modeTitle = `Floor Sweep Ξ${targetFloor} · ${traitLabel}`;
+      else modeTitle = `Sweep ${sweepCount} · ${traitLabel}`;
+
+      // ── Determine fetch limit ──────────────────────────────────────────────
+      const fetchLimit = (sweepMode === 'count') ? sweepCount + 1 : 1000;
+
+      // ── Fetch listings from DB ─────────────────────────────────────────────
       let allFetched = [];
       if(!matchedGroups.length && traitCount === null){
-        console.log('[/sweep] plain sweep from DB, sweepCount:', sweepCount);
+        console.log('[/sweep] plain sweep from DB, mode:', sweepMode);
         const dbRes = await pgPool.query(
           `SELECT l.token_id, l.price_eth, l.url, t.os_rank, t.obs_rank, t.trait_count
            FROM listings l
            LEFT JOIN tokens t ON t.id = l.token_id
            ORDER BY l.price_eth ASC
            LIMIT $1`,
-          [sweepCount + 1]
+          [fetchLimit]
         );
         allFetched = dbRes.rows.map(r => ({
           token_id: parseInt(r.token_id),
@@ -2012,10 +2069,10 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         console.log('[/sweep] plain sweep tokens returned:', allFetched.length);
       } else {
         if(!RAILWAY_URL) throw new Error('RAILWAY_API_URL is required for trait/count sweeps.');
-        const qs = new URLSearchParams({ listed:'1', limit: String(sweepCount+1), key: API_SECRET||'' });
+        const qs = new URLSearchParams({ listed:'1', limit: String(fetchLimit), key: API_SECRET||'' });
         if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
         if(traitCount !== null) qs.set('trait_count', String(traitCount));
-        console.log('[/sweep] fetching multi-trait-tokens, groups:', matchedGroups.length, 'traitCount:', traitCount, 'sweepCount:', sweepCount);
+        console.log('[/sweep] fetching multi-trait-tokens, mode:', sweepMode, 'groups:', matchedGroups.length, 'traitCount:', traitCount);
         const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
         console.log('[/sweep] response status:', r.status);
         if(!r.ok){ const txt = await r.text(); throw new Error('multi-trait-tokens HTTP ' + r.status + ': ' + txt.slice(0,200)); }
@@ -2024,41 +2081,86 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         if(!j.ok) throw new Error(j.error||'API error');
         allFetched = (j.tokens||[]).map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
       }
-      const sweepListings = allFetched.slice(0, sweepCount);
-      const postSweepToken = allFetched[sweepCount] || null;
 
-      if(!sweepListings.length){
+      if(!allFetched.length){
         await interaction.editReply('No listed tokens found for **' + traitLabel + '**.');
         return;
       }
 
-      // ── Compute stats ────────────────────────────────────────────────────
-      const available = sweepListings.length;
-      const short = available < sweepCount;
-      const prices = sweepListings.map(t => parseFloat(t.price_eth));
-      const totalEth = prices.reduce((a,b)=>a+b,0);
-      const avgEth   = totalEth / prices.length;
-      const cheapest = prices[0];
-      const highest  = prices[prices.length-1];
-      const floorAfter = postSweepToken ? parseFloat(postSweepToken.price_eth) : null;
+      // ── Apply mode logic ───────────────────────────────────────────────────
+      let sweepListings = [];
+      let postSweepToken = null;
       const fmt = n => n.toFixed(4);
 
-      // ── Build embed description ──────────────────────────────────────────
-      let desc = '';
-      if(short) desc += '⚠️ Only ' + available + ' listed\n\n';
-      desc += '**Total:** Ξ ' + fmt(totalEth) + '\n';
-      desc += '**Average:** Ξ ' + fmt(avgEth) + '\n';
-      desc += '**Cheapest:** Ξ ' + fmt(cheapest) + '\n';
-      desc += '**Highest included:** Ξ ' + fmt(highest) + '\n';
-      if(floorAfter) desc += '**New floor after sweep:** Ξ ' + fmt(floorAfter) + '\n';
+      if(sweepMode === 'budget'){
+        let running = 0;
+        for(const t of allFetched){
+          if(running + t.price_eth <= budget){ sweepListings.push(t); running += t.price_eth; }
+          else { postSweepToken = postSweepToken || t; break; }
+        }
+        if(!sweepListings.length){
+          await interaction.editReply(`No listings fit within that budget of **Ξ${budget}** for **${traitLabel}**.\nCheapest available: Ξ${fmt(allFetched[0].price_eth)}`);
+          return;
+        }
+      } else if(sweepMode === 'floor'){
+        for(const t of allFetched){
+          if(t.price_eth < targetFloor) sweepListings.push(t);
+          else { postSweepToken = postSweepToken || t; break; }
+        }
+        if(!sweepListings.length){
+          await interaction.editReply(`No listings below target floor of **Ξ${targetFloor}** for **${traitLabel}**.\nCheapest available: Ξ${fmt(allFetched[0].price_eth)}`);
+          return;
+        }
+      } else {
+        sweepListings  = allFetched.slice(0, sweepCount);
+        postSweepToken = allFetched[sweepCount] || null;
+      }
 
+      // ── Compute stats ──────────────────────────────────────────────────────
+      const available  = sweepListings.length;
+      const short      = sweepMode === 'count' && available < sweepCount;
+      const prices     = sweepListings.map(t => parseFloat(t.price_eth));
+      const totalEth   = prices.reduce((a,b)=>a+b,0);
+      const avgEth     = totalEth / prices.length;
+      const cheapest   = prices[0];
+      const highest    = prices[prices.length-1];
+      const floorAfter = postSweepToken ? parseFloat(postSweepToken.price_eth) : null;
+
+      // ── Build embed description ────────────────────────────────────────────
+      let desc = '';
+      if(sweepMode === 'budget'){
+        const remaining = budget - totalEth;
+        desc += `**Budget:** Ξ ${fmt(budget)}\n`;
+        desc += `**Tokens swept:** ${available}\n`;
+        desc += `**Total ETH:** Ξ ${fmt(totalEth)}\n`;
+        desc += `**ETH left:** Ξ ${fmt(remaining)}\n`;
+        desc += `**Average price:** Ξ ${fmt(avgEth)}\n`;
+        desc += `**Cheapest included:** Ξ ${fmt(cheapest)}\n`;
+        desc += `**Highest included:** Ξ ${fmt(highest)}\n`;
+        if(floorAfter) desc += `**New floor after sweep:** Ξ ${fmt(floorAfter)}\n`;
+      } else if(sweepMode === 'floor'){
+        desc += `**Target floor:** Ξ ${targetFloor.toFixed(4)}\n`;
+        desc += `**Tokens swept:** ${available}\n`;
+        desc += `**Total ETH:** Ξ ${fmt(totalEth)}\n`;
+        desc += `**Average price:** Ξ ${fmt(avgEth)}\n`;
+        desc += `**Cheapest included:** Ξ ${fmt(cheapest)}\n`;
+        desc += `**Highest included:** Ξ ${fmt(highest)}\n`;
+        if(floorAfter) desc += `**New floor after sweep:** Ξ ${fmt(floorAfter)}\n`;
+      } else {
+        if(short) desc += '⚠️ Only ' + available + ' listed\n\n';
+        desc += '**Total:** Ξ ' + fmt(totalEth) + '\n';
+        desc += '**Average:** Ξ ' + fmt(avgEth) + '\n';
+        desc += '**Cheapest:** Ξ ' + fmt(cheapest) + '\n';
+        desc += '**Highest included:** Ξ ' + fmt(highest) + '\n';
+        if(floorAfter) desc += '**New floor after sweep:** Ξ ' + fmt(floorAfter) + '\n';
+      }
 
       const embed = new EmbedBuilder()
-        .setTitle(title)
-        .setColor(0x2dd4bf)
+        .setTitle(modeTitle)
+        .setColor(COLORS.OCAS_GREEN)
         .setDescription(desc.slice(0, 4090));
 
-      // ── All tokens live behind the private Show All Tokens button ────────
+      // ── All tokens behind private Show All Tokens button ──────────────────
       const components = [];
       const sessionId = interaction.id;
       const cleanSweepListings = sweepListings.map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);

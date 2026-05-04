@@ -135,7 +135,7 @@ const commands = [
     .addStringOption(o=>o.setName('search').setDescription('Search: "zombie", "15 traits", "rank 1-100", or a token number').setRequired(false)),
 
   new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep cheapest listed OCAS')
-    .addStringOption(o=>o.setName('search').setDescription('e.g. "10", "10 zombie", "zombie hoodie", "10 zombie 15 traits"').setRequired(false)),
+    .addStringOption(o=>o.setName('search').setDescription('e.g. "10", "2eth", "0.05 floor", "10 zombie", "1eth zombie hoodie", "0.1 floor zombie"').setRequired(false)),
 
 
 ].map(c=>c.toJSON());
