@@ -2073,30 +2073,49 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   }
 
   if(commandName==='help'){
+    const marketCmds=[
+      '`/ocas search:zombie hoodie` — Random or searched OCAS token',
+      '`/ocas search:gold chain floor` — Cheapest listed with that trait',
+      '`/sweep search:10` — Cost to sweep 10 cheapest listed',
+      '`/sweep search:10 zombie hoodie` — Sweep cheapest 10 with traits',
+      '`/traitfind search:zombie` — Sales history for a trait',
+      '`/traitfind search:zombie listings` — Currently listed tokens with that trait',
+      '`/rankfind search:1-100` — Listed tokens by OS rank range',
+      '`/rankfind search:1-100 sales` — Sales history by OS rank range',
+    ].join('\n');
+    const salesCmds=[
+      '`/lastsale` — Most recent sale',
+      '`/recentsales count:10` — Last N sales',
+      '`/sale token:1234` — Last sale for a specific token',
+      '`/listings count:5` — Recent new listings',
+    ].join('\n');
+    const alertCmds=[
+      '`/myalert trait:Type value:Zombie` — DM when a Zombie sells or lists',
+      '`/myalert rank_min:1 rank_max:100` — DM when a top-100 token lists',
+      '`/myalertstatus` — See your current alert settings',
+      '`/myalertclear` — Remove your DM alert',
+    ].join('\n');
     const adminCmds=[
-      '`/setup` - Configure sales channel + collection',
-      '`/setlistings` - Set the listings channel',
-      '`/setchannel` - Change sales channel',
-      '`/setcollection` - Change collection',
-      '`/salesfilter` - Filter auto-posted sales by trait',
-      '`/listingfilter` - Filter auto-posted listings by trait',
-      '`/clearfilters` - Clear all server filters',
-      '`/pause` / `/resume` - Pause/resume auto-posts',
-      '`/status` - Show server config'
+      '`/setup` / `/setuphere` — Configure sales channel + collection',
+      '`/setlistings` / `/setlistingshere` — Set listings channel',
+      '`/salesfilter` — Filter auto-posted sales by trait',
+      '`/traitlistingfilter` — Filter auto-posted listings by trait',
+      '`/ranklistings` — Auto-post listings for a rank range',
+      '`/clearranklisting` — Remove rank listing filter',
+      '`/clearallfilters` — Clear all server filters',
+      '`/pause` / `/resume` — Pause/resume auto-posts',
+      '`/status` — Show server config',
     ].join('\n');
-    const publicCmds=[
-      '`/lastsale` - Most recent sale',
-      '`/recentsales count:10` - Last N sales',
-      '`/sale token:1234` - Specific token last sale',
-      '`/traitfind trait:Type value:Zombie` - Search sales by trait',
-      '`/listings count:5` - Recent new listings',
-      '`/myalert trait:Type value:Zombie sales:true listings:true` - Get DMs for matching events',
-      '`/myalertclear` - Remove your DM alert',
-      '`/myalertstatus` - See your alert settings',
-      '`/help` - This message'
-    ].join('\n');
-    await interaction.reply({embeds:[new EmbedBuilder().setTitle('NFT Sales Bot - Commands').setColor(0x7aa2ff)
-      .addFields({name:'Admin Commands (Manage Server required)',value:adminCmds,inline:false},{name:'Public Commands',value:publicCmds,inline:false})], flags: MessageFlags.Ephemeral});
+    await interaction.reply({embeds:[new EmbedBuilder()
+      .setTitle('OCAS Market Bot')
+      .setColor(0x2dd4bf)
+      .setDescription('Your OCAS market assistant — search tokens, track sales, sweep floors, and set personal alerts.')
+      .addFields(
+        {name:'🔍 Market & Search', value:marketCmds, inline:false},
+        {name:'📈 Sales & Listings', value:salesCmds, inline:false},
+        {name:'🔔 Personal DM Alerts', value:alertCmds, inline:false},
+        {name:'⚙️ Admin (Manage Server)', value:adminCmds, inline:false},
+      )], flags: MessageFlags.Ephemeral});
     return;
   }
 });
@@ -2137,43 +2156,38 @@ client.on('guildCreate', async (guild)=>{
     const channelTip=[
       'Recommended 4-channel setup:',
       '',
-      '**#all-sales** - auto-posts every sale (make read-only for members)',
-      '**#all-listings** - auto-posts every listing (make read-only for members)',
-      '**#sales-search** - members use `/traitfind`, `/recentsales`, `/sale`',
-      '**#listings-search** - members use `/listings`',
+      '**#all-sales** — auto-posts every sale (make read-only for members)',
+      '**#all-listings** — auto-posts every listing (make read-only for members)',
+      '**#market** — members use `/ocas`, `/sweep`, `/traitfind`, `/rankfind`',
+      '**#sales-history** — members use `/recentsales`, `/sale`, `/lastsale`',
       '',
       'To make a channel read-only: Channel Settings > Permissions > @everyone > disable Send Messages'
     ].join('\n');
 
     const personalAlerts=[
       'Anyone can set personal DM alerts with `/myalert`.',
-      'They get a private DM when a matching sale or listing happens.',
+      'You get a private DM when a matching sale or listing happens.',
       '',
-      '`/myalert trait:Type value:Zombie sales:true listings:true`',
-      '- DM me whenever a Zombie sells or gets listed',
+      '`/myalert trait:Type value:Zombie` — DM when any Zombie sells or lists',
+      '`/myalert rank_min:1 rank_max:100` — DM when a top-100 token gets listed',
       '',
-      '`/myalert trait:Background value:Blue listings:true sales:false`',
-      '- DM me only when a Blue Background token gets listed',
-      '',
-      '`/myalertclear` - Remove your alert',
-      '`/myalertstatus` - See your current alert'
+      '`/myalertclear` — Remove your alert',
+      '`/myalertstatus` — See your current alert'
     ].join('\n');
 
     const serverFilters=[
       'Admins can filter what auto-posts to each channel:',
       '',
-      '`/salesfilter trait:Type value:Zombie`',
-      'Only post sales where Type = Zombie',
+      '`/salesfilter trait:Type value:Zombie` — Only post Zombie sales',
+      '`/traitlistingfilter trait:Type value:Zombie` — Only post Zombie listings',
+      '`/ranklistings min:1 max:100` — Auto-post when top-100 tokens list',
       '',
-      '`/listingfilter trait:Background value:Blue`',
-      'Only post listings where Background = Blue',
-      '',
-      '`/clearfilters` - Remove all server filters',
-      '`/status` - See current configuration'
+      '`/clearallfilters` — Remove all server filters',
+      '`/status` — See current configuration'
     ].join('\n');
 
     const embed = new EmbedBuilder()
-      .setTitle('Thanks for adding the NFT Sales Bot!')
+      .setTitle('Thanks for adding OCAS Market Bot!')
       .setColor(0x2dd4bf)
       .setDescription(desc)
       .addFields(
