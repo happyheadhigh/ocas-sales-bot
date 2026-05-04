@@ -96,6 +96,8 @@ const commands = [
   new SlashCommandBuilder().setName('myalert').setDescription('Get personal DMs when matching sales or listings happen')
     .addStringOption(o=>o.setName('trait').setDescription('Trait name to filter by (e.g. Type)').setRequired(false))
     .addStringOption(o=>o.setName('value').setDescription('Trait value to filter by (e.g. Zombie)').setRequired(false))
+    .addIntegerOption(o=>o.setName('rank_min').setDescription('Minimum OS rank for DM alerts (e.g. 1)').setRequired(false).setMinValue(1).setMaxValue(10000))
+    .addIntegerOption(o=>o.setName('rank_max').setDescription('Maximum OS rank for DM alerts (e.g. 100)').setRequired(false).setMinValue(1).setMaxValue(10000))
     .addBooleanOption(o=>o.setName('sales').setDescription('DM me for sales? (default: true)').setRequired(false))
     .addBooleanOption(o=>o.setName('listings').setDescription('DM me for listings? (default: true)').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
@@ -129,13 +131,13 @@ const commands = [
         {name:'Best rank first', value:'rank'},
       )),
 
-  new SlashCommandBuilder().setName('ranklistingfilter').setDescription('Alert when a token in an OS rank range gets listed')
+  new SlashCommandBuilder().setName('ranklistings').setDescription('Auto-post to channel when a token in an OS rank range gets listed')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addIntegerOption(o=>o.setName('min').setDescription('Minimum OS rank (e.g. 1)').setRequired(true).setMinValue(1).setMaxValue(10000))
     .addIntegerOption(o=>o.setName('max').setDescription('Maximum OS rank (e.g. 100)').setRequired(true).setMinValue(1).setMaxValue(10000))
     .addChannelOption(o=>o.setName('channel').setDescription('Channel to post rank alerts in (defaults to listings channel)').setRequired(false)),
 
-  new SlashCommandBuilder().setName('removerankfilter').setDescription('Remove the rank listing alert')
+  new SlashCommandBuilder().setName('clearranklisting').setDescription('Remove the rank listing channel filter')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder().setName('ocas').setDescription('Show a random OCAS — search by trait, count, rank, or token ID')
