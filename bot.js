@@ -182,6 +182,16 @@ function deleteAlert(userId){ delete userAlerts[userId]; saveAllAlerts(); }
 const lastSaleIds     = new Map(); // guildId → last sale id
 const lastListingIds  = new Map(); // guildId → last listing id
 const alertedEventIds = new Set(); // dedup personal DM alerts across multiple servers
+const recentChannelPosts = new Map(); // dedup: channelId+tokenId → timestamp, prevents double-posting
+function isRecentChannelPost(channelId, tokenId, windowMs=180000){
+  const key = channelId + ':' + tokenId;
+  const last = recentChannelPosts.get(key);
+  if(last && Date.now() - last < windowMs) return true;
+  recentChannelPosts.set(key, Date.now());
+  // Prune old entries every 500 posts
+  if(recentChannelPosts.size > 500){ const cutoff=Date.now()-windowMs; for(const [k,v] of recentChannelPosts) if(v<cutoff) recentChannelPosts.delete(k); }
+  return false;
+}
 const imageCache      = new Map(); // "contract:tokenId" → {result, ts}
 const IMAGE_CACHE_TTL = 60 * 60 * 1000; // 1 hour TTL
 
@@ -592,7 +602,7 @@ function traitObjectToArray(traitsObj){
 }
 
 function osRankBadge(osRank){
-  return osRank ? `♦${Number(osRank).toLocaleString()}` : '';
+  return osRank ? `◆${Number(osRank).toLocaleString()}` : '';
 }
 
 function titleTokenId(tokenId, fallbackName){
@@ -914,8 +924,10 @@ async function pollListings(){
           .map(l=>buildListingEmbed(l,config).catch(e=>{console.error('[Build listing]',e.message);return null;}))
       );
 
-      for(const embed of embeds){
-        if(!embed) continue;
+      for(let i=0;i<embeds.length;i++){
+        const embed=embeds[i]; if(!embed) continue;
+        const lid=toPostListings[i]; const tokenId=String(lid?.asset?.token_id||lid?.asset?.identifier||lid?.criteria?.encoded_token_ids||lid?.token_id||'');
+        if(tokenId && isRecentChannelPost(channel.id, tokenId)) { console.log('[Listing dedup] skipping #'+tokenId+' already posted to channel'); continue; }
         try{ await sendEmbed(channel,embed); }catch(e){ console.error('[Listing post]',e.message); }
         await new Promise(r=>setTimeout(r,300));
       }
@@ -948,9 +960,13 @@ async function pollListings(){
                   { ...listing, _dbToken: dbMeta },
                   { ...config, _rankAlert: true }
                 );
-                try{ await sendEmbed(alertChannel, alertEmbed); }
-                catch(e){ console.error('[Rank alert post]', e.message); }
-                console.log(`[Rank Alert] #${id} OS Rank #${osRank} listed`);
+                if(isRecentChannelPost(alertChannel.id, String(id))){
+                  console.log(`[Rank Alert] #${id} deduped — already posted to channel recently`);
+                } else {
+                  try{ await sendEmbed(alertChannel, alertEmbed); }
+                  catch(e){ console.error('[Rank alert post]', e.message); }
+                  console.log(`[Rank Alert] #${id} OS Rank #${osRank} listed`);
+                }
               }
             }catch(e){ console.warn('[Rank alert]', e.message); }
           }
@@ -1647,7 +1663,7 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
         const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
         const embed = new EmbedBuilder()
           .setColor(0xf59e0b)
-          .setTitle(`◆ OS #${l.os_rank ?? '?'} — #${l.token_id} listed for Ξ ${priceStr}`)
+          .setTitle(`${priceStr} ETH • #${l.token_id}${l.os_rank ? ' ◆'+Number(l.os_rank).toLocaleString() : ''} Listed`)
           .setURL(l.url)
 
           .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · sorted by ${sortBy}` })
@@ -1977,7 +1993,6 @@ _Tip: Add \`RAILWAY_API_URL\` env var to search full history._`);
       desc += '**Highest included:** Ξ ' + fmt(highest) + '\n';
       if(floorAfter) desc += '**New floor after sweep:** Ξ ' + fmt(floorAfter) + '\n';
 
-      desc += '\n_Click **Show All Tokens** to view the full clickable token list._';
 
       const embed = new EmbedBuilder()
         .setTitle(title)
