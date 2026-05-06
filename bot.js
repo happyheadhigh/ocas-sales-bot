@@ -663,9 +663,9 @@ async function buildSaleEmbed(sale, config){
   const footerBits = ['Sales Bot', slug];
   if(timeStr) footerBits.push(timeStr);
 
-  // Sale color: rank tier first, then WETH rose, then OCAS green
-  const rankTierColor = getRankTierColor(osRank);
-  const saleColor = rankTierColor ?? (isWeth ? COLORS.WETH_ROSE : COLORS.OCAS_GREEN);
+  // Sale color = payment type only. Rank is visible in the title (⬥) and
+  // does not affect sidebar color — that would confuse ETH vs WETH signal.
+  const saleColor = isWeth ? COLORS.WETH_ROSE : COLORS.OCAS_GREEN;
 
   const embed=new EmbedBuilder()
     .setTitle(embedTitle)
