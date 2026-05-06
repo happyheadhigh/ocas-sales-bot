@@ -529,23 +529,30 @@ async function extractPngFromSvg(svgSource){
     svgText=await r.text();
   }
   const SIZE=500;
+
+  // Render the original SVG directly so pixel-banded backgrounds are preserved
+  // exactly as authored — no gradient reconstruction. Previously the background
+  // rect bands were discarded and rebuilt as a smooth linearGradient, causing
+  // the blurry gradient look vs OpenSea's sharp pixel bands.
+  let bgBuf;
+  try{
+    bgBuf=await sharp(Buffer.from(svgText))
+      .resize(SIZE,SIZE,{kernel:'nearest',fit:'fill'})
+      .png()
+      .toBuffer();
+  }catch(e){ throw new Error('SVG render failed: '+e.message); }
+
+  // Extract the embedded character PNG and re-composite at full size with
+  // nearest-neighbor upscaling so character pixels stay crisp.
   const pngMatch=svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
-  let charBuf=null;
   if(pngMatch){
-    const rawPng=Buffer.from(pngMatch[1].replace(/\s/g,''),'base64');
-    charBuf=await sharp(rawPng).resize(SIZE,SIZE,{kernel:'nearest'}).png().toBuffer();
+    try{
+      const rawPng=Buffer.from(pngMatch[1].replace(/\s/g,''),'base64');
+      const charBuf=await sharp(rawPng).resize(SIZE,SIZE,{kernel:'nearest'}).png().toBuffer();
+      return sharp(bgBuf).composite([{input:charBuf,blend:'over'}]).png().toBuffer();
+    }catch(e){ console.warn('[extractPngFromSvg] char composite failed, using full SVG render:',e.message); }
   }
-  const stopMatches=[...svgText.matchAll(/stop-color=["'](#[0-9a-fA-F]{6,8})["']/g)];
-  const stops=stopMatches.map(m=>m[1].slice(0,7));
-  const unique=stops.filter((c,i)=>c!==stops[i-1]);
-  const gd=svgText.match(/linearGradient[^>]+x1=["']([\d.]+)["'][^>]+y1=["']([\d.]+)["'][^>]+x2=["']([\d.]+)["'][^>]+y2=["']([\d.]+)["']/);
-  const [gx1,gy1,gx2,gy2]=gd?[gd[1],gd[2],gd[3],gd[4]]:['0','0','0','1'];
-  let gradStops;
-  if(unique.length<=1){ const c=unique[0]||'#1a1a2e'; gradStops=`<stop offset="0%" stop-color="${c}"/><stop offset="100%" stop-color="${c}"/>`; }
-  else { gradStops=unique.map((c,i)=>`<stop offset="${Math.round(i/(unique.length-1)*100)}%" stop-color="${c}"/>`).join(''); }
-  const bgSvg=`<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}"><defs><linearGradient id="bg" x1="${gx1}" y1="${gy1}" x2="${gx2}" y2="${gy2}">${gradStops}</linearGradient></defs><rect width="${SIZE}" height="${SIZE}" fill="url(#bg)"/></svg>`;
-  const bgBuf=await sharp(Buffer.from(bgSvg)).resize(SIZE,SIZE).png().toBuffer();
-  if(charBuf) return sharp(bgBuf).composite([{input:charBuf,blend:'over'}]).png().toBuffer();
+
   return bgBuf;
 }
 
