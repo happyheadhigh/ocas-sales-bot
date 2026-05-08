@@ -1926,6 +1926,12 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const priceLine   = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${floorPrice >= 1 ? floorPrice.toFixed(3) : floorPrice.toFixed(4)}\n` : '';
       const contextLine = descParts.length ? `${descParts.join(' · ')}\n` : '';
 
+      // Fetch OS rank for title badge + rank-tier sidebar color
+      const dbMeta  = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+      const osRank  = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
+      const rankBadge = osRank ? ` ⬥${osRank.toLocaleString()}` : '';
+      const ocasColor = getRankTierColor(osRank) ?? COLORS.OCAS_BG;
+
       const traitsRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`ocas_traits:${tokenId}`)
@@ -1934,8 +1940,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       );
 
       const embed = new EmbedBuilder()
-        .setTitle(`OCAS #${tokenId}`)
-        .setColor(COLORS.OCAS_BG)
+        .setTitle(`OCAS #${tokenId}${rankBadge}`)
+        .setColor(ocasColor)
         .setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
 
       if(imgResult?.type==='buffer'){
