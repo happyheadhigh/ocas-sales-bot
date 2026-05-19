@@ -847,8 +847,16 @@ async function pollSales(){
       const toPost = newSales.reverse();
 
       // ── Sweep detection: count buyer+tx combos across this batch ─────────
+      // WETH sales = accepted offers, not floor sweeps — exclude them entirely.
+      const WETH_CONTRACT = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
+      const isWethSale = s => {
+        const sym  = (s.payment?.symbol || s.currency || '').toUpperCase();
+        const addr = (s.payment?.token_address || '').toLowerCase();
+        return sym === 'WETH' || addr === WETH_CONTRACT;
+      };
       const sweepCounts = new Map();
       for(const sale of toPost){
+        if(isWethSale(sale)) continue; // accepted offers don't count as sweeps
         const buyer  = sale.buyer || '';
         const txHash = sale.transaction || sale.order_hash || sale.id || '';
         if(!buyer || buyer === 'unknown') continue;
@@ -859,6 +867,7 @@ async function pollSales(){
       }
       // Mark sweep sales before building embeds so 🧹 appears in title
       for(const sale of toPost){
+        if(isWethSale(sale)) continue; // never mark WETH sales as sweeps
         const buyer  = sale.buyer || '';
         const txHash = sale.transaction || sale.order_hash || sale.id || '';
         const key    = txHash
