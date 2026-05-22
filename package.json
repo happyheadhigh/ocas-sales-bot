@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node bot.js",
     "register": "node register-commands.js",
-    "dev": "node --watch bot.js"
+    "dev": "node --watch bot.js",
+    "wallet:sync": "node wallet-sync.js",
+    "wallet:backfill": "node wallet-sync.js --backfill",
+    "wallet:derive": "node wallet-derive.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

@@ -13,6 +13,13 @@ const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const DEFAULT_OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
+const OCAS_CONTRACT = normalizeEthAddress(process.env.OCAS_CONTRACT || DEFAULT_OCAS_CONTRACT);
+
+function normalizeEthAddress(addr) {
+  const s = String(addr || '').trim().toLowerCase();
+  return /^0x[a-f0-9]{40}$/.test(s) ? s : '';
+}
 
 // ── Database connection pool ──────────────────────────────────────────────────
 const pool = new Pool({
@@ -30,8 +37,14 @@ pool.on('error', (err) => console.error('DB pool error:', err.message));
 // ── Simple auth middleware ────────────────────────────────────────────────────
 // All requests must include ?key=YOUR_API_SECRET or x-api-key header
 const API_SECRET = process.env.API_SECRET;
+const REQUIRE_API_AUTH = process.env.NODE_ENV === 'production';
 function auth(req, res, next) {
-  if (!API_SECRET) return next(); // no secret set = open (dev only)
+  if (!API_SECRET) {
+    if (REQUIRE_API_AUTH) {
+      return res.status(503).json({ ok: false, error: 'API auth is not configured' });
+    }
+    return next(); // no secret set = open in local/dev only
+  }
   const key = req.query.key || req.headers['x-api-key'];
   if (key !== API_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' });
   next();
@@ -844,8 +857,239 @@ app.get('/db/trait-count-floor', auth, async (req, res) => {
   }
 });
 
+// ── Wallet analytics helpers ─────────────────────────────────────────────────
+function isEthAddress(addr) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(addr || '').trim());
+}
+function cleanAddress(addr) {
+  return normalizeEthAddress(addr);
+}
+function intParam(value, fallback, max) {
+  const n = parseInt(value || fallback, 10);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.min(n, max);
+}
+function isMissingWalletAnalyticsTable(e) {
+  return e?.code === '42P01' || /nft_transfers|wallet_token_intervals|wallet_daily_snapshots|wallet_analytics_cache/i.test(e?.message || '');
+}
+function emptyWalletResponse(address, extra = {}) {
+  return { ok: true, address, synced: false, ...extra };
+}
+
+// ── GET /db/wallet/:address/summary ──────────────────────────────────────────
+// Current derived wallet summary. Returns empty data if wallet sync has not run.
+app.get('/db/wallet/:address/summary', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  try {
+    const cache = await pool.query(
+      `SELECT summary_json, updated_at FROM wallet_analytics_cache WHERE wallet_address = $1`,
+      [address]
+    );
+    if (cache.rows.length) {
+      res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+      return res.json({ ok: true, address, synced: true, cached: true, updated_at: cache.rows[0].updated_at, summary: cache.rows[0].summary_json });
+    }
+
+    const current = await pool.query(`
+      SELECT w.token_id, t.os_rank, t.obs_rank, l.price_eth
+      FROM wallet_token_intervals w
+      LEFT JOIN tokens t ON t.id = w.token_id
+      LEFT JOIN listings l ON l.token_id = w.token_id
+      WHERE w.wallet_address = $1 AND w.disposed_at IS NULL
+      ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC
+      LIMIT 10000
+    `, [address]);
+
+    const owned = current.rows;
+    const ranks = owned.map(r => parseInt(r.os_rank || r.obs_rank)).filter(Number.isFinite);
+    const listed = owned.filter(r => r.price_eth != null);
+    const floor = await pool.query('SELECT MIN(price_eth) AS floor_eth FROM listings');
+    const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
+    const estimated = floorEth == null ? null : owned.length * floorEth;
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      address,
+      synced: true,
+      cached: false,
+      summary: {
+        owned_count: owned.length,
+        best_rank: ranks.length ? Math.min(...ranks) : null,
+        listed_count: listed.length,
+        estimated_floor_value: estimated,
+        floor_eth: floorEth,
+        top_tokens: owned.slice(0, 12).map(r => ({
+          token_id: parseInt(r.token_id),
+          os_rank: r.os_rank ? parseInt(r.os_rank) : null,
+          obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
+          price_eth: r.price_eth != null ? parseFloat(r.price_eth) : null,
+        })),
+      },
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json(emptyWalletResponse(address, { summary: { owned_count: 0, best_rank: null, listed_count: 0, estimated_floor_value: null } }));
+    console.error('/db/wallet/:address/summary error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/wallet/:address/transfers ────────────────────────────────────────
+app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const limit = intParam(req.query.limit, 100, 200);
+  const offset = intParam(req.query.offset, 0, 10000);
+  try {
+    const result = await pool.query(`
+      SELECT contract, token_id, from_address, to_address, tx_hash, log_index, block_number, block_ts, event_type
+      FROM nft_transfers
+      WHERE contract = $1 AND (from_address = $2 OR to_address = $2)
+      ORDER BY block_number DESC, log_index DESC
+      LIMIT $3 OFFSET $4
+    `, [OCAS_CONTRACT, address, limit, offset]);
+    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    res.json({
+      ok: true,
+      address,
+      contract: OCAS_CONTRACT,
+      synced: true,
+      transfers: result.rows.map(r => ({
+        contract: r.contract,
+        token_id: parseInt(r.token_id),
+        from_address: r.from_address,
+        to_address: r.to_address,
+        tx_hash: r.tx_hash,
+        log_index: parseInt(r.log_index),
+        block_number: parseInt(r.block_number),
+        block_ts: r.block_ts,
+        event_type: r.event_type,
+      })),
+      count: result.rows.length,
+      limit,
+      offset,
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json(emptyWalletResponse(address, { transfers: [], count: 0, limit, offset }));
+    console.error('/db/wallet/:address/transfers error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/wallet/:address/history ──────────────────────────────────────────
+app.get('/db/wallet/:address/history', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const days = intParam(req.query.days, 90, 365);
+  try {
+    const result = await pool.query(`
+      SELECT snapshot_date, owned_count, best_rank, listed_count, estimated_floor_value
+      FROM wallet_daily_snapshots
+      WHERE wallet_address = $1
+        AND snapshot_date >= CURRENT_DATE - ($2 || ' days')::INTERVAL
+      ORDER BY snapshot_date ASC
+    `, [address, days]);
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json({
+      ok: true,
+      address,
+      synced: true,
+      history: result.rows.map(r => ({
+        snapshot_date: r.snapshot_date,
+        owned_count: parseInt(r.owned_count),
+        best_rank: r.best_rank ? parseInt(r.best_rank) : null,
+        listed_count: parseInt(r.listed_count),
+        estimated_floor_value: r.estimated_floor_value != null ? parseFloat(r.estimated_floor_value) : null,
+      })),
+      count: result.rows.length,
+      days,
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json(emptyWalletResponse(address, { history: [], count: 0, days }));
+    console.error('/db/wallet/:address/history error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/wallet/:address/traits ───────────────────────────────────────────
+app.get('/db/wallet/:address/traits', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const limit = intParam(req.query.limit, 100, 500);
+  try {
+    const result = await pool.query(`
+      SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS count,
+             ARRAY_AGG(w.token_id ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC) AS token_ids
+      FROM wallet_token_intervals w
+      JOIN token_traits tt ON tt.token_id = w.token_id
+      LEFT JOIN tokens t ON t.id = w.token_id
+      WHERE w.wallet_address = $1 AND w.disposed_at IS NULL
+      GROUP BY tt.trait_name, tt.trait_value
+      ORDER BY count DESC, tt.trait_name ASC, tt.trait_value ASC
+      LIMIT $2
+    `, [address, limit]);
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json({
+      ok: true,
+      address,
+      synced: true,
+      traits: result.rows.map(r => ({
+        trait_name: r.trait_name,
+        trait_value: r.trait_value,
+        count: parseInt(r.count),
+        token_ids: (r.token_ids || []).map(Number).filter(Number.isFinite),
+      })),
+      count: result.rows.length,
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json(emptyWalletResponse(address, { traits: [], count: 0 }));
+    console.error('/db/wallet/:address/traits error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/token/:id/history ────────────────────────────────────────────────
+app.get('/db/token/:id/history', auth, async (req, res) => {
+  const tokenId = parseInt(req.params.id, 10);
+  if (!tokenId || tokenId < 1 || tokenId > 10000) return res.status(400).json({ ok: false, error: 'invalid token id' });
+  const limit = intParam(req.query.limit, 100, 200);
+  try {
+    const result = await pool.query(`
+      SELECT contract, token_id, from_address, to_address, tx_hash, log_index, block_number, block_ts, event_type
+      FROM nft_transfers
+      WHERE contract = $1 AND token_id = $2
+      ORDER BY block_number ASC, log_index ASC
+      LIMIT $3
+    `, [OCAS_CONTRACT, tokenId, limit]);
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json({
+      ok: true,
+      token_id: tokenId,
+      contract: OCAS_CONTRACT,
+      synced: true,
+      history: result.rows.map(r => ({
+        contract: r.contract,
+        token_id: parseInt(r.token_id),
+        from_address: r.from_address,
+        to_address: r.to_address,
+        tx_hash: r.tx_hash,
+        log_index: parseInt(r.log_index),
+        block_number: parseInt(r.block_number),
+        block_ts: r.block_ts,
+        event_type: r.event_type,
+      })),
+      count: result.rows.length,
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json({ ok: true, token_id: tokenId, synced: false, history: [], count: 0 });
+    console.error('/db/token/:id/history error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
-  console.log(`Auth: ${API_SECRET ? 'enabled' : 'DISABLED (set API_SECRET to enable)'}`);
+  console.log(`Auth: ${API_SECRET ? 'enabled' : (REQUIRE_API_AUTH ? 'REQUIRED BUT MISSING' : 'DISABLED (dev only; set API_SECRET to enable)')}`);
 });
