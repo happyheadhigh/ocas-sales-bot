@@ -552,20 +552,11 @@ const BURN_STARTED_TOPIC   = '0x' + require('crypto').createHash('sha256').updat
 const BURN_STARTED_SIG   = 'BurnStarted(address,uint256,uint256,uint256[],uint16,uint8,bool,uint8,uint64,bytes32)';
 const BURN_FINALIZED_SIG = 'BurnFinalized(uint256,uint256,uint256,uint16,uint8,bool,uint8)';
 
-// Simple keccak256 for topic matching — use ethers if available, else manual
-function keccak256Topic(sig){
-  try{
-    const { ethers } = require('ethers');
-    return ethers.id(sig);
-  }catch{
-    // fallback — pre-computed
-    const known = {
-      [BURN_STARTED_SIG]:   '0x9b76a2fd14b0e4b6e34a5e0ea99a1cf19f2490d4cee498f9bf5ab2c39b4cb02c',
-      [BURN_FINALIZED_SIG]: '0x7d3aed0f4b07774d94c3c3fb3e4d15e8e7cba8c0af3e9b4e8e7d9f5a2c1b3d4e',
-    };
-    return known[sig] || null;
-  }
-}
+// Correct keccak256 topic hashes — computed from actual event signatures
+// BurnStarted(address,uint256,uint256,uint256[],uint16,uint8,bool,uint8,uint64,bytes32)
+const TOPIC_BURN_STARTED   = '0x4dd367d2c410889fbff76f34abdefdceb947ad0c58baaf327ead8ac9d6a38c22';
+// BurnFinalized(uint256,uint256,uint256,uint16,uint8,bool,uint8)
+const TOPIC_BURN_FINALIZED = '0x4c7b2090df533e8b1f7bd4ab01aadb95fedf5006f15ff4300c1709b97c4c6d5e';
 
 // ABI fragments for decoding
 const BURN_STARTED_ABI = [
@@ -592,11 +583,9 @@ async function buildBurnEmbed(finalEvent, startEvent){
   const bodyType     = finalEvent.resultBodyType;
   const isAngel      = finalEvent.resultIsAngel;
   const points       = finalEvent.points;
-  const burnSeed     = finalEvent.burnSeed;
   const burnerWallet = startEvent?.owner || 'unknown';
   const burnedIds    = startEvent?.tokenIds || [];
   const txHash       = finalEvent.txHash || '';
-  const blockNumber  = finalEvent.blockNumber || 0;
 
   const typeLabel = burnTypeLabel(bodyType, isAngel);
   const typeEmoji = burnTypeEmoji(bodyType, isAngel);
@@ -614,6 +603,11 @@ async function buildBurnEmbed(finalEvent, startEvent){
     ? burnedIds.slice(0,20).map(id => `#${id}`).join(', ') + (burnedIds.length > 20 ? ` +${burnedIds.length-20} more` : '')
     : 'unknown';
 
+  // Fetch DB metadata for the created token — traits + OS rank
+  const dbMeta = await fetchTokenMetaFromDb(survivorId).catch(()=>null);
+  const osRank = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
+  const rankBadge = osRank ? ` ⬥${osRank.toLocaleString()}` : '';
+
   // Fetch created token image
   let imgResult = getCachedImage(`${contract}:${survivorId}`);
   if(!imgResult){
@@ -628,13 +622,24 @@ async function buildBurnEmbed(finalEvent, startEvent){
     .setColor(color)
     .setURL(osUrl)
     .addFields(
-      { name:'Created Token', value:`[#${survivorId}](${osUrl})`,  inline:true },
-      { name:'Type',          value:typeLabel,                      inline:true },
-      { name:'Points Used',   value:String(points || 0),           inline:true },
-      { name:'Burned',        value:burnedStr,                      inline:false },
-      { name:'Burner',        value:burnerLink,                     inline:true },
-      { name:'Tokens Burned', value:String(burnedIds.length || '?'),inline:true },
+      { name:'Created Token', value:`[#${survivorId}${rankBadge}](${osUrl})`, inline:true },
+      { name:'Type',          value:typeLabel,                                  inline:true },
+      { name:'Points Used',   value:String(points || 0),                       inline:true },
+      { name:'Burner',        value:burnerLink,                                 inline:true },
+      { name:'Tokens Burned', value:String(burnedIds.length || '?'),           inline:true },
+      { name:'​',        value:'​',                                   inline:true },
+      { name:'Burned IDs',    value:burnedStr,                                  inline:false },
     );
+
+  // Add traits of the created token if available
+  if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
+    const traitLines = Object.entries(dbMeta.traits).slice(0,12).map(([k,v])=>`**${k}:** ${v}`);
+    const half = Math.ceil(traitLines.length/2);
+    embed.addFields(
+      { name:'Traits', value:traitLines.slice(0,half).join('\n'),    inline:true },
+      { name:'​', value:traitLines.slice(half).join('\n')||'​', inline:true },
+    );
+  }
 
   const linkParts = [`[OpenSea](${osUrl})`, `[TraitView](${tvUrl})`];
   if(etherscan) linkParts.push(`[Etherscan](${etherscan})`);
@@ -701,139 +706,124 @@ async function pollBurnEvents(){
     `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
 
   try{
-    // Get last processed block from DB
     const lastBlockRaw = await dbLoad('burn_last_block');
     let fromBlock = lastBlockRaw ? parseInt(lastBlockRaw) + 1 : null;
 
-    // If no stored block, start from current - 1000 to catch recent events
     if(!fromBlock){
-      const blockRes = await fetch(rpcUrl, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'eth_blockNumber', params:[] })
-      });
-      const blockJson = await blockRes.json();
-      fromBlock = Math.max(0, parseInt(blockJson.result, 16) - 1000);
+      const r = await fetch(rpcUrl,{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({jsonrpc:'2.0',id:1,method:'eth_blockNumber',params:[]})});
+      const j = await r.json();
+      fromBlock = Math.max(0, parseInt(j.result,16) - 2000);
+      console.log('[Burn] First run, starting from block', fromBlock);
     }
 
-    const toBlockRes = await fetch(rpcUrl, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'eth_blockNumber', params:[] })
-    });
-    const toBlockJson = await toBlockRes.json();
-    const toBlock = parseInt(toBlockJson.result, 16);
-
+    const r2 = await fetch(rpcUrl,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({jsonrpc:'2.0',id:1,method:'eth_blockNumber',params:[]})});
+    const j2 = await r2.json();
+    const toBlock = parseInt(j2.result,16);
     if(fromBlock >= toBlock) return;
 
-    // Fetch logs for both events from the burn contract
-    const logsRes = await fetch(rpcUrl, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        jsonrpc:'2.0', id:2, method:'eth_getLogs', params:[{
-          address: BURN_CONTRACT,
-          fromBlock: '0x' + fromBlock.toString(16),
-          toBlock:   '0x' + toBlock.toString(16),
-        }]
-      })
-    });
+    const logsRes = await fetch(rpcUrl,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({jsonrpc:'2.0',id:2,method:'eth_getLogs',params:[{
+        address: BURN_CONTRACT,
+        fromBlock: '0x'+fromBlock.toString(16),
+        toBlock:   '0x'+toBlock.toString(16),
+        // Filter for only our two event topics
+        topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
+      }]})});
     const logsJson = await logsRes.json();
     const logs = logsJson.result || [];
+    if(logsJson.error) throw new Error('eth_getLogs error: ' + JSON.stringify(logsJson.error));
 
-    if(logs.length) console.log(`[Burn] Processing ${logs.length} log(s) blocks ${fromBlock}→${toBlock}`);
+    if(logs.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${fromBlock}→${toBlock}`);
 
+    // ── Pass 1: process BurnStarted — store pending burns ─────────────────
     for(const log of logs){
-      const topic0 = log.topics[0];
-      const blockNum = parseInt(log.blockNumber, 16);
-      const txHash = log.transactionHash;
-
+      if(log.topics[0]?.toLowerCase() !== TOPIC_BURN_STARTED) continue;
+      // BurnStarted topics: [topic0, owner(indexed), survivorTokenId(indexed), survivorTokenIdSeed(indexed)]
+      // data: tokenIds[], points, resultBodyType, resultIsAngel, boostChance, revealBlock, selectionHash
       try{
-        // ── BurnStarted ────────────────────────────────────────────────
-        // topics: [sig, owner(indexed), survivorTokenId(indexed), survivorTokenIdSeed(indexed)]
-        // data:   tokenIds[], points, resultBodyType, resultIsAngel, boostChance, revealBlock, selectionHash
-        if(log.topics.length >= 4){
-          const owner = '0x' + log.topics[1].slice(26);
-          const survivorTokenId = parseInt(log.topics[2], 16);
-          // Decode data: first field is dynamic array (tokenIds)
-          // ABI encoding: offset(32), ..., array_length(32), elements...
-          const data = log.data.slice(2); // remove 0x
-          if(data.length > 64){
-            try{
-              const offset  = parseInt(data.slice(0,64), 16); // should be 0xe0 (224/32=7 words before array)
-              const words   = [];
-              for(let i=0;i<data.length;i+=64) words.push(data.slice(i,i+64));
-              // static params after tokenIds[]: points(uint16), resultBodyType(uint8), resultIsAngel(bool), boostChance(uint8), revealBlock(uint64), selectionHash(bytes32)
-              // tokenIds array starts at offset/32
-              const arrStart = offset/32;
-              const arrLen   = parseInt(words[arrStart]||'0',16);
-              const tokenIds = [];
-              for(let i=0;i<arrLen;i++) tokenIds.push(parseInt(words[arrStart+1+i]||'0',16));
-              const staticStart = arrStart + 1 + arrLen;
-              const points       = parseInt(words[staticStart]||'0',16);
-              const bodyType     = parseInt(words[staticStart+1]||'0',16);
-              const isAngel      = parseInt(words[staticStart+2]||'0',16) === 1;
-              const boostChance  = parseInt(words[staticStart+3]||'0',16);
-
-              await storeBurnStarted({
-                owner, survivorTokenId, tokenIds, points,
-                resultBodyType: bodyType, resultIsAngel: isAngel, boostChance,
-                blockNumber: blockNum, txHash,
-              });
-              console.log(`[Burn] BurnStarted: survivor=#${survivorTokenId} burned=${tokenIds.length} by ${shortAddr(owner)}`);
-            }catch(decodeErr){ console.warn('[Burn] BurnStarted decode error:', decodeErr.message); }
-          }
-        }
-      }catch(e){ console.warn('[Burn] log parse error:', e.message); }
-    }
-
-    // Second pass: look for BurnFinalized
-    // topics: [sig, survivorTokenId(indexed), survivorTokenIdSeed(indexed)]
-    // data:   burnSeed, points, resultBodyType, resultIsAngel, boostChance
-    for(const log of logs){
-      if(log.topics.length < 3) continue;
-      const blockNum = parseInt(log.blockNumber, 16);
-      const txHash   = log.transactionHash;
-      const logIndex = parseInt(log.logIndex, 16);
-      try{
-        const survivorTokenId = parseInt(log.topics[1], 16);
-        const data  = log.data.slice(2);
-        const words = [];
+        const owner           = '0x' + log.topics[1].slice(26);
+        const survivorTokenId = parseInt(log.topics[2], 16);
+        const txHash          = log.transactionHash;
+        const blockNum        = parseInt(log.blockNumber, 16);
+        const data            = log.data.slice(2);
+        const words           = [];
         for(let i=0;i<data.length;i+=64) words.push(data.slice(i,i+64));
-        if(words.length < 5) continue;
-        const burnSeed    = words[0];
+
+        // ABI: data starts with offset to tokenIds[] dynamic array
+        // word[0] = offset (bytes) to start of tokenIds array = 0xe0 = 224 = 7*32
+        // word[1..6] = 6 static params (points, bodyType, isAngel, boostChance, revealBlock, selectionHash)
+        // BUT: dynamic array comes FIRST in data for this event
+        // Actual layout: offset_to_array | points | bodyType | isAngel | boostChance | revealBlock | selectionHash | array_len | array_items...
+        const offset   = parseInt(words[0]||'0', 16); // byte offset = 0xe0 = 224 → word index 7
+        const arrWord  = offset / 32;                 // = 7
+        const arrLen   = parseInt(words[arrWord]||'0', 16);
+        const tokenIds = [];
+        for(let i=0;i<arrLen;i++) tokenIds.push(parseInt(words[arrWord+1+i]||'0',16));
+
+        // Static params are words 1..6 (before the array)
         const points      = parseInt(words[1]||'0',16);
         const bodyType    = parseInt(words[2]||'0',16);
         const isAngel     = parseInt(words[3]||'0',16) === 1;
         const boostChance = parseInt(words[4]||'0',16);
 
-        // Only process if this looks like a finalization (has reasonable points + bodyType)
-        if(bodyType > 4 || points === 0) continue;
-        // Check if already stored
-        const existing = await pgPool.query(
-          'SELECT id FROM burn_events WHERE survivor_token_id=$1 AND block_number=$2',
-          [survivorTokenId, blockNum]
-        );
-        if(existing.rows.length) continue;
+        await storeBurnStarted({ owner, survivorTokenId, tokenIds, points,
+          resultBodyType: bodyType, resultIsAngel: isAngel, boostChance, blockNumber: blockNum, txHash });
+        console.log(`[Burn] BurnStarted: #${survivorTokenId} ← [${tokenIds.join(',')}] by ${shortAddr(owner)} pts=${points} type=${bodyType}`);
+      }catch(e){ console.warn('[Burn] BurnStarted decode error:', e.message, 'topics:', log.topics, 'data:', log.data?.slice(0,130)); }
+    }
 
-        const finalEvent = { survivorTokenId, burnSeed, points, resultBodyType: bodyType,
-          resultIsAngel: isAngel, boostChance, txHash, blockNumber: blockNum, logIndex };
+    // ── Pass 2: process BurnFinalized — post embeds ────────────────────────
+    for(const log of logs){
+      if(log.topics[0]?.toLowerCase() !== TOPIC_BURN_FINALIZED) continue;
+      // BurnFinalized topics: [topic0, survivorTokenId(indexed), survivorTokenIdSeed(indexed)]
+      // data: burnSeed, points, resultBodyType, resultIsAngel, boostChance
+      try{
+        const survivorTokenId = parseInt(log.topics[1], 16);
+        const txHash          = log.transactionHash;
+        const blockNum        = parseInt(log.blockNumber, 16);
+        const logIndex        = parseInt(log.logIndex, 16);
+        const data            = log.data.slice(2);
+        const words           = [];
+        for(let i=0;i<data.length;i+=64) words.push(data.slice(i,i+64));
+
+        // data layout: burnSeed | points | resultBodyType | resultIsAngel | boostChance
+        const burnSeed    = words[0] || '';
+        const points      = parseInt(words[1]||'0',16);
+        const bodyType    = parseInt(words[2]||'0',16);
+        const isAngel     = parseInt(words[3]||'0',16) === 1;
+        const boostChance = parseInt(words[4]||'0',16);
+
+        console.log(`[Burn] BurnFinalized raw: #${survivorTokenId} bodyType=${bodyType} isAngel=${isAngel} points=${points}`);
+
+        // Check duplicate
+        const existing = await pgPool.query(
+          'SELECT id FROM burn_events WHERE tx_hash=$1', [txHash]
+        );
+        if(existing.rows.length){ console.log(`[Burn] Already stored tx ${txHash.slice(0,10)}...`); continue; }
+
+        // Cross-reference with BurnStarted data
         const startEvent = pendingBurns.get(String(survivorTokenId)) ||
           await loadBurnStartFromDB(survivorTokenId);
 
-        await storeBurnFinalized(finalEvent, startEvent);
-        console.log(`[Burn] BurnFinalized: #${survivorTokenId} → ${burnTypeLabel(bodyType,isAngel)} burned=${startEvent?.tokenIds?.length||'?'}`);
+        if(!startEvent) console.warn(`[Burn] No BurnStarted found for survivor #${survivorTokenId} — embed will show unknown burner/burned IDs`);
 
-        // Post embed to burn channel
+        const finalEvent = { survivorTokenId, burnSeed, points, resultBodyType: bodyType,
+          resultIsAngel: isAngel, boostChance, txHash, blockNumber: blockNum, logIndex };
+
+        await storeBurnFinalized(finalEvent, startEvent);
+        console.log(`[Burn] BurnFinalized: #${survivorTokenId} → ${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
+
         const burnChannel = await getBurnAlertChannel();
         if(burnChannel){
-          try{
-            const embed = await buildBurnEmbed(finalEvent, startEvent);
-            await sendEmbed(burnChannel, embed);
-          }catch(e){ console.error('[Burn embed post]', e.message); }
+          const embed = await buildBurnEmbed(finalEvent, startEvent);
+          await sendEmbed(burnChannel, embed);
         }
         pendingBurns.delete(String(survivorTokenId));
-      }catch(e){ console.warn('[Burn] BurnFinalized parse error:', e.message); }
+      }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
     }
 
-    // Save last processed block
     await dbSave('burn_last_block', String(toBlock));
   }catch(e){ console.error('[Burn poller]', e.message); }
 }
@@ -1615,19 +1605,19 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
-  // /setupburn — set burn alert channel to current channel
+  // /setupburn — set burn alert channel (optional channel param, defaults to current)
   if(commandName==='setupburn'){
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const channelId = interaction.channelId;
+    const channelOption = interaction.options.getChannel('channel');
+    const channelId = channelOption ? channelOption.id : interaction.channelId;
     if(!burnConfig[guildId]) burnConfig[guildId] = {};
     burnConfig[guildId].channelId = channelId;
     await saveBurnConfig();
     await interaction.reply({embeds:[new EmbedBuilder()
       .setTitle('🔥 Burn Alerts Configured')
       .setColor(BURN_COLORS.FIRE)
-      .setDescription(`Burn alerts will post to this channel <#${channelId}>.
-The bot will automatically detect OCAS Burn Machine events and post here.`)
-    ]});
+      .setDescription(`Burn alerts will post to <#${channelId}>.\nThe bot will automatically detect OCAS Burn Machine events and post there.`)
+    ], flags: MessageFlags.Ephemeral});
     return;
   }
 
@@ -3024,6 +3014,12 @@ client.once('clientReady', async ()=>{
   await loadSaleCursors();
   await loadListingCursors();
   await loadBurnConfig();
+  // Reset burn block cursor so the poller re-scans with the corrected topic filters.
+  // This one-time reset ensures previously misidentified events get reprocessed.
+  // Safe to remove after first successful deploy.
+  await dbSave('burn_last_block', null).catch(()=>{});
+  await pgPool.query("DELETE FROM bot_state WHERE key='burn_last_block'").catch(()=>{});
+  console.log('[Burn] Reset burn_last_block for fresh scan with correct topic filters');
   console.log('Servers configured: '+Object.keys(serverConfigs).length);
   pollSales();
   pollListings();

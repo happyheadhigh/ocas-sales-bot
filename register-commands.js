@@ -139,8 +139,9 @@ const commands = [
 
   // ── Burn Machine ────────────────────────────────────────────────────────────
   new SlashCommandBuilder().setName('setupburn')
-    .setDescription('Set burn alerts channel to this channel (posts burn events here)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    .setDescription('Set the channel for OCAS burn alerts (defaults to this channel)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addChannelOption(o=>o.setName('channel').setDescription('Channel to post burn alerts in (leave blank for this channel)').setRequired(false)),
 
   new SlashCommandBuilder().setName('burnstats')
     .setDescription('Show OCAS Burn Machine stats — total burned, created, estimated supply'),
