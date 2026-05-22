@@ -137,6 +137,27 @@ const commands = [
   new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep cheapest listed OCAS')
     .addStringOption(o=>o.setName('search').setDescription('e.g. "10", "2eth", "0.05 floor", "10 zombie", "1eth zombie hoodie", "0.1 floor zombie"').setRequired(false)),
 
+  // ── Burn Machine ────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('setupburn')
+    .setDescription('Set burn alerts channel to this channel (posts burn events here)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder().setName('burnstats')
+    .setDescription('Show OCAS Burn Machine stats — total burned, created, estimated supply'),
+
+  new SlashCommandBuilder().setName('burnlatest')
+    .setDescription('Show the most recent finalized OCAS burn event'),
+
+  new SlashCommandBuilder().setName('burn')
+    .setDescription('Show burn status and lineage for a token')
+    .addIntegerOption(o=>o.setName('token').setDescription('Token ID (e.g. 1234)').setRequired(true).setMinValue(1).setMaxValue(10000)),
+
+  new SlashCommandBuilder().setName('burnwallet')
+    .setDescription('Show burn history for a wallet address')
+    .addStringOption(o=>o.setName('wallet').setDescription('Wallet address (0x...)').setRequired(true)),
+
+  new SlashCommandBuilder().setName('burnleaderboard')
+    .setDescription('Top OCAS burners ranked by tokens burned'),
 
 ].map(c=>c.toJSON());
 

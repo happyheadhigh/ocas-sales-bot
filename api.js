@@ -844,6 +844,378 @@ app.get('/db/trait-count-floor', auth, async (req, res) => {
   }
 });
 
+<<<<<<< Updated upstream
+=======
+// ── Wallet analytics helpers ─────────────────────────────────────────────────
+function isEthAddress(addr) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(addr || '').trim());
+}
+function cleanAddress(addr) {
+  return normalizeEthAddress(addr);
+}
+function intParam(value, fallback, max) {
+  const n = parseInt(value || fallback, 10);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.min(n, max);
+}
+function isMissingWalletAnalyticsTable(e) {
+  return e?.code === '42P01' || /nft_transfers|wallet_token_intervals|wallet_daily_snapshots|wallet_analytics_cache/i.test(e?.message || '');
+}
+function emptyWalletResponse(address, extra = {}) {
+  return { ok: true, address, synced: false, ...extra };
+}
+
+// ── GET /db/wallet/:address/summary ──────────────────────────────────────────
+// Current derived wallet summary. Returns empty data if wallet sync has not run.
+app.get('/db/wallet/:address/summary', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  try {
+    const cache = await pool.query(
+      `SELECT summary_json, updated_at FROM wallet_analytics_cache WHERE wallet_address = $1`,
+      [address]
+    );
+    if (cache.rows.length) {
+      res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+      return res.json({ ok: true, address, synced: true, cached: true, updated_at: cache.rows[0].updated_at, summary: cache.rows[0].summary_json });
+    }
+
+    const current = await pool.query(`
+      SELECT w.token_id, t.os_rank, t.obs_rank, l.price_eth
+      FROM wallet_token_intervals w
+      LEFT JOIN tokens t ON t.id = w.token_id
+      LEFT JOIN listings l ON l.token_id = w.token_id
+      WHERE w.wallet_address = $1 AND w.disposed_at IS NULL
+      ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC
+      LIMIT 10000
+    `, [address]);
+
+    const owned = current.rows;
+    const ranks = owned.map(r => parseInt(r.os_rank || r.obs_rank)).filter(Number.isFinite);
+    const listed = owned.filter(r => r.price_eth != null);
+    const floor = await pool.query('SELECT MIN(price_eth) AS floor_eth FROM listings');
+    const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
+    const estimated = floorEth == null ? null : owned.length * floorEth;
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      address,
+      synced: true,
+      cached: false,
+      summary: {
+        owned_count: owned.length,
+        best_rank: ranks.length ? Math.min(...ranks) : null,
+        listed_count: listed.length,
+        estimated_floor_value: estimated,
+        floor_eth: floorEth,
+        top_tokens: owned.slice(0, 12).map(r => ({
+          token_id: parseInt(r.token_id),
+          os_rank: r.os_rank ? parseInt(r.os_rank) : null,
+          obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
+          price_eth: r.price_eth != null ? parseFloat(r.price_eth) : null,
+        })),
+      },
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json(emptyWalletResponse(address, { summary: { owned_count: 0, best_rank: null, listed_count: 0, estimated_floor_value: null } }));
+    console.error('/db/wallet/:address/summary error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/wallet/:address/transfers ────────────────────────────────────────
+app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const limit = intParam(req.query.limit, 100, 200);
+  const offset = intParam(req.query.offset, 0, 10000);
+  try {
+    const result = await pool.query(`
+      SELECT contract, token_id, from_address, to_address, tx_hash, log_index, block_number, block_ts, event_type
+      FROM nft_transfers
+      WHERE contract = $1 AND (from_address = $2 OR to_address = $2)
+      ORDER BY block_number DESC, log_index DESC
+      LIMIT $3 OFFSET $4
+    `, [OCAS_CONTRACT, address, limit, offset]);
+    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    res.json({
+      ok: true,
+      address,
+      contract: OCAS_CONTRACT,
+      synced: true,
+      transfers: result.rows.map(r => ({
+        contract: r.contract,
+        token_id: parseInt(r.token_id),
+        from_address: r.from_address,
+        to_address: r.to_address,
+        tx_hash: r.tx_hash,
+        log_index: parseInt(r.log_index),
+        block_number: parseInt(r.block_number),
+        block_ts: r.block_ts,
+        event_type: r.event_type,
+      })),
+      count: result.rows.length,
+      limit,
+      offset,
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json(emptyWalletResponse(address, { transfers: [], count: 0, limit, offset }));
+    console.error('/db/wallet/:address/transfers error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/wallet/:address/history ──────────────────────────────────────────
+app.get('/db/wallet/:address/history', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const days = intParam(req.query.days, 90, 365);
+  try {
+    const result = await pool.query(`
+      SELECT snapshot_date, owned_count, best_rank, listed_count, estimated_floor_value
+      FROM wallet_daily_snapshots
+      WHERE wallet_address = $1
+        AND snapshot_date >= CURRENT_DATE - ($2 || ' days')::INTERVAL
+      ORDER BY snapshot_date ASC
+    `, [address, days]);
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json({
+      ok: true,
+      address,
+      synced: true,
+      history: result.rows.map(r => ({
+        snapshot_date: r.snapshot_date,
+        owned_count: parseInt(r.owned_count),
+        best_rank: r.best_rank ? parseInt(r.best_rank) : null,
+        listed_count: parseInt(r.listed_count),
+        estimated_floor_value: r.estimated_floor_value != null ? parseFloat(r.estimated_floor_value) : null,
+      })),
+      count: result.rows.length,
+      days,
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json(emptyWalletResponse(address, { history: [], count: 0, days }));
+    console.error('/db/wallet/:address/history error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/wallet/:address/traits ───────────────────────────────────────────
+app.get('/db/wallet/:address/traits', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const limit = intParam(req.query.limit, 100, 500);
+  try {
+    const result = await pool.query(`
+      SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS count,
+             ARRAY_AGG(w.token_id ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC) AS token_ids
+      FROM wallet_token_intervals w
+      JOIN token_traits tt ON tt.token_id = w.token_id
+      LEFT JOIN tokens t ON t.id = w.token_id
+      WHERE w.wallet_address = $1 AND w.disposed_at IS NULL
+      GROUP BY tt.trait_name, tt.trait_value
+      ORDER BY count DESC, tt.trait_name ASC, tt.trait_value ASC
+      LIMIT $2
+    `, [address, limit]);
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json({
+      ok: true,
+      address,
+      synced: true,
+      traits: result.rows.map(r => ({
+        trait_name: r.trait_name,
+        trait_value: r.trait_value,
+        count: parseInt(r.count),
+        token_ids: (r.token_ids || []).map(Number).filter(Number.isFinite),
+      })),
+      count: result.rows.length,
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json(emptyWalletResponse(address, { traits: [], count: 0 }));
+    console.error('/db/wallet/:address/traits error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/token/:id/history ────────────────────────────────────────────────
+app.get('/db/token/:id/history', auth, async (req, res) => {
+  const tokenId = parseInt(req.params.id, 10);
+  if (!tokenId || tokenId < 1 || tokenId > 10000) return res.status(400).json({ ok: false, error: 'invalid token id' });
+  const limit = intParam(req.query.limit, 100, 200);
+  try {
+    const result = await pool.query(`
+      SELECT contract, token_id, from_address, to_address, tx_hash, log_index, block_number, block_ts, event_type
+      FROM nft_transfers
+      WHERE contract = $1 AND token_id = $2
+      ORDER BY block_number ASC, log_index ASC
+      LIMIT $3
+    `, [OCAS_CONTRACT, tokenId, limit]);
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json({
+      ok: true,
+      token_id: tokenId,
+      contract: OCAS_CONTRACT,
+      synced: true,
+      history: result.rows.map(r => ({
+        contract: r.contract,
+        token_id: parseInt(r.token_id),
+        from_address: r.from_address,
+        to_address: r.to_address,
+        tx_hash: r.tx_hash,
+        log_index: parseInt(r.log_index),
+        block_number: parseInt(r.block_number),
+        block_ts: r.block_ts,
+        event_type: r.event_type,
+      })),
+      count: result.rows.length,
+    });
+  } catch (e) {
+    if (isMissingWalletAnalyticsTable(e)) return res.json({ ok: true, token_id: tokenId, synced: false, history: [], count: 0 });
+    console.error('/db/token/:id/history error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/burn-events ──────────────────────────────────────────────────────
+// Recent burn events for TraitView integration.
+// Query params: limit (default 20, max 100), wallet (optional filter)
+app.get('/db/burn-events', auth, async (req, res) => {
+  try {
+    const limit  = Math.min(parseInt(req.query.limit || '20'), 100);
+    const wallet = req.query.wallet ? req.query.wallet.toLowerCase().trim() : null;
+    const params = wallet ? [wallet, limit] : [limit];
+    const where  = wallet ? 'WHERE LOWER(be.burner_wallet) = $1' : '';
+    const pLimit = wallet ? '$2' : '$1';
+    const result = await pool.query(`
+      SELECT be.id, be.tx_hash, be.block_number, be.burner_wallet, be.survivor_token_id,
+             be.result_body_type, be.result_is_angel, be.points_used, be.boost_chance,
+             be.burned_at,
+             COALESCE(array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) FILTER (WHERE bei.burned_token_id IS NOT NULL), '{}') AS burned_ids
+      FROM burn_events be
+      LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+      ${where}
+      GROUP BY be.id
+      ORDER BY be.burned_at DESC
+      LIMIT ${pLimit}
+    `, params);
+    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    res.json({
+      ok: true,
+      burns: result.rows.map(r => ({
+        id:               r.id,
+        tx_hash:          r.tx_hash,
+        block_number:     parseInt(r.block_number),
+        burner_wallet:    r.burner_wallet,
+        survivor_token_id: parseInt(r.survivor_token_id),
+        result_body_type: r.result_body_type,
+        result_is_angel:  r.result_is_angel,
+        points_used:      r.points_used ? parseInt(r.points_used) : null,
+        boost_chance:     r.boost_chance ? parseInt(r.boost_chance) : null,
+        burned_at:        r.burned_at,
+        burned_ids:       (r.burned_ids || []).map(Number).filter(Number.isFinite),
+      })),
+      count: result.rows.length,
+    });
+  } catch(e) {
+    console.error('/db/burn-events error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/burn/:tokenId ─────────────────────────────────────────────────────
+// Burn lineage for a specific token — was it burned, or created via burn?
+app.get('/db/burn/:tokenId', auth, async (req, res) => {
+  try {
+    const tokenId = parseInt(req.params.tokenId);
+    if (!tokenId || tokenId < 1) return res.status(400).json({ ok: false, error: 'invalid token id' });
+
+    const [burnedRes, createdRes] = await Promise.all([
+      pool.query(`
+        SELECT be.survivor_token_id, be.burner_wallet, be.burned_at,
+               be.result_body_type, be.result_is_angel, be.tx_hash
+        FROM burn_event_inputs bei
+        JOIN burn_events be ON be.id = bei.burn_event_id
+        WHERE bei.burned_token_id = $1
+        LIMIT 1
+      `, [tokenId]),
+      pool.query(`
+        SELECT be.burner_wallet, be.burned_at, be.result_body_type,
+               be.result_is_angel, be.points_used, be.tx_hash,
+               COALESCE(array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) FILTER (WHERE bei.burned_token_id IS NOT NULL), '{}') AS burned_ids
+        FROM burn_events be
+        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        WHERE be.survivor_token_id = $1
+        GROUP BY be.id LIMIT 1
+      `, [tokenId]),
+    ]);
+
+    const status = burnedRes.rows.length ? 'burned'
+      : createdRes.rows.length ? 'created'
+      : 'active';
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      token_id: tokenId,
+      status,
+      burned_into: burnedRes.rows.length ? {
+        survivor_token_id: parseInt(burnedRes.rows[0].survivor_token_id),
+        burner_wallet:     burnedRes.rows[0].burner_wallet,
+        burned_at:         burnedRes.rows[0].burned_at,
+        result_body_type:  burnedRes.rows[0].result_body_type,
+        result_is_angel:   burnedRes.rows[0].result_is_angel,
+        tx_hash:           burnedRes.rows[0].tx_hash,
+      } : null,
+      created_from: createdRes.rows.length ? {
+        burner_wallet:    createdRes.rows[0].burner_wallet,
+        burned_at:        createdRes.rows[0].burned_at,
+        result_body_type: createdRes.rows[0].result_body_type,
+        result_is_angel:  createdRes.rows[0].result_is_angel,
+        points_used:      createdRes.rows[0].points_used,
+        tx_hash:          createdRes.rows[0].tx_hash,
+        burned_ids:       (createdRes.rows[0].burned_ids || []).map(Number).filter(Number.isFinite),
+      } : null,
+    });
+  } catch(e) {
+    console.error('/db/burn/:tokenId error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/burn-stats ────────────────────────────────────────────────────────
+app.get('/db/burn-stats', auth, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT
+        COUNT(be.id)::int AS total_burns,
+        COALESCE(SUM(sub.burned_count), 0)::int AS total_tokens_burned,
+        COUNT(be.id)::int AS total_tokens_created
+      FROM burn_events be
+      LEFT JOIN (
+        SELECT burn_event_id, COUNT(*)::int AS burned_count
+        FROM burn_event_inputs GROUP BY burn_event_id
+      ) sub ON sub.burn_event_id = be.id
+    `);
+    const stats = r.rows[0];
+    const burned  = parseInt(stats.total_tokens_burned) || 0;
+    const created = parseInt(stats.total_tokens_created) || 0;
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      total_burns:          parseInt(stats.total_burns) || 0,
+      total_tokens_burned:  burned,
+      total_tokens_created: created,
+      net_supply_reduction: burned - created,
+      estimated_supply:     10000 - (burned - created),
+    });
+  } catch(e) {
+    console.error('/db/burn-stats error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+>>>>>>> Stashed changes
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
