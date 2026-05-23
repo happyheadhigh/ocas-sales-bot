@@ -4,7 +4,8 @@ const { Pool } = require('pg');
 
 const BURN_CONTRACT = '0x1095c73C337CC5e03f9E1D426c524CC3e32a50f6';
 const ZERO_START = process.env.BURN_START_BLOCK ? parseInt(process.env.BURN_START_BLOCK, 10) : null;
-const CHUNK = Math.max(100, parseInt(process.env.BURN_REPAIR_CHUNK || process.env.BURN_BLOCK_CHUNK || '1000', 10));
+const CHUNK = Math.max(1, parseInt(process.env.BURN_REPAIR_CHUNK || process.env.BURN_BLOCK_CHUNK || '1000', 10));
+const DELAY_MS = Math.max(0, parseInt(process.env.BURN_REPAIR_DELAY_MS || '500', 10));
 const TOPIC_BURN_STARTED   = '0x4dd367d2c410889fbff76f34abdefdceb947ad0c58baaf327ead8ac9d6a38c22';
 const TOPIC_BURN_FINALIZED = '0x4c7b2090df533e8b1f7bd4ab01aadb95fedf5006f15ff4300c1709b97c4c6d5e';
 
@@ -208,6 +209,41 @@ async function upsertFinalized(client, event){
   return { id, inputCount: started?.tokenIds?.length || 0 };
 }
 
+async function repairMissingInputs(client){
+  const before = await totals(client);
+  const missing = await client.query(`
+    SELECT be.id, be.survivor_token_id
+    FROM burn_events be
+    LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+    GROUP BY be.id
+    HAVING COUNT(bei.id) = 0
+    ORDER BY be.block_number ASC, be.log_index ASC
+  `);
+  let repairedBurns = 0;
+  let insertedInputs = 0;
+  for(const row of missing.rows){
+    const started = await loadStarted(client, row.survivor_token_id);
+    const tokenIds = started?.tokenIds || [];
+    if(!tokenIds.length) continue;
+    for(const tokenId of tokenIds){
+      const r = await client.query(
+        `INSERT INTO burn_event_inputs (burn_event_id, burned_token_id)
+         VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [row.id, tokenId]
+      );
+      insertedInputs += r.rowCount;
+    }
+    repairedBurns++;
+  }
+  const after = await totals(client);
+  return {
+    before: Number(before.missing_input_burns || 0),
+    after: Number(after.missing_input_burns || 0),
+    repairedBurns,
+    insertedInputs,
+  };
+}
+
 async function totals(client){
   const r = await client.query(`
     SELECT
@@ -237,20 +273,38 @@ async function main(){
     if(!lock.rows[0]?.locked){ console.log('[burn-repair] Another repair is already running.'); return; }
 
     const latest = intHex(await rpc('eth_blockNumber', []));
+    console.log(`[burn-repair] start=${ZERO_START} latest=${latest} chunk=${CHUNK} delayMs=${DELAY_MS}`);
     let foundFinalized = 0;
     let foundStarted = 0;
     let chunks = 0;
     const failedChunks = [];
 
-    for(let from = ZERO_START; from <= latest; from += CHUNK){
-      const to = Math.min(latest, from + CHUNK - 1);
+    async function fetchLogsRange(from, to){
+      console.log(`[burn-repair] eth_getLogs fromBlock=${from} toBlock=${to}`);
       try{
-        const logs = await rpc('eth_getLogs', [{
+        return await rpc('eth_getLogs', [{
           address: BURN_CONTRACT,
           fromBlock: hex(from),
           toBlock: hex(to),
           topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
         }]);
+      }catch(e){
+        if(from < to){
+          console.warn(`[burn-repair] splitting failed range ${from}-${to}: ${e.message}`);
+          const mid = Math.floor((from + to) / 2);
+          const left = await fetchLogsRange(from, mid);
+          if(DELAY_MS) await sleep(DELAY_MS);
+          const right = await fetchLogsRange(mid + 1, to);
+          return [...(left || []), ...(right || [])];
+        }
+        throw e;
+      }
+    }
+
+    for(let from = ZERO_START; from <= latest; from += CHUNK){
+      const to = Math.min(latest, from + CHUNK - 1);
+      try{
+        const logs = await fetchLogsRange(from, to);
         for(const log of logs || []){
           if(log.topics[0]?.toLowerCase() === TOPIC_BURN_STARTED){
             await upsertStarted(client, decodeStarted(log));
@@ -269,8 +323,10 @@ async function main(){
         failedChunks.push([from, to, e.message]);
         console.error(`[burn-repair] failed chunk ${from}-${to}: ${e.message}`);
       }
+      if(DELAY_MS) await sleep(DELAY_MS);
     }
 
+    const missingRepair = await repairMissingInputs(client);
     const t = await totals(client);
     const reduction = Number(t.tokens_burned || 0) - Number(t.tokens_created || 0);
     const estimated = 10000 - reduction;
@@ -278,6 +334,10 @@ async function main(){
     console.log(`chunks completed: ${chunks}`);
     console.log(`failed chunks: ${failedChunks.length}`);
     for(const [from,to,msg] of failedChunks) console.log(`missing/failed range: ${from}-${to} (${msg})`);
+    console.log(`missing input rows before repair: ${missingRepair.before}`);
+    console.log(`missing input rows after repair: ${missingRepair.after}`);
+    console.log(`missing input burns repaired: ${missingRepair.repairedBurns}`);
+    console.log(`burn_event_inputs inserted during repair: ${missingRepair.insertedInputs}`);
     console.log(`finalized burn events found: ${t.finalized_burns}`);
     console.log(`tokens burned found: ${t.tokens_burned}`);
     console.log(`tokens created found: ${t.tokens_created}`);
