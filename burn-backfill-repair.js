@@ -167,21 +167,32 @@ async function upsertStarted(client, event){
   return id;
 }
 
-async function loadStarted(client, survivorTokenId){
+async function loadStarted(client, survivorTokenId, maxBlockNumber = null){
+  const params = [survivorTokenId];
+  const blockFilter = maxBlockNumber == null ? '' : 'AND bse.block_number <= $2';
+  if(maxBlockNumber != null) params.push(maxBlockNumber);
   const r = await client.query(`
-    SELECT bse.owner_wallet, array_agg(bsi.burned_token_id ORDER BY bsi.burned_token_id) AS token_ids
+    SELECT bse.id, bse.owner_wallet, bse.block_number, bse.log_index,
+           array_agg(bsi.burned_token_id ORDER BY bsi.burned_token_id) AS token_ids
     FROM burn_started_events bse
     LEFT JOIN burn_started_inputs bsi ON bsi.burn_started_id = bse.id
     WHERE bse.survivor_token_id = $1
+      ${blockFilter}
     GROUP BY bse.id
     ORDER BY bse.block_number DESC, bse.log_index DESC
     LIMIT 1
-  `, [survivorTokenId]);
-  return r.rows[0] ? { owner: r.rows[0].owner_wallet, tokenIds: (r.rows[0].token_ids || []).filter(Boolean) } : null;
+  `, params);
+  return r.rows[0] ? {
+    id: r.rows[0].id,
+    owner: r.rows[0].owner_wallet,
+    blockNumber: r.rows[0].block_number,
+    logIndex: r.rows[0].log_index,
+    tokenIds: (r.rows[0].token_ids || []).filter(Boolean),
+  } : null;
 }
 
 async function upsertFinalized(client, event){
-  const started = await loadStarted(client, event.survivorTokenId);
+  const started = await loadStarted(client, event.survivorTokenId, event.blockNumber);
   const r = await client.query(`
     INSERT INTO burn_events
       (tx_hash, block_number, log_index, burner_wallet, survivor_token_id,
@@ -209,22 +220,43 @@ async function upsertFinalized(client, event){
   return { id, inputCount: started?.tokenIds?.length || 0 };
 }
 
-async function repairMissingInputs(client){
+async function reconcileFinalizedInputs(client){
   const before = await totals(client);
-  const missing = await client.query(`
-    SELECT be.id, be.survivor_token_id
+  const finalized = await client.query(`
+    SELECT be.id, be.survivor_token_id, be.block_number, be.log_index,
+           array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) FILTER (WHERE bei.id IS NOT NULL) AS current_ids
     FROM burn_events be
     LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
     GROUP BY be.id
-    HAVING COUNT(bei.id) = 0
     ORDER BY be.block_number ASC, be.log_index ASC
   `);
+  let missingBefore = 0;
+  let missingAfter = 0;
   let repairedBurns = 0;
   let insertedInputs = 0;
-  for(const row of missing.rows){
-    const started = await loadStarted(client, row.survivor_token_id);
+  let deletedInputs = 0;
+  let startedMatches = 0;
+  let startedMissing = 0;
+
+  for(const row of finalized.rows){
+    const currentIds = (row.current_ids || []).filter(Boolean).map(Number).sort((a,b)=>a-b);
+    if(!currentIds.length) missingBefore++;
+
+    const started = await loadStarted(client, row.survivor_token_id, row.block_number);
     const tokenIds = started?.tokenIds || [];
-    if(!tokenIds.length) continue;
+    if(!tokenIds.length){
+      startedMissing++;
+      if(!currentIds.length) missingAfter++;
+      continue;
+    }
+    startedMatches++;
+
+    const desiredIds = [...new Set(tokenIds.map(Number).filter(Number.isFinite))].sort((a,b)=>a-b);
+    const same = currentIds.length === desiredIds.length && currentIds.every((id, i) => id === desiredIds[i]);
+    if(same) continue;
+
+    const del = await client.query('DELETE FROM burn_event_inputs WHERE burn_event_id = $1', [row.id]);
+    deletedInputs += del.rowCount;
     for(const tokenId of tokenIds){
       const r = await client.query(
         `INSERT INTO burn_event_inputs (burn_event_id, burned_token_id)
@@ -235,24 +267,39 @@ async function repairMissingInputs(client){
     }
     repairedBurns++;
   }
+
   const after = await totals(client);
   return {
-    before: Number(before.missing_input_burns || 0),
-    after: Number(after.missing_input_burns || 0),
+    before: Number(before.missing_input_burns || missingBefore || 0),
+    after: Number(after.missing_input_burns || missingAfter || 0),
     repairedBurns,
     insertedInputs,
+    deletedInputs,
+    startedMatches,
+    startedMissing,
   };
 }
 
 async function totals(client){
   const r = await client.query(`
+    WITH finalized AS (
+      SELECT id FROM burn_events
+    ),
+    finalized_inputs AS (
+      SELECT DISTINCT bei.burn_event_id, bei.burned_token_id
+      FROM burn_event_inputs bei
+      JOIN finalized f ON f.id = bei.burn_event_id
+    )
     SELECT
-      COUNT(DISTINCT be.id)::int AS finalized_burns,
-      COUNT(DISTINCT (bei.burn_event_id, bei.burned_token_id))::int AS tokens_burned,
-      COUNT(DISTINCT be.id)::int AS tokens_created,
-      COUNT(DISTINCT be.id) FILTER (WHERE bei.burn_event_id IS NULL)::int AS missing_input_burns
-    FROM burn_events be
-    LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+      (SELECT COUNT(*)::int FROM finalized) AS finalized_burns,
+      (SELECT COUNT(*)::int FROM finalized_inputs) AS tokens_burned,
+      (SELECT COUNT(*)::int FROM finalized) AS tokens_created,
+      (
+        SELECT COUNT(*)::int
+        FROM finalized f
+        LEFT JOIN finalized_inputs fi ON fi.burn_event_id = f.id
+        WHERE fi.burn_event_id IS NULL
+      ) AS missing_input_burns
   `);
   const d = await client.query(`
     SELECT COUNT(*)::int AS duplicate_inputs FROM (
@@ -262,7 +309,25 @@ async function totals(client){
       HAVING COUNT(*) > 1
     ) x
   `);
-  return { ...r.rows[0], duplicate_inputs: d.rows[0].duplicate_inputs };
+  const diagnostics = await client.query(`
+    WITH finalized AS (
+      SELECT id, survivor_token_id FROM burn_events
+    )
+    SELECT
+      (SELECT COUNT(*)::int
+       FROM burn_event_inputs bei
+       LEFT JOIN burn_events be ON be.id = bei.burn_event_id
+       WHERE be.id IS NULL) AS orphaned_burn_inputs,
+      (SELECT COUNT(*)::int
+       FROM burn_started_events bse
+       LEFT JOIN finalized be ON be.survivor_token_id = bse.survivor_token_id
+       WHERE be.id IS NULL) AS started_without_finalize,
+      (SELECT COUNT(*)::int
+       FROM finalized be
+       LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+       WHERE bei.id IS NULL) AS finalized_without_inputs
+  `);
+  return { ...r.rows[0], ...diagnostics.rows[0], duplicate_inputs: d.rows[0].duplicate_inputs };
 }
 
 async function main(){
@@ -326,7 +391,7 @@ async function main(){
       if(DELAY_MS) await sleep(DELAY_MS);
     }
 
-    const missingRepair = await repairMissingInputs(client);
+    const inputRepair = await reconcileFinalizedInputs(client);
     const t = await totals(client);
     const reduction = Number(t.tokens_burned || 0) - Number(t.tokens_created || 0);
     const estimated = 10000 - reduction;
@@ -334,10 +399,16 @@ async function main(){
     console.log(`chunks completed: ${chunks}`);
     console.log(`failed chunks: ${failedChunks.length}`);
     for(const [from,to,msg] of failedChunks) console.log(`missing/failed range: ${from}-${to} (${msg})`);
-    console.log(`missing input rows before repair: ${missingRepair.before}`);
-    console.log(`missing input rows after repair: ${missingRepair.after}`);
-    console.log(`missing input burns repaired: ${missingRepair.repairedBurns}`);
-    console.log(`burn_event_inputs inserted during repair: ${missingRepair.insertedInputs}`);
+    console.log(`missing input rows before repair: ${inputRepair.before}`);
+    console.log(`missing input rows after repair: ${inputRepair.after}`);
+    console.log(`finalized burns reconciled: ${inputRepair.repairedBurns}`);
+    console.log(`burn_event_inputs inserted during repair: ${inputRepair.insertedInputs}`);
+    console.log(`burn_event_inputs deleted during repair: ${inputRepair.deletedInputs}`);
+    console.log(`matched BurnStarted rows: ${inputRepair.startedMatches}`);
+    console.log(`finalized burns without matching BurnStarted: ${inputRepair.startedMissing}`);
+    console.log(`orphaned burn inputs: ${t.orphaned_burn_inputs}`);
+    console.log(`started burns without finalize: ${t.started_without_finalize}`);
+    console.log(`finalized burns without inputs: ${t.finalized_without_inputs}`);
     console.log(`finalized burn events found: ${t.finalized_burns}`);
     console.log(`tokens burned found: ${t.tokens_burned}`);
     console.log(`tokens created found: ${t.tokens_created}`);

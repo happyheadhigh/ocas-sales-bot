@@ -2942,18 +2942,24 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     try{
       const [statsRes, latestRes] = await Promise.all([
         pgPool.query(`
+          WITH finalized AS (
+            SELECT id FROM burn_events
+          ),
+          finalized_inputs AS (
+            SELECT DISTINCT bei.burn_event_id, bei.burned_token_id
+            FROM burn_event_inputs bei
+            JOIN finalized f ON f.id = bei.burn_event_id
+          )
           SELECT
-            COUNT(DISTINCT be.id)::int AS total_burns,
-            COUNT(DISTINCT (bei.burn_event_id, bei.burned_token_id))::int AS total_burned,
-            COUNT(DISTINCT be.id)::int AS total_created,
-            COUNT(DISTINCT be.id) FILTER (WHERE input_counts.input_count IS NULL OR input_counts.input_count = 0)::int AS missing_input_burns
-          FROM burn_events be
-          LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-          LEFT JOIN (
-            SELECT burn_event_id, COUNT(*)::int AS input_count
-            FROM burn_event_inputs
-            GROUP BY burn_event_id
-          ) input_counts ON input_counts.burn_event_id = be.id
+            (SELECT COUNT(*)::int FROM finalized) AS total_burns,
+            (SELECT COUNT(*)::int FROM finalized_inputs) AS total_burned,
+            (SELECT COUNT(*)::int FROM finalized) AS total_created,
+            (
+              SELECT COUNT(*)::int
+              FROM finalized f
+              LEFT JOIN finalized_inputs fi ON fi.burn_event_id = f.id
+              WHERE fi.burn_event_id IS NULL
+            ) AS missing_input_burns
         `),
         pgPool.query(`
           SELECT be.survivor_token_id, be.result_body_type, be.result_is_angel,
