@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node bot.js",
     "register": "node register-commands.js",
-    "dev": "node --watch bot.js"
+    "dev": "node --watch bot.js",
+    "burn:repair": "node burn-backfill-repair.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

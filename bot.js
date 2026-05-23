@@ -165,6 +165,13 @@ async function ensureBotStateTable(){
       )
     `);
     await pgPool.query(`
+      DELETE FROM burn_event_inputs a
+      USING burn_event_inputs b
+      WHERE a.id > b.id
+        AND a.burn_event_id = b.burn_event_id
+        AND a.burned_token_id = b.burned_token_id
+    `);
+    await pgPool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS burn_event_inputs_event_token_idx
       ON burn_event_inputs(burn_event_id, burned_token_id)
     `);
@@ -2937,9 +2944,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         pgPool.query(`
           SELECT
             COUNT(DISTINCT be.id)::int AS total_burns,
-            COUNT(bei.burned_token_id)::int AS total_burned,
+            COUNT(DISTINCT (bei.burn_event_id, bei.burned_token_id))::int AS total_burned,
             COUNT(DISTINCT be.id)::int AS total_created,
-            COUNT(*) FILTER (WHERE input_counts.input_count IS NULL OR input_counts.input_count = 0)::int AS missing_input_burns
+            COUNT(DISTINCT be.id) FILTER (WHERE input_counts.input_count IS NULL OR input_counts.input_count = 0)::int AS missing_input_burns
           FROM burn_events be
           LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
           LEFT JOIN (
@@ -2970,7 +2977,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           { name:'Total Burns',       value:String(stats.total_burns||0),   inline:true },
           { name:'Tokens Burned',     value:String(burned),                  inline:true },
           { name:'Tokens Created',    value:String(created),                 inline:true },
-          { name:'Net Supply Change', value:`-${burned - created}`,             inline:true },
+          { name:'Supply Reduced By', value:String(burned - created),        inline:true },
           { name:'Est. Supply',       value:String(estimatedSupply),         inline:true },
           { name:'Links',             value:`[Burn Machine](https://www.onchainallstars.xyz/burn-machine) | [TraitView](https://traitview.com/) | [Etherscan](https://etherscan.io/address/${BURN_CONTRACT})`, inline:false },
         );
