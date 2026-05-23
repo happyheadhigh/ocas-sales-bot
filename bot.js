@@ -74,6 +74,7 @@ const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BURN_START_BLOCK, 10) : null;
 const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
 const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '2000', 10));
+const BURN_ALERT_CHANNEL_ID = process.env.BURN_ALERT_CHANNEL_ID || '';
 const BURN_COLORS = {
   FIRE:        0xFF6B00, // default burn embed
   RADIOACTIVE: 0x39FF14, // radioactive type
@@ -360,8 +361,9 @@ const ocasTraitsCache = new Map(); // tokenId → {traits, expires}
 const sweepSessions = new Map(); // sessionId → { listings, page }
 
 // ── Burn machine config (stored per-guild via bot_state) ─────────────────────
-// burnConfig: { channelId, lastBlock }
-let burnConfig = {}; // guildId → { channelId }
+// burnConfig: guildId -> { burnAlertChannelId }.
+// Legacy { channelId } is still read for backwards compatibility.
+let burnConfig = {};
 async function loadBurnConfig(){
   const db = await dbLoad('burn_config');
   if(db){ burnConfig = db; console.log('[Burn] Config loaded'); }
@@ -370,6 +372,9 @@ async function saveBurnConfig(){
   await dbSave('burn_config', burnConfig);
 }
 function getBurnConfig(guildId){ return burnConfig[guildId] || null; }
+function getConfiguredBurnChannelId(cfg){
+  return cfg?.burnAlertChannelId || cfg?.channelId || null;
+}
 
 function normalizePhrase(s){
   return String(s||"").toLowerCase().replace(/&/g," and ").replace(/[^a-z0-9]+/g," ").replace(/\s+/g," ").trim();
@@ -623,16 +628,33 @@ const BURN_FINALIZED_ABI = [
   'event BurnFinalized(uint256 indexed survivorTokenId, uint256 indexed survivorTokenIdSeed, uint256 burnSeed, uint16 points, uint8 resultBodyType, bool resultIsAngel, uint8 boostChance)'
 ];
 
-async function getBurnAlertChannel(){
-  // Find first guild with burn channel configured
-  for(const guildId of Object.keys(burnConfig)){
-    const bc = burnConfig[guildId];
-    if(bc?.channelId){
-      const ch = client.channels.cache.get(bc.channelId);
-      if(ch) return ch;
+async function resolveDiscordChannel(channelId){
+  if(!channelId) return null;
+  return client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(()=>null);
+}
+
+async function getBurnAlertChannels(){
+  const configuredIds = [];
+  const seen = new Set();
+  for(const cfg of Object.values(burnConfig || {})){
+    const channelId = getConfiguredBurnChannelId(cfg);
+    if(channelId && !seen.has(channelId)){
+      seen.add(channelId);
+      configuredIds.push(channelId);
     }
   }
-  return null;
+
+  if(!configuredIds.length && BURN_ALERT_CHANNEL_ID){
+    configuredIds.push(BURN_ALERT_CHANNEL_ID);
+  }
+
+  const channels = [];
+  for(const channelId of configuredIds){
+    const ch = await resolveDiscordChannel(channelId);
+    if(ch) channels.push(ch);
+    else console.warn(`[Burn] Configured burn alert channel not found: ${channelId}`);
+  }
+  return channels;
 }
 
 async function buildBurnEmbed(finalEvent, startEvent){
@@ -916,8 +938,9 @@ async function pollBurnEventsLegacy(){
         await storeBurnFinalized(finalEvent, startEvent);
         console.log(`[Burn] BurnFinalized: #${survivorTokenId} → ${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
-        const burnChannel = await getBurnAlertChannel();
-        if(burnChannel){
+        const burnChannels = await getBurnAlertChannels();
+        for(const burnChannel of burnChannels){
+          if(isRecentChannelPost(burnChannel.id, `burn:${survivorTokenId}:${txHash}`)) continue;
           const embed = await buildBurnEmbed(finalEvent, startEvent);
           await sendEmbed(burnChannel, embed);
         }
@@ -1005,8 +1028,9 @@ async function processBurnLogs(logs, shouldAlert){
       console.log(`[Burn] BurnFinalized: #${survivorTokenId} tier=${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
       if(shouldAlert){
-        const burnChannel = await getBurnAlertChannel();
-        if(burnChannel){
+        const burnChannels = await getBurnAlertChannels();
+        for(const burnChannel of burnChannels){
+          if(isRecentChannelPost(burnChannel.id, `burn:${survivorTokenId}:${txHash}`)) continue;
           const embed = await buildBurnEmbed(finalEvent, startEvent);
           await sendEmbed(burnChannel, embed);
         }
@@ -1907,7 +1931,8 @@ client.on('interactionCreate', async (interaction)=>{
     const channelOption = interaction.options.getChannel('channel');
     const channelId = channelOption ? channelOption.id : interaction.channelId;
     if(!burnConfig[guildId]) burnConfig[guildId] = {};
-    burnConfig[guildId].channelId = channelId;
+    burnConfig[guildId].burnAlertChannelId = channelId;
+    burnConfig[guildId].channelId = channelId; // legacy compatibility for older saved configs/tools
     await saveBurnConfig();
     await interaction.reply({embeds:[new EmbedBuilder()
       .setTitle('Burn Alerts Configured')
@@ -2076,6 +2101,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     const ra  = config.rankAlert
       ? `⬥ OS Rank #${config.rankAlert.min}–#${config.rankAlert.max}${config.rankAlert.channelId ? ` → <#${config.rankAlert.channelId}>` : ''}`
       : 'none';
+    const burnCfg = getBurnConfig(guildId);
+    const burnChannelId = getConfiguredBurnChannelId(burnCfg);
     await interaction.reply({embeds:[new EmbedBuilder().setTitle('Bot Status').setColor(0x7aa2ff)
       .addFields(
         {name:'Collection',        value:config.slug||'not set',                                            inline:true},
@@ -2083,7 +2110,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         {name:'​',            value:'​',                                                           inline:true},
         {name:'Sales Channel',     value:config.channelId?`<#${config.channelId}>`:'not set',               inline:true},
         {name:'Listings Channel',  value:config.listingsChannelId?`<#${config.listingsChannelId}>`:'not set', inline:true},
-        {name:'​',            value:'​',                                                           inline:true},
+        {name:'Burn Alerts',       value:burnChannelId?`<#${burnChannelId}>`:'not set',                    inline:true},
         {name:'Sales Filters',     value:sf,                                                                 inline:true},
         {name:'Listing Filters',   value:lf,                                                                 inline:true},
         {name:'Rank Alert',        value:ra,                                                                 inline:true},
