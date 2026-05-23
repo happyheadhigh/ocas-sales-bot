@@ -351,6 +351,9 @@ const lastSaleIds     = new Map(); // guildId → last sale id
 const lastListingIds  = new Map(); // guildId → last listing id
 const alertedEventIds = new Set(); // dedup personal DM alerts across multiple servers
 const recentChannelPosts = new Map(); // dedup: channelId+tokenId → timestamp, prevents double-posting
+// Rate limit for /burnrefresh: userId+tokenId → last used timestamp
+// One use per token per user per 5 minutes — prevents OS API spam
+const burnRefreshCooldowns = new Map();
 function isRecentChannelPost(channelId, tokenId, windowMs=180000){
   const key = channelId + ':' + tokenId;
   const last = recentChannelPosts.get(key);
@@ -3645,6 +3648,98 @@ It has not been burned and was not created via the burn machine.`)
     return;
   }
 
+  // /burnrefresh token:ID — community command to re-queue a burn alert with fresh metadata
+  if(commandName==='burnrefresh'){
+    const tokenId = interaction.options.getInteger('token');
+    if(!tokenId) return interaction.reply({ content:'Provide a token ID.', flags: MessageFlags.Ephemeral });
+
+    // Rate limit: 1 use per user per token per 5 minutes
+    const COOLDOWN_MS = 5 * 60 * 1000;
+    const rlKey = `${interaction.user.id}:${tokenId}`;
+    const lastUsed = burnRefreshCooldowns.get(rlKey);
+    if(lastUsed && Date.now() - lastUsed < COOLDOWN_MS){
+      const secsLeft = Math.ceil((COOLDOWN_MS - (Date.now() - lastUsed)) / 1000);
+      return interaction.reply({
+        content: `You can use this command again for #${tokenId} in **${secsLeft}s**.`,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+    burnRefreshCooldowns.set(rlKey, Date.now());
+    // Prune old entries
+    if(burnRefreshCooldowns.size > 1000){
+      const cutoff = Date.now() - COOLDOWN_MS;
+      for(const [k,v] of burnRefreshCooldowns) if(v < cutoff) burnRefreshCooldowns.delete(k);
+    }
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try{
+      // Look up the burn event from DB
+      const r = await pgPool.query(`
+        SELECT be.id, be.tx_hash, be.block_number, be.burner_wallet, be.survivor_token_id,
+               be.result_body_type, be.result_is_angel, be.points_used, be.log_index,
+               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+        FROM burn_events be
+        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        WHERE be.survivor_token_id = $1
+        GROUP BY be.id
+        ORDER BY be.block_number DESC, be.log_index DESC
+        LIMIT 1
+      `, [tokenId]);
+
+      if(!r.rows.length){
+        await interaction.editReply(`No burn event found for #${tokenId}. Only the created/survivor token ID can be refreshed.`);
+        return;
+      }
+
+      const row = r.rows[0];
+      const finalEvent = {
+        survivorTokenId: row.survivor_token_id,
+        resultBodyType:  row.result_body_type,
+        resultIsAngel:   row.result_is_angel,
+        points:          row.points_used,
+        txHash:          row.tx_hash,
+        blockNumber:     row.block_number,
+        logIndex:        row.log_index,
+        burnEventId:     row.id,
+      };
+      const startEvent = {
+        owner:    row.burner_wallet,
+        tokenIds: (row.burned_ids || []).filter(Boolean),
+      };
+
+      // Queue to pending alert system (skip if already pending)
+      const alertKey = String(tokenId);
+      const alreadyPending = pendingBurnAlerts.has(alertKey);
+      if(!alreadyPending){
+        pendingBurnAlerts.set(alertKey, {
+          finalEvent,
+          startEvent,
+          preBurnTraits: null, // no pre-burn snapshot available; will post once OS returns traits
+          addedAt:  Date.now(),
+          attempts: 0,
+          slowMode: false,
+        });
+      }
+
+      // Trigger OS metadata refresh regardless — this is the whole point of the command
+      const refreshEnabled = BURN_METADATA_REFRESH_ENABLED;
+      if(refreshEnabled){
+        triggerOsMetadataRefresh(tokenId); // fire-and-forget
+      }
+
+      const statusMsg = alreadyPending
+        ? `#${tokenId} is already queued — metadata refresh triggered again. Alert will post once traits update.`
+        : `Queued burn alert for #${tokenId}. Metadata refresh triggered${refreshEnabled ? '' : ' (BURN_METADATA_REFRESH_ENABLED is off)'}. Alert will post once OS updates the traits — usually within 1–5 minutes.`;
+
+      console.log(`[BurnRefresh] user=${interaction.user.id} token=#${tokenId} guild=${guildId} alreadyPending=${alreadyPending}`);
+      await interaction.editReply(statusMsg);
+    }catch(e){
+      console.error('[BurnRefresh]', e.message);
+      await interaction.editReply('Error: ' + e.message);
+    }
+    return;
+  }
+
   if(commandName==='help'){
     const marketCmds=[
       '`/ocas search:zombie hoodie` — Random or searched OCAS token',
@@ -3670,6 +3765,7 @@ It has not been burned and was not created via the burn machine.`)
       '`/burn token:1234` — Token burn status and lineage',
       '`/burnwallet wallet:0x...` — Wallet burn history',
       '`/burnleaderboard` — Top burners by tokens burned',
+      '`/burnrefresh token:1234` — Refresh metadata + re-post burn alert (5 min cooldown)',
     ].join('\n');
     const alertCmds=[
       '`/myalert trait:Type value:Zombie` — DM when a Zombie sells or lists',

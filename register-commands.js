@@ -161,6 +161,10 @@ const commands = [
   new SlashCommandBuilder().setName('burnleaderboard')
     .setDescription('Top OCAS burners ranked by tokens burned'),
 
+  new SlashCommandBuilder().setName('burnrefresh')
+    .setDescription('Refresh metadata and re-post burn alert for a created token (5 min cooldown)')
+    .addIntegerOption(o=>o.setName('token').setDescription('Survivor/created token ID (e.g. 1304)').setRequired(true).setMinValue(1).setMaxValue(10000)),
+
 ].map(c=>c.toJSON());
 
 const rest = new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
