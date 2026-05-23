@@ -75,6 +75,7 @@ const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BUR
 const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
 const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '2000', 10));
 const BURN_ALERT_CHANNEL_ID = process.env.BURN_ALERT_CHANNEL_ID || '';
+const BURN_METADATA_REFRESH_ENABLED = String(process.env.BURN_METADATA_REFRESH_ENABLED || 'false').toLowerCase() === 'true';
 const BURN_COLORS = {
   FIRE:        0xFF6B00, // default burn embed
   RADIOACTIVE: 0x39FF14, // radioactive type
@@ -713,17 +714,17 @@ async function buildBurnEmbed(finalEvent, startEvent){
 
   const burnedCount = burnedIds.length || '?';
 
-  // Fetch DB metadata for the created token — traits only (no rank badge needed)
+  // Fetch metadata — prefer what's already in cache (set by processPendingBurnAlerts with fresh data)
+  // fetchCreatedTokenMeta reads from cache first, so if pending alert processor already primed it we get fresh traits
   const dbMeta = await fetchCreatedTokenMeta(survivorId).catch(()=>null);
 
-  // Fetch created token image
-  let imgResult = getCachedImage(`${contract}:${survivorId}`);
-  if(!imgResult){
-    try{
-      imgResult = await resolveImage({identifier:String(survivorId)}, contract, 'ethereum');
-      if(imgResult) setCachedImage(`${contract}:${survivorId}`, imgResult);
-    }catch(e){ console.warn('[Burn embed image]', e.message); }
-  }
+  // Image — always fetch fresh for burn embeds (bypass image cache)
+  imageCache?.delete?.(`${contract}:${survivorId}`);
+  let imgResult = null;
+  try{
+    imgResult = await resolveImage({identifier:String(survivorId)}, contract, 'ethereum');
+    if(imgResult) setCachedImage(`${contract}:${survivorId}`, imgResult);
+  }catch(e){ console.warn('[Burn embed image]', e.message); }
 
   const embed = new EmbedBuilder()
     .setTitle(`🔥 OCAS Burn • #${survivorId} created`)
@@ -772,8 +773,79 @@ async function buildBurnEmbed(finalEvent, startEvent){
 // Pending burn map: survivorTokenId → { owner, tokenIds, points, resultBodyType, resultIsAngel, boostChance, blockNumber, txHash }
 const pendingBurns = new Map();
 
+// ── Pending burn alert queue ──────────────────────────────────────────────────
+// survivorTokenId → { finalEvent, startEvent, preBurnTraits, addedAt, attempts, slowMode }
+// Populated on BurnFinalized; drained by processPendingBurnAlerts every 30s.
+const pendingBurnAlerts = new Map();
+
+// Fetch fresh OS metadata for a token, bypassing ALL caches.
+async function fetchFreshOsMeta(tokenId){
+  const id = parseInt(tokenId);
+  if(!id) return null;
+  // Delete both cache keys so the next call hits the network
+  tokenMetaCache.delete(id);
+  tokenMetaCache.delete(`os:${id}`);
+  // Also bust the image cache so the embed gets the new image
+  const imgKey = `${OCAS_CONTRACT}:${id}`;
+  if(typeof imageCache !== 'undefined') imageCache?.delete?.(imgKey);
+  try{
+    const r = await fetch(
+      `https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}`,
+      { headers: osHeaders() }
+    );
+    if(!r.ok){ console.warn(`[BurnMeta] OS fetch failed for #${id}: HTTP ${r.status}`); return null; }
+    const j = await r.json();
+    const n = j.nft || j;
+    const rawTraits = Array.isArray(n.traits) ? n.traits : (Array.isArray(n.attributes) ? n.attributes : []);
+    const traits = {};
+    for(const t of rawTraits){
+      const name  = t.trait_type || t.traitType || t.type || t.name;
+      const value = t.value;
+      if(name && value != null) traits[String(name)] = String(value);
+    }
+    return Object.keys(traits).length ? traits : null;
+  }catch(e){
+    console.warn(`[BurnMeta] fetchFreshOsMeta error for #${id}:`, e.message);
+    return null;
+  }
+}
+
+// One-time fire-and-forget POST to OpenSea's metadata refresh endpoint.
+// Tells OpenSea to re-fetch this token's metadata from the contract.
+// Only called once per burn event. Does not block — errors are logged and ignored.
+async function triggerOsMetadataRefresh(tokenId){
+  if(!BURN_METADATA_REFRESH_ENABLED) return;
+  const id = parseInt(tokenId);
+  if(!id) return;
+  try{
+    const r = await fetch(
+      `https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}/refresh`,
+      { method:'POST', headers: osHeaders() }
+    );
+    console.log(`[BurnMeta] OS refresh triggered for #${id} — HTTP ${r.status}`);
+  }catch(e){
+    console.warn(`[BurnMeta] OS refresh trigger failed for #${id}:`, e.message);
+  }
+}
+
+// Returns true if two trait objects differ (or one is null and the other isn't).
+function traitsDiffer(a, b){
+  if(!a && !b) return false;
+  if(!a || !b) return true;
+  const keysA = Object.keys(a).sort();
+  const keysB = Object.keys(b).sort();
+  if(keysA.length !== keysB.length) return true;
+  for(const k of keysA){ if(String(a[k]) !== String(b[k])) return true; }
+  return false;
+}
+
 async function storeBurnStarted(event){
   try{
+    // Snapshot pre-burn DB traits for the survivor token so we can detect when metadata refreshes
+    const preBurnMeta = await fetchTokenMetaFromDb(event.survivorTokenId).catch(()=>null);
+    const preBurnTraits = preBurnMeta?.traits ? { ...preBurnMeta.traits } : null;
+    if(preBurnTraits) console.log(`[BurnMeta] Pre-burn snapshot for #${event.survivorTokenId}: Type=${preBurnTraits.Type||preBurnTraits.type||'?'}`);
+
     // Cache in memory for cross-referencing with BurnFinalized
     pendingBurns.set(String(event.survivorTokenId), {
       owner:         event.owner,
@@ -785,6 +857,7 @@ async function storeBurnStarted(event){
       blockNumber:   event.blockNumber,
       logIndex:       event.logIndex,
       txHash:        event.txHash,
+      preBurnTraits, // snapshot for metadata refresh detection
     });
     const r = await pgPool.query(
       `INSERT INTO burn_started_events
@@ -1017,7 +1090,21 @@ async function pollBurnEventsLegacy(){
         finalEvent.burnEventId = await storeBurnFinalized(finalEvent, startEvent);
         console.log(`[Burn] BurnFinalized: #${survivorTokenId} → ${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
-        await postBurnAlertToConfiguredChannels(finalEvent, startEvent);
+        // Queue to pending alert system — same as processBurnLogs
+        const alertKey = String(survivorTokenId);
+        if(!pendingBurnAlerts.has(alertKey)){
+          pendingBurnAlerts.set(alertKey, {
+            finalEvent: { ...finalEvent },
+            startEvent: { ...startEvent },
+            preBurnTraits: startEvent?.preBurnTraits || null,
+            addedAt:  Date.now(),
+            attempts: 0,
+            slowMode: false,
+          });
+          console.log(`[BurnMeta] Queued pending alert for #${survivorTokenId} — awaiting metadata refresh`);
+          // Fire-and-forget OS metadata refresh — helps speed up metadata propagation
+          triggerOsMetadataRefresh(survivorTokenId);
+        }
         pendingBurns.delete(String(survivorTokenId));
       }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
     }
@@ -1102,10 +1189,164 @@ async function processBurnLogs(logs, shouldAlert){
       console.log(`[Burn] BurnFinalized: #${survivorTokenId} tier=${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
       if(shouldAlert){
-        await postBurnAlertToConfiguredChannels(finalEvent, startEvent);
+        // Queue to pending alert system — do NOT post immediately.
+        // processPendingBurnAlerts() will wait for metadata to refresh before posting.
+        const preBurnTraits = startEvent?.preBurnTraits || null;
+        const alertKey = String(survivorTokenId);
+        if(!pendingBurnAlerts.has(alertKey)){
+          pendingBurnAlerts.set(alertKey, {
+            finalEvent: { ...finalEvent },
+            startEvent: { ...startEvent },
+            preBurnTraits,
+            addedAt:  Date.now(),
+            attempts: 0,
+            slowMode: false,
+          });
+          console.log(`[BurnMeta] Queued pending alert for #${survivorTokenId} — awaiting metadata refresh`);
+          // Fire-and-forget OS metadata refresh — helps speed up metadata propagation
+          triggerOsMetadataRefresh(survivorTokenId);
+        }
       }
       pendingBurns.delete(String(survivorTokenId));
     }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
+  }
+}
+
+// ── Pending burn alert processor ─────────────────────────────────────────────
+// Runs every 30s. For each queued burn event, fetches fresh OS metadata and
+// compares to the pre-burn snapshot. Posts alert only when traits have changed.
+// Switches to 2-min retry after 10 min. Keeps retrying until metadata changes.
+async function processPendingBurnAlerts(){
+  if(!pendingBurnAlerts.size) return;
+  const now = Date.now();
+  const THIRTY_SECS  = 30_000;
+  const TWO_MINS     = 2 * 60_000;
+  const TEN_MINS     = 10 * 60_000;
+  const TWO_HOURS    = 2 * 60 * 60_000;
+
+  for(const [key, entry] of pendingBurnAlerts){
+    const { finalEvent, startEvent, preBurnTraits, addedAt, attempts, slowMode } = entry;
+    const survivorId = finalEvent.survivorTokenId;
+    const ageMs      = now - addedAt;
+
+    // Throttle: in slow mode check every 2 min, normal every 30s
+    const minInterval = slowMode ? TWO_MINS : THIRTY_SECS;
+    if(entry.lastChecked && (now - entry.lastChecked) < minInterval) continue;
+    entry.lastChecked = now;
+    entry.attempts++;
+
+    // Switch to slow mode after 10 minutes
+    if(ageMs > TEN_MINS && !slowMode){
+      entry.slowMode = true;
+      console.log(`[BurnMeta] #${survivorId} switching to slow retry (2 min) after 10 min`);
+    }
+
+    // Hard cap: 2 hours — post minimal fallback alert and remove
+    if(ageMs > TWO_HOURS){
+      console.warn(`[BurnMeta] #${survivorId} metadata still stale after 2 hours — posting minimal fallback alert`);
+      try{
+        await postBurnFallbackAlert(finalEvent, startEvent);
+      }catch(e){ console.error(`[BurnMeta] fallback alert failed for #${survivorId}:`, e.message); }
+      pendingBurnAlerts.delete(key);
+      continue;
+    }
+
+    // Fetch fresh OS metadata — bypasses all caches
+    let freshTraits = null;
+    try{
+      freshTraits = await fetchFreshOsMeta(survivorId);
+    }catch(e){
+      console.warn(`[BurnMeta] fetchFreshOsMeta error for #${survivorId}:`, e.message);
+      continue; // retry next tick
+    }
+
+    if(!freshTraits){
+      console.log(`[BurnMeta] #${survivorId} OS returned no traits yet (attempt ${entry.attempts})`);
+      continue;
+    }
+
+    // Compare fresh traits to pre-burn snapshot
+    const changed = traitsDiffer(preBurnTraits, freshTraits);
+    const typeStr  = freshTraits.Type || freshTraits.type || '?';
+    const oldType  = preBurnTraits ? (preBurnTraits.Type || preBurnTraits.type || '?') : 'unknown';
+
+    if(!changed && preBurnTraits){
+      console.log(`[BurnMeta] #${survivorId} still stale (attempt ${entry.attempts}) Type=${typeStr} (was ${oldType})`);
+      continue;
+    }
+
+    if(!preBurnTraits){
+      // No snapshot to compare — if we got traits assume they're fresh enough
+      console.log(`[BurnMeta] #${survivorId} no pre-burn snapshot; posting with fresh traits Type=${typeStr}`);
+    } else {
+      console.log(`[BurnMeta] #${survivorId} metadata refreshed! Type ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
+    }
+
+    // Set the fresh traits into cache so buildBurnEmbed picks them up
+    const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
+    tokenMetaCache.set(parseInt(survivorId), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+    tokenMetaCache.set(`os:${parseInt(survivorId)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+    // Bust image cache so embed fetches new image
+    imageCache?.delete?.(`${OCAS_CONTRACT}:${survivorId}`);
+
+    try{
+      await postBurnAlertToConfiguredChannels(finalEvent, startEvent);
+      pendingBurnAlerts.delete(key);
+    }catch(e){
+      console.error(`[BurnMeta] postBurnAlertToConfiguredChannels failed for #${survivorId}:`, e.message);
+      // Keep in queue and retry next tick
+    }
+  }
+}
+
+// Minimal fallback alert — no traits/image — used when metadata never refreshed after 2h
+async function postBurnFallbackAlert(finalEvent, startEvent){
+  const burnChannels = await getBurnAlertChannels();
+  if(!burnChannels.length) return;
+  const survivorId  = finalEvent.survivorTokenId;
+  const contract    = OCAS_CONTRACT;
+  const osUrl       = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
+  const tvUrl       = `https://traitview.com/?token=${survivorId}`;
+  const txHash      = finalEvent.txHash || '';
+  const etherscan   = txHash ? `https://etherscan.io/tx/${txHash}` : null;
+  const burnedCount = startEvent?.tokenIds?.length || '?';
+  const burnerWallet = startEvent?.owner || 'unknown';
+  const burnerLink  = burnerWallet !== 'unknown'
+    ? `[${shortAddr(burnerWallet)}](https://opensea.io/${burnerWallet})` : 'unknown';
+  const color       = burnTypeColor(finalEvent.resultBodyType, finalEvent.resultIsAngel);
+  const linkParts   = [`[OpenSea](${osUrl})`, `[TraitView](${tvUrl})`];
+  if(etherscan) linkParts.push(`[Etherscan](${etherscan})`);
+  const burnKey = finalEvent.burnEventId || `${txHash}:${finalEvent.logIndex}`;
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🔥 OCAS Burn • #${survivorId} created`)
+    .setColor(color)
+    .setURL(osUrl)
+    .addFields(
+      { name:'Burner',        value:burnerLink,           inline:true },
+      { name:'Tokens Burned', value:String(burnedCount),  inline:true },
+      { name:'Points Used',   value:`${finalEvent.points || 0} pts`, inline:true },
+      { name:'Traits',        value:'_Metadata still syncing — check TraitView or OpenSea_', inline:false },
+      { name:'Links',         value:linkParts.join(' | '), inline:false },
+    )
+    .setFooter({ text:'OCAS Burn Machine' })
+    .setTimestamp();
+
+  embed._components = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`burn_ids:${burnKey}`)
+      .setLabel(`Show Burned Tokens (${burnedCount})`)
+      .setStyle(ButtonStyle.Secondary)
+  )];
+
+  const dedupeKey = `burn:${txHash}:${finalEvent.logIndex ?? ''}`;
+  for(const target of burnChannels){
+    const { guildId, channelId, channel } = target;
+    try{
+      if(isRecentChannelPost(channelId, dedupeKey)) continue;
+      await sendEmbed(channel, embed);
+      console.log(`[BurnMeta] fallback alert posted guild=${guildId} channel=${channelId}`);
+    }catch(e){ console.warn(`[BurnMeta] fallback post failed guild=${guildId}:`, e.message); }
   }
 }
 
@@ -3160,11 +3401,22 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         LIMIT $1
       `, [count]);
       if(!r.rows.length){ await interaction.editReply('No burn events recorded yet.'); return; }
-      const embeds = await Promise.all(r.rows.map(row => {
+      const THIRTY_MIN = 30 * 60 * 1000;
+      const embeds = await Promise.all(r.rows.map(async row => {
         const finalEvent = { survivorTokenId: row.survivor_token_id, resultBodyType: row.result_body_type,
-        resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash, blockNumber: row.block_number, logIndex: row.log_index,
-        burnEventId: row.id };
+          resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash,
+          blockNumber: row.block_number, logIndex: row.log_index, burnEventId: row.id };
         const startEvent = { owner: row.burner_wallet, tokenIds: (row.burned_ids||[]).filter(Boolean) };
+        // For burns < 30 min old: bypass DB cache and fetch fresh OS metadata
+        const burnAge = row.burned_at ? Date.now() - new Date(row.burned_at).getTime() : Infinity;
+        if(burnAge < THIRTY_MIN){
+          const freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
+          if(freshTraits){
+            const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
+            tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+            tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+          }
+        }
         return buildBurnEmbed(finalEvent, startEvent);
       }));
 
@@ -3585,6 +3837,8 @@ client.once('clientReady', async ()=>{
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
   }
+  // Process pending burn alerts every 30s — waits for metadata to refresh before posting
+  setInterval(processPendingBurnAlerts, 30_000);
 });
 
 client.on('error',e=>console.error('[Discord]',e.message));
