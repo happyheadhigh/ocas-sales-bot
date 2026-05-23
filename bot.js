@@ -711,15 +711,10 @@ async function buildBurnEmbed(finalEvent, startEvent){
     ? `[${shortAddr(burnerWallet)}](https://opensea.io/${burnerWallet})`
     : 'unknown';
 
-  const burnedStr = burnedIds.length
-    ? burnedIds.slice(0,20).map(id => `#${id}`).join(', ') + (burnedIds.length > 20 ? ` +${burnedIds.length-20} more` : '')
-    : 'unknown';
-
-  // Fetch DB metadata for the created token — traits + OS rank
-  const dbMeta = await fetchCreatedTokenMeta(survivorId).catch(()=>null);
-  const actualType = dbMeta?.traits?.Type || dbMeta?.traits?.type || null;
-  const createdType = actualType || 'Traits updating';
   const burnedCount = burnedIds.length || '?';
+
+  // Fetch DB metadata for the created token — traits only (no rank badge needed)
+  const dbMeta = await fetchCreatedTokenMeta(survivorId).catch(()=>null);
 
   // Fetch created token image
   let imgResult = getCachedImage(`${contract}:${survivorId}`);
@@ -731,25 +726,28 @@ async function buildBurnEmbed(finalEvent, startEvent){
   }
 
   const embed = new EmbedBuilder()
-    .setTitle('OCAS Burn')
+    .setTitle(`🔥 OCAS Burn • #${survivorId} created`)
     .setColor(color)
     .setURL(osUrl)
-    .setDescription(`#${survivorId} • ${createdType} • ${burnedCount} burned • ${points || 0} pts`)
+    // No description — all info is in fields
     .addFields(
-      { name:'Created Token', value:`[#${survivorId}](${osUrl})`, inline:true },
-      { name:'Burner',        value:burnerLink,                  inline:true },
+      { name:'Burner',         value:burnerLink,             inline:true },
+      { name:'Tokens Burned',  value:String(burnedCount),    inline:true },
+      { name:'Points Used',    value:`${points || 0} pts`,   inline:true },
     );
 
-  // Add traits of the created token if available
+  // Single Traits field in 2 columns — same layout as sales/listings
   if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
-    const traitLines = Object.entries(dbMeta.traits).slice(0,12).map(([k,v])=>`**${cleanTraitLabel(k)}:** ${v}`);
-    const half = Math.ceil(traitLines.length/2);
+    const traitLines = Object.entries(dbMeta.traits)
+      .slice(0, 14)
+      .map(([k,v]) => `**${cleanTraitLabel(k)}:** ${v}`);
+    const half = Math.ceil(traitLines.length / 2);
     embed.addFields(
-      { name:'Traits', value:traitLines.slice(0,half).join('\n'),    inline:true },
-      { name:'More Traits', value:traitLines.slice(half).join('\n')||' ', inline:true },
+      { name:'Traits',    value: traitLines.slice(0, half).join('\n') || '\u200b', inline:true },
+      { name:'\u200b',   value: traitLines.slice(half).join('\n')   || '\u200b', inline:true },
     );
   } else {
-    embed.addFields({ name:'Traits', value:'Traits updating - check TraitView/OpenSea shortly.', inline:false });
+    embed.addFields({ name:'Traits', value:'_Syncing — check TraitView or OpenSea shortly_', inline:false });
   }
 
   const linkParts = [`[OpenSea](${osUrl})`, `[TraitView](${tvUrl})`];
@@ -758,14 +756,16 @@ async function buildBurnEmbed(finalEvent, startEvent){
   embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
 
   embed._imageResult = imgResult || null;
-  if(finalEvent.burnEventId && burnedIds.length){
-    embed._components = [new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`burn_ids:${finalEvent.burnEventId}`)
-        .setLabel('Show Burned Tokens')
-        .setStyle(ButtonStyle.Secondary)
-    )];
-  }
+
+  // Always show Show Burned Tokens button
+  const burnKey = finalEvent.burnEventId || `${finalEvent.txHash}:${finalEvent.logIndex}`;
+  embed._components = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`burn_ids:${burnKey}`)
+      .setLabel(`Show Burned Tokens (${burnedCount})`)
+      .setStyle(ButtonStyle.Secondary)
+  )];
+
   return embed;
 }
 
