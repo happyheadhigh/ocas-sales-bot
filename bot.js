@@ -219,6 +219,13 @@ async function ensureBotStateTable(){
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS burn_inputs_token_idx ON burn_event_inputs(burned_token_id)
     `);
+    // Index for trait lookups — prevents full table scan on traitfind/rankfind
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS token_traits_token_id_idx ON token_traits(token_id)
+    `).catch(()=>{}); // table may not exist yet on fresh deploy
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS token_traits_name_value_idx ON token_traits(LOWER(trait_name), LOWER(trait_value))
+    `).catch(()=>{});
     console.log('[DB] burn tables ready');
   }catch(e){ console.error('[DB] ensureBotStateTable error:', e.message); }
 }
@@ -1066,21 +1073,20 @@ async function pollBurnEvents(){
 
     if(fromBlock > latest) return;
 
-    let cursor = fromBlock;
-    while(cursor <= latest){
-      const chunkTo = Math.min(latest, cursor + BURN_BLOCK_CHUNK - 1);
-      const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
-        address: BURN_CONTRACT,
-        fromBlock: '0x'+cursor.toString(16),
-        toBlock:   '0x'+chunkTo.toString(16),
-        topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
-      }]);
-      const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
-      if(logs?.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${cursor}-${chunkTo}`);
-      await processBurnLogs(logs || [], shouldAlert);
-      await dbSave('burn_last_block', String(chunkTo));
-      cursor = chunkTo + 1;
-    }
+    // Process ONE chunk per poll tick — keeps the event loop free so
+    // api.js requests (traitfind, rankfind, etc) don't time out during backfill.
+    const chunkTo = Math.min(latest, fromBlock + BURN_BLOCK_CHUNK - 1);
+    const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
+    const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
+      address: BURN_CONTRACT,
+      fromBlock: '0x'+fromBlock.toString(16),
+      toBlock:   '0x'+chunkTo.toString(16),
+      topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
+    }]);
+    if(logs?.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${fromBlock}-${chunkTo}`);
+    await processBurnLogs(logs || [], shouldAlert);
+    await dbSave('burn_last_block', String(chunkTo));
+    if(chunkTo < latest) console.log(`[Burn] Backfill in progress — ${latest - chunkTo} blocks remaining`);
   }catch(e){ console.error('[Burn poller]', e.message); }
 }
 
