@@ -70,6 +70,10 @@ function getRankTierColor(osRank){
 
 // ── Burn Machine ──────────────────────────────────────────────────────────────
 const BURN_CONTRACT = '0x1095c73C337CC5e03f9E1D426c524CC3e32a50f6';
+const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
+const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BURN_START_BLOCK, 10) : null;
+const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
+const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '2000', 10));
 const BURN_COLORS = {
   FIRE:        0xFF6B00, // default burn embed
   RADIOACTIVE: 0x39FF14, // radioactive type
@@ -103,6 +107,10 @@ function burnTypeEmoji(bodyType, isAngel){
     default: return '🔥';
   }
 }
+function normAddr(addr){
+  const s = String(addr || '').trim().toLowerCase();
+  return /^0x[a-f0-9]{40}$/.test(s) ? s : '';
+}
 
 // ── Railway Postgres pool (same DB as api.js) ─────────────────────────────────
 const { Pool } = require('pg');
@@ -132,7 +140,7 @@ async function ensureBotStateTable(){
     await pgPool.query(`
       CREATE TABLE IF NOT EXISTS burn_events (
         id               SERIAL PRIMARY KEY,
-        tx_hash          TEXT NOT NULL UNIQUE,
+        tx_hash          TEXT NOT NULL,
         block_number     BIGINT NOT NULL,
         log_index        INT NOT NULL,
         burner_wallet    TEXT NOT NULL,
@@ -145,12 +153,54 @@ async function ensureBotStateTable(){
         burned_at         TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    await pgPool.query(`ALTER TABLE burn_events DROP CONSTRAINT IF EXISTS burn_events_tx_hash_key`);
+    await pgPool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS burn_events_tx_log_idx ON burn_events(tx_hash, log_index)
+    `);
     await pgPool.query(`
       CREATE TABLE IF NOT EXISTS burn_event_inputs (
         id              SERIAL PRIMARY KEY,
         burn_event_id   INT NOT NULL REFERENCES burn_events(id) ON DELETE CASCADE,
         burned_token_id INT NOT NULL
       )
+    `);
+    await pgPool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS burn_event_inputs_event_token_idx
+      ON burn_event_inputs(burn_event_id, burned_token_id)
+    `);
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS burn_started_events (
+        id                SERIAL PRIMARY KEY,
+        tx_hash           TEXT NOT NULL,
+        block_number      BIGINT NOT NULL,
+        log_index         INT NOT NULL,
+        owner_wallet      TEXT NOT NULL,
+        survivor_token_id INT NOT NULL,
+        points_used       INT,
+        result_body_type  INT,
+        result_is_angel   BOOLEAN DEFAULT FALSE,
+        boost_chance      INT,
+        reveal_block      BIGINT,
+        selection_hash    TEXT,
+        started_at        TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pgPool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS burn_started_tx_log_idx ON burn_started_events(tx_hash, log_index)
+    `);
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS burn_started_survivor_idx ON burn_started_events(survivor_token_id)
+    `);
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS burn_started_inputs (
+        id              SERIAL PRIMARY KEY,
+        burn_started_id INT NOT NULL REFERENCES burn_started_events(id) ON DELETE CASCADE,
+        burned_token_id INT NOT NULL
+      )
+    `);
+    await pgPool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS burn_started_inputs_event_token_idx
+      ON burn_started_inputs(burn_started_id, burned_token_id)
     `);
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS burn_events_burner_idx ON burn_events(burner_wallet)
@@ -587,11 +637,10 @@ async function buildBurnEmbed(finalEvent, startEvent){
   const burnedIds    = startEvent?.tokenIds || [];
   const txHash       = finalEvent.txHash || '';
 
-  const typeLabel = burnTypeLabel(bodyType, isAngel);
-  const typeEmoji = burnTypeEmoji(bodyType, isAngel);
+  const burnTierLabel = burnTypeLabel(bodyType, isAngel);
   const color     = burnTypeColor(bodyType, isAngel);
 
-  const contract  = '0x078be86f3104a32313a47815792230a3808642cc';
+  const contract  = OCAS_CONTRACT;
   const osUrl     = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
   const tvUrl     = `https://traitview.com/?token=${survivorId}`;
   const etherscan = txHash ? `https://etherscan.io/tx/${txHash}` : null;
@@ -604,9 +653,10 @@ async function buildBurnEmbed(finalEvent, startEvent){
     : 'unknown';
 
   // Fetch DB metadata for the created token — traits + OS rank
-  const dbMeta = await fetchTokenMetaFromDb(survivorId).catch(()=>null);
+  const dbMeta = await fetchCreatedTokenMeta(survivorId).catch(()=>null);
   const osRank = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
-  const rankBadge = osRank ? ` ⬥${osRank.toLocaleString()}` : '';
+  const rankBadge = osRank ? ` #${osRank.toLocaleString()}` : '';
+  const actualType = dbMeta?.traits?.Type || dbMeta?.traits?.type || null;
 
   // Fetch created token image
   let imgResult = getCachedImage(`${contract}:${survivorId}`);
@@ -618,16 +668,17 @@ async function buildBurnEmbed(finalEvent, startEvent){
   }
 
   const embed = new EmbedBuilder()
-    .setTitle(`${typeEmoji} OCAS Burn — ${typeLabel} Created`)
+    .setTitle('OCAS Burn')
     .setColor(color)
     .setURL(osUrl)
+    .setDescription(`#${survivorId} was created from ${burnedIds.length || '?'} burned OCAS.`)
     .addFields(
       { name:'Created Token', value:`[#${survivorId}${rankBadge}](${osUrl})`, inline:true },
-      { name:'Type',          value:typeLabel,                                  inline:true },
+      { name:'Result Type',   value:actualType || 'Traits updating - check again shortly', inline:true },
       { name:'Points Used',   value:String(points || 0),                       inline:true },
+      { name:'Burn Tier',     value:burnTierLabel,                              inline:true },
       { name:'Burner',        value:burnerLink,                                 inline:true },
       { name:'Tokens Burned', value:String(burnedIds.length || '?'),           inline:true },
-      { name:'​',        value:'​',                                   inline:true },
       { name:'Burned IDs',    value:burnedStr,                                  inline:false },
     );
 
@@ -637,14 +688,16 @@ async function buildBurnEmbed(finalEvent, startEvent){
     const half = Math.ceil(traitLines.length/2);
     embed.addFields(
       { name:'Traits', value:traitLines.slice(0,half).join('\n'),    inline:true },
-      { name:'​', value:traitLines.slice(half).join('\n')||'​', inline:true },
+      { name:'More Traits', value:traitLines.slice(half).join('\n')||' ', inline:true },
     );
+  } else {
+    embed.addFields({ name:'Traits', value:'Traits updating - check TraitView/OpenSea shortly.', inline:false });
   }
 
   const linkParts = [`[OpenSea](${osUrl})`, `[TraitView](${tvUrl})`];
   if(etherscan) linkParts.push(`[Etherscan](${etherscan})`);
-  embed.addFields({ name:'Links', value:linkParts.join(' • '), inline:false });
-  embed.setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' }).setTimestamp();
+  embed.addFields({ name:'Links', value:linkParts.join(' | '), inline:false });
+  embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
 
   embed._imageResult = imgResult || null;
   return embed;
@@ -664,8 +717,41 @@ async function storeBurnStarted(event){
       resultIsAngel: event.resultIsAngel,
       boostChance:   event.boostChance,
       blockNumber:   event.blockNumber,
+      logIndex:       event.logIndex,
       txHash:        event.txHash,
     });
+    const r = await pgPool.query(
+      `INSERT INTO burn_started_events
+         (tx_hash, block_number, log_index, owner_wallet, survivor_token_id,
+          points_used, result_body_type, result_is_angel, boost_chance, reveal_block, selection_hash)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (tx_hash, log_index) DO UPDATE SET
+          owner_wallet=EXCLUDED.owner_wallet,
+          survivor_token_id=EXCLUDED.survivor_token_id,
+          points_used=EXCLUDED.points_used,
+          result_body_type=EXCLUDED.result_body_type,
+          result_is_angel=EXCLUDED.result_is_angel,
+          boost_chance=EXCLUDED.boost_chance,
+          reveal_block=EXCLUDED.reveal_block,
+          selection_hash=EXCLUDED.selection_hash
+       RETURNING id`,
+      [
+        event.txHash || '', event.blockNumber || 0, event.logIndex || 0,
+        normAddr(event.owner) || event.owner || '', event.survivorTokenId,
+        event.points, event.resultBodyType, event.resultIsAngel,
+        event.boostChance, event.revealBlock || null, event.selectionHash || null,
+      ]
+    );
+    const burnStartedId = r.rows[0]?.id;
+    if(burnStartedId){
+      for(const tokenId of event.tokenIds || []){
+        await pgPool.query(
+          `INSERT INTO burn_started_inputs (burn_started_id, burned_token_id)
+           VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+          [burnStartedId, tokenId]
+        ).catch(()=>{});
+      }
+    }
   }catch(e){ console.warn('[Burn] storeBurnStarted error:', e.message); }
 }
 
@@ -677,7 +763,15 @@ async function storeBurnFinalized(finalEvent, startEvent){
          (tx_hash, block_number, log_index, burner_wallet, survivor_token_id,
           result_body_type, result_is_angel, points_used, boost_chance, burn_seed)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       ON CONFLICT (tx_hash) DO NOTHING
+       ON CONFLICT (tx_hash, log_index) DO UPDATE SET
+          block_number=EXCLUDED.block_number,
+          burner_wallet=EXCLUDED.burner_wallet,
+          survivor_token_id=EXCLUDED.survivor_token_id,
+          result_body_type=EXCLUDED.result_body_type,
+          result_is_angel=EXCLUDED.result_is_angel,
+          points_used=EXCLUDED.points_used,
+          boost_chance=EXCLUDED.boost_chance,
+          burn_seed=EXCLUDED.burn_seed
        RETURNING id`,
       [
         finalEvent.txHash || '', finalEvent.blockNumber || 0, finalEvent.logIndex || 0,
@@ -699,7 +793,7 @@ async function storeBurnFinalized(finalEvent, startEvent){
   }catch(e){ console.warn('[Burn] storeBurnFinalized DB error:', e.message); }
 }
 
-async function pollBurnEvents(){
+async function pollBurnEventsLegacy(){
   if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return;
   const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
   const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
@@ -799,9 +893,9 @@ async function pollBurnEvents(){
 
         // Check duplicate
         const existing = await pgPool.query(
-          'SELECT id FROM burn_events WHERE tx_hash=$1', [txHash]
+          'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
         );
-        if(existing.rows.length){ console.log(`[Burn] Already stored tx ${txHash.slice(0,10)}...`); continue; }
+        if(existing.rows.length){ console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}`); continue; }
 
         // Cross-reference with BurnStarted data
         const startEvent = pendingBurns.get(String(survivorTokenId)) ||
@@ -828,8 +922,163 @@ async function pollBurnEvents(){
   }catch(e){ console.error('[Burn poller]', e.message); }
 }
 
+async function burnRpc(rpcUrl, method, params){
+  const r = await fetch(rpcUrl,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:Date.now(),method,params})});
+  const j = await r.json();
+  if(j.error) throw new Error(`${method} error: ${JSON.stringify(j.error)}`);
+  return j.result;
+}
+
+async function processBurnLogs(logs, shouldAlert){
+  if(logs.length) console.log(`[Burn] processing ${logs.length} log(s), alerts=${shouldAlert ? 'on' : 'off'}`);
+
+  for(const log of logs){
+    if(log.topics[0]?.toLowerCase() !== TOPIC_BURN_STARTED) continue;
+    try{
+      const owner           = normAddr('0x' + log.topics[1].slice(26));
+      const survivorTokenId = parseInt(log.topics[2], 16);
+      const txHash          = String(log.transactionHash || '').toLowerCase();
+      const blockNum        = parseInt(log.blockNumber, 16);
+      const logIndex        = parseInt(log.logIndex, 16);
+      const data            = log.data.slice(2);
+      const words           = [];
+      for(let i=0;i<data.length;i+=64) words.push(data.slice(i,i+64));
+
+      const offset   = parseInt(words[0]||'0', 16);
+      const arrWord  = offset / 32;
+      const arrLen   = parseInt(words[arrWord]||'0', 16);
+      const tokenIds = [];
+      for(let i=0;i<arrLen;i++) tokenIds.push(parseInt(words[arrWord+1+i]||'0',16));
+
+      const points        = parseInt(words[1]||'0',16);
+      const bodyType      = parseInt(words[2]||'0',16);
+      const isAngel       = parseInt(words[3]||'0',16) === 1;
+      const boostChance   = parseInt(words[4]||'0',16);
+      const revealBlock   = parseInt(words[5]||'0',16);
+      const selectionHash = words[6] ? '0x' + words[6] : null;
+
+      await storeBurnStarted({ owner, survivorTokenId, tokenIds, points,
+        resultBodyType: bodyType, resultIsAngel: isAngel, boostChance,
+        revealBlock, selectionHash, blockNumber: blockNum, logIndex, txHash });
+      console.log(`[Burn] BurnStarted: #${survivorTokenId} <- [${tokenIds.join(',')}] by ${shortAddr(owner)} pts=${points} tier=${bodyType}`);
+    }catch(e){ console.warn('[Burn] BurnStarted decode error:', e.message, 'topics:', log.topics, 'data:', log.data?.slice(0,130)); }
+  }
+
+  for(const log of logs){
+    if(log.topics[0]?.toLowerCase() !== TOPIC_BURN_FINALIZED) continue;
+    try{
+      const survivorTokenId = parseInt(log.topics[1], 16);
+      const txHash          = String(log.transactionHash || '').toLowerCase();
+      const blockNum        = parseInt(log.blockNumber, 16);
+      const logIndex        = parseInt(log.logIndex, 16);
+      const data            = log.data.slice(2);
+      const words           = [];
+      for(let i=0;i<data.length;i+=64) words.push(data.slice(i,i+64));
+
+      const burnSeed    = words[0] || '';
+      const points      = parseInt(words[1]||'0',16);
+      const bodyType    = parseInt(words[2]||'0',16);
+      const isAngel     = parseInt(words[3]||'0',16) === 1;
+      const boostChance = parseInt(words[4]||'0',16);
+
+      const existing = await pgPool.query(
+        'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
+      );
+      if(existing.rows.length){ console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}`); continue; }
+
+      const startEvent = pendingBurns.get(String(survivorTokenId)) ||
+        await loadBurnStartFromDB(survivorTokenId);
+      if(!startEvent) console.warn(`[Burn] No BurnStarted found for survivor #${survivorTokenId} - embed will show unknown burner/burned IDs`);
+
+      const finalEvent = { survivorTokenId, burnSeed, points, resultBodyType: bodyType,
+        resultIsAngel: isAngel, boostChance, txHash, blockNumber: blockNum, logIndex };
+
+      await storeBurnFinalized(finalEvent, startEvent);
+      console.log(`[Burn] BurnFinalized: #${survivorTokenId} tier=${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
+
+      if(shouldAlert){
+        const burnChannel = await getBurnAlertChannel();
+        if(burnChannel){
+          const embed = await buildBurnEmbed(finalEvent, startEvent);
+          await sendEmbed(burnChannel, embed);
+        }
+      }
+      pendingBurns.delete(String(survivorTokenId));
+    }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
+  }
+}
+
+async function pollBurnEvents(){
+  if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return;
+  const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
+  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
+    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+
+  try{
+    const lastBlockRaw = await dbLoad('burn_last_block');
+    const latest = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
+    let fromBlock = lastBlockRaw ? parseInt(lastBlockRaw, 10) + 1 : null;
+    let historicalBackfill = false;
+
+    if(!fromBlock){
+      if(Number.isFinite(BURN_START_BLOCK) && BURN_START_BLOCK >= 0){
+        fromBlock = BURN_START_BLOCK;
+        historicalBackfill = true;
+        console.log(`[Burn] No burn_last_block; starting historical backfill from BURN_START_BLOCK=${fromBlock}`);
+      } else {
+        fromBlock = Math.max(0, latest - 2000);
+        historicalBackfill = true;
+        console.warn(`[Burn] BURN_START_BLOCK missing; safe fallback starts at latest-2000 (${fromBlock}). Set BURN_START_BLOCK for full historical backfill.`);
+      }
+    }
+
+    if(fromBlock > latest) return;
+
+    let cursor = fromBlock;
+    while(cursor <= latest){
+      const chunkTo = Math.min(latest, cursor + BURN_BLOCK_CHUNK - 1);
+      const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
+        address: BURN_CONTRACT,
+        fromBlock: '0x'+cursor.toString(16),
+        toBlock:   '0x'+chunkTo.toString(16),
+        topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
+      }]);
+      const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
+      if(logs?.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${cursor}-${chunkTo}`);
+      await processBurnLogs(logs || [], shouldAlert);
+      await dbSave('burn_last_block', String(chunkTo));
+      cursor = chunkTo + 1;
+    }
+  }catch(e){ console.error('[Burn poller]', e.message); }
+}
+
 async function loadBurnStartFromDB(survivorTokenId){
-  // Try to reconstruct from BurnStarted data stored in burn_events (if already saved)
+  // Prefer the persisted BurnStarted event so backfills/restarts can still
+  // attach burned input IDs to the later BurnFinalized event.
+  try{
+    const r = await pgPool.query(
+      `SELECT bse.owner_wallet, bse.points_used, bse.result_body_type, bse.result_is_angel,
+              bse.boost_chance, array_agg(bsi.burned_token_id ORDER BY bsi.burned_token_id) AS token_ids
+       FROM burn_started_events bse
+       LEFT JOIN burn_started_inputs bsi ON bsi.burn_started_id = bse.id
+       WHERE bse.survivor_token_id = $1
+       GROUP BY bse.id
+       ORDER BY bse.block_number DESC, bse.log_index DESC
+       LIMIT 1`,
+      [survivorTokenId]
+    );
+    if(r.rows.length){
+      return {
+        owner: r.rows[0].owner_wallet,
+        tokenIds: (r.rows[0].token_ids||[]).filter(Boolean),
+        points: r.rows[0].points_used,
+        resultBodyType: r.rows[0].result_body_type,
+        resultIsAngel: r.rows[0].result_is_angel,
+        boostChance: r.rows[0].boost_chance,
+      };
+    }
+  }catch(e){}
   try{
     const r = await pgPool.query(
       `SELECT be.burner_wallet, array_agg(bei.burned_token_id) AS token_ids
@@ -839,9 +1088,7 @@ async function loadBurnStartFromDB(survivorTokenId){
        GROUP BY be.burner_wallet LIMIT 1`,
       [survivorTokenId]
     );
-    if(r.rows.length){
-      return { owner: r.rows[0].burner_wallet, tokenIds: (r.rows[0].token_ids||[]).filter(Boolean) };
-    }
+    if(r.rows.length) return { owner: r.rows[0].burner_wallet, tokenIds: (r.rows[0].token_ids||[]).filter(Boolean) };
   }catch(e){}
   return null;
 }
@@ -972,10 +1219,14 @@ async function resolveImage(nft, contract, chain){
 
 // ── Send embed (handles buffer attachment vs URL) ─────────────────────────────
 async function sendEmbed(target, embed){
+  return target.send(buildEmbedPayload(embed));
+}
+
+function buildEmbedPayload(embed){
   const ir=embed._imageResult; delete embed._imageResult;
-  if(ir?.type==='buffer'){ const att=new AttachmentBuilder(ir.buffer,{name:ir.filename}); embed.setThumbnail(`attachment://${ir.filename}`); return target.send({embeds:[embed],files:[att]}); }
+  if(ir?.type==='buffer'){ const att=new AttachmentBuilder(ir.buffer,{name:ir.filename}); embed.setThumbnail(`attachment://${ir.filename}`); return {embeds:[embed],files:[att]}; }
   if(ir?.type==='url') embed.setThumbnail(ir.url);
-  return target.send({embeds:[embed]});
+  return {embeds:[embed]};
 }
 
 
@@ -1008,6 +1259,44 @@ async function fetchTokenMetaFromDb(tokenId){
     console.warn('[Token meta]', id, e.message);
     return null;
   }
+}
+
+async function fetchTokenMetaFromOpenSea(tokenId){
+  const id = parseInt(tokenId);
+  if(!id) return null;
+  const cacheKey = `os:${id}`;
+  const cached = tokenMetaCache.get(cacheKey);
+  if(cached && Date.now() < cached.expires) return cached.meta;
+  try{
+    const r = await fetch(`https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}`, { headers: osHeaders() });
+    if(!r.ok) return null;
+    const j = await r.json();
+    const n = j.nft || j;
+    const rawTraits = Array.isArray(n.traits) ? n.traits : (Array.isArray(n.attributes) ? n.attributes : []);
+    const traits = {};
+    for(const t of rawTraits){
+      const name = t.trait_type || t.traitType || t.type || t.name;
+      const value = t.value;
+      if(name && value != null) traits[String(name)] = String(value);
+    }
+    const meta = {
+      os_rank: null,
+      traits: Object.keys(traits).length ? traits : null,
+      trait_count: Object.keys(traits).length || null,
+    };
+    tokenMetaCache.set(cacheKey, { meta, expires: Date.now() + 2 * 60 * 1000 });
+    return meta;
+  }catch(e){
+    console.warn('[Token meta OpenSea]', id, e.message);
+    return null;
+  }
+}
+
+async function fetchCreatedTokenMeta(tokenId){
+  const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+  if(dbMeta?.traits && Object.keys(dbMeta.traits).length) return dbMeta;
+  const osMeta = await fetchTokenMetaFromOpenSea(tokenId).catch(()=>null);
+  return osMeta?.traits ? { ...(dbMeta || {}), ...osMeta } : dbMeta;
 }
 
 function traitObjectToArray(traitsObj){
@@ -1614,7 +1903,7 @@ client.on('interactionCreate', async (interaction)=>{
     burnConfig[guildId].channelId = channelId;
     await saveBurnConfig();
     await interaction.reply({embeds:[new EmbedBuilder()
-      .setTitle('🔥 Burn Alerts Configured')
+      .setTitle('Burn Alerts Configured')
       .setColor(BURN_COLORS.FIRE)
       .setDescription(`Burn alerts will post to <#${channelId}>.\nThe bot will automatically detect OCAS Burn Machine events and post there.`)
     ], flags: MessageFlags.Ephemeral});
@@ -2626,7 +2915,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash, blockNumber: row.block_number };
       const startEvent = { owner: row.burner_wallet, tokenIds: (row.burned_ids||[]).filter(Boolean) };
       const embed = await buildBurnEmbed(finalEvent, startEvent);
-      await sendEmbed(interaction.channel, embed);
+      await interaction.editReply(buildEmbedPayload(embed));
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
@@ -2660,7 +2949,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const estimatedSupply = 10000 - netReduction;
 
       const embed = new EmbedBuilder()
-        .setTitle('🔥 OCAS Burn Machine Stats')
+        .setTitle('OCAS Burn Machine Stats')
         .setColor(BURN_COLORS.FIRE)
         .addFields(
           { name:'Total Burns',       value:String(stats.total_burns||0),   inline:true },
@@ -2671,13 +2960,12 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           { name:'Burn Machine',      value:'[Etherscan](https://etherscan.io/address/'+BURN_CONTRACT+')', inline:true },
         );
       if(latest){
-        const typeLabel = burnTypeLabel(latest.result_body_type, latest.result_is_angel);
         const ago       = latest.burned_at ? timeSince(Math.floor(new Date(latest.burned_at).getTime()/1000)) : '?';
         embed.addFields({ name:'Latest Burn',
-          value:`[#${latest.survivor_token_id}](https://opensea.io/assets/ethereum/0x078be86f3104a32313a47815792230a3808642cc/${latest.survivor_token_id}) — ${typeLabel} — ${ago}`,
+          value:`[#${latest.survivor_token_id}](https://opensea.io/assets/ethereum/${OCAS_CONTRACT}/${latest.survivor_token_id}) - ${latest.burned_count || '?'} burned - ${ago}`,
           inline:false });
       }
-      embed.setFooter({ text:'on-chain-all-stars • Burn Machine' }).setTimestamp();
+      embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
       await interaction.editReply({ embeds:[embed] });
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
@@ -2689,18 +2977,21 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     if(!tokenInput) return interaction.reply({ content:'Provide a token ID.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     try{
-      const contract = '0x078be86f3104a32313a47815792230a3808642cc';
+      const contract = OCAS_CONTRACT;
       // Check if token was burned (appears in burn_event_inputs)
       const burnedRes = await pgPool.query(`
-        SELECT be.survivor_token_id, be.burner_wallet, be.burned_at, be.result_body_type, be.result_is_angel
+        SELECT be.survivor_token_id, be.burner_wallet, be.burned_at, be.result_body_type, be.result_is_angel,
+               be.points_used, array_agg(bei2.burned_token_id ORDER BY bei2.burned_token_id) AS burned_ids
         FROM burn_event_inputs bei
         JOIN burn_events be ON be.id = bei.burn_event_id
+        LEFT JOIN burn_event_inputs bei2 ON bei2.burn_event_id = be.id
         WHERE bei.burned_token_id = $1
+        GROUP BY be.id
         LIMIT 1
       `, [tokenInput]);
       // Check if token was created via burn (appears as survivor)
       const createdRes = await pgPool.query(`
-        SELECT be.burner_wallet, be.burned_at, be.result_body_type, be.result_is_angel,
+        SELECT be.tx_hash, be.burner_wallet, be.burned_at, be.result_body_type, be.result_is_angel,
                be.points_used, array_agg(bei.burned_token_id) AS burned_ids
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
@@ -2719,38 +3010,34 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const b = burnedRes.rows[0];
         const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const survivorUrl = `https://opensea.io/assets/ethereum/${contract}/${b.survivor_token_id}`;
-        embed.setTitle(`🔥 #${tokenInput} was Burned`)
+        const burnedIds = (b.burned_ids||[]).filter(Boolean);
+        embed.setTitle(`#${tokenInput} Burn Status`)
           .setDescription(`This token was burned ${ago}.
-It became: [#${b.survivor_token_id}](${survivorUrl}) — ${burnTypeLabel(b.result_body_type, b.result_is_angel)}`)
+It helped create [#${b.survivor_token_id}](${survivorUrl}).`)
           .addFields(
             { name:'Burner', value:`[${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`, inline:true },
             { name:'Created', value:`[#${b.survivor_token_id}](${survivorUrl})`, inline:true },
-            { name:'Links', value:`[OpenSea](${osUrl}) • [TraitView](${tvUrl})`, inline:false },
+            { name:'Burn Tier', value:burnTypeLabel(b.result_body_type, b.result_is_angel), inline:true },
+            { name:'Tokens Burned', value:String(burnedIds.length || '?'), inline:true },
+            { name:'Points Used', value:String(b.points_used || 0), inline:true },
+            { name:'Links', value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl})`, inline:false },
           );
       } else if(createdRes.rows.length){
         const cr = createdRes.rows[0];
-        const ago = cr.burned_at ? timeSince(Math.floor(new Date(cr.burned_at).getTime()/1000)) : '?';
         const burnedIds = (cr.burned_ids||[]).filter(Boolean);
-        embed.setTitle(`✨ #${tokenInput} was Created via Burn`)
-          .setDescription(`This token was created ${ago} as a burn result.`)
-          .addFields(
-            { name:'Type',         value:burnTypeLabel(cr.result_body_type, cr.result_is_angel), inline:true },
-            { name:'Points Used',  value:String(cr.points_used||0),                             inline:true },
-            { name:'Tokens Burned',value:String(burnedIds.length),                              inline:true },
-            { name:'Burned IDs',   value:burnedIds.slice(0,10).map(id=>`#${id}`).join(', ') || '?', inline:false },
-            { name:'Burner',       value:`[${shortAddr(cr.burner_wallet)}](https://opensea.io/${cr.burner_wallet})`, inline:true },
-            { name:'Links',        value:`[OpenSea](${osUrl}) • [TraitView](${tvUrl})`, inline:false },
-          );
-        let imgResult = getCachedImage(`${contract}:${tokenInput}`);
-        if(!imgResult) imgResult = await resolveImage({identifier:String(tokenInput)}, contract, 'ethereum').catch(()=>null);
-        embed._imageResult = imgResult;
+        const burnEmbed = await buildBurnEmbed(
+          { survivorTokenId: tokenInput, resultBodyType: cr.result_body_type, resultIsAngel: cr.result_is_angel, points: cr.points_used, txHash: cr.tx_hash },
+          { owner: cr.burner_wallet, tokenIds: burnedIds }
+        );
+        await interaction.editReply(buildEmbedPayload(burnEmbed));
+        return;
       } else {
-        embed.setTitle(`#${tokenInput} — No Burn Activity`)
+        embed.setTitle(`#${tokenInput} - No Burn Activity`)
           .setDescription(`This token has no recorded burn events.
 It has not been burned and was not created via the burn machine.`)
-          .addFields({ name:'Links', value:`[OpenSea](${osUrl}) • [TraitView](${tvUrl})`, inline:false });
+          .addFields({ name:'Links', value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl})`, inline:false });
       }
-      await sendEmbed(interaction.channel, embed);
+      await interaction.editReply({ embeds:[embed] });
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
@@ -2762,7 +3049,7 @@ It has not been burned and was not created via the burn machine.`)
       return interaction.reply({ content:'Invalid wallet address. Use format: 0x...', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     try{
-      const contract = '0x078be86f3104a32313a47815792230a3808642cc';
+      const contract = OCAS_CONTRACT;
       const r = await pgPool.query(`
         SELECT be.id, be.survivor_token_id, be.result_body_type, be.result_is_angel,
                be.points_used, be.burned_at,
@@ -2785,22 +3072,22 @@ It has not been burned and was not created via the burn machine.`)
       const typeOrder = { 3:0, 1:1, 2:2, 0:3 };
       const best = r.rows.sort((a,b)=>(typeOrder[a.result_body_type]??4)-(typeOrder[b.result_body_type]??4))[0];
       const embed = new EmbedBuilder()
-        .setTitle(`🔥 Burn History: ${shortAddr(walletAddr)}`)
+        .setTitle(`Burn History: ${shortAddr(walletAddr)}`)
         .setColor(BURN_COLORS.FIRE)
         .setURL(`https://opensea.io/${walletAddr}`)
         .addFields(
           { name:'Tokens Burned',   value:String(totalBurned),  inline:true },
           { name:'Tokens Created',  value:String(totalCreated), inline:true },
           { name:'Total Points',    value:String(totalPoints),  inline:true },
-          { name:'Best Created',    value:`[#${best.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${best.survivor_token_id}) — ${burnTypeLabel(best.result_body_type, best.result_is_angel)}`, inline:false },
+          { name:'Best Created',    value:`[#${best.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${best.survivor_token_id}) - burn tier ${burnTypeLabel(best.result_body_type, best.result_is_angel)}`, inline:false },
         );
       const recentLines = r.rows.slice(0,5).map(row=>{
         const ids = (row.burned_ids||[]).filter(Boolean);
         const ago = row.burned_at ? timeSince(Math.floor(new Date(row.burned_at).getTime()/1000)) : '?';
-        return `${burnTypeEmoji(row.result_body_type,row.result_is_angel)} [#${row.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${row.survivor_token_id}) — ${burnTypeLabel(row.result_body_type,row.result_is_angel)} — ${ids.length} burned — ${ago}`;
+        return `[#${row.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${row.survivor_token_id}) - ${ids.length} burned - ${ago}`;
       });
       embed.addFields({ name:'Recent Burns (up to 5)', value:recentLines.join('\n'), inline:false });
-      embed.setFooter({ text:'on-chain-all-stars • Burn Machine' }).setTimestamp();
+      embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
       await interaction.editReply({ embeds:[embed] });
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
@@ -2810,7 +3097,7 @@ It has not been burned and was not created via the burn machine.`)
   if(commandName==='burnleaderboard'){
     await interaction.deferReply();
     try{
-      const contract = '0x078be86f3104a32313a47815792230a3808642cc';
+      const contract = OCAS_CONTRACT;
       const r = await pgPool.query(`
         SELECT be.burner_wallet,
                COUNT(be.id)::int AS total_burns,
@@ -2822,17 +3109,15 @@ It has not been burned and was not created via the burn machine.`)
         LIMIT 10
       `);
       if(!r.rows.length){ await interaction.editReply('No burn data yet.'); return; }
-      const medals = ['🥇','🥈','🥉'];
       const lines = r.rows.map((row,i)=>{
-        const medal  = medals[i] || `**${i+1}.**`;
         const wallet = `[${shortAddr(row.burner_wallet)}](https://opensea.io/${row.burner_wallet})`;
-        return `${medal} ${wallet} — ${row.total_burned} burned · ${row.total_burns} burns · ${row.total_points||0} pts`;
+        return `**${i+1}.** ${wallet} - ${row.total_burned} burned - ${row.total_burns} burns - ${row.total_points||0} pts`;
       });
       const embed = new EmbedBuilder()
-        .setTitle('🔥 OCAS Burn Leaderboard')
+        .setTitle('OCAS Burn Leaderboard')
         .setColor(BURN_COLORS.FIRE)
         .setDescription(lines.join('\n'))
-        .setFooter({ text:'Ranked by total tokens burned • on-chain-all-stars' })
+        .setFooter({ text:'Ranked by total tokens burned' })
         .setTimestamp();
       await interaction.editReply({ embeds:[embed] });
     }catch(e){ await interaction.editReply('Error: '+e.message); }
@@ -3014,12 +3299,6 @@ client.once('clientReady', async ()=>{
   await loadSaleCursors();
   await loadListingCursors();
   await loadBurnConfig();
-  // Reset burn block cursor so the poller re-scans with the corrected topic filters.
-  // This one-time reset ensures previously misidentified events get reprocessed.
-  // Safe to remove after first successful deploy.
-  await dbSave('burn_last_block', null).catch(()=>{});
-  await pgPool.query("DELETE FROM bot_state WHERE key='burn_last_block'").catch(()=>{});
-  console.log('[Burn] Reset burn_last_block for fresh scan with correct topic filters');
   console.log('Servers configured: '+Object.keys(serverConfigs).length);
   pollSales();
   pollListings();
