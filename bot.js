@@ -717,9 +717,10 @@ async function buildBurnEmbed(finalEvent, startEvent){
 
   const burnedCount = burnedIds.length || '?';
 
-  // Fetch metadata — prefer what's already in cache (set by processPendingBurnAlerts with fresh data)
-  // fetchCreatedTokenMeta reads from cache first, so if pending alert processor already primed it we get fresh traits
-  const dbMeta = await fetchCreatedTokenMeta(survivorId).catch(()=>null);
+  // Fetch metadata — ONLY use tokenMetaCache (primed by processPendingBurnAlerts with fresh OS data).
+  // Do NOT fall back to DB here — DB has pre-burn stale traits and would pollute the embed.
+  const cached = tokenMetaCache.get(parseInt(survivorId)) || tokenMetaCache.get(`os:${parseInt(survivorId)}`);
+  const dbMeta = (cached && Date.now() < cached.expires) ? cached.meta : null;
 
   // Image — always fetch fresh for burn embeds (bypass image cache)
   imageCache?.delete?.(`${contract}:${survivorId}`);
@@ -1268,21 +1269,26 @@ async function processPendingBurnAlerts(){
       continue;
     }
 
-    // Compare fresh traits to pre-burn snapshot
-    const changed = traitsDiffer(preBurnTraits, freshTraits);
-    const typeStr  = freshTraits.Type || freshTraits.type || '?';
-    const oldType  = preBurnTraits ? (preBurnTraits.Type || preBurnTraits.type || '?') : 'unknown';
+    const typeStr = freshTraits.Type || freshTraits.type || '?';
+    const oldType = preBurnTraits ? (preBurnTraits.Type || preBurnTraits.type || '?') : 'unknown';
 
-    if(!changed && preBurnTraits){
-      console.log(`[BurnMeta] #${survivorId} still stale (attempt ${entry.attempts}) Type=${typeStr} (was ${oldType})`);
-      continue;
-    }
-
-    if(!preBurnTraits){
-      // No snapshot to compare — if we got traits assume they're fresh enough
-      console.log(`[BurnMeta] #${survivorId} no pre-burn snapshot; posting with fresh traits Type=${typeStr}`);
+    if(preBurnTraits){
+      // Have a snapshot — compare full trait object
+      const changed = traitsDiffer(preBurnTraits, freshTraits);
+      if(!changed){
+        console.log(`[BurnMeta] #${survivorId} still stale (attempt ${entry.attempts}) Type=${typeStr} (was ${oldType})`);
+        continue;
+      }
+      console.log(`[BurnMeta] #${survivorId} metadata refreshed! ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
     } else {
-      console.log(`[BurnMeta] #${survivorId} metadata refreshed! Type ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
+      // No snapshot — enforce a 90s minimum wait after addedAt before trusting any traits.
+      // This gives the OS refresh request time to propagate before we accept whatever OS returns.
+      const MIN_WAIT_MS = 90_000;
+      if(ageMs < MIN_WAIT_MS){
+        console.log(`[BurnMeta] #${survivorId} no snapshot — waiting ${Math.round((MIN_WAIT_MS - ageMs)/1000)}s more before accepting traits`);
+        continue;
+      }
+      console.log(`[BurnMeta] #${survivorId} no snapshot — posting after ${Math.round(ageMs/1000)}s wait, Type=${typeStr}`);
     }
 
     // Set the fresh traits into cache so buildBurnEmbed picks them up
@@ -3707,18 +3713,36 @@ It has not been burned and was not created via the burn machine.`)
         tokenIds: (row.burned_ids || []).filter(Boolean),
       };
 
-      // Queue to pending alert system (skip if already pending)
+      // Snapshot current DB traits to compare against after refresh
+      const snapMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+      const preBurnTraits = snapMeta?.traits ? { ...snapMeta.traits } : null;
+      if(preBurnTraits){
+        const snapType = preBurnTraits.Type || preBurnTraits.type || '?';
+        console.log(`[BurnRefresh] DB snapshot for #${tokenId}: Type=${snapType}`);
+      } else {
+        console.log(`[BurnRefresh] No DB snapshot for #${tokenId} — will use 90s minimum wait`);
+      }
+
+      // Queue to pending alert system (skip if already pending, but always re-trigger refresh)
       const alertKey = String(tokenId);
       const alreadyPending = pendingBurnAlerts.has(alertKey);
       if(!alreadyPending){
         pendingBurnAlerts.set(alertKey, {
           finalEvent,
           startEvent,
-          preBurnTraits: null, // no pre-burn snapshot available; will post once OS returns traits
+          preBurnTraits, // snapshot for comparison — if null, 90s minimum wait applies
           addedAt:  Date.now(),
           attempts: 0,
           slowMode: false,
         });
+      } else {
+        // Already pending — update the snapshot and reset the timer so 90s wait applies fresh
+        const existing = pendingBurnAlerts.get(alertKey);
+        if(preBurnTraits) existing.preBurnTraits = preBurnTraits;
+        existing.addedAt = Date.now();
+        existing.attempts = 0;
+        existing.slowMode = false;
+        existing.lastChecked = null;
       }
 
       // Trigger OS metadata refresh regardless — this is the whole point of the command
