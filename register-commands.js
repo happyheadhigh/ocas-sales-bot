@@ -147,7 +147,8 @@ const commands = [
     .setDescription('Show OCAS Burn Machine stats — total burned, created, estimated supply'),
 
   new SlashCommandBuilder().setName('burnlatest')
-    .setDescription('Show the most recent finalized OCAS burn event'),
+    .setDescription('Show recent finalized OCAS burn events')
+    .addIntegerOption(o=>o.setName('count').setDescription('Number of burns to show (max 10, default 1)').setRequired(false).setMinValue(1).setMaxValue(10)),
 
   new SlashCommandBuilder().setName('burn')
     .setDescription('Show burn status and lineage for a token')

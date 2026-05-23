@@ -555,6 +555,24 @@ async function fetchFloorEth(slug) {
   } catch { return null; }
 }
 
+let cachedOpenSeaItems = { value: null, expires: 0 };
+async function fetchOpenSeaItemCount(slug='on-chain-all-stars') {
+  if(cachedOpenSeaItems.expires > Date.now()) return cachedOpenSeaItems.value;
+  try {
+    const r = await fetch(
+      `https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}/stats`,
+      { headers: osHeaders() }
+    );
+    if (!r.ok) return null;
+    const j = await r.json();
+    const value = j?.total?.supply ?? j?.total?.count ?? j?.total?.items
+      ?? j?.stats?.total_supply ?? j?.stats?.count ?? j?.stats?.num_items ?? null;
+    const n = value == null ? null : parseInt(value, 10);
+    cachedOpenSeaItems = { value: Number.isFinite(n) ? n : null, expires: Date.now() + 10 * 60 * 1000 };
+    return cachedOpenSeaItems.value;
+  } catch { return null; }
+}
+
 async function fireSweepAlert({ sales: sweepSales, config }, channel) {
   const buyer = sweepSales[0].buyer || 'unknown';
   const count = sweepSales.length;
@@ -704,6 +722,43 @@ async function buildBurnEmbed(finalEvent, startEvent){
 }
 
 // Pending burn map: survivorTokenId → { owner, tokenIds, points, resultBodyType, resultIsAngel, boostChance, blockNumber, txHash }
+function shortenBurnedIds(ids, max=6){
+  const clean = (ids || []).filter(Boolean).map(id => `#${id}`);
+  if(clean.length <= max) return clean.join(', ') || 'unknown';
+  return clean.slice(0, max).join(', ') + ` +${clean.length - max} more`;
+}
+
+async function formatRecentBurnLine(row, index){
+  const tokenId = parseInt(row.survivor_token_id);
+  const burnedIds = (row.burned_ids || []).filter(Boolean);
+  const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+  const actualType = dbMeta?.traits?.Type || dbMeta?.traits?.type || 'traits updating';
+  const burnTier = row.result_body_type != null ? burnTypeLabel(row.result_body_type, row.result_is_angel) : 'unknown';
+  const ago = row.burned_at ? timeSince(Math.floor(new Date(row.burned_at).getTime()/1000)) : '?';
+  const osUrl = `https://opensea.io/assets/ethereum/${OCAS_CONTRACT}/${tokenId}`;
+  const tvUrl = `https://traitview.com/?token=${tokenId}`;
+  const txUrl = row.tx_hash ? `https://etherscan.io/tx/${row.tx_hash}` : null;
+  const links = [`[TraitView](${tvUrl})`];
+  if(txUrl) links.push(`[Tx](${txUrl})`);
+  return [
+    `**${index}. [#${tokenId}](${osUrl})** - ${actualType}`,
+    `Burn Tier: ${burnTier} | Burned: ${burnedIds.length || '?'} | Burner: ${shortAddr(row.burner_wallet)}`,
+    `Burned IDs: ${shortenBurnedIds(burnedIds)}`,
+    `${links.join(' | ')} | ${ago}`,
+  ].join('\n');
+}
+
+async function buildRecentBurnsEmbed(rows, startIndex=1, title='Recent OCAS Burns'){
+  const lines = [];
+  for(let i=0;i<rows.length;i++) lines.push(await formatRecentBurnLine(rows[i], startIndex + i));
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setColor(BURN_COLORS.FIRE)
+    .setDescription(lines.join('\n\n') || 'No burn events recorded yet.')
+    .setFooter({ text:'OCAS Burn Machine' })
+    .setTimestamp();
+}
+
 const pendingBurns = new Map();
 
 async function storeBurnStarted(event){
@@ -2901,21 +2956,42 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   if(commandName==='burnlatest'){
     await interaction.deferReply();
     try{
+      const count = Math.max(1, Math.min(interaction.options.getInteger('count') || 1, 10));
       const r = await pgPool.query(`
         SELECT be.id, be.tx_hash, be.block_number, be.burner_wallet, be.survivor_token_id,
-               be.result_body_type, be.result_is_angel, be.points_used, be.burned_at,
+               be.result_body_type, be.result_is_angel, be.points_used, be.burned_at, be.log_index,
                array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-        GROUP BY be.id ORDER BY be.burned_at DESC LIMIT 1
-      `);
+        GROUP BY be.id
+        ORDER BY be.block_number DESC, be.log_index DESC
+        LIMIT $1
+      `, [count]);
       if(!r.rows.length){ await interaction.editReply('No burn events recorded yet.'); return; }
-      const row = r.rows[0];
-      const finalEvent = { survivorTokenId: row.survivor_token_id, resultBodyType: row.result_body_type,
-        resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash, blockNumber: row.block_number };
-      const startEvent = { owner: row.burner_wallet, tokenIds: (row.burned_ids||[]).filter(Boolean) };
-      const embed = await buildBurnEmbed(finalEvent, startEvent);
-      await interaction.editReply(buildEmbedPayload(embed));
+      const firstRows = count > 5 ? r.rows.slice(0, 5) : r.rows;
+      const embed = await buildRecentBurnsEmbed(firstRows, 1);
+      const payload = { embeds:[embed], components:[] };
+      if(count > 5 && r.rows.length > 5){
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId('show_more')
+            .setLabel(`Show More (${r.rows.length - 5} remaining)`)
+            .setStyle(ButtonStyle.Primary)
+        );
+        payload.components = [row];
+      }
+      await interaction.editReply(payload);
+      if(count > 5 && r.rows.length > 5){
+        const msg = await interaction.fetchReply();
+        const remainingEmbed = await buildRecentBurnsEmbed(r.rows.slice(5), 6, 'Recent OCAS Burns');
+        slideshowSessions.set(msg.id, {
+          embeds: [remainingEmbed],
+          index: 0,
+          userId: interaction.user.id,
+          expiresAt: Date.now() + 15 * 60 * 1000,
+          isShowMore: true,
+        });
+      }
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
@@ -2926,10 +3002,18 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     try{
       const [statsRes, latestRes, pausedRes] = await Promise.all([
         pgPool.query(`
-          SELECT COUNT(*)::int AS total_burns,
-                 SUM(array_length(ARRAY(SELECT burned_token_id FROM burn_event_inputs WHERE burn_event_id = be.id), 1))::int AS total_burned,
-                 COUNT(*)::int AS total_created
+          SELECT
+            COUNT(DISTINCT be.id)::int AS total_burns,
+            COUNT(bei.burned_token_id)::int AS total_burned,
+            COUNT(DISTINCT be.id)::int AS total_created,
+            COUNT(*) FILTER (WHERE input_counts.input_count IS NULL OR input_counts.input_count = 0)::int AS missing_input_burns
           FROM burn_events be
+          LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+          LEFT JOIN (
+            SELECT burn_event_id, COUNT(*)::int AS input_count
+            FROM burn_event_inputs
+            GROUP BY burn_event_id
+          ) input_counts ON input_counts.burn_event_id = be.id
         `),
         pgPool.query(`
           SELECT be.survivor_token_id, be.result_body_type, be.result_is_angel,
@@ -2939,14 +3023,21 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
           GROUP BY be.id ORDER BY be.burned_at DESC LIMIT 1
         `),
-        pgPool.query(`SELECT value FROM bot_state WHERE key='burn_paused'`),
+        pgPool.query(`SELECT COUNT(*)::int AS duplicate_inputs
+                      FROM (
+                        SELECT burn_event_id, burned_token_id
+                        FROM burn_event_inputs
+                        GROUP BY burn_event_id, burned_token_id
+                        HAVING COUNT(*) > 1
+                      ) d`),
       ]);
       const stats   = statsRes.rows[0];
       const latest  = latestRes.rows[0];
+      const diagnostics = pausedRes.rows[0] || {};
       const burned  = stats.total_burned || 0;
       const created = stats.total_created || 0;
-      const netReduction = burned - created;
-      const estimatedSupply = 10000 - netReduction;
+      const estimatedSupply = 10000 - burned + created;
+      const openSeaItems = await fetchOpenSeaItemCount('on-chain-all-stars').catch(()=>null);
 
       const embed = new EmbedBuilder()
         .setTitle('OCAS Burn Machine Stats')
@@ -2955,10 +3046,18 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           { name:'Total Burns',       value:String(stats.total_burns||0),   inline:true },
           { name:'Tokens Burned',     value:String(burned),                  inline:true },
           { name:'Tokens Created',    value:String(created),                 inline:true },
-          { name:'Net Supply Change', value:`-${netReduction}`,             inline:true },
+          { name:'Net Supply Change', value:`-${burned - created}`,             inline:true },
           { name:'Est. Supply',       value:String(estimatedSupply),         inline:true },
-          { name:'Burn Machine',      value:'[Etherscan](https://etherscan.io/address/'+BURN_CONTRACT+')', inline:true },
+          { name:'OpenSea Items',     value:openSeaItems == null ? 'unavailable' : String(openSeaItems), inline:true },
+          { name:'Links',             value:`[Burn Machine](https://www.onchainallstars.xyz/burn-machine) | [TraitView](https://traitview.com/) | [Etherscan](https://etherscan.io/address/${BURN_CONTRACT})`, inline:false },
         );
+      if(openSeaItems != null && openSeaItems !== estimatedSupply){
+        embed.addFields({
+          name:'Supply Check',
+          value:`DB estimate differs from OpenSea by ${estimatedSupply - openSeaItems}. Missing input burns: ${stats.missing_input_burns || 0}. Duplicate inputs: ${diagnostics.duplicate_inputs || 0}. Backfill may be incomplete or OpenSea may lag.`,
+          inline:false,
+        });
+      }
       if(latest){
         const ago       = latest.burned_at ? timeSince(Math.floor(new Date(latest.burned_at).getTime()/1000)) : '?';
         embed.addFields({ name:'Latest Burn',
