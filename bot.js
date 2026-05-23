@@ -19,7 +19,7 @@
  *   /lastsale            — Most recent sale
  *   /recentsales         — Last N sales
  *   /sale token:1234     — Specific token's last sale
- *   /traitfind           — Search sales history by trait
+ *   /traitfind           — Search tokens/listings/sales by trait
  *   /listings            — Show current active listings
  *   /myalert             — Set personal DM alert (sales + listings)
  *   /myalertclear        — Remove your personal DM alert
@@ -1506,6 +1506,70 @@ async function buildListingEmbed(listing, config){
   return embed;
 }
 
+// ── Command search helpers ───────────────────────────────────────────────────
+function traitGroupsLabel(groups, fallback){
+  const parts = (groups || []).map(group => {
+    const first = group && group[0];
+    return first ? `${first.trait_name}: ${first.trait_value}` : null;
+  }).filter(Boolean);
+  return parts.length ? parts.join(' + ') : String(fallback || '').trim();
+}
+
+async function fetchBotApiJson(url, label){
+  let r;
+  try{
+    r = await fetch(url);
+  }catch(e){
+    throw new Error(`${label} unavailable: ${e.message}`);
+  }
+  if(!r.ok){
+    let detail = '';
+    try{ detail = (await r.text()).slice(0, 180).replace(/\s+/g, ' ').trim(); }catch(_){}
+    throw new Error(`${label} returned HTTP ${r.status}${detail ? ` (${detail})` : ''}`);
+  }
+  const j = await r.json();
+  if(!j.ok) throw new Error(`${label} error: ${j.error || 'unknown error'}`);
+  return j;
+}
+
+async function buildTokenSearchEmbed(token, config, footerLabel){
+  const tokenId = token.token_id ?? token.id ?? token.identifier;
+  const id = String(tokenId || '');
+  const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+  const chain = config.chain || 'ethereum';
+  const slug = config.slug || '';
+  const dbMeta = token._dbToken || (id ? await fetchTokenMetaFromDb(id) : null);
+  const osRank = dbMeta?.os_rank || token.os_rank || null;
+  const rankPart = osRankBadge(osRank);
+  const osUrl = id ? `https://opensea.io/assets/${chain}/${contract}/${id}` : `https://opensea.io/collection/${slug}`;
+  const tvUrl = id ? `https://traitview.com/?jump=${id}` : 'https://traitview.com/';
+  const embed = new EmbedBuilder()
+    .setTitle(`${titleTokenId(id)}${rankPart ? ' '+rankPart : ''}`)
+    .setColor(getRankTierColor(osRank) ?? COLORS.OCAS_BG)
+    .setURL(osUrl)
+    .setFooter({ text: footerLabel || 'Trait Search' })
+    .setTimestamp();
+
+  const traits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
+  const stats = [];
+  if(osRank) stats.push(`OS Rank: ${Number(osRank).toLocaleString()}`);
+  if(token.obs_rank) stats.push(`TraitView Rank: ${Number(token.obs_rank).toLocaleString()}`);
+  if(dbMeta?.trait_count || token.trait_count) stats.push(`Traits: ${dbMeta?.trait_count || token.trait_count}`);
+  if(stats.length) embed.addFields({ name:'Stats', value:stats.join('\n'), inline:false });
+
+  if(traits.length){
+    const traitLines = traits.slice(0, 12).map(t => `**${t.trait_type}**: ${t.value}`);
+    const half = Math.ceil(traitLines.length / 2);
+    embed.addFields(
+      { name:'Traits', value:traitLines.slice(0, half).join('\n'), inline:true },
+      { name:'\u200b', value:traitLines.slice(half).join('\n') || '\u200b', inline:true },
+    );
+  }
+  embed.addFields({ name:'Links', value:`[OpenSea](${osUrl}) - [TraitView](${tvUrl})`, inline:false });
+  try{ embed._imageResult = id ? await resolveImage({ identifier:id }, contract, chain) : null; }catch(_){}
+  return embed;
+}
+
 // ── Poll sales ────────────────────────────────────────────────────────────────
 async function pollSales(){
   for(const [guildId,config] of Object.entries(serverConfigs)){
@@ -2176,17 +2240,16 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     return;
   }
 
-  // /traitfind — search sales history by trait. Tries Railway DB first (full history),
-  // falls back to OpenSea pagination (capped ~1500 sales) if DB not configured.
+  // /traitfind - token search by default; add "listings" or "sales" for those modes.
   if(commandName==='traitfind'){
     const slug       = interaction.options.getString('collection') || config.slug;
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = process.env.RAILWAY_API_URL;
     const API_SECRET  = process.env.API_SECRET;
 
-    // Detect mode: listings or sales (default)
+    // Detect mode: tokens default, or explicit listings/sales.
     const wantListings = /\blistings?\b/i.test(rawSearch);
-    const wantSales    = !wantListings; // sales is default
+    const wantSales    = /\bsales?\b/i.test(rawSearch);
     let workingSearch = rawSearch.replace(/\b(listings?|sales?)\b/gi, ' ').trim();
 
     // Parse count: first standalone number (default 10, max 20)
@@ -2194,22 +2257,71 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
     if(numMatch){ const n=parseInt(numMatch[1]); if(n>0&&n<=20){ want=n; workingSearch=workingSearch.replace(numMatch[0],' ').trim(); } }
 
-    // Resolve trait name+value using phrase-aware parser
-    let trait = '', value = '';
+    // Resolve trait name+value using phrase-aware parser.
+    let trait = '', value = '', groups = [], unmatched = [], traitParseError = null;
     if(workingSearch && RAILWAY_URL){
       try{
         const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
         const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
-        if(resolved.groups.length){ trait = resolved.groups[0][0].trait_name; value = resolved.groups[0][0].trait_value; }
-      }catch(e){ console.warn('[traitfind] parser error:', e.message); }
+        groups = resolved.groups || [];
+        unmatched = resolved.unmatched || [];
+        if(groups.length){ trait = groups[0][0].trait_name; value = groups[0][0].trait_value; }
+      }catch(e){ traitParseError = e; console.warn('[traitfind] parser error:', e.message); }
     }
-    if(!trait && workingSearch){ trait=''; value=workingSearch; }
+    if(!trait && workingSearch){ value=workingSearch; }
+    const matchLabel = traitGroupsLabel(groups, value || workingSearch);
 
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    if(!value) return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie` or `/traitfind search:gold chain listings`', flags: MessageFlags.Ephemeral});
+    if(!workingSearch) return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie`, `/traitfind search:zombie listings`, or `/traitfind search:zombie sales`', flags: MessageFlags.Ephemeral});
+    if(!RAILWAY_URL) return interaction.reply({content:'Trait search needs the internal TraitView API (`RAILWAY_API_URL`) so it can read the token DB/cache.', flags: MessageFlags.Ephemeral});
+    if(traitParseError) return interaction.reply({content:`I could not load the trait index from the TraitView API. ${traitParseError.message}`, flags: MessageFlags.Ephemeral});
+    if(!groups.length){
+      const extra = unmatched.length ? ` Unmatched words: ${unmatched.join(', ')}.` : '';
+      return interaction.reply({content:`I could not match **${workingSearch}** to known OCAS traits.${extra} Try an exact trait/value like \`zombie\`, \`gold chain\`, or \`alien epic bear\`.`, flags: MessageFlags.Ephemeral});
+    }
     await interaction.deferReply();
 
     try{
+      // Token search is the default. "listings" narrows the same trait search
+      // to active listings. "sales" keeps the existing sales-history behavior.
+      if(wantListings || !wantSales){
+        const listedOnly = wantListings;
+        await interaction.editReply(`Searching ${listedOnly ? 'listed tokens' : 'OCAS tokens'} matching **${matchLabel}**...`);
+        const qs = new URLSearchParams({ limit: String(want), key: API_SECRET||'' });
+        qs.set('groups', JSON.stringify(groups));
+        if(listedOnly) qs.set('listed', '1');
+        const label = listedOnly ? '/db/multi-trait-tokens listings API' : '/db/multi-trait-tokens token API';
+        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, label);
+        const tokens = j.tokens || [];
+        if(!tokens.length){
+          await interaction.editReply(`No ${listedOnly ? 'active listings' : 'OCAS tokens'} found matching **${matchLabel}**.`);
+          return;
+        }
+        const cfg = {...config, slug};
+        const embeds = await Promise.all(tokens.map(async t => {
+          const tokenId = t.token_id ?? t.id ?? t.identifier;
+          const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+          if(listedOnly){
+            const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
+            const fakeListingObj = {
+              token_id: tokenId,
+              asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
+                       traits: dbMeta?.traits ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v})) : [] },
+              payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
+              maker: t.seller || '',
+              url: t.url || null,
+              os_rank: t.os_rank || null,
+              _dbToken: dbMeta,
+            };
+            return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
+          }
+          return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
+        }));
+        await postEmbeds(interaction, embeds.filter(Boolean),
+          `Found **${tokens.length}** ${listedOnly ? 'listing' : 'token'}${tokens.length===1?'':'s'} matching **${matchLabel}**${listedOnly ? ' (cheapest first)' : ''}:`);
+        return;
+      }
+
       // ── Listings mode ──────────────────────────────────────────────────────
       if(wantListings && RAILWAY_URL){
         await interaction.editReply(`🔍 Searching listed tokens with **${trait ? trait+': ' : ''}${value}**...`);
@@ -2300,7 +2412,10 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const cfg={...config,slug};
       await interaction.editReply(`Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (OpenSea, last ~${pages*100}):`);
       for(const sale of matched){const embed=await buildSaleEmbed(sale,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
-    }catch(e){await interaction.editReply('Error: '+e.message);}
+    }catch(e){
+      console.warn('[traitfind]', e.message);
+      await interaction.editReply(`I could not load trait results from the TraitView API. ${e.message}`);
+    }
     return;
   }
 
@@ -2466,10 +2581,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       if(wantSales){
         const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, limit: '20', sort: 'desc' });
         if(API_SECRET) qs.set('key', API_SECRET);
-        const r = await fetch(`${RAILWAY_URL}/db/rank-sales?${qs}`);
-        if(!r.ok) throw new Error(`rank-sales API HTTP ${r.status}`);
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error || 'API error');
+        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/rank-sales?${qs}`, '/db/rank-sales API');
         const sales = j.sales || [];
         if(!sales.length){ await interaction.editReply(`No sales found for OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
         const cfg = {...config};
@@ -2492,39 +2604,42 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       }
 
       // ── Listings mode (default) ────────────────────────────────────────────
-      const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
+      const qs = new URLSearchParams({ listed: '1', rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
       if(API_SECRET) qs.set('key', API_SECRET);
-      const r = await fetch(`${RAILWAY_URL}/db/rank-listings?${qs}`);
-      if(!r.ok) throw new Error(`API HTTP ${r.status}`);
-      const j = await r.json();
-      if(!j.ok) throw new Error(j.error || 'API error');
-      let listings = j.listings || [];
+      const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, '/db/multi-trait-tokens rank listings API');
+      let listings = j.tokens || [];
       if(!listings.length){ await interaction.editReply(`No listings found with OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
       if(sortBy === 'rank') listings.sort((a,b) => (a.os_rank??9999) - (b.os_rank??9999));
       const rankEmbeds = await Promise.all(listings.map(async l => {
-        const tokenTraits = l.traits && typeof l.traits==='object' ? Object.entries(l.traits).map(([k,v])=>({trait_type:k,value:v})) : [];
+        const tokenId = l.token_id ?? l.id ?? l.identifier;
+        const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+        const tokenTraits = dbMeta?.traits
+          ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v}))
+          : (l.traits && typeof l.traits==='object' ? Object.entries(l.traits).map(([k,v])=>({trait_type:k,value:v})) : []);
         const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
         const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
-        const tvUrl = `https://traitview.com/?token=${l.token_id}`;
+        const listingUrl = l.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+        const tvUrl = `https://traitview.com/?jump=${tokenId}`;
         const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
         const embed = new EmbedBuilder()
           .setColor(rankColor)
-          .setTitle(`${priceStr} ETH • #${l.token_id}${rankBadge} • Listed`)
-          .setURL(l.url)
+          .setTitle(`${priceStr} ETH • #${tokenId}${rankBadge} • Listed`)
+          .setURL(listingUrl)
           .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
           .setTimestamp();
         const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
         if(tokenTraits.length){
           embed.setDescription(tokenTraits.slice(0,8).map(t=>`**${t.trait_type}:** ${t.value}`).join('\n') + '\n\n**Links**\n' + tvLink);
         } else { embed.setDescription('**Links**\n' + tvLink); }
-        try{ embed._imageResult = await resolveImage({ identifier: String(l.token_id) }, contract, 'ethereum'); }catch(e){}
+        try{ embed._imageResult = await resolveImage({ identifier: String(tokenId) }, contract, 'ethereum'); }catch(e){}
         return embed;
       }));
       const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
       await postEmbeds(interaction, rankEmbeds.filter(Boolean),
         `🏆 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${listings.length} listing${listings.length===1?'':'s'} (${sortLabel}):`);
     }catch(e){
-      await interaction.editReply('Error: ' + e.message);
+      console.warn('[rankfind]', e.message);
+      await interaction.editReply(`I could not load rank results from the TraitView API. ${e.message}`);
     }
     return;
   }
@@ -3186,8 +3301,9 @@ It has not been burned and was not created via the burn machine.`)
       '`/sweep search:10` — Cost to sweep 10 cheapest listed',
       '`/sweep search:2eth zombie` — Budget sweep with trait filter',
       '`/sweep search:0.05 floor zombie` — Clear below target floor',
-      '`/traitfind search:zombie` — Sales history for a trait',
+      '`/traitfind search:zombie` — Tokens matching a trait',
       '`/traitfind search:zombie listings` — Currently listed with that trait',
+      '`/traitfind search:zombie sales` — Sales history for that trait',
       '`/rankfind search:1-100` — Listed tokens by OS rank range',
       '`/rankfind search:1-100 sales` — Sales history by OS rank range',
     ].join('\n');
