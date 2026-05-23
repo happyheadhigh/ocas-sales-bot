@@ -717,8 +717,6 @@ async function buildBurnEmbed(finalEvent, startEvent){
 
   // Fetch DB metadata for the created token — traits + OS rank
   const dbMeta = await fetchCreatedTokenMeta(survivorId).catch(()=>null);
-  const osRank = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
-  const rankBadge = osRank ? ` #${osRank.toLocaleString()}` : '';
   const actualType = dbMeta?.traits?.Type || dbMeta?.traits?.type || null;
   const createdType = actualType || 'Traits updating';
   const burnedCount = burnedIds.length || '?';
@@ -738,10 +736,8 @@ async function buildBurnEmbed(finalEvent, startEvent){
     .setURL(osUrl)
     .setDescription(`#${survivorId} • ${createdType} • ${burnedCount} burned • ${points || 0} pts`)
     .addFields(
-      { name:'Created Token', value:`[#${survivorId}${rankBadge}](${osUrl})`, inline:true },
-      { name:'Points Used',   value:String(points || 0),                       inline:true },
-      { name:'Burner',        value:burnerLink,                                 inline:true },
-      { name:'Tokens Burned', value:String(burnedIds.length || '?'),           inline:true },
+      { name:'Created Token', value:`[#${survivorId}](${osUrl})`, inline:true },
+      { name:'Burner',        value:burnerLink,                  inline:true },
     );
 
   // Add traits of the created token if available
@@ -766,7 +762,7 @@ async function buildBurnEmbed(finalEvent, startEvent){
     embed._components = [new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`burn_ids:${finalEvent.burnEventId}`)
-        .setLabel('View Burned IDs')
+        .setLabel('Show Burned Tokens')
         .setStyle(ButtonStyle.Secondary)
     )];
   }
@@ -2032,7 +2028,7 @@ client.on('interactionCreate', async (interaction)=>{
       const survivorId = r.rows[0].survivor_token_id;
       const ids = r.rows.map(row => row.burned_token_id).filter(Boolean);
       const text = ids.length ? ids.map(id => `#${id}`).join(', ') : 'No burned token IDs found.';
-      await interaction.editReply({ content:`**OCAS Burn #${survivorId} - Burned IDs**\n${text}`.slice(0, 1900) });
+      await interaction.editReply({ content:`**Burned Tokens:**\n${text}`.slice(0, 1900) });
     }catch(e){
       console.error('[Burn IDs]', e.message);
       try{ await interaction.editReply({ content:'Error loading burned IDs.' }); }catch(_){}
@@ -3166,7 +3162,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       if(!r.rows.length){ await interaction.editReply('No burn events recorded yet.'); return; }
       const embeds = await Promise.all(r.rows.map(row => {
         const finalEvent = { survivorTokenId: row.survivor_token_id, resultBodyType: row.result_body_type,
-          resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash, blockNumber: row.block_number, logIndex: row.log_index };
+        resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash, blockNumber: row.block_number, logIndex: row.log_index,
+        burnEventId: row.id };
         const startEvent = { owner: row.burner_wallet, tokenIds: (row.burned_ids||[]).filter(Boolean) };
         return buildBurnEmbed(finalEvent, startEvent);
       }));
