@@ -221,6 +221,20 @@ async function ensureBotStateTable(){
     `);
     // Index for trait lookups — prevents full table scan on traitfind/rankfind
     await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS burn_alert_posts (
+        id           SERIAL PRIMARY KEY,
+        tx_hash      TEXT NOT NULL,
+        log_index    INT NOT NULL,
+        guild_id     TEXT,
+        channel_id   TEXT NOT NULL,
+        posted_at    TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pgPool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS burn_alert_posts_tx_log_channel_idx
+      ON burn_alert_posts(tx_hash, log_index, channel_id)
+    `);
+    await pgPool.query(`
       CREATE INDEX IF NOT EXISTS token_traits_token_id_idx ON token_traits(token_id)
     `).catch(()=>{}); // table may not exist yet on fresh deploy
     await pgPool.query(`
@@ -373,7 +387,16 @@ const sweepSessions = new Map(); // sessionId → { listings, page }
 let burnConfig = {};
 async function loadBurnConfig(){
   const db = await dbLoad('burn_config');
-  if(db){ burnConfig = db; console.log('[Burn] Config loaded'); }
+  if(db){
+    burnConfig = db;
+    const configured = Object.entries(burnConfig || {})
+      .map(([guildId, cfg]) => `${guildId}:${getConfiguredBurnChannelId(cfg) || 'none'}`)
+      .join(', ');
+    console.log(`[Burn] Config loaded (${Object.keys(burnConfig || {}).length} guilds): ${configured || 'none'}`);
+  } else {
+    burnConfig = {};
+    console.log('[Burn] Config loaded (0 guilds): none');
+  }
 }
 async function saveBurnConfig(){
   await dbSave('burn_config', burnConfig);
@@ -641,27 +664,32 @@ async function resolveDiscordChannel(channelId){
 }
 
 async function getBurnAlertChannels(){
-  const configuredIds = [];
+  const configured = [];
   const seen = new Set();
-  for(const cfg of Object.values(burnConfig || {})){
+  for(const [guildId, cfg] of Object.entries(burnConfig || {})){
     const channelId = getConfiguredBurnChannelId(cfg);
     if(channelId && !seen.has(channelId)){
       seen.add(channelId);
-      configuredIds.push(channelId);
+      configured.push({ guildId, channelId });
     }
   }
 
-  if(!configuredIds.length && BURN_ALERT_CHANNEL_ID){
-    configuredIds.push(BURN_ALERT_CHANNEL_ID);
+  if(!configured.length && BURN_ALERT_CHANNEL_ID){
+    configured.push({ guildId: 'fallback', channelId: BURN_ALERT_CHANNEL_ID });
   }
 
   const channels = [];
-  for(const channelId of configuredIds){
+  for(const item of configured){
+    const { guildId, channelId } = item;
     const ch = await resolveDiscordChannel(channelId);
-    if(ch) channels.push(ch);
-    else console.warn(`[Burn] Configured burn alert channel not found: ${channelId}`);
+    if(ch) channels.push({ guildId, channelId, channel: ch });
+    else console.warn(`[Burn] Configured burn alert channel not found guild=${guildId} channel=${channelId}`);
   }
   return channels;
+}
+
+function cleanTraitLabel(label){
+  return String(label || '').replace(/\d+$/, '').trim() || String(label || '');
 }
 
 async function buildBurnEmbed(finalEvent, startEvent){
@@ -673,7 +701,6 @@ async function buildBurnEmbed(finalEvent, startEvent){
   const burnedIds    = startEvent?.tokenIds || [];
   const txHash       = finalEvent.txHash || '';
 
-  const burnTierLabel = burnTypeLabel(bodyType, isAngel);
   const color     = burnTypeColor(bodyType, isAngel);
 
   const contract  = OCAS_CONTRACT;
@@ -693,6 +720,8 @@ async function buildBurnEmbed(finalEvent, startEvent){
   const osRank = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
   const rankBadge = osRank ? ` #${osRank.toLocaleString()}` : '';
   const actualType = dbMeta?.traits?.Type || dbMeta?.traits?.type || null;
+  const createdType = actualType || 'Traits updating';
+  const burnedCount = burnedIds.length || '?';
 
   // Fetch created token image
   let imgResult = getCachedImage(`${contract}:${survivorId}`);
@@ -707,20 +736,17 @@ async function buildBurnEmbed(finalEvent, startEvent){
     .setTitle('OCAS Burn')
     .setColor(color)
     .setURL(osUrl)
-    .setDescription(`#${survivorId} was created from ${burnedIds.length || '?'} burned OCAS.`)
+    .setDescription(`#${survivorId} • ${createdType} • ${burnedCount} burned • ${points || 0} pts`)
     .addFields(
       { name:'Created Token', value:`[#${survivorId}${rankBadge}](${osUrl})`, inline:true },
-      { name:'Result Type',   value:actualType || 'Traits updating - check again shortly', inline:true },
       { name:'Points Used',   value:String(points || 0),                       inline:true },
-      { name:'Burn Tier',     value:burnTierLabel,                              inline:true },
       { name:'Burner',        value:burnerLink,                                 inline:true },
       { name:'Tokens Burned', value:String(burnedIds.length || '?'),           inline:true },
-      { name:'Burned IDs',    value:burnedStr,                                  inline:false },
     );
 
   // Add traits of the created token if available
   if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
-    const traitLines = Object.entries(dbMeta.traits).slice(0,12).map(([k,v])=>`**${k}:** ${v}`);
+    const traitLines = Object.entries(dbMeta.traits).slice(0,12).map(([k,v])=>`**${cleanTraitLabel(k)}:** ${v}`);
     const half = Math.ceil(traitLines.length/2);
     embed.addFields(
       { name:'Traits', value:traitLines.slice(0,half).join('\n'),    inline:true },
@@ -736,6 +762,14 @@ async function buildBurnEmbed(finalEvent, startEvent){
   embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
 
   embed._imageResult = imgResult || null;
+  if(finalEvent.burnEventId && burnedIds.length){
+    embed._components = [new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`burn_ids:${finalEvent.burnEventId}`)
+        .setLabel('View Burned IDs')
+        .setStyle(ButtonStyle.Secondary)
+    )];
+  }
   return embed;
 }
 
@@ -826,7 +860,49 @@ async function storeBurnFinalized(finalEvent, startEvent){
         ).catch(()=>{});
       }
     }
+    return r.rows[0]?.id || null;
   }catch(e){ console.warn('[Burn] storeBurnFinalized DB error:', e.message); }
+  return null;
+}
+
+async function postBurnAlertToConfiguredChannels(finalEvent, startEvent){
+  const burnChannels = await getBurnAlertChannels();
+  if(!burnChannels.length){
+    console.log(`[Burn alert] no configured burn alert channels for tx=${finalEvent.txHash || 'unknown'} log=${finalEvent.logIndex ?? 'unknown'}`);
+    return;
+  }
+  const dedupeKey = `burn:${finalEvent.txHash || ''}:${finalEvent.logIndex ?? ''}`;
+  for(const target of burnChannels){
+    const { guildId, channelId, channel } = target;
+    try{
+      if(isRecentChannelPost(channelId, dedupeKey)){
+        console.log(`[Burn alert] skipped guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex}`);
+        continue;
+      }
+      const posted = await pgPool.query(
+        'SELECT 1 FROM burn_alert_posts WHERE tx_hash=$1 AND log_index=$2 AND channel_id=$3 LIMIT 1',
+        [finalEvent.txHash || '', finalEvent.logIndex || 0, channelId]
+      ).catch(e => {
+        console.warn(`[Burn alert] dedupe lookup failed guild=${guildId} channel=${channelId}: ${e.message}`);
+        return { rows: [] };
+      });
+      if(posted.rows.length){
+        console.log(`[Burn alert] skipped guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex} reason=already-posted`);
+        continue;
+      }
+      const embed = await buildBurnEmbed(finalEvent, startEvent);
+      await sendEmbed(channel, embed);
+      await pgPool.query(
+        `INSERT INTO burn_alert_posts (tx_hash, log_index, guild_id, channel_id)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (tx_hash, log_index, channel_id) DO NOTHING`,
+        [finalEvent.txHash || '', finalEvent.logIndex || 0, guildId, channelId]
+      ).catch(e => console.warn(`[Burn alert] post marker failed guild=${guildId} channel=${channelId}: ${e.message}`));
+      console.log(`[Burn alert] posted guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex}`);
+    }catch(e){
+      console.warn(`[Burn alert] failed guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex}: ${e.message}`);
+    }
+  }
 }
 
 async function pollBurnEventsLegacy(){
@@ -931,7 +1007,7 @@ async function pollBurnEventsLegacy(){
         const existing = await pgPool.query(
           'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
         );
-        if(existing.rows.length){ console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}`); continue; }
+        if(existing.rows.length) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; still checking alert fanout`);
 
         // Cross-reference with BurnStarted data
         const startEvent = pendingBurns.get(String(survivorTokenId)) ||
@@ -942,15 +1018,10 @@ async function pollBurnEventsLegacy(){
         const finalEvent = { survivorTokenId, burnSeed, points, resultBodyType: bodyType,
           resultIsAngel: isAngel, boostChance, txHash, blockNumber: blockNum, logIndex };
 
-        await storeBurnFinalized(finalEvent, startEvent);
+        finalEvent.burnEventId = await storeBurnFinalized(finalEvent, startEvent);
         console.log(`[Burn] BurnFinalized: #${survivorTokenId} → ${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
-        const burnChannels = await getBurnAlertChannels();
-        for(const burnChannel of burnChannels){
-          if(isRecentChannelPost(burnChannel.id, `burn:${survivorTokenId}:${txHash}`)) continue;
-          const embed = await buildBurnEmbed(finalEvent, startEvent);
-          await sendEmbed(burnChannel, embed);
-        }
+        await postBurnAlertToConfiguredChannels(finalEvent, startEvent);
         pendingBurns.delete(String(survivorTokenId));
       }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
     }
@@ -1022,7 +1093,7 @@ async function processBurnLogs(logs, shouldAlert){
       const existing = await pgPool.query(
         'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
       );
-      if(existing.rows.length){ console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}`); continue; }
+      if(existing.rows.length) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; still checking alert fanout`);
 
       const startEvent = pendingBurns.get(String(survivorTokenId)) ||
         await loadBurnStartFromDB(survivorTokenId);
@@ -1031,16 +1102,11 @@ async function processBurnLogs(logs, shouldAlert){
       const finalEvent = { survivorTokenId, burnSeed, points, resultBodyType: bodyType,
         resultIsAngel: isAngel, boostChance, txHash, blockNumber: blockNum, logIndex };
 
-      await storeBurnFinalized(finalEvent, startEvent);
+      finalEvent.burnEventId = await storeBurnFinalized(finalEvent, startEvent);
       console.log(`[Burn] BurnFinalized: #${survivorTokenId} tier=${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
       if(shouldAlert){
-        const burnChannels = await getBurnAlertChannels();
-        for(const burnChannel of burnChannels){
-          if(isRecentChannelPost(burnChannel.id, `burn:${survivorTokenId}:${txHash}`)) continue;
-          const embed = await buildBurnEmbed(finalEvent, startEvent);
-          await sendEmbed(burnChannel, embed);
-        }
+        await postBurnAlertToConfiguredChannels(finalEvent, startEvent);
       }
       pendingBurns.delete(String(survivorTokenId));
     }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
@@ -1261,9 +1327,11 @@ async function sendEmbed(target, embed){
 
 function buildEmbedPayload(embed){
   const ir=embed._imageResult; delete embed._imageResult;
-  if(ir?.type==='buffer'){ const att=new AttachmentBuilder(ir.buffer,{name:ir.filename}); embed.setThumbnail(`attachment://${ir.filename}`); return {embeds:[embed],files:[att]}; }
+  const components = embed._components || [];
+  delete embed._components;
+  if(ir?.type==='buffer'){ const att=new AttachmentBuilder(ir.buffer,{name:ir.filename}); embed.setThumbnail(`attachment://${ir.filename}`); return {embeds:[embed],files:[att],components}; }
   if(ir?.type==='url') embed.setThumbnail(ir.url);
-  return {embeds:[embed]};
+  return {embeds:[embed],components};
 }
 
 
@@ -1947,6 +2015,31 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
+  if(interaction.isButton() && interaction.customId.startsWith('burn_ids:')){
+    const burnEventId = parseInt(interaction.customId.split(':')[1], 10);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if(!burnEventId){ await interaction.editReply({ content:'Burn details are unavailable for this alert.' }); return; }
+      const r = await pgPool.query(
+        `SELECT be.survivor_token_id, bei.burned_token_id
+         FROM burn_events be
+         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+         WHERE be.id = $1
+         ORDER BY bei.burned_token_id ASC`,
+        [burnEventId]
+      );
+      if(!r.rows.length){ await interaction.editReply({ content:'Burned IDs are not available for this alert.' }); return; }
+      const survivorId = r.rows[0].survivor_token_id;
+      const ids = r.rows.map(row => row.burned_token_id).filter(Boolean);
+      const text = ids.length ? ids.map(id => `#${id}`).join(', ') : 'No burned token IDs found.';
+      await interaction.editReply({ content:`**OCAS Burn #${survivorId} - Burned IDs**\n${text}`.slice(0, 1900) });
+    }catch(e){
+      console.error('[Burn IDs]', e.message);
+      try{ await interaction.editReply({ content:'Error loading burned IDs.' }); }catch(_){}
+    }
+    return;
+  }
+
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
   const config=getConfig(guildId);
@@ -2000,10 +2093,13 @@ client.on('interactionCreate', async (interaction)=>{
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const channelOption = interaction.options.getChannel('channel');
     const channelId = channelOption ? channelOption.id : interaction.channelId;
-    if(!burnConfig[guildId]) burnConfig[guildId] = {};
+    const latestBurnConfig = await dbLoad('burn_config') || {};
+    burnConfig = { ...latestBurnConfig };
+    burnConfig[guildId] = { ...(latestBurnConfig[guildId] || {}) };
     burnConfig[guildId].burnAlertChannelId = channelId;
     burnConfig[guildId].channelId = channelId; // legacy compatibility for older saved configs/tools
     await saveBurnConfig();
+    console.log(`[Burn] Config saved guild=${guildId} channel=${channelId} totalGuilds=${Object.keys(burnConfig || {}).length}`);
     await interaction.reply({embeds:[new EmbedBuilder()
       .setTitle('Burn Alerts Configured')
       .setColor(BURN_COLORS.FIRE)
