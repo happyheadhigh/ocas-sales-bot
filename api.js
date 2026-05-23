@@ -844,8 +844,6 @@ app.get('/db/trait-count-floor', auth, async (req, res) => {
   }
 });
 
-<<<<<<< Updated upstream
-=======
 // ── Wallet analytics helpers ─────────────────────────────────────────────────
 function isEthAddress(addr) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(addr || '').trim());
@@ -1215,7 +1213,6 @@ app.get('/db/burn-stats', auth, async (req, res) => {
   }
 });
 
->>>>>>> Stashed changes
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
