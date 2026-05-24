@@ -1300,6 +1300,22 @@ async function processPendingBurnAlerts(){
 
     try{
       await postBurnAlertToConfiguredChannels(finalEvent, startEvent);
+      // Write fresh post-burn traits back to token_traits DB so /burnlatest works after restarts.
+      // token_traits is row-per-trait: delete stale rows then insert fresh ones.
+      try{
+        const tid = parseInt(survivorId);
+        await pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [tid]);
+        for(const [traitName, traitValue] of Object.entries(freshTraits)){
+          await pgPool.query(
+            `INSERT INTO token_traits (token_id, trait_name, trait_value)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+            [tid, String(traitName), String(traitValue)]
+          );
+        }
+        console.log(`[BurnMeta] Wrote ${Object.keys(freshTraits).length} post-burn trait rows to DB for #${survivorId}`);
+      }catch(dbErr){
+        console.warn(`[BurnMeta] Failed to write post-burn traits for #${survivorId}:`, dbErr.message);
+      }
       pendingBurnAlerts.delete(key);
     }catch(e){
       console.error(`[BurnMeta] postBurnAlertToConfiguredChannels failed for #${survivorId}:`, e.message);
@@ -3423,10 +3439,30 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         // For burns < 30 min old: bypass DB cache and fetch fresh OS metadata
         const burnAge = row.burned_at ? Date.now() - new Date(row.burned_at).getTime() : Infinity;
         if(row.already_posted){
+          // Post-burn traits were written to token_traits by processPendingBurnAlerts — read from DB.
+          // Fall back to OS only if rows are missing (pre-fix historical burns or failed write).
           const dbMeta = await fetchTokenMetaFromDb(row.survivor_token_id).catch(()=>null);
           if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
             tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
             tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
+          } else {
+            // DB missing post-burn traits — OS fallback + backfill DB for next time
+            const freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
+            if(freshTraits){
+              const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
+              tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+              tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+              // Backfill DB so future calls skip this OS hit
+              const tid = parseInt(row.survivor_token_id);
+              pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [tid]).then(() =>
+                Promise.all(Object.entries(freshTraits).map(([n,v]) =>
+                  pgPool.query(
+                    `INSERT INTO token_traits (token_id, trait_name, trait_value) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+                    [tid, String(n), String(v)]
+                  )
+                ))
+              ).catch(e => console.warn(`[burnlatest] DB backfill failed for #${tid}:`, e.message));
+            }
           }
         } else if(burnAge < THIRTY_MIN){
           const freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
