@@ -13,6 +13,17 @@ const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+<<<<<<< Updated upstream
+=======
+const DEFAULT_OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
+
+function normalizeEthAddress(addr) {
+  const s = String(addr || '').trim().toLowerCase();
+  return /^0x[a-f0-9]{40}$/.test(s) ? s : '';
+}
+>>>>>>> Stashed changes
+
+const OCAS_CONTRACT = normalizeEthAddress(process.env.OCAS_CONTRACT || DEFAULT_OCAS_CONTRACT);
 
 // ── Database connection pool ──────────────────────────────────────────────────
 const pool = new Pool({
