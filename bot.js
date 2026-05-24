@@ -1411,7 +1411,10 @@ async function pollBurnEvents(){
 
     // Process ONE chunk per poll tick — keeps the event loop free so
     // api.js requests (traitfind, rankfind, etc) don't time out during backfill.
-    const chunkTo = Math.min(latest, fromBlock + BURN_BLOCK_CHUNK - 1);
+    // Adaptive chunk: catch up faster when behind, stay small when live
+    const blockGap = latest - fromBlock;
+    const adaptiveChunk = blockGap > 10 ? Math.min(BURN_BLOCK_CHUNK, 50) : 2;
+    const chunkTo = Math.min(latest, fromBlock + adaptiveChunk - 1);
     const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
     const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
       address: BURN_CONTRACT,
