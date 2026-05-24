@@ -1277,13 +1277,30 @@ async function processPendingBurnAlerts(){
     const oldType = preBurnTraits ? (preBurnTraits.Type || preBurnTraits.type || '?') : 'unknown';
 
     if(preBurnTraits){
-      // Have a snapshot — compare full trait object
+      // Have a snapshot — compare full trait object to detect when OS has updated
       const changed = traitsDiffer(preBurnTraits, freshTraits);
       if(!changed){
         console.log(`[BurnMeta] #${survivorId} still stale (attempt ${entry.attempts}) Type=${typeStr} (was ${oldType})`);
+        entry.candidateTraits = null; // reset candidate if OS reverted
         continue;
       }
-      console.log(`[BurnMeta] #${survivorId} metadata refreshed! ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
+      // Traits differ from pre-burn — but OS may still be mid-refresh (partial update).
+      // Require stability: store as candidate and only post if identical on next tick.
+      if(!entry.candidateTraits){
+        entry.candidateTraits = freshTraits;
+        entry.candidateAt = now;
+        console.log(`[BurnMeta] #${survivorId} traits changed from pre-burn (${oldType} → ${typeStr}) — waiting one more tick to confirm stability`);
+        continue;
+      }
+      // We have a candidate from last tick — check if traits are stable
+      if(traitsDiffer(entry.candidateTraits, freshTraits)){
+        entry.candidateTraits = freshTraits;
+        entry.candidateAt = now;
+        console.log(`[BurnMeta] #${survivorId} traits still changing (Type=${typeStr}) — waiting for stability`);
+        continue;
+      }
+      // Stable across two consecutive polls — safe to post
+      console.log(`[BurnMeta] #${survivorId} metadata stable! ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
     } else {
       // No snapshot — enforce a 90s minimum wait after addedAt before trusting any traits.
       // This gives the OS refresh request time to propagate before we accept whatever OS returns.
@@ -1292,7 +1309,20 @@ async function processPendingBurnAlerts(){
         console.log(`[BurnMeta] #${survivorId} no snapshot — waiting ${Math.round((MIN_WAIT_MS - ageMs)/1000)}s more before accepting traits`);
         continue;
       }
-      console.log(`[BurnMeta] #${survivorId} no snapshot — posting after ${Math.round(ageMs/1000)}s wait, Type=${typeStr}`);
+      // No snapshot, apply same stability check
+      if(!entry.candidateTraits){
+        entry.candidateTraits = freshTraits;
+        entry.candidateAt = now;
+        console.log(`[BurnMeta] #${survivorId} no snapshot — traits received, waiting one tick to confirm stability, Type=${typeStr}`);
+        continue;
+      }
+      if(traitsDiffer(entry.candidateTraits, freshTraits)){
+        entry.candidateTraits = freshTraits;
+        entry.candidateAt = now;
+        console.log(`[BurnMeta] #${survivorId} no snapshot — traits still changing (Type=${typeStr})`);
+        continue;
+      }
+      console.log(`[BurnMeta] #${survivorId} no snapshot — traits stable after ${Math.round(ageMs/1000)}s wait, Type=${typeStr}`);
     }
 
     // Set the fresh traits into cache so buildBurnEmbed picks them up
