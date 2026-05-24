@@ -1259,6 +1259,14 @@ async function processPendingBurnAlerts(){
       continue;
     }
 
+    // Global minimum wait: 3 minutes after BurnFinalized before polling OS at all.
+    // OS needs time to fully propagate all traits — image updates before traits do.
+    const MIN_POLL_WAIT_MS = 3 * 60_000;
+    if(ageMs < MIN_POLL_WAIT_MS){
+      console.log(`[BurnMeta] #${survivorId} waiting ${Math.round((MIN_POLL_WAIT_MS - ageMs)/1000)}s before first OS poll`);
+      continue;
+    }
+
     // Fetch fresh OS metadata — bypasses all caches
     let freshTraits = null;
     try{
@@ -1304,7 +1312,7 @@ async function processPendingBurnAlerts(){
     } else {
       // No snapshot — enforce a 90s minimum wait after addedAt before trusting any traits.
       // This gives the OS refresh request time to propagate before we accept whatever OS returns.
-      const MIN_WAIT_MS = 90_000;
+      const MIN_WAIT_MS = 3 * 60_000;
       if(ageMs < MIN_WAIT_MS){
         console.log(`[BurnMeta] #${survivorId} no snapshot — waiting ${Math.round((MIN_WAIT_MS - ageMs)/1000)}s more before accepting traits`);
         continue;
