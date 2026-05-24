@@ -696,7 +696,7 @@ function cleanTraitLabel(label){
   return String(label || '').replace(/\d+$/, '').trim() || String(label || '');
 }
 
-async function buildBurnEmbed(finalEvent, startEvent){
+async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
   const survivorId   = finalEvent.survivorTokenId;
   const bodyType     = finalEvent.resultBodyType;
   const isAngel      = finalEvent.resultIsAngel;
@@ -717,10 +717,14 @@ async function buildBurnEmbed(finalEvent, startEvent){
 
   const burnedCount = burnedIds.length || '?';
 
-  // Fetch metadata — ONLY use tokenMetaCache (primed by processPendingBurnAlerts with fresh OS data).
-  // Do NOT fall back to DB here — DB has pre-burn stale traits and would pollute the embed.
-  const cached = tokenMetaCache.get(parseInt(survivorId)) || tokenMetaCache.get(`os:${parseInt(survivorId)}`);
-  const dbMeta = (cached && Date.now() < cached.expires) ? cached.meta : null;
+  // Prefer directly-passed freshTraits over cache to avoid stale-cache races.
+  let dbMeta = null;
+  if(overrideTraits && Object.keys(overrideTraits).length){
+    dbMeta = { traits: overrideTraits, trait_count: Object.keys(overrideTraits).length };
+  } else {
+    const cached = tokenMetaCache.get(parseInt(survivorId)) || tokenMetaCache.get(`os:${parseInt(survivorId)}`);
+    dbMeta = (cached && Date.now() < cached.expires) ? cached.meta : null;
+  }
 
   // Image — always fetch fresh for burn embeds (bypass image cache)
   imageCache?.delete?.(`${contract}:${survivorId}`);
@@ -938,7 +942,7 @@ async function storeBurnFinalized(finalEvent, startEvent){
   return null;
 }
 
-async function postBurnAlertToConfiguredChannels(finalEvent, startEvent){
+async function postBurnAlertToConfiguredChannels(finalEvent, startEvent, freshTraits = null){
   const burnChannels = await getBurnAlertChannels();
   if(!burnChannels.length){
     console.log(`[Burn alert] no configured burn alert channels for tx=${finalEvent.txHash || 'unknown'} log=${finalEvent.logIndex ?? 'unknown'}`);
@@ -963,7 +967,7 @@ async function postBurnAlertToConfiguredChannels(finalEvent, startEvent){
         console.log(`[Burn alert] skipped guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex} reason=already-posted`);
         continue;
       }
-      const embed = await buildBurnEmbed(finalEvent, startEvent);
+      const embed = await buildBurnEmbed(finalEvent, startEvent, freshTraits);
       await sendEmbed(channel, embed);
       await pgPool.query(
         `INSERT INTO burn_alert_posts (tx_hash, log_index, guild_id, channel_id)
@@ -1299,7 +1303,7 @@ async function processPendingBurnAlerts(){
     imageCache?.delete?.(`${OCAS_CONTRACT}:${survivorId}`);
 
     try{
-      await postBurnAlertToConfiguredChannels(finalEvent, startEvent);
+      await postBurnAlertToConfiguredChannels(finalEvent, startEvent, freshTraits);
       // Write fresh post-burn traits back to token_traits DB so /burnlatest works after restarts.
       // token_traits is row-per-trait: delete stale rows then insert fresh ones.
       try{
