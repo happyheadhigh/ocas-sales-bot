@@ -75,7 +75,7 @@ const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BUR
 const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
 const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '2000', 10));
 const BURN_ALERT_CHANNEL_ID = process.env.BURN_ALERT_CHANNEL_ID || '';
-const BURN_METADATA_REFRESH_ENABLED = String(process.env.BURN_METADATA_REFRESH_ENABLED || 'false').toLowerCase() === 'true';
+const BURN_METADATA_REFRESH_ENABLED = true; // always on — needed for correct post-burn traits in alert
 const BURN_COLORS = {
   FIRE:        0xFF6B00, // default burn embed
   RADIOACTIVE: 0x39FF14, // radioactive type
@@ -1413,7 +1413,7 @@ async function pollBurnEvents(){
     // api.js requests (traitfind, rankfind, etc) don't time out during backfill.
     // Adaptive chunk: catch up faster when behind, stay small when live
     const blockGap = latest - fromBlock;
-    const adaptiveChunk = blockGap > 5 ? 50 : 2;
+    const adaptiveChunk = blockGap > 3 ? 10 : 2;
     const chunkTo = Math.min(latest, fromBlock + adaptiveChunk - 1);
     const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
     const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
