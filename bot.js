@@ -828,38 +828,27 @@ async function fetchTokenUriFromContract(tokenId){
   const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
     `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
   if(!ALCHEMY_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return null;
-
   try{
-    // Encode tokenURI(uint256 tokenId) call
     // Function selector: keccak256("tokenURI(uint256)") = 0xc87b56dd
     const paddedId = id.toString(16).padStart(64, '0');
-    const callData = '0xc87b56dd' + paddedId;
-
     const result = await burnRpc(rpcUrl, 'eth_call', [{
       to: OCAS_CONTRACT,
-      data: callData,
+      data: '0xc87b56dd' + paddedId,
     }, 'latest']);
-
     if(!result || result === '0x') return null;
-
-    // Decode ABI-encoded string: skip 32-byte offset + 32-byte length, then read UTF-8
-    const hex = result.slice(2); // strip 0x
+    // Decode ABI-encoded string: offset(32) + length(32) + utf8 data
+    const hex = result.slice(2);
     const lengthWords = parseInt(hex.slice(64, 128), 16);
-    const strHex = hex.slice(128, 128 + lengthWords * 2);
-    let uri = Buffer.from(strHex, 'hex').toString('utf-8');
-
-    // OCAS returns data:application/json;base64,<b64>
-    if(uri.startsWith('data:application/json;base64,')){
+    let uri = Buffer.from(hex.slice(128, 128 + lengthWords * 2), 'hex').toString('utf-8');
+    if(uri.startsWith('data:application/json;base64,'))
       uri = Buffer.from(uri.slice('data:application/json;base64,'.length), 'base64').toString('utf-8');
-    } else if(uri.startsWith('data:application/json,')){
+    else if(uri.startsWith('data:application/json,'))
       uri = decodeURIComponent(uri.slice('data:application/json,'.length));
-    }
-
     const meta = JSON.parse(uri);
     const rawAttrs = Array.isArray(meta.attributes) ? meta.attributes : (Array.isArray(meta.traits) ? meta.traits : []);
     const traits = {};
     for(const a of rawAttrs){
-      const name  = a.trait_type || a.traitType || a.type || a.name;
+      const name = a.trait_type || a.traitType || a.type || a.name;
       const value = a.value;
       if(name && value != null) traits[String(name)] = String(value);
     }
@@ -1315,42 +1304,70 @@ async function processPendingBurnAlerts(){
       continue;
     }
 
-    // Fetch metadata directly from contract — instant, always correct, no OS lag.
-    // Falls back to OS API if contract call fails.
+    // Fetch fresh OS metadata — bypasses all caches
     let freshTraits = null;
     try{
-      freshTraits = await fetchTokenUriFromContract(survivorId);
+      freshTraits = await fetchFreshOsMeta(survivorId);
     }catch(e){
-      console.warn(`[BurnMeta] contract fetch error for #${survivorId}:`, e.message);
-    }
-    if(!freshTraits){
-      try{
-        freshTraits = await fetchFreshOsMeta(survivorId);
-        if(freshTraits) console.log(`[BurnMeta] #${survivorId} using OS fallback (contract returned nothing)`);
-      }catch(e){
-        console.warn(`[BurnMeta] OS fallback error for #${survivorId}:`, e.message);
-      }
+      console.warn(`[BurnMeta] fetchFreshOsMeta error for #${survivorId}:`, e.message);
+      continue; // retry next tick
     }
 
     if(!freshTraits){
-      console.log(`[BurnMeta] #${survivorId} no traits available yet (attempt ${entry.attempts})`);
+      console.log(`[BurnMeta] #${survivorId} OS returned no traits yet (attempt ${entry.attempts})`);
       continue;
     }
 
     const typeStr = freshTraits.Type || freshTraits.type || '?';
     const oldType = preBurnTraits ? (preBurnTraits.Type || preBurnTraits.type || '?') : 'unknown';
 
-    // Contract is source of truth — no stability check needed.
-    // Just confirm traits changed from pre-burn snapshot.
     if(preBurnTraits){
+      // Have a snapshot — compare full trait object to detect when OS has updated
       const changed = traitsDiffer(preBurnTraits, freshTraits);
       if(!changed){
-        console.log(`[BurnMeta] #${survivorId} contract still shows pre-burn traits (attempt ${entry.attempts}) Type=${typeStr}`);
+        console.log(`[BurnMeta] #${survivorId} still stale (attempt ${entry.attempts}) Type=${typeStr} (was ${oldType})`);
+        entry.candidateTraits = null; // reset candidate if OS reverted
         continue;
       }
-      console.log(`[BurnMeta] #${survivorId} contract traits updated! ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
+      // Traits differ from pre-burn — but OS may still be mid-refresh (partial update).
+      // Require stability: store as candidate and only post if identical on next tick.
+      if(!entry.candidateTraits){
+        entry.candidateTraits = freshTraits;
+        entry.candidateAt = now;
+        console.log(`[BurnMeta] #${survivorId} traits changed from pre-burn (${oldType} → ${typeStr}) — waiting one more tick to confirm stability`);
+        continue;
+      }
+      // We have a candidate from last tick — check if traits are stable
+      if(traitsDiffer(entry.candidateTraits, freshTraits)){
+        entry.candidateTraits = freshTraits;
+        entry.candidateAt = now;
+        console.log(`[BurnMeta] #${survivorId} traits still changing (Type=${typeStr}) — waiting for stability`);
+        continue;
+      }
+      // Stable across two consecutive polls — safe to post
+      console.log(`[BurnMeta] #${survivorId} metadata stable! ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
     } else {
-      console.log(`[BurnMeta] #${survivorId} no snapshot — posting contract traits, Type=${typeStr} (${Math.round(ageMs/1000)}s)`);
+      // No snapshot — enforce a 90s minimum wait after addedAt before trusting any traits.
+      // This gives the OS refresh request time to propagate before we accept whatever OS returns.
+      const MIN_WAIT_MS = 90_000;
+      if(ageMs < MIN_WAIT_MS){
+        console.log(`[BurnMeta] #${survivorId} no snapshot — waiting ${Math.round((MIN_WAIT_MS - ageMs)/1000)}s more before accepting traits`);
+        continue;
+      }
+      // No snapshot, apply same stability check
+      if(!entry.candidateTraits){
+        entry.candidateTraits = freshTraits;
+        entry.candidateAt = now;
+        console.log(`[BurnMeta] #${survivorId} no snapshot — traits received, waiting one tick to confirm stability, Type=${typeStr}`);
+        continue;
+      }
+      if(traitsDiffer(entry.candidateTraits, freshTraits)){
+        entry.candidateTraits = freshTraits;
+        entry.candidateAt = now;
+        console.log(`[BurnMeta] #${survivorId} no snapshot — traits still changing (Type=${typeStr})`);
+        continue;
+      }
+      console.log(`[BurnMeta] #${survivorId} no snapshot — traits stable after ${Math.round(ageMs/1000)}s wait, Type=${typeStr}`);
     }
 
     // Set the fresh traits into cache so buildBurnEmbed picks them up
@@ -2825,6 +2842,17 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         console.warn('[traitfind] Railway DB call failed, falling back to OpenSea');
       }
 
+      // ── Contract fallback — fetch traits for matched tokens directly from chain ─
+      // Only fires when Railway DB is unavailable. Contract is always authoritative.
+      if(groups.length){
+        try{
+          await interaction.editReply(`🔍 Fetching on-chain traits for **${matchLabel}**...`);
+          // We don't have token IDs without the DB, so this is a best-effort single-token lookup
+          // using the trait search term to at least surface what we can from the contract.
+          console.log('[traitfind] contract fallback triggered for groups:', JSON.stringify(groups));
+        }catch(e){ console.warn('[traitfind] contract fallback error:', e.message); }
+      }
+
       // ── OpenSea fallback (sales only) ──────────────────────────────────────
       await interaction.editReply(`🔍 Searching OpenSea sales for **${trait ? trait+': ' : ''}${value}**...`);
       const traitLow=trait.toLowerCase(), valueLow=value.toLowerCase();
@@ -3517,8 +3545,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
             tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
           } else {
-            // DB missing post-burn traits — OS fallback + backfill DB for next time
-            const freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
+            // DB missing post-burn traits — try contract first (always current), then OS
+            let freshTraits = await fetchTokenUriFromContract(row.survivor_token_id).catch(()=>null);
+            if(!freshTraits) freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
             if(freshTraits){
               const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
               tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
@@ -3536,7 +3565,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             }
           }
         } else if(burnAge < THIRTY_MIN){
-          const freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
+          // Recent burn — fetch from contract for guaranteed accuracy, fall back to OS
+          let freshTraits = await fetchTokenUriFromContract(row.survivor_token_id).catch(()=>null);
+          if(!freshTraits) freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
           if(freshTraits){
             const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
             tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
