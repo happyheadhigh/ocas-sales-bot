@@ -3402,7 +3402,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const r = await pgPool.query(`
         SELECT be.id, be.tx_hash, be.block_number, be.burner_wallet, be.survivor_token_id,
                be.result_body_type, be.result_is_angel, be.points_used, be.burned_at, be.log_index,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids,
+               EXISTS (
+                 SELECT 1 FROM burn_alert_posts bap
+                 WHERE bap.tx_hash = be.tx_hash AND bap.log_index = be.log_index
+               ) AS already_posted
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
         GROUP BY be.id
@@ -3418,7 +3422,13 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const startEvent = { owner: row.burner_wallet, tokenIds: (row.burned_ids||[]).filter(Boolean) };
         // For burns < 30 min old: bypass DB cache and fetch fresh OS metadata
         const burnAge = row.burned_at ? Date.now() - new Date(row.burned_at).getTime() : Infinity;
-        if(burnAge < THIRTY_MIN){
+        if(row.already_posted){
+          const dbMeta = await fetchTokenMetaFromDb(row.survivor_token_id).catch(()=>null);
+          if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
+            tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
+            tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
+          }
+        } else if(burnAge < THIRTY_MIN){
           const freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
           if(freshTraits){
             const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
