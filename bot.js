@@ -1379,7 +1379,11 @@ async function postBurnFallbackAlert(finalEvent, startEvent){
   }
 }
 
+let _pollBurnRunning = false;
 async function pollBurnEvents(){
+  if(_pollBurnRunning){ console.log('[Burn] Poll tick skipped — previous still running'); return; }
+  _pollBurnRunning = true;
+  try{
   if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return;
   const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
   const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
@@ -1415,12 +1419,12 @@ async function pollBurnEvents(){
       toBlock:   '0x'+chunkTo.toString(16),
       topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
     }]);
-    console.log(`[Burn] Polling blocks ${fromBlock}-${chunkTo} (latest=${latest})`);
     if(logs?.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${fromBlock}-${chunkTo}`);
     await processBurnLogs(logs || [], shouldAlert);
     await dbSave('burn_last_block', String(chunkTo));
-    if(chunkTo < latest) console.log(`[Burn] Behind by ${latest - chunkTo} block(s)`);
+    if(chunkTo < latest) console.log(`[Burn] Backfill in progress — ${latest - chunkTo} blocks remaining`);
   }catch(e){ console.error('[Burn poller]', e.message); }
+  } finally { _pollBurnRunning = false; }
 }
 
 async function loadBurnStartFromDB(survivorTokenId){
@@ -4004,7 +4008,7 @@ client.once('clientReady', async ()=>{
   if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL){
     console.log('[Burn] Starting burn poller');
     pollBurnEvents();
-    setInterval(pollBurnEvents, 30_000);
+    setInterval(pollBurnEvents, 2 * 60 * 1000);
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
   }
