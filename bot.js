@@ -19,7 +19,7 @@
  *   /lastsale            — Most recent sale
  *   /recentsales         — Last N sales
  *   /sale token:1234     — Specific token's last sale
- *   /traitfind           — Search sales history by trait
+ *   /traitfind           — Search tokens/listings/sales by trait
  *   /listings            — Show current active listings
  *   /myalert             — Set personal DM alert (sales + listings)
  *   /myalertclear        — Remove your personal DM alert
@@ -75,6 +75,7 @@ const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BUR
 const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
 const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '2000', 10));
 const BURN_ALERT_CHANNEL_ID = process.env.BURN_ALERT_CHANNEL_ID || '';
+const BURN_METADATA_REFRESH_ENABLED = true; // always on — needed for correct post-burn traits in alert
 const BURN_COLORS = {
   FIRE:        0xFF6B00, // default burn embed
   RADIOACTIVE: 0x39FF14, // radioactive type
@@ -219,6 +220,27 @@ async function ensureBotStateTable(){
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS burn_inputs_token_idx ON burn_event_inputs(burned_token_id)
     `);
+    // Index for trait lookups — prevents full table scan on traitfind/rankfind
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS burn_alert_posts (
+        id           SERIAL PRIMARY KEY,
+        tx_hash      TEXT NOT NULL,
+        log_index    INT NOT NULL,
+        guild_id     TEXT,
+        channel_id   TEXT NOT NULL,
+        posted_at    TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pgPool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS burn_alert_posts_tx_log_channel_idx
+      ON burn_alert_posts(tx_hash, log_index, channel_id)
+    `);
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS token_traits_token_id_idx ON token_traits(token_id)
+    `).catch(()=>{}); // table may not exist yet on fresh deploy
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS token_traits_name_value_idx ON token_traits(LOWER(trait_name), LOWER(trait_value))
+    `).catch(()=>{});
     console.log('[DB] burn tables ready');
   }catch(e){ console.error('[DB] ensureBotStateTable error:', e.message); }
 }
@@ -329,6 +351,9 @@ const lastSaleIds     = new Map(); // guildId → last sale id
 const lastListingIds  = new Map(); // guildId → last listing id
 const alertedEventIds = new Set(); // dedup personal DM alerts across multiple servers
 const recentChannelPosts = new Map(); // dedup: channelId+tokenId → timestamp, prevents double-posting
+// Rate limit for /burnrefresh: userId+tokenId → last used timestamp
+// One use per token per user per 5 minutes — prevents OS API spam
+const burnRefreshCooldowns = new Map();
 function isRecentChannelPost(channelId, tokenId, windowMs=180000){
   const key = channelId + ':' + tokenId;
   const last = recentChannelPosts.get(key);
@@ -366,7 +391,16 @@ const sweepSessions = new Map(); // sessionId → { listings, page }
 let burnConfig = {};
 async function loadBurnConfig(){
   const db = await dbLoad('burn_config');
-  if(db){ burnConfig = db; console.log('[Burn] Config loaded'); }
+  if(db){
+    burnConfig = db;
+    const configured = Object.entries(burnConfig || {})
+      .map(([guildId, cfg]) => `${guildId}:${getConfiguredBurnChannelId(cfg) || 'none'}`)
+      .join(', ');
+    console.log(`[Burn] Config loaded (${Object.keys(burnConfig || {}).length} guilds): ${configured || 'none'}`);
+  } else {
+    burnConfig = {};
+    console.log('[Burn] Config loaded (0 guilds): none');
+  }
 }
 async function saveBurnConfig(){
   await dbSave('burn_config', burnConfig);
@@ -634,30 +668,35 @@ async function resolveDiscordChannel(channelId){
 }
 
 async function getBurnAlertChannels(){
-  const configuredIds = [];
+  const configured = [];
   const seen = new Set();
-  for(const cfg of Object.values(burnConfig || {})){
+  for(const [guildId, cfg] of Object.entries(burnConfig || {})){
     const channelId = getConfiguredBurnChannelId(cfg);
     if(channelId && !seen.has(channelId)){
       seen.add(channelId);
-      configuredIds.push(channelId);
+      configured.push({ guildId, channelId });
     }
   }
 
-  if(!configuredIds.length && BURN_ALERT_CHANNEL_ID){
-    configuredIds.push(BURN_ALERT_CHANNEL_ID);
+  if(!configured.length && BURN_ALERT_CHANNEL_ID){
+    configured.push({ guildId: 'fallback', channelId: BURN_ALERT_CHANNEL_ID });
   }
 
   const channels = [];
-  for(const channelId of configuredIds){
+  for(const item of configured){
+    const { guildId, channelId } = item;
     const ch = await resolveDiscordChannel(channelId);
-    if(ch) channels.push(ch);
-    else console.warn(`[Burn] Configured burn alert channel not found: ${channelId}`);
+    if(ch) channels.push({ guildId, channelId, channel: ch });
+    else console.warn(`[Burn] Configured burn alert channel not found guild=${guildId} channel=${channelId}`);
   }
   return channels;
 }
 
-async function buildBurnEmbed(finalEvent, startEvent){
+function cleanTraitLabel(label){
+  return String(label || '').replace(/\d+$/, '').trim() || String(label || '');
+}
+
+async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
   const survivorId   = finalEvent.survivorTokenId;
   const bodyType     = finalEvent.resultBodyType;
   const isAngel      = finalEvent.resultIsAngel;
@@ -666,7 +705,6 @@ async function buildBurnEmbed(finalEvent, startEvent){
   const burnedIds    = startEvent?.tokenIds || [];
   const txHash       = finalEvent.txHash || '';
 
-  const burnTierLabel = burnTypeLabel(bodyType, isAngel);
   const color     = burnTypeColor(bodyType, isAngel);
 
   const contract  = OCAS_CONTRACT;
@@ -677,50 +715,48 @@ async function buildBurnEmbed(finalEvent, startEvent){
     ? `[${shortAddr(burnerWallet)}](https://opensea.io/${burnerWallet})`
     : 'unknown';
 
-  const burnedStr = burnedIds.length
-    ? burnedIds.slice(0,20).map(id => `#${id}`).join(', ') + (burnedIds.length > 20 ? ` +${burnedIds.length-20} more` : '')
-    : 'unknown';
+  const burnedCount = burnedIds.length || '?';
 
-  // Fetch DB metadata for the created token — traits + OS rank
-  const dbMeta = await fetchCreatedTokenMeta(survivorId).catch(()=>null);
-  const osRank = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
-  const rankBadge = osRank ? ` #${osRank.toLocaleString()}` : '';
-  const actualType = dbMeta?.traits?.Type || dbMeta?.traits?.type || null;
-
-  // Fetch created token image
-  let imgResult = getCachedImage(`${contract}:${survivorId}`);
-  if(!imgResult){
-    try{
-      imgResult = await resolveImage({identifier:String(survivorId)}, contract, 'ethereum');
-      if(imgResult) setCachedImage(`${contract}:${survivorId}`, imgResult);
-    }catch(e){ console.warn('[Burn embed image]', e.message); }
+  // Prefer directly-passed freshTraits over cache to avoid stale-cache races.
+  let dbMeta = null;
+  if(overrideTraits && Object.keys(overrideTraits).length){
+    dbMeta = { traits: overrideTraits, trait_count: Object.keys(overrideTraits).length };
+  } else {
+    const cached = tokenMetaCache.get(parseInt(survivorId)) || tokenMetaCache.get(`os:${parseInt(survivorId)}`);
+    dbMeta = (cached && Date.now() < cached.expires) ? cached.meta : null;
   }
 
+  // Image — always fetch fresh for burn embeds (bypass image cache)
+  imageCache?.delete?.(`${contract}:${survivorId}`);
+  let imgResult = null;
+  try{
+    imgResult = await resolveImage({identifier:String(survivorId)}, contract, 'ethereum');
+    if(imgResult) setCachedImage(`${contract}:${survivorId}`, imgResult);
+  }catch(e){ console.warn('[Burn embed image]', e.message); }
+
   const embed = new EmbedBuilder()
-    .setTitle('OCAS Burn')
+    .setTitle(`🔥 OCAS Burn • #${survivorId} created`)
     .setColor(color)
     .setURL(osUrl)
-    .setDescription(`#${survivorId} was created from ${burnedIds.length || '?'} burned OCAS.`)
+    // No description — all info is in fields
     .addFields(
-      { name:'Created Token', value:`[#${survivorId}${rankBadge}](${osUrl})`, inline:true },
-      { name:'Result Type',   value:actualType || 'Traits updating - check again shortly', inline:true },
-      { name:'Points Used',   value:String(points || 0),                       inline:true },
-      { name:'Burn Tier',     value:burnTierLabel,                              inline:true },
-      { name:'Burner',        value:burnerLink,                                 inline:true },
-      { name:'Tokens Burned', value:String(burnedIds.length || '?'),           inline:true },
-      { name:'Burned IDs',    value:burnedStr,                                  inline:false },
+      { name:'Burner',         value:burnerLink,             inline:true },
+      { name:'Tokens Burned',  value:String(burnedCount),    inline:true },
+      { name:'Points Used',    value:`${points || 0} pts`,   inline:true },
     );
 
-  // Add traits of the created token if available
+  // Single Traits field in 2 columns — same layout as sales/listings
   if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
-    const traitLines = Object.entries(dbMeta.traits).slice(0,12).map(([k,v])=>`**${k}:** ${v}`);
-    const half = Math.ceil(traitLines.length/2);
+    const traitLines = Object.entries(dbMeta.traits)
+      .slice(0, 14)
+      .map(([k,v]) => `**${cleanTraitLabel(k)}:** ${v}`);
+    const half = Math.ceil(traitLines.length / 2);
     embed.addFields(
-      { name:'Traits', value:traitLines.slice(0,half).join('\n'),    inline:true },
-      { name:'More Traits', value:traitLines.slice(half).join('\n')||' ', inline:true },
+      { name:'Traits',    value: traitLines.slice(0, half).join('\n') || '\u200b', inline:true },
+      { name:'\u200b',   value: traitLines.slice(half).join('\n')   || '\u200b', inline:true },
     );
   } else {
-    embed.addFields({ name:'Traits', value:'Traits updating - check TraitView/OpenSea shortly.', inline:false });
+    embed.addFields({ name:'Traits', value:'_Syncing — check TraitView or OpenSea shortly_', inline:false });
   }
 
   const linkParts = [`[OpenSea](${osUrl})`, `[TraitView](${tvUrl})`];
@@ -729,14 +765,151 @@ async function buildBurnEmbed(finalEvent, startEvent){
   embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
 
   embed._imageResult = imgResult || null;
+
+  // Always show Show Burned Tokens button
+  const burnKey = finalEvent.burnEventId || `${finalEvent.txHash}:${finalEvent.logIndex}`;
+  embed._components = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`burn_ids:${burnKey}`)
+      .setLabel(`Show Burned Tokens (${burnedCount})`)
+      .setStyle(ButtonStyle.Secondary)
+  )];
+
   return embed;
 }
 
 // Pending burn map: survivorTokenId → { owner, tokenIds, points, resultBodyType, resultIsAngel, boostChance, blockNumber, txHash }
 const pendingBurns = new Map();
 
+// ── Pending burn alert queue ──────────────────────────────────────────────────
+// survivorTokenId → { finalEvent, startEvent, preBurnTraits, addedAt, attempts, slowMode }
+// Populated on BurnFinalized; drained by processPendingBurnAlerts every 30s.
+const pendingBurnAlerts = new Map();
+
+// Fetch fresh OS metadata for a token, bypassing ALL caches.
+async function fetchFreshOsMeta(tokenId){
+  const id = parseInt(tokenId);
+  if(!id) return null;
+  // Delete both cache keys so the next call hits the network
+  tokenMetaCache.delete(id);
+  tokenMetaCache.delete(`os:${id}`);
+  // Also bust the image cache so the embed gets the new image
+  const imgKey = `${OCAS_CONTRACT}:${id}`;
+  if(typeof imageCache !== 'undefined') imageCache?.delete?.(imgKey);
+  try{
+    const r = await fetch(
+      `https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}`,
+      { headers: osHeaders() }
+    );
+    if(!r.ok){ console.warn(`[BurnMeta] OS fetch failed for #${id}: HTTP ${r.status}`); return null; }
+    const j = await r.json();
+    const n = j.nft || j;
+    const rawTraits = Array.isArray(n.traits) ? n.traits : (Array.isArray(n.attributes) ? n.attributes : []);
+    const traits = {};
+    for(const t of rawTraits){
+      const name  = t.trait_type || t.traitType || t.type || t.name;
+      const value = t.value;
+      if(name && value != null) traits[String(name)] = String(value);
+    }
+    return Object.keys(traits).length ? traits : null;
+  }catch(e){
+    console.warn(`[BurnMeta] fetchFreshOsMeta error for #${id}:`, e.message);
+    return null;
+  }
+}
+
+// ── Fetch metadata directly from the OCAS contract via tokenURI(uint256) ────
+// Uses Alchemy eth_call — ~2 CUs, 100-300ms, always returns current on-chain data.
+// Returns traits object or null on failure.
+async function fetchTokenUriFromContract(tokenId){
+  const id = parseInt(tokenId);
+  if(!id) return null;
+  const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
+  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
+    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+  if(!ALCHEMY_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return null;
+
+  try{
+    // Encode tokenURI(uint256 tokenId) call
+    // Function selector: keccak256("tokenURI(uint256)") = 0xc87b56dd
+    const paddedId = id.toString(16).padStart(64, '0');
+    const callData = '0xc87b56dd' + paddedId;
+
+    const result = await burnRpc(rpcUrl, 'eth_call', [{
+      to: OCAS_CONTRACT,
+      data: callData,
+    }, 'latest']);
+
+    if(!result || result === '0x') return null;
+
+    // Decode ABI-encoded string: skip 32-byte offset + 32-byte length, then read UTF-8
+    const hex = result.slice(2); // strip 0x
+    const lengthWords = parseInt(hex.slice(64, 128), 16);
+    const strHex = hex.slice(128, 128 + lengthWords * 2);
+    let uri = Buffer.from(strHex, 'hex').toString('utf-8');
+
+    // OCAS returns data:application/json;base64,<b64>
+    if(uri.startsWith('data:application/json;base64,')){
+      uri = Buffer.from(uri.slice('data:application/json;base64,'.length), 'base64').toString('utf-8');
+    } else if(uri.startsWith('data:application/json,')){
+      uri = decodeURIComponent(uri.slice('data:application/json,'.length));
+    }
+
+    const meta = JSON.parse(uri);
+    const rawAttrs = Array.isArray(meta.attributes) ? meta.attributes : (Array.isArray(meta.traits) ? meta.traits : []);
+    const traits = {};
+    for(const a of rawAttrs){
+      const name  = a.trait_type || a.traitType || a.type || a.name;
+      const value = a.value;
+      if(name && value != null) traits[String(name)] = String(value);
+    }
+    if(Object.keys(traits).length){
+      console.log(`[Contract] tokenURI #${id} → Type=${traits.Type||traits.type||'?'} (${Object.keys(traits).length} traits)`);
+      return traits;
+    }
+    return null;
+  }catch(e){
+    console.warn(`[Contract] tokenURI fetch failed for #${id}:`, e.message);
+    return null;
+  }
+}
+
+// One-time fire-and-forget POST to OpenSea's metadata refresh endpoint.
+// Tells OpenSea to re-fetch this token's metadata from the contract.
+// Only called once per burn event. Does not block — errors are logged and ignored.
+async function triggerOsMetadataRefresh(tokenId){
+  if(!BURN_METADATA_REFRESH_ENABLED) return;
+  const id = parseInt(tokenId);
+  if(!id) return;
+  try{
+    const r = await fetch(
+      `https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}/refresh`,
+      { method:'POST', headers: osHeaders() }
+    );
+    console.log(`[BurnMeta] OS refresh triggered for #${id} — HTTP ${r.status}`);
+  }catch(e){
+    console.warn(`[BurnMeta] OS refresh trigger failed for #${id}:`, e.message);
+  }
+}
+
+// Returns true if two trait objects differ (or one is null and the other isn't).
+function traitsDiffer(a, b){
+  if(!a && !b) return false;
+  if(!a || !b) return true;
+  const keysA = Object.keys(a).sort();
+  const keysB = Object.keys(b).sort();
+  if(keysA.length !== keysB.length) return true;
+  for(const k of keysA){ if(String(a[k]) !== String(b[k])) return true; }
+  return false;
+}
+
 async function storeBurnStarted(event){
   try{
+    // Snapshot pre-burn DB traits for the survivor token so we can detect when metadata refreshes
+    const preBurnMeta = await fetchTokenMetaFromDb(event.survivorTokenId).catch(()=>null);
+    const preBurnTraits = preBurnMeta?.traits ? { ...preBurnMeta.traits } : null;
+    if(preBurnTraits) console.log(`[BurnMeta] Pre-burn snapshot for #${event.survivorTokenId}: Type=${preBurnTraits.Type||preBurnTraits.type||'?'}`);
+
     // Cache in memory for cross-referencing with BurnFinalized
     pendingBurns.set(String(event.survivorTokenId), {
       owner:         event.owner,
@@ -748,6 +921,7 @@ async function storeBurnStarted(event){
       blockNumber:   event.blockNumber,
       logIndex:       event.logIndex,
       txHash:        event.txHash,
+      preBurnTraits, // snapshot for metadata refresh detection
     });
     const r = await pgPool.query(
       `INSERT INTO burn_started_events
@@ -819,7 +993,49 @@ async function storeBurnFinalized(finalEvent, startEvent){
         ).catch(()=>{});
       }
     }
+    return r.rows[0]?.id || null;
   }catch(e){ console.warn('[Burn] storeBurnFinalized DB error:', e.message); }
+  return null;
+}
+
+async function postBurnAlertToConfiguredChannels(finalEvent, startEvent, freshTraits = null){
+  const burnChannels = await getBurnAlertChannels();
+  if(!burnChannels.length){
+    console.log(`[Burn alert] no configured burn alert channels for tx=${finalEvent.txHash || 'unknown'} log=${finalEvent.logIndex ?? 'unknown'}`);
+    return;
+  }
+  const dedupeKey = `burn:${finalEvent.txHash || ''}:${finalEvent.logIndex ?? ''}`;
+  for(const target of burnChannels){
+    const { guildId, channelId, channel } = target;
+    try{
+      if(isRecentChannelPost(channelId, dedupeKey)){
+        console.log(`[Burn alert] skipped guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex}`);
+        continue;
+      }
+      const posted = await pgPool.query(
+        'SELECT 1 FROM burn_alert_posts WHERE tx_hash=$1 AND log_index=$2 AND channel_id=$3 LIMIT 1',
+        [finalEvent.txHash || '', finalEvent.logIndex || 0, channelId]
+      ).catch(e => {
+        console.warn(`[Burn alert] dedupe lookup failed guild=${guildId} channel=${channelId}: ${e.message}`);
+        return { rows: [] };
+      });
+      if(posted.rows.length){
+        console.log(`[Burn alert] skipped guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex} reason=already-posted`);
+        continue;
+      }
+      const embed = await buildBurnEmbed(finalEvent, startEvent, freshTraits);
+      await sendEmbed(channel, embed);
+      await pgPool.query(
+        `INSERT INTO burn_alert_posts (tx_hash, log_index, guild_id, channel_id)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (tx_hash, log_index, channel_id) DO NOTHING`,
+        [finalEvent.txHash || '', finalEvent.logIndex || 0, guildId, channelId]
+      ).catch(e => console.warn(`[Burn alert] post marker failed guild=${guildId} channel=${channelId}: ${e.message}`));
+      console.log(`[Burn alert] posted guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex}`);
+    }catch(e){
+      console.warn(`[Burn alert] failed guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex}: ${e.message}`);
+    }
+  }
 }
 
 async function pollBurnEventsLegacy(){
@@ -924,7 +1140,7 @@ async function pollBurnEventsLegacy(){
         const existing = await pgPool.query(
           'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
         );
-        if(existing.rows.length){ console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}`); continue; }
+        if(existing.rows.length) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; still checking alert fanout`);
 
         // Cross-reference with BurnStarted data
         const startEvent = pendingBurns.get(String(survivorTokenId)) ||
@@ -935,14 +1151,23 @@ async function pollBurnEventsLegacy(){
         const finalEvent = { survivorTokenId, burnSeed, points, resultBodyType: bodyType,
           resultIsAngel: isAngel, boostChance, txHash, blockNumber: blockNum, logIndex };
 
-        await storeBurnFinalized(finalEvent, startEvent);
+        finalEvent.burnEventId = await storeBurnFinalized(finalEvent, startEvent);
         console.log(`[Burn] BurnFinalized: #${survivorTokenId} → ${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
-        const burnChannels = await getBurnAlertChannels();
-        for(const burnChannel of burnChannels){
-          if(isRecentChannelPost(burnChannel.id, `burn:${survivorTokenId}:${txHash}`)) continue;
-          const embed = await buildBurnEmbed(finalEvent, startEvent);
-          await sendEmbed(burnChannel, embed);
+        // Queue to pending alert system — same as processBurnLogs
+        const alertKey = String(survivorTokenId);
+        if(!pendingBurnAlerts.has(alertKey)){
+          pendingBurnAlerts.set(alertKey, {
+            finalEvent: { ...finalEvent },
+            startEvent: { ...startEvent },
+            preBurnTraits: startEvent?.preBurnTraits || null,
+            addedAt:  Date.now(),
+            attempts: 0,
+            slowMode: false,
+          });
+          console.log(`[BurnMeta] Queued pending alert for #${survivorTokenId} — awaiting metadata refresh`);
+          // Fire-and-forget OS metadata refresh — helps speed up metadata propagation
+          triggerOsMetadataRefresh(survivorTokenId);
         }
         pendingBurns.delete(String(survivorTokenId));
       }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
@@ -1015,7 +1240,7 @@ async function processBurnLogs(logs, shouldAlert){
       const existing = await pgPool.query(
         'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
       );
-      if(existing.rows.length){ console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}`); continue; }
+      if(existing.rows.length) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; still checking alert fanout`);
 
       const startEvent = pendingBurns.get(String(survivorTokenId)) ||
         await loadBurnStartFromDB(survivorTokenId);
@@ -1024,15 +1249,26 @@ async function processBurnLogs(logs, shouldAlert){
       const finalEvent = { survivorTokenId, burnSeed, points, resultBodyType: bodyType,
         resultIsAngel: isAngel, boostChance, txHash, blockNumber: blockNum, logIndex };
 
-      await storeBurnFinalized(finalEvent, startEvent);
+      finalEvent.burnEventId = await storeBurnFinalized(finalEvent, startEvent);
       console.log(`[Burn] BurnFinalized: #${survivorTokenId} tier=${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
       if(shouldAlert){
-        const burnChannels = await getBurnAlertChannels();
-        for(const burnChannel of burnChannels){
-          if(isRecentChannelPost(burnChannel.id, `burn:${survivorTokenId}:${txHash}`)) continue;
-          const embed = await buildBurnEmbed(finalEvent, startEvent);
-          await sendEmbed(burnChannel, embed);
+        // Queue to pending alert system — do NOT post immediately.
+        // processPendingBurnAlerts() will wait for metadata to refresh before posting.
+        const preBurnTraits = startEvent?.preBurnTraits || null;
+        const alertKey = String(survivorTokenId);
+        if(!pendingBurnAlerts.has(alertKey)){
+          pendingBurnAlerts.set(alertKey, {
+            finalEvent: { ...finalEvent },
+            startEvent: { ...startEvent },
+            preBurnTraits,
+            addedAt:  Date.now(),
+            attempts: 0,
+            slowMode: false,
+          });
+          console.log(`[BurnMeta] Queued pending alert for #${survivorTokenId} — awaiting metadata refresh`);
+          // Fire-and-forget OS metadata refresh — helps speed up metadata propagation
+          triggerOsMetadataRefresh(survivorTokenId);
         }
       }
       pendingBurns.delete(String(survivorTokenId));
@@ -1040,7 +1276,172 @@ async function processBurnLogs(logs, shouldAlert){
   }
 }
 
+// ── Pending burn alert processor ─────────────────────────────────────────────
+// Runs every 30s. For each queued burn event, fetches fresh OS metadata and
+// compares to the pre-burn snapshot. Posts alert only when traits have changed.
+// Switches to 2-min retry after 10 min. Keeps retrying until metadata changes.
+async function processPendingBurnAlerts(){
+  if(!pendingBurnAlerts.size) return;
+  const now = Date.now();
+  const THIRTY_SECS  = 30_000;
+  const TWO_MINS     = 2 * 60_000;
+  const TEN_MINS     = 10 * 60_000;
+  const TWO_HOURS    = 2 * 60 * 60_000;
+
+  for(const [key, entry] of pendingBurnAlerts){
+    const { finalEvent, startEvent, preBurnTraits, addedAt, attempts, slowMode } = entry;
+    const survivorId = finalEvent.survivorTokenId;
+    const ageMs      = now - addedAt;
+
+    // Throttle: in slow mode check every 2 min, normal every 30s
+    const minInterval = slowMode ? TWO_MINS : THIRTY_SECS;
+    if(entry.lastChecked && (now - entry.lastChecked) < minInterval) continue;
+    entry.lastChecked = now;
+    entry.attempts++;
+
+    // Switch to slow mode after 10 minutes
+    if(ageMs > TEN_MINS && !slowMode){
+      entry.slowMode = true;
+      console.log(`[BurnMeta] #${survivorId} switching to slow retry (2 min) after 10 min`);
+    }
+
+    // Hard cap: 2 hours — post minimal fallback alert and remove
+    if(ageMs > TWO_HOURS){
+      console.warn(`[BurnMeta] #${survivorId} metadata still stale after 2 hours — posting minimal fallback alert`);
+      try{
+        await postBurnFallbackAlert(finalEvent, startEvent);
+      }catch(e){ console.error(`[BurnMeta] fallback alert failed for #${survivorId}:`, e.message); }
+      pendingBurnAlerts.delete(key);
+      continue;
+    }
+
+    // Fetch metadata directly from contract — instant, always correct, no OS lag.
+    // Falls back to OS API if contract call fails.
+    let freshTraits = null;
+    try{
+      freshTraits = await fetchTokenUriFromContract(survivorId);
+    }catch(e){
+      console.warn(`[BurnMeta] contract fetch error for #${survivorId}:`, e.message);
+    }
+    if(!freshTraits){
+      try{
+        freshTraits = await fetchFreshOsMeta(survivorId);
+        if(freshTraits) console.log(`[BurnMeta] #${survivorId} using OS fallback (contract returned nothing)`);
+      }catch(e){
+        console.warn(`[BurnMeta] OS fallback error for #${survivorId}:`, e.message);
+      }
+    }
+
+    if(!freshTraits){
+      console.log(`[BurnMeta] #${survivorId} no traits available yet (attempt ${entry.attempts})`);
+      continue;
+    }
+
+    const typeStr = freshTraits.Type || freshTraits.type || '?';
+    const oldType = preBurnTraits ? (preBurnTraits.Type || preBurnTraits.type || '?') : 'unknown';
+
+    // Contract is source of truth — no stability check needed.
+    // Just confirm traits changed from pre-burn snapshot.
+    if(preBurnTraits){
+      const changed = traitsDiffer(preBurnTraits, freshTraits);
+      if(!changed){
+        console.log(`[BurnMeta] #${survivorId} contract still shows pre-burn traits (attempt ${entry.attempts}) Type=${typeStr}`);
+        continue;
+      }
+      console.log(`[BurnMeta] #${survivorId} contract traits updated! ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
+    } else {
+      console.log(`[BurnMeta] #${survivorId} no snapshot — posting contract traits, Type=${typeStr} (${Math.round(ageMs/1000)}s)`);
+    }
+
+    // Set the fresh traits into cache so buildBurnEmbed picks them up
+    const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
+    tokenMetaCache.set(parseInt(survivorId), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+    tokenMetaCache.set(`os:${parseInt(survivorId)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+    // Bust image cache so embed fetches new image
+    imageCache?.delete?.(`${OCAS_CONTRACT}:${survivorId}`);
+
+    try{
+      await postBurnAlertToConfiguredChannels(finalEvent, startEvent, freshTraits);
+      // Write fresh post-burn traits back to token_traits DB so /burnlatest works after restarts.
+      // token_traits is row-per-trait: delete stale rows then insert fresh ones.
+      try{
+        const tid = parseInt(survivorId);
+        await pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [tid]);
+        for(const [traitName, traitValue] of Object.entries(freshTraits)){
+          await pgPool.query(
+            `INSERT INTO token_traits (token_id, trait_name, trait_value)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+            [tid, String(traitName), String(traitValue)]
+          );
+        }
+        console.log(`[BurnMeta] Wrote ${Object.keys(freshTraits).length} post-burn trait rows to DB for #${survivorId}`);
+      }catch(dbErr){
+        console.warn(`[BurnMeta] Failed to write post-burn traits for #${survivorId}:`, dbErr.message);
+      }
+      pendingBurnAlerts.delete(key);
+    }catch(e){
+      console.error(`[BurnMeta] postBurnAlertToConfiguredChannels failed for #${survivorId}:`, e.message);
+      // Keep in queue and retry next tick
+    }
+  }
+}
+
+// Minimal fallback alert — no traits/image — used when metadata never refreshed after 2h
+async function postBurnFallbackAlert(finalEvent, startEvent){
+  const burnChannels = await getBurnAlertChannels();
+  if(!burnChannels.length) return;
+  const survivorId  = finalEvent.survivorTokenId;
+  const contract    = OCAS_CONTRACT;
+  const osUrl       = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
+  const tvUrl       = `https://traitview.com/?token=${survivorId}`;
+  const txHash      = finalEvent.txHash || '';
+  const etherscan   = txHash ? `https://etherscan.io/tx/${txHash}` : null;
+  const burnedCount = startEvent?.tokenIds?.length || '?';
+  const burnerWallet = startEvent?.owner || 'unknown';
+  const burnerLink  = burnerWallet !== 'unknown'
+    ? `[${shortAddr(burnerWallet)}](https://opensea.io/${burnerWallet})` : 'unknown';
+  const color       = burnTypeColor(finalEvent.resultBodyType, finalEvent.resultIsAngel);
+  const linkParts   = [`[OpenSea](${osUrl})`, `[TraitView](${tvUrl})`];
+  if(etherscan) linkParts.push(`[Etherscan](${etherscan})`);
+  const burnKey = finalEvent.burnEventId || `${txHash}:${finalEvent.logIndex}`;
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🔥 OCAS Burn • #${survivorId} created`)
+    .setColor(color)
+    .setURL(osUrl)
+    .addFields(
+      { name:'Burner',        value:burnerLink,           inline:true },
+      { name:'Tokens Burned', value:String(burnedCount),  inline:true },
+      { name:'Points Used',   value:`${finalEvent.points || 0} pts`, inline:true },
+      { name:'Traits',        value:'_Metadata still syncing — check TraitView or OpenSea_', inline:false },
+      { name:'Links',         value:linkParts.join(' | '), inline:false },
+    )
+    .setFooter({ text:'OCAS Burn Machine' })
+    .setTimestamp();
+
+  embed._components = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`burn_ids:${burnKey}`)
+      .setLabel(`Show Burned Tokens (${burnedCount})`)
+      .setStyle(ButtonStyle.Secondary)
+  )];
+
+  const dedupeKey = `burn:${txHash}:${finalEvent.logIndex ?? ''}`;
+  for(const target of burnChannels){
+    const { guildId, channelId, channel } = target;
+    try{
+      if(isRecentChannelPost(channelId, dedupeKey)) continue;
+      await sendEmbed(channel, embed);
+      console.log(`[BurnMeta] fallback alert posted guild=${guildId} channel=${channelId}`);
+    }catch(e){ console.warn(`[BurnMeta] fallback post failed guild=${guildId}:`, e.message); }
+  }
+}
+
+let _pollBurnRunning = false;
 async function pollBurnEvents(){
+  if(_pollBurnRunning){ console.log('[Burn] Poll tick skipped — previous still running'); return; }
+  _pollBurnRunning = true;
+  try{
   if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return;
   const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
   const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
@@ -1066,22 +1467,26 @@ async function pollBurnEvents(){
 
     if(fromBlock > latest) return;
 
-    let cursor = fromBlock;
-    while(cursor <= latest){
-      const chunkTo = Math.min(latest, cursor + BURN_BLOCK_CHUNK - 1);
-      const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
-        address: BURN_CONTRACT,
-        fromBlock: '0x'+cursor.toString(16),
-        toBlock:   '0x'+chunkTo.toString(16),
-        topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
-      }]);
-      const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
-      if(logs?.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${cursor}-${chunkTo}`);
-      await processBurnLogs(logs || [], shouldAlert);
-      await dbSave('burn_last_block', String(chunkTo));
-      cursor = chunkTo + 1;
-    }
+    // Process ONE chunk per poll tick — keeps the event loop free so
+    // api.js requests (traitfind, rankfind, etc) don't time out during backfill.
+    // Adaptive chunk: catch up faster when behind, stay small when live
+    const blockGap = latest - fromBlock;
+    const adaptiveChunk = blockGap > 3 ? 10 : 2;
+    const chunkTo = Math.min(latest, fromBlock + adaptiveChunk - 1);
+    const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
+    const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
+      address: BURN_CONTRACT,
+      fromBlock: '0x'+fromBlock.toString(16),
+      toBlock:   '0x'+chunkTo.toString(16),
+      topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
+    }]);
+    console.log(`[Burn] Polling blocks ${fromBlock}-${chunkTo} (latest=${latest})`);
+    if(logs?.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${fromBlock}-${chunkTo}`);
+    await processBurnLogs(logs || [], shouldAlert);
+    await dbSave('burn_last_block', String(chunkTo));
+    if(chunkTo < latest) console.log(`[Burn] Behind by ${latest - chunkTo} block(s)`);
   }catch(e){ console.error('[Burn poller]', e.message); }
+  } finally { _pollBurnRunning = false; }
 }
 
 async function loadBurnStartFromDB(survivorTokenId){
@@ -1255,9 +1660,11 @@ async function sendEmbed(target, embed){
 
 function buildEmbedPayload(embed){
   const ir=embed._imageResult; delete embed._imageResult;
-  if(ir?.type==='buffer'){ const att=new AttachmentBuilder(ir.buffer,{name:ir.filename}); embed.setThumbnail(`attachment://${ir.filename}`); return {embeds:[embed],files:[att]}; }
+  const components = embed._components || [];
+  delete embed._components;
+  if(ir?.type==='buffer'){ const att=new AttachmentBuilder(ir.buffer,{name:ir.filename}); embed.setThumbnail(`attachment://${ir.filename}`); return {embeds:[embed],files:[att],components}; }
   if(ir?.type==='url') embed.setThumbnail(ir.url);
-  return {embeds:[embed]};
+  return {embeds:[embed],components};
 }
 
 
@@ -1503,6 +1910,70 @@ async function buildListingEmbed(listing, config){
   const linkParts = ['[OpenSea]('+osUrl+')'];
   if(tvUrl) linkParts.push('[TraitView]('+tvUrl+')');
   embed.addFields({name:'Links', value:linkParts.join(' • '), inline:false});
+  return embed;
+}
+
+// ── Command search helpers ───────────────────────────────────────────────────
+function traitGroupsLabel(groups, fallback){
+  const parts = (groups || []).map(group => {
+    const first = group && group[0];
+    return first ? `${first.trait_name}: ${first.trait_value}` : null;
+  }).filter(Boolean);
+  return parts.length ? parts.join(' + ') : String(fallback || '').trim();
+}
+
+async function fetchBotApiJson(url, label){
+  let r;
+  try{
+    r = await fetch(url);
+  }catch(e){
+    throw new Error(`${label} unavailable: ${e.message}`);
+  }
+  if(!r.ok){
+    let detail = '';
+    try{ detail = (await r.text()).slice(0, 180).replace(/\s+/g, ' ').trim(); }catch(_){}
+    throw new Error(`${label} returned HTTP ${r.status}${detail ? ` (${detail})` : ''}`);
+  }
+  const j = await r.json();
+  if(!j.ok) throw new Error(`${label} error: ${j.error || 'unknown error'}`);
+  return j;
+}
+
+async function buildTokenSearchEmbed(token, config, footerLabel){
+  const tokenId = token.token_id ?? token.id ?? token.identifier;
+  const id = String(tokenId || '');
+  const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+  const chain = config.chain || 'ethereum';
+  const slug = config.slug || '';
+  const dbMeta = token._dbToken || (id ? await fetchTokenMetaFromDb(id) : null);
+  const osRank = dbMeta?.os_rank || token.os_rank || null;
+  const rankPart = osRankBadge(osRank);
+  const osUrl = id ? `https://opensea.io/assets/${chain}/${contract}/${id}` : `https://opensea.io/collection/${slug}`;
+  const tvUrl = id ? `https://traitview.com/?jump=${id}` : 'https://traitview.com/';
+  const embed = new EmbedBuilder()
+    .setTitle(`${titleTokenId(id)}${rankPart ? ' '+rankPart : ''}`)
+    .setColor(getRankTierColor(osRank) ?? COLORS.OCAS_BG)
+    .setURL(osUrl)
+    .setFooter({ text: footerLabel || 'Trait Search' })
+    .setTimestamp();
+
+  const traits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
+  const stats = [];
+  if(osRank) stats.push(`OS Rank: ${Number(osRank).toLocaleString()}`);
+  if(token.obs_rank) stats.push(`TraitView Rank: ${Number(token.obs_rank).toLocaleString()}`);
+  if(dbMeta?.trait_count || token.trait_count) stats.push(`Traits: ${dbMeta?.trait_count || token.trait_count}`);
+  if(stats.length) embed.addFields({ name:'Stats', value:stats.join('\n'), inline:false });
+
+  if(traits.length){
+    const traitLines = traits.slice(0, 12).map(t => `**${t.trait_type}**: ${t.value}`);
+    const half = Math.ceil(traitLines.length / 2);
+    embed.addFields(
+      { name:'Traits', value:traitLines.slice(0, half).join('\n'), inline:true },
+      { name:'\u200b', value:traitLines.slice(half).join('\n') || '\u200b', inline:true },
+    );
+  }
+  embed.addFields({ name:'Links', value:`[OpenSea](${osUrl}) - [TraitView](${tvUrl})`, inline:false });
+  try{ embed._imageResult = id ? await resolveImage({ identifier:id }, contract, chain) : null; }catch(_){}
   return embed;
 }
 
@@ -1877,6 +2348,31 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
+  if(interaction.isButton() && interaction.customId.startsWith('burn_ids:')){
+    const burnEventId = parseInt(interaction.customId.split(':')[1], 10);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if(!burnEventId){ await interaction.editReply({ content:'Burn details are unavailable for this alert.' }); return; }
+      const r = await pgPool.query(
+        `SELECT be.survivor_token_id, bei.burned_token_id
+         FROM burn_events be
+         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+         WHERE be.id = $1
+         ORDER BY bei.burned_token_id ASC`,
+        [burnEventId]
+      );
+      if(!r.rows.length){ await interaction.editReply({ content:'Burned IDs are not available for this alert.' }); return; }
+      const survivorId = r.rows[0].survivor_token_id;
+      const ids = r.rows.map(row => row.burned_token_id).filter(Boolean);
+      const text = ids.length ? ids.map(id => `#${id}`).join(', ') : 'No burned token IDs found.';
+      await interaction.editReply({ content:`**Burned Tokens:**\n${text}`.slice(0, 1900) });
+    }catch(e){
+      console.error('[Burn IDs]', e.message);
+      try{ await interaction.editReply({ content:'Error loading burned IDs.' }); }catch(_){}
+    }
+    return;
+  }
+
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
   const config=getConfig(guildId);
@@ -1930,10 +2426,13 @@ client.on('interactionCreate', async (interaction)=>{
     if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
     const channelOption = interaction.options.getChannel('channel');
     const channelId = channelOption ? channelOption.id : interaction.channelId;
-    if(!burnConfig[guildId]) burnConfig[guildId] = {};
+    const latestBurnConfig = await dbLoad('burn_config') || {};
+    burnConfig = { ...latestBurnConfig };
+    burnConfig[guildId] = { ...(latestBurnConfig[guildId] || {}) };
     burnConfig[guildId].burnAlertChannelId = channelId;
     burnConfig[guildId].channelId = channelId; // legacy compatibility for older saved configs/tools
     await saveBurnConfig();
+    console.log(`[Burn] Config saved guild=${guildId} channel=${channelId} totalGuilds=${Object.keys(burnConfig || {}).length}`);
     await interaction.reply({embeds:[new EmbedBuilder()
       .setTitle('Burn Alerts Configured')
       .setColor(BURN_COLORS.FIRE)
@@ -2176,17 +2675,16 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     return;
   }
 
-  // /traitfind — search sales history by trait. Tries Railway DB first (full history),
-  // falls back to OpenSea pagination (capped ~1500 sales) if DB not configured.
+  // /traitfind - token search by default; add "listings" or "sales" for those modes.
   if(commandName==='traitfind'){
     const slug       = interaction.options.getString('collection') || config.slug;
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = process.env.RAILWAY_API_URL;
     const API_SECRET  = process.env.API_SECRET;
 
-    // Detect mode: listings or sales (default)
+    // Detect mode: tokens default, or explicit listings/sales.
     const wantListings = /\blistings?\b/i.test(rawSearch);
-    const wantSales    = !wantListings; // sales is default
+    const wantSales    = /\bsales?\b/i.test(rawSearch);
     let workingSearch = rawSearch.replace(/\b(listings?|sales?)\b/gi, ' ').trim();
 
     // Parse count: first standalone number (default 10, max 20)
@@ -2194,22 +2692,71 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
     if(numMatch){ const n=parseInt(numMatch[1]); if(n>0&&n<=20){ want=n; workingSearch=workingSearch.replace(numMatch[0],' ').trim(); } }
 
-    // Resolve trait name+value using phrase-aware parser
-    let trait = '', value = '';
+    // Resolve trait name+value using phrase-aware parser.
+    let trait = '', value = '', groups = [], unmatched = [], traitParseError = null;
     if(workingSearch && RAILWAY_URL){
       try{
         const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
         const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
-        if(resolved.groups.length){ trait = resolved.groups[0][0].trait_name; value = resolved.groups[0][0].trait_value; }
-      }catch(e){ console.warn('[traitfind] parser error:', e.message); }
+        groups = resolved.groups || [];
+        unmatched = resolved.unmatched || [];
+        if(groups.length){ trait = groups[0][0].trait_name; value = groups[0][0].trait_value; }
+      }catch(e){ traitParseError = e; console.warn('[traitfind] parser error:', e.message); }
     }
-    if(!trait && workingSearch){ trait=''; value=workingSearch; }
+    if(!trait && workingSearch){ value=workingSearch; }
+    const matchLabel = traitGroupsLabel(groups, value || workingSearch);
 
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    if(!value) return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie` or `/traitfind search:gold chain listings`', flags: MessageFlags.Ephemeral});
+    if(!workingSearch) return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie`, `/traitfind search:zombie listings`, or `/traitfind search:zombie sales`', flags: MessageFlags.Ephemeral});
+    if(!RAILWAY_URL) return interaction.reply({content:'Trait search needs the internal TraitView API (`RAILWAY_API_URL`) so it can read the token DB/cache.', flags: MessageFlags.Ephemeral});
+    if(traitParseError) return interaction.reply({content:`I could not load the trait index from the TraitView API. ${traitParseError.message}`, flags: MessageFlags.Ephemeral});
+    if(!groups.length){
+      const extra = unmatched.length ? ` Unmatched words: ${unmatched.join(', ')}.` : '';
+      return interaction.reply({content:`I could not match **${workingSearch}** to known OCAS traits.${extra} Try an exact trait/value like \`zombie\`, \`gold chain\`, or \`alien epic bear\`.`, flags: MessageFlags.Ephemeral});
+    }
     await interaction.deferReply();
 
     try{
+      // Token search is the default. "listings" narrows the same trait search
+      // to active listings. "sales" keeps the existing sales-history behavior.
+      if(wantListings || !wantSales){
+        const listedOnly = wantListings;
+        await interaction.editReply(`Searching ${listedOnly ? 'listed tokens' : 'OCAS tokens'} matching **${matchLabel}**...`);
+        const qs = new URLSearchParams({ limit: String(want), key: API_SECRET||'' });
+        qs.set('groups', JSON.stringify(groups));
+        if(listedOnly) qs.set('listed', '1');
+        const label = listedOnly ? '/db/multi-trait-tokens listings API' : '/db/multi-trait-tokens token API';
+        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, label);
+        const tokens = j.tokens || [];
+        if(!tokens.length){
+          await interaction.editReply(`No ${listedOnly ? 'active listings' : 'OCAS tokens'} found matching **${matchLabel}**.`);
+          return;
+        }
+        const cfg = {...config, slug};
+        const embeds = await Promise.all(tokens.map(async t => {
+          const tokenId = t.token_id ?? t.id ?? t.identifier;
+          const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+          if(listedOnly){
+            const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
+            const fakeListingObj = {
+              token_id: tokenId,
+              asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
+                       traits: dbMeta?.traits ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v})) : [] },
+              payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
+              maker: t.seller || '',
+              url: t.url || null,
+              os_rank: t.os_rank || null,
+              _dbToken: dbMeta,
+            };
+            return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
+          }
+          return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
+        }));
+        await postEmbeds(interaction, embeds.filter(Boolean),
+          `Found **${tokens.length}** ${listedOnly ? 'listing' : 'token'}${tokens.length===1?'':'s'} matching **${matchLabel}**${listedOnly ? ' (cheapest first)' : ''}:`);
+        return;
+      }
+
       // ── Listings mode ──────────────────────────────────────────────────────
       if(wantListings && RAILWAY_URL){
         await interaction.editReply(`🔍 Searching listed tokens with **${trait ? trait+': ' : ''}${value}**...`);
@@ -2300,7 +2847,10 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const cfg={...config,slug};
       await interaction.editReply(`Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (OpenSea, last ~${pages*100}):`);
       for(const sale of matched){const embed=await buildSaleEmbed(sale,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
-    }catch(e){await interaction.editReply('Error: '+e.message);}
+    }catch(e){
+      console.warn('[traitfind]', e.message);
+      await interaction.editReply(`I could not load trait results from the TraitView API. ${e.message}`);
+    }
     return;
   }
 
@@ -2466,10 +3016,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       if(wantSales){
         const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, limit: '20', sort: 'desc' });
         if(API_SECRET) qs.set('key', API_SECRET);
-        const r = await fetch(`${RAILWAY_URL}/db/rank-sales?${qs}`);
-        if(!r.ok) throw new Error(`rank-sales API HTTP ${r.status}`);
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error || 'API error');
+        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/rank-sales?${qs}`, '/db/rank-sales API');
         const sales = j.sales || [];
         if(!sales.length){ await interaction.editReply(`No sales found for OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
         const cfg = {...config};
@@ -2492,39 +3039,42 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       }
 
       // ── Listings mode (default) ────────────────────────────────────────────
-      const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
+      const qs = new URLSearchParams({ listed: '1', rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
       if(API_SECRET) qs.set('key', API_SECRET);
-      const r = await fetch(`${RAILWAY_URL}/db/rank-listings?${qs}`);
-      if(!r.ok) throw new Error(`API HTTP ${r.status}`);
-      const j = await r.json();
-      if(!j.ok) throw new Error(j.error || 'API error');
-      let listings = j.listings || [];
+      const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, '/db/multi-trait-tokens rank listings API');
+      let listings = j.tokens || [];
       if(!listings.length){ await interaction.editReply(`No listings found with OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
       if(sortBy === 'rank') listings.sort((a,b) => (a.os_rank??9999) - (b.os_rank??9999));
       const rankEmbeds = await Promise.all(listings.map(async l => {
-        const tokenTraits = l.traits && typeof l.traits==='object' ? Object.entries(l.traits).map(([k,v])=>({trait_type:k,value:v})) : [];
+        const tokenId = l.token_id ?? l.id ?? l.identifier;
+        const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+        const tokenTraits = dbMeta?.traits
+          ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v}))
+          : (l.traits && typeof l.traits==='object' ? Object.entries(l.traits).map(([k,v])=>({trait_type:k,value:v})) : []);
         const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
         const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
-        const tvUrl = `https://traitview.com/?token=${l.token_id}`;
+        const listingUrl = l.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+        const tvUrl = `https://traitview.com/?jump=${tokenId}`;
         const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
         const embed = new EmbedBuilder()
           .setColor(rankColor)
-          .setTitle(`${priceStr} ETH • #${l.token_id}${rankBadge} • Listed`)
-          .setURL(l.url)
+          .setTitle(`${priceStr} ETH • #${tokenId}${rankBadge} • Listed`)
+          .setURL(listingUrl)
           .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
           .setTimestamp();
         const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
         if(tokenTraits.length){
           embed.setDescription(tokenTraits.slice(0,8).map(t=>`**${t.trait_type}:** ${t.value}`).join('\n') + '\n\n**Links**\n' + tvLink);
         } else { embed.setDescription('**Links**\n' + tvLink); }
-        try{ embed._imageResult = await resolveImage({ identifier: String(l.token_id) }, contract, 'ethereum'); }catch(e){}
+        try{ embed._imageResult = await resolveImage({ identifier: String(tokenId) }, contract, 'ethereum'); }catch(e){}
         return embed;
       }));
       const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
       await postEmbeds(interaction, rankEmbeds.filter(Boolean),
         `🏆 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${listings.length} listing${listings.length===1?'':'s'} (${sortLabel}):`);
     }catch(e){
-      await interaction.editReply('Error: ' + e.message);
+      console.warn('[rankfind]', e.message);
+      await interaction.editReply(`I could not load rank results from the TraitView API. ${e.message}`);
     }
     return;
   }
@@ -2939,7 +3489,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const r = await pgPool.query(`
         SELECT be.id, be.tx_hash, be.block_number, be.burner_wallet, be.survivor_token_id,
                be.result_body_type, be.result_is_angel, be.points_used, be.burned_at, be.log_index,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids,
+               EXISTS (
+                 SELECT 1 FROM burn_alert_posts bap
+                 WHERE bap.tx_hash = be.tx_hash AND bap.log_index = be.log_index
+               ) AS already_posted
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
         GROUP BY be.id
@@ -2947,10 +3501,48 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         LIMIT $1
       `, [count]);
       if(!r.rows.length){ await interaction.editReply('No burn events recorded yet.'); return; }
-      const embeds = await Promise.all(r.rows.map(row => {
+      const THIRTY_MIN = 30 * 60 * 1000;
+      const embeds = await Promise.all(r.rows.map(async row => {
         const finalEvent = { survivorTokenId: row.survivor_token_id, resultBodyType: row.result_body_type,
-          resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash, blockNumber: row.block_number, logIndex: row.log_index };
+          resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash,
+          blockNumber: row.block_number, logIndex: row.log_index, burnEventId: row.id };
         const startEvent = { owner: row.burner_wallet, tokenIds: (row.burned_ids||[]).filter(Boolean) };
+        // For burns < 30 min old: bypass DB cache and fetch fresh OS metadata
+        const burnAge = row.burned_at ? Date.now() - new Date(row.burned_at).getTime() : Infinity;
+        if(row.already_posted){
+          // Post-burn traits were written to token_traits by processPendingBurnAlerts — read from DB.
+          // Fall back to OS only if rows are missing (pre-fix historical burns or failed write).
+          const dbMeta = await fetchTokenMetaFromDb(row.survivor_token_id).catch(()=>null);
+          if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
+            tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
+            tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
+          } else {
+            // DB missing post-burn traits — OS fallback + backfill DB for next time
+            const freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
+            if(freshTraits){
+              const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
+              tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+              tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+              // Backfill DB so future calls skip this OS hit
+              const tid = parseInt(row.survivor_token_id);
+              pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [tid]).then(() =>
+                Promise.all(Object.entries(freshTraits).map(([n,v]) =>
+                  pgPool.query(
+                    `INSERT INTO token_traits (token_id, trait_name, trait_value) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+                    [tid, String(n), String(v)]
+                  )
+                ))
+              ).catch(e => console.warn(`[burnlatest] DB backfill failed for #${tid}:`, e.message));
+            }
+          }
+        } else if(burnAge < THIRTY_MIN){
+          const freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
+          if(freshTraits){
+            const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
+            tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+            tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+          }
+        }
         return buildBurnEmbed(finalEvent, startEvent);
       }));
 
@@ -3179,6 +3771,116 @@ It has not been burned and was not created via the burn machine.`)
     return;
   }
 
+  // /burnrefresh token:ID — community command to re-queue a burn alert with fresh metadata
+  if(commandName==='burnrefresh'){
+    const tokenId = interaction.options.getInteger('token');
+    if(!tokenId) return interaction.reply({ content:'Provide a token ID.', flags: MessageFlags.Ephemeral });
+
+    // Rate limit: 1 use per user per token per 5 minutes
+    const COOLDOWN_MS = 5 * 60 * 1000;
+    const rlKey = `${interaction.user.id}:${tokenId}`;
+    const lastUsed = burnRefreshCooldowns.get(rlKey);
+    if(lastUsed && Date.now() - lastUsed < COOLDOWN_MS){
+      const secsLeft = Math.ceil((COOLDOWN_MS - (Date.now() - lastUsed)) / 1000);
+      return interaction.reply({
+        content: `You can use this command again for #${tokenId} in **${secsLeft}s**.`,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+    burnRefreshCooldowns.set(rlKey, Date.now());
+    // Prune old entries
+    if(burnRefreshCooldowns.size > 1000){
+      const cutoff = Date.now() - COOLDOWN_MS;
+      for(const [k,v] of burnRefreshCooldowns) if(v < cutoff) burnRefreshCooldowns.delete(k);
+    }
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try{
+      // Look up the burn event from DB
+      const r = await pgPool.query(`
+        SELECT be.id, be.tx_hash, be.block_number, be.burner_wallet, be.survivor_token_id,
+               be.result_body_type, be.result_is_angel, be.points_used, be.log_index,
+               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+        FROM burn_events be
+        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        WHERE be.survivor_token_id = $1
+        GROUP BY be.id
+        ORDER BY be.block_number DESC, be.log_index DESC
+        LIMIT 1
+      `, [tokenId]);
+
+      if(!r.rows.length){
+        await interaction.editReply(`No burn event found for #${tokenId}. Only the created/survivor token ID can be refreshed.`);
+        return;
+      }
+
+      const row = r.rows[0];
+      const finalEvent = {
+        survivorTokenId: row.survivor_token_id,
+        resultBodyType:  row.result_body_type,
+        resultIsAngel:   row.result_is_angel,
+        points:          row.points_used,
+        txHash:          row.tx_hash,
+        blockNumber:     row.block_number,
+        logIndex:        row.log_index,
+        burnEventId:     row.id,
+      };
+      const startEvent = {
+        owner:    row.burner_wallet,
+        tokenIds: (row.burned_ids || []).filter(Boolean),
+      };
+
+      // Snapshot current DB traits to compare against after refresh
+      const snapMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+      const preBurnTraits = snapMeta?.traits ? { ...snapMeta.traits } : null;
+      if(preBurnTraits){
+        const snapType = preBurnTraits.Type || preBurnTraits.type || '?';
+        console.log(`[BurnRefresh] DB snapshot for #${tokenId}: Type=${snapType}`);
+      } else {
+        console.log(`[BurnRefresh] No DB snapshot for #${tokenId} — will use 90s minimum wait`);
+      }
+
+      // Queue to pending alert system (skip if already pending, but always re-trigger refresh)
+      const alertKey = String(tokenId);
+      const alreadyPending = pendingBurnAlerts.has(alertKey);
+      if(!alreadyPending){
+        pendingBurnAlerts.set(alertKey, {
+          finalEvent,
+          startEvent,
+          preBurnTraits, // snapshot for comparison — if null, 90s minimum wait applies
+          addedAt:  Date.now(),
+          attempts: 0,
+          slowMode: false,
+        });
+      } else {
+        // Already pending — update the snapshot and reset the timer so 90s wait applies fresh
+        const existing = pendingBurnAlerts.get(alertKey);
+        if(preBurnTraits) existing.preBurnTraits = preBurnTraits;
+        existing.addedAt = Date.now();
+        existing.attempts = 0;
+        existing.slowMode = false;
+        existing.lastChecked = null;
+      }
+
+      // Trigger OS metadata refresh regardless — this is the whole point of the command
+      const refreshEnabled = BURN_METADATA_REFRESH_ENABLED;
+      if(refreshEnabled){
+        triggerOsMetadataRefresh(tokenId); // fire-and-forget
+      }
+
+      const statusMsg = alreadyPending
+        ? `#${tokenId} is already queued — metadata refresh triggered again. Alert will post once traits update.`
+        : `Queued burn alert for #${tokenId}. Metadata refresh triggered${refreshEnabled ? '' : ' (BURN_METADATA_REFRESH_ENABLED is off)'}. Alert will post once OS updates the traits — usually within 1–5 minutes.`;
+
+      console.log(`[BurnRefresh] user=${interaction.user.id} token=#${tokenId} guild=${guildId} alreadyPending=${alreadyPending}`);
+      await interaction.editReply(statusMsg);
+    }catch(e){
+      console.error('[BurnRefresh]', e.message);
+      await interaction.editReply('Error: ' + e.message);
+    }
+    return;
+  }
+
   if(commandName==='help'){
     const marketCmds=[
       '`/ocas search:zombie hoodie` — Random or searched OCAS token',
@@ -3186,8 +3888,9 @@ It has not been burned and was not created via the burn machine.`)
       '`/sweep search:10` — Cost to sweep 10 cheapest listed',
       '`/sweep search:2eth zombie` — Budget sweep with trait filter',
       '`/sweep search:0.05 floor zombie` — Clear below target floor',
-      '`/traitfind search:zombie` — Sales history for a trait',
+      '`/traitfind search:zombie` — Tokens matching a trait',
       '`/traitfind search:zombie listings` — Currently listed with that trait',
+      '`/traitfind search:zombie sales` — Sales history for that trait',
       '`/rankfind search:1-100` — Listed tokens by OS rank range',
       '`/rankfind search:1-100 sales` — Sales history by OS rank range',
     ].join('\n');
@@ -3203,6 +3906,7 @@ It has not been burned and was not created via the burn machine.`)
       '`/burn token:1234` — Token burn status and lineage',
       '`/burnwallet wallet:0x...` — Wallet burn history',
       '`/burnleaderboard` — Top burners by tokens burned',
+      '`/burnrefresh token:1234` — Refresh metadata + re-post burn alert (5 min cooldown)',
     ].join('\n');
     const alertCmds=[
       '`/myalert trait:Type value:Zombie` — DM when a Zombie sells or lists',
@@ -3366,10 +4070,12 @@ client.once('clientReady', async ()=>{
   if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL){
     console.log('[Burn] Starting burn poller');
     pollBurnEvents();
-    setInterval(pollBurnEvents, 2 * 60 * 1000);
+    setInterval(pollBurnEvents, 30_000);
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
   }
+  // Process pending burn alerts every 30s — waits for metadata to refresh before posting
+  setInterval(processPendingBurnAlerts, 30_000);
 });
 
 client.on('error',e=>console.error('[Discord]',e.message));
