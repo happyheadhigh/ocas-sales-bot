@@ -3771,7 +3771,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         .setColor(BURN_COLORS.FIRE)
         .setTitle(`🔥 #${tokenInput} burn history`)
         .setDescription(
-          `Burned **${burns.length} time${burns.length===1?'':' times'}** · **${totalTokensBurned} tokens** consumed · **${totalPts} pts** total`
+          `Burned **${burns.length} time${burns.length===1?'':'s'}** · **${totalTokensBurned} tokens** consumed · **${totalPts} pts** total`
         )
         .setURL(osUrl)
         .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
@@ -3780,12 +3780,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const displayBurns = [...burns].reverse().slice(0, 10);
       displayBurns.forEach((b, i) => {
         const burnNum = burns.length - i;
-        const ago     = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-        const ids     = (b.burned_ids||[]).filter(Boolean);
-        const idsStr  = ids.length ? ids.map(id=>`#${id}`).join(', ') : '?';
+        const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
+        const ids      = (b.burned_ids||[]).filter(Boolean);
         const fieldVal = [
           `**Burner:** [${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`,
-          `**Tokens:** ${idsStr.length > 400 ? idsStr.slice(0,397)+'...' : idsStr} → #${tokenInput}`,
+          `**Tokens:** ${ids.length || '?'}`,
           `**Points:** ${b.points_used||0}`,
         ].join('\n');
         embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:false });
@@ -3801,7 +3800,22 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         inline:false
       });
 
-      await replyWithEmbed(embed, tokenInput);
+      const showTokensBtn = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`burn_all_tokens:${tokenInput}`)
+          .setLabel('Show all tokens')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      const ir = await fetchThumbForToken(tokenInput);
+      if(ir?.type==='buffer'){
+        const att = new AttachmentBuilder(ir.buffer, { name:`token-${tokenInput}.png` });
+        embed.setThumbnail(`attachment://token-${tokenInput}.png`);
+        await interaction.editReply({ embeds:[embed], files:[att], components:[showTokensBtn] });
+      } else {
+        if(ir?.type==='url') embed.setThumbnail(ir.url);
+        await interaction.editReply({ embeds:[embed], components:[showTokensBtn] });
+      }
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
