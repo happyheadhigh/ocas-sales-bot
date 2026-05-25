@@ -2399,6 +2399,36 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
+  if(interaction.isButton() && interaction.customId.startsWith('burn_all_tokens:')){
+    const survivorId = parseInt(interaction.customId.split(':')[1], 10);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const r = await pgPool.query(`
+        SELECT be.burned_at, be.points_used,
+               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+        FROM burn_events be
+        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        WHERE be.survivor_token_id = $1
+        GROUP BY be.id
+        ORDER BY be.burned_at ASC NULLS LAST
+      `, [survivorId]);
+      if(!r.rows.length){ await interaction.editReply({ content:'No burn history found.' }); return; }
+      const lines = r.rows.map((b, i) => {
+        const burnNum = i + 1;
+        const ids = (b.burned_ids||[]).filter(Boolean);
+        const idsStr = ids.length ? ids.map(id=>`#${id}`).join(', ') : '?';
+        return `**Burn ${burnNum}:** ${idsStr} → #${survivorId}`;
+      });
+      const msgContent = lines.join('\n').slice(0, 1900);
+      await interaction.editReply({ content: msgContent });
+    }catch(e){
+      console.error('[Burn All Tokens]', e.message);
+      try{ await interaction.editReply({ content:'Error loading token history.' }); }catch(_){}
+    }
+    return;
+  }
+
+
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
   const config=getConfig(guildId);
@@ -3777,9 +3807,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
 
       // Most recent first, up to 10
-      const displayBurns = [...burns].reverse().slice(0, 10);
+      const displayBurns = [...burns].slice(0, 10);
       displayBurns.forEach((b, i) => {
-        const burnNum = burns.length - i;
+        const burnNum = i + 1;
         const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const ids      = (b.burned_ids||[]).filter(Boolean);
         const fieldVal = [
