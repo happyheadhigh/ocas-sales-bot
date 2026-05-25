@@ -3665,10 +3665,40 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const contract = OCAS_CONTRACT;
-      // Check if token was burned (appears in burn_event_inputs)
-      const burnedRes = await pgPool.query(`
-        SELECT be.survivor_token_id, be.burner_wallet, be.burned_at, be.result_body_type, be.result_is_angel,
-               be.points_used, array_agg(bei2.burned_token_id ORDER BY bei2.burned_token_id) AS burned_ids
+      const osUrl  = `https://opensea.io/assets/ethereum/${contract}/${tokenInput}`;
+      const tvUrl  = `https://traitview.com/?token=${tokenInput}`;
+      const ethUrl = `https://etherscan.io/token/${contract}?a=${tokenInput}`;
+
+      // Helper: fetch thumbnail for any token ID — token_traits first, contract fallback
+      async function fetchThumbForToken(tid){
+        try{
+          const traitRows = await pgPool.query(
+            `SELECT trait_name, trait_value FROM token_traits WHERE token_id=$1`, [tid]
+          );
+          if(!traitRows.rows.length){
+            await fetchTokenUriFromContract(tid); // warm the cache, ignore result
+          }
+          return await resolveImage({ identifier: String(tid) }, contract, 'ethereum');
+        }catch(e){ return null; }
+      }
+
+      async function replyWithEmbed(embed, tid){
+        const ir = await fetchThumbForToken(tid);
+        if(ir?.type==='buffer'){
+          const att = new AttachmentBuilder(ir.buffer, { name:`token-${tid}.png` });
+          embed.setThumbnail(`attachment://token-${tid}.png`);
+          await interaction.editReply({ embeds:[embed], files:[att] });
+        } else {
+          if(ir?.type==='url') embed.setThumbnail(ir.url);
+          await interaction.editReply({ embeds:[embed] });
+        }
+      }
+
+      // Check if this token was consumed in a burn
+      const consumedRes = await pgPool.query(`
+        SELECT be.survivor_token_id, be.burner_wallet, be.burned_at,
+               be.points_used, be.tx_hash,
+               array_agg(bei2.burned_token_id ORDER BY bei2.burned_token_id) AS burned_ids
         FROM burn_event_inputs bei
         JOIN burn_events be ON be.id = bei.burn_event_id
         LEFT JOIN burn_event_inputs bei2 ON bei2.burn_event_id = be.id
@@ -3676,55 +3706,102 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         GROUP BY be.id
         LIMIT 1
       `, [tokenInput]);
-      // Check if token was created via burn (appears as survivor)
-      const createdRes = await pgPool.query(`
-        SELECT be.tx_hash, be.burner_wallet, be.burned_at, be.result_body_type, be.result_is_angel,
-               be.points_used, array_agg(bei.burned_token_id) AS burned_ids
+
+      // Check if this token was ever a survivor
+      const survivorCheckRes = await pgPool.query(
+        `SELECT COUNT(*)::int AS cnt FROM burn_events WHERE survivor_token_id=$1`, [tokenInput]
+      );
+      const isSurvivor = (survivorCheckRes.rows[0]?.cnt || 0) > 0;
+
+      if(!consumedRes.rows.length && !isSurvivor){
+        const embed = new EmbedBuilder()
+          .setColor(BURN_COLORS.FIRE)
+          .setTitle(`#${tokenInput} — no burn activity`)
+          .setDescription(`This token has not been burned and was not created via the burn machine.`)
+          .addFields({ name:'Links', value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl})`, inline:false })
+          .setURL(osUrl)
+          .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
+        await replyWithEmbed(embed, tokenInput);
+        return;
+      }
+
+      if(consumedRes.rows.length && !isSurvivor){
+        // Token was consumed — show the single burn it was part of + pointer to survivor chain
+        const b = consumedRes.rows[0];
+        const survivorId  = b.survivor_token_id;
+        const survivorUrl = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
+        const ago         = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
+        const burnedIds   = (b.burned_ids||[]).filter(Boolean);
+        const tokensStr   = burnedIds.length ? burnedIds.map(id=>`#${id}`).join(', ') : '?';
+        const embed = new EmbedBuilder()
+          .setColor(BURN_COLORS.FIRE)
+          .setTitle(`#${tokenInput} — consumed in burn`)
+          .setDescription(`This token was burned **${ago}** and helped create [#${survivorId}](${survivorUrl}).`)
+          .addFields(
+            { name:'Burner',           value:`[${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`, inline:true },
+            { name:'Created',          value:`[#${survivorId}](${survivorUrl})`, inline:true },
+            { name:'Tokens burned',    value:String(burnedIds.length || '?'), inline:true },
+            { name:'Points used',      value:String(b.points_used || 0), inline:true },
+            { name:'All tokens',       value:tokensStr.length > 1024 ? tokensStr.slice(0,1021)+'...' : tokensStr, inline:false },
+            { name:'See full history', value:`\`/burn token:${survivorId}\``, inline:false },
+            { name:'Links',            value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl}) | [Etherscan](https://etherscan.io/tx/${b.tx_hash||''})`, inline:false },
+          )
+          .setURL(osUrl)
+          .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
+        await replyWithEmbed(embed, tokenInput);
+        return;
+      }
+
+      // Token is a survivor — fetch full burn chain
+      const chainRes = await pgPool.query(`
+        SELECT be.tx_hash, be.burner_wallet, be.burned_at, be.points_used,
+               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
         WHERE be.survivor_token_id = $1
-        GROUP BY be.id LIMIT 1
+        GROUP BY be.id
+        ORDER BY be.burned_at ASC NULLS LAST
       `, [tokenInput]);
 
-      const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenInput}`;
-      const tvUrl = `https://traitview.com/?token=${tokenInput}`;
+      const burns            = chainRes.rows;
+      const totalPts         = burns.reduce((s,r)=>s+(r.points_used||0), 0);
+      const totalTokensBurned = burns.reduce((s,r)=>s+((r.burned_ids||[]).filter(Boolean).length), 0);
+
       const embed = new EmbedBuilder()
         .setColor(BURN_COLORS.FIRE)
+        .setTitle(`🔥 #${tokenInput} burn history`)
+        .setDescription(
+          `Burned **${burns.length} time${burns.length===1?'':' times'}** · **${totalTokensBurned} tokens** consumed · **${totalPts} pts** total`
+        )
         .setURL(osUrl)
         .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
 
-      if(burnedRes.rows.length){
-        const b = burnedRes.rows[0];
-        const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-        const survivorUrl = `https://opensea.io/assets/ethereum/${contract}/${b.survivor_token_id}`;
-        const burnedIds = (b.burned_ids||[]).filter(Boolean);
-        embed.setTitle(`#${tokenInput} Burn Status`)
-          .setDescription(`This token was burned ${ago}.
-It helped create [#${b.survivor_token_id}](${survivorUrl}).`)
-          .addFields(
-            { name:'Burner', value:`[${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`, inline:true },
-            { name:'Created', value:`[#${b.survivor_token_id}](${survivorUrl})`, inline:true },
-            { name:'Burn Tier', value:burnTypeLabel(b.result_body_type, b.result_is_angel), inline:true },
-            { name:'Tokens Burned', value:String(burnedIds.length || '?'), inline:true },
-            { name:'Points Used', value:String(b.points_used || 0), inline:true },
-            { name:'Links', value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl})`, inline:false },
-          );
-      } else if(createdRes.rows.length){
-        const cr = createdRes.rows[0];
-        const burnedIds = (cr.burned_ids||[]).filter(Boolean);
-        const burnEmbed = await buildBurnEmbed(
-          { survivorTokenId: tokenInput, resultBodyType: cr.result_body_type, resultIsAngel: cr.result_is_angel, points: cr.points_used, txHash: cr.tx_hash },
-          { owner: cr.burner_wallet, tokenIds: burnedIds }
-        );
-        await interaction.editReply(buildEmbedPayload(burnEmbed));
-        return;
-      } else {
-        embed.setTitle(`#${tokenInput} - No Burn Activity`)
-          .setDescription(`This token has no recorded burn events.
-It has not been burned and was not created via the burn machine.`)
-          .addFields({ name:'Links', value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl})`, inline:false });
+      // Most recent first, up to 10
+      const displayBurns = [...burns].reverse().slice(0, 10);
+      displayBurns.forEach((b, i) => {
+        const burnNum = burns.length - i;
+        const ago     = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
+        const ids     = (b.burned_ids||[]).filter(Boolean);
+        const idsStr  = ids.length ? ids.map(id=>`#${id}`).join(', ') : '?';
+        const fieldVal = [
+          `**Burner:** [${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`,
+          `**Tokens:** ${idsStr.length > 400 ? idsStr.slice(0,397)+'...' : idsStr} → #${tokenInput}`,
+          `**Points:** ${b.points_used||0}`,
+        ].join('\n');
+        embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:false });
+      });
+
+      if(burns.length > 10){
+        embed.addFields({ name:`+${burns.length-10} earlier burns`, value:'Only the 10 most recent burns are shown.', inline:false });
       }
-      await interaction.editReply({ embeds:[embed] });
+
+      embed.addFields({
+        name:'Links',
+        value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl}) | [Etherscan](${ethUrl})`,
+        inline:false
+      });
+
+      await replyWithEmbed(embed, tokenInput);
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
@@ -3766,7 +3843,7 @@ It has not been burned and was not created via the burn machine.`)
           { name:'Tokens Burned',   value:String(totalBurned),  inline:true },
           { name:'Tokens Created',  value:String(totalCreated), inline:true },
           { name:'Total Points',    value:String(totalPoints),  inline:true },
-          { name:'Best Created',    value:`[#${best.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${best.survivor_token_id}) - burn tier ${burnTypeLabel(best.result_body_type, best.result_is_angel)}`, inline:false },
+          { name:'Best Created',    value:`[#${best.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${best.survivor_token_id})`, inline:false },
         );
       const recentLines = r.rows.slice(0,5).map(row=>{
         const ids = (row.burned_ids||[]).filter(Boolean);
