@@ -1276,120 +1276,57 @@ async function processBurnLogs(logs, shouldAlert){
 
 // ── Pending burn alert processor ─────────────────────────────────────────────
 // Runs every 30s. For each queued burn event, fetches fresh OS metadata and
-// compares to the pre-burn snapshot. Posts alert only when traits have changed.
-// Switches to 2-min retry after 10 min. Keeps retrying until metadata changes.
+// Reads traits directly from contract tokenURI — no OS polling or snapshot wait needed.
+// Contract always has current on-chain state the moment BurnFinalized is confirmed.
+// Falls back to OS metadata if contract call fails. Retries up to 2 hours on post failure.
 async function processPendingBurnAlerts(){
   if(!pendingBurnAlerts.size) return;
   const now = Date.now();
-  const THIRTY_SECS  = 30_000;
-  const TWO_MINS     = 2 * 60_000;
-  const TEN_MINS     = 10 * 60_000;
-  const TWO_HOURS    = 2 * 60 * 60_000;
+  const TWO_HOURS = 2 * 60 * 60_000;
 
   for(const [key, entry] of pendingBurnAlerts){
-    const { finalEvent, startEvent, preBurnTraits, addedAt, attempts, slowMode } = entry;
+    const { finalEvent, startEvent, addedAt, attempts } = entry;
     const survivorId = finalEvent.survivorTokenId;
     const ageMs      = now - addedAt;
-
-    // Throttle: in slow mode check every 2 min, normal every 30s
-    const minInterval = slowMode ? TWO_MINS : THIRTY_SECS;
-    if(entry.lastChecked && (now - entry.lastChecked) < minInterval) continue;
-    entry.lastChecked = now;
     entry.attempts++;
 
-    // Switch to slow mode after 10 minutes
-    if(ageMs > TEN_MINS && !slowMode){
-      entry.slowMode = true;
-      console.log(`[BurnMeta] #${survivorId} switching to slow retry (2 min) after 10 min`);
-    }
-
-    // Hard cap: 2 hours — post minimal fallback alert and remove
+    // Hard cap: 2 hours — post minimal fallback and remove
     if(ageMs > TWO_HOURS){
-      console.warn(`[BurnMeta] #${survivorId} metadata still stale after 2 hours — posting minimal fallback alert`);
-      try{
-        await postBurnFallbackAlert(finalEvent, startEvent);
-      }catch(e){ console.error(`[BurnMeta] fallback alert failed for #${survivorId}:`, e.message); }
+      console.warn(`[BurnMeta] #${survivorId} failed to post after 2 hours — posting minimal fallback`);
+      try{ await postBurnFallbackAlert(finalEvent, startEvent); }catch(e){ console.error(`[BurnMeta] fallback failed for #${survivorId}:`, e.message); }
       pendingBurnAlerts.delete(key);
       continue;
     }
 
-    // Fetch fresh OS metadata — bypasses all caches
+    // Fetch traits from contract — always current post-burn state
     let freshTraits = null;
     try{
-      freshTraits = await fetchFreshOsMeta(survivorId);
+      freshTraits = await fetchTokenUriFromContract(survivorId);
+      if(freshTraits) console.log(`[BurnMeta] #${survivorId} contract traits OK → Type=${freshTraits.Type||freshTraits.type||'?'}`);
     }catch(e){
-      console.warn(`[BurnMeta] fetchFreshOsMeta error for #${survivorId}:`, e.message);
-      continue; // retry next tick
+      console.warn(`[BurnMeta] contract tokenURI failed for #${survivorId}:`, e.message);
+    }
+
+    // Fallback to OS if contract call failed
+    if(!freshTraits){
+      console.log(`[BurnMeta] #${survivorId} contract failed — trying OS fallback`);
+      try{ freshTraits = await fetchFreshOsMeta(survivorId); }catch(e){ console.warn(`[BurnMeta] OS fallback also failed for #${survivorId}:`, e.message); }
     }
 
     if(!freshTraits){
-      console.log(`[BurnMeta] #${survivorId} OS returned no traits yet (attempt ${entry.attempts})`);
+      console.log(`[BurnMeta] #${survivorId} no traits yet (attempt ${entry.attempts}) — retrying next tick`);
       continue;
     }
 
-    const typeStr = freshTraits.Type || freshTraits.type || '?';
-    const oldType = preBurnTraits ? (preBurnTraits.Type || preBurnTraits.type || '?') : 'unknown';
-
-    if(preBurnTraits){
-      // Have a snapshot — compare full trait object to detect when OS has updated
-      const changed = traitsDiffer(preBurnTraits, freshTraits);
-      if(!changed){
-        console.log(`[BurnMeta] #${survivorId} still stale (attempt ${entry.attempts}) Type=${typeStr} (was ${oldType})`);
-        entry.candidateTraits = null; // reset candidate if OS reverted
-        continue;
-      }
-      // Traits differ from pre-burn — but OS may still be mid-refresh (partial update).
-      // Require stability: store as candidate and only post if identical on next tick.
-      if(!entry.candidateTraits){
-        entry.candidateTraits = freshTraits;
-        entry.candidateAt = now;
-        console.log(`[BurnMeta] #${survivorId} traits changed from pre-burn (${oldType} → ${typeStr}) — waiting one more tick to confirm stability`);
-        continue;
-      }
-      // We have a candidate from last tick — check if traits are stable
-      if(traitsDiffer(entry.candidateTraits, freshTraits)){
-        entry.candidateTraits = freshTraits;
-        entry.candidateAt = now;
-        console.log(`[BurnMeta] #${survivorId} traits still changing (Type=${typeStr}) — waiting for stability`);
-        continue;
-      }
-      // Stable across two consecutive polls — safe to post
-      console.log(`[BurnMeta] #${survivorId} metadata stable! ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
-    } else {
-      // No snapshot — enforce a 90s minimum wait after addedAt before trusting any traits.
-      // This gives the OS refresh request time to propagate before we accept whatever OS returns.
-      const MIN_WAIT_MS = 90_000;
-      if(ageMs < MIN_WAIT_MS){
-        console.log(`[BurnMeta] #${survivorId} no snapshot — waiting ${Math.round((MIN_WAIT_MS - ageMs)/1000)}s more before accepting traits`);
-        continue;
-      }
-      // No snapshot, apply same stability check
-      if(!entry.candidateTraits){
-        entry.candidateTraits = freshTraits;
-        entry.candidateAt = now;
-        console.log(`[BurnMeta] #${survivorId} no snapshot — traits received, waiting one tick to confirm stability, Type=${typeStr}`);
-        continue;
-      }
-      if(traitsDiffer(entry.candidateTraits, freshTraits)){
-        entry.candidateTraits = freshTraits;
-        entry.candidateAt = now;
-        console.log(`[BurnMeta] #${survivorId} no snapshot — traits still changing (Type=${typeStr})`);
-        continue;
-      }
-      console.log(`[BurnMeta] #${survivorId} no snapshot — traits stable after ${Math.round(ageMs/1000)}s wait, Type=${typeStr}`);
-    }
-
-    // Set the fresh traits into cache so buildBurnEmbed picks them up
+    // Set traits into cache so buildBurnEmbed picks them up
     const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
     tokenMetaCache.set(parseInt(survivorId), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
     tokenMetaCache.set(`os:${parseInt(survivorId)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
-    // Bust image cache so embed fetches new image
     imageCache?.delete?.(`${OCAS_CONTRACT}:${survivorId}`);
 
     try{
       await postBurnAlertToConfiguredChannels(finalEvent, startEvent, freshTraits);
-      // Write fresh post-burn traits back to token_traits DB so /burnlatest works after restarts.
-      // token_traits is row-per-trait: delete stale rows then insert fresh ones.
+      // Write post-burn traits to DB so /burnlatest and /burn work after restarts
       try{
         const tid = parseInt(survivorId);
         await pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [tid]);
@@ -1406,8 +1343,8 @@ async function processPendingBurnAlerts(){
       }
       pendingBurnAlerts.delete(key);
     }catch(e){
-      console.error(`[BurnMeta] postBurnAlertToConfiguredChannels failed for #${survivorId}:`, e.message);
-      // Keep in queue and retry next tick
+      console.error(`[BurnMeta] post failed for #${survivorId}:`, e.message);
+      // Keep in queue — retry next tick
     }
   }
 }
@@ -1595,11 +1532,10 @@ function timeSince(ts){
   const s=Math.floor(Date.now()/1000-ts);
   if(s<60)   return s+'s ago';
   if(s<3600) return Math.floor(s/60)+'m ago';
-  // Anything older than 1 hour: show readable date + time
-  const d=new Date(ts*1000);
-  const date=d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
-  const time=d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true});
-  return date+' at '+time;
+  if(s<86400) return Math.floor(s/3600)+'h ago';
+  if(s<2592000) return Math.floor(s/86400)+'d ago';
+  if(s<31536000) return Math.floor(s/2592000)+'mo ago';
+  return Math.floor(s/31536000)+'y ago';
 }
 function isSvg(url){ if(!url) return false; const s=String(url).trim(); return s.startsWith('<svg')||s.startsWith('data:image/svg')||s.toLowerCase().endsWith('.svg')||s.includes('image/svg'); }
 function isDiscordOk(url){ if(!url||isSvg(url)) return false; const s=url.toLowerCase(); return (s.startsWith('http://')||s.startsWith('https://'))&&!s.startsWith('data:'); }
