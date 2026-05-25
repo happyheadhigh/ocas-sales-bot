@@ -863,6 +863,8 @@ async function fetchTokenUriFromContract(tokenId){
     }
     if(Object.keys(traits).length){
       console.log(`[Contract] tokenURI #${id} → Type=${traits.Type||traits.type||'?'} (${Object.keys(traits).length} traits)`);
+      // Attach image to traits object so callers can use it directly
+      if(meta.image) traits.__image = meta.image;
       return traits;
     }
     return null;
@@ -3635,15 +3637,28 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const tvUrl  = `https://traitview.com/?token=${tokenInput}`;
       const ethUrl = `https://etherscan.io/token/${contract}?a=${tokenInput}`;
 
-      // Helper: fetch thumbnail for any token ID — token_traits first, contract fallback
+      // Helper: fetch thumbnail for any token ID
+      // Priority: 1) contract tokenURI image field (fastest, always current)
+      //           2) resolveImage via OpenSea (fallback)
       async function fetchThumbForToken(tid){
         try{
-          const traitRows = await pgPool.query(
-            `SELECT trait_name, trait_value FROM token_traits WHERE token_id=$1`, [tid]
-          );
-          if(!traitRows.rows.length){
-            await fetchTokenUriFromContract(tid); // warm the cache, ignore result
+          // Try contract tokenURI first — returns traits + __image field
+          const contractTraits = await fetchTokenUriFromContract(tid).catch(()=>null);
+          if(contractTraits?.__image){
+            const imgSrc = contractTraits.__image;
+            // SVG image — extract PNG
+            if(imgSrc.startsWith('<svg') || imgSrc.startsWith('data:image/svg') || imgSrc.toLowerCase().includes('image/svg')){
+              try{
+                const buf = await extractPngFromSvg(imgSrc);
+                if(buf) return { type:'buffer', buffer:buf, filename:`token-${tid}.png` };
+              }catch(_){}
+            }
+            // Regular URL
+            if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)){
+              return { type:'url', url:imgSrc };
+            }
           }
+          // Fallback to OpenSea
           return await resolveImage({ identifier: String(tid) }, contract, 'ethereum');
         }catch(e){ return null; }
       }
