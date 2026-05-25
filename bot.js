@@ -3817,7 +3817,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           `**Tokens:** ${ids.length || '?'}`,
           `**Points:** ${b.points_used||0}`,
         ].join('\n');
-        embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:false });
+        embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:true });
       });
 
       if(burns.length > 10){
@@ -3833,7 +3833,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const showTokensBtn = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`burn_all_tokens:${tokenInput}`)
-          .setLabel('Show all tokens')
+          .setLabel('Show all burned tokens')
           .setStyle(ButtonStyle.Secondary)
       );
 
