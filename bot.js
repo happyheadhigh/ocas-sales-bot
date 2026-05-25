@@ -236,8 +236,17 @@ async function ensureBotStateTable(){
       ON burn_alert_posts(tx_hash, log_index, channel_id)
     `);
     await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS token_traits (
+        id          SERIAL PRIMARY KEY,
+        token_id    INT NOT NULL,
+        trait_name  TEXT NOT NULL,
+        trait_value TEXT NOT NULL,
+        UNIQUE (token_id, trait_name)
+      )
+    `);
+    await pgPool.query(`
       CREATE INDEX IF NOT EXISTS token_traits_token_id_idx ON token_traits(token_id)
-    `).catch(()=>{}); // table may not exist yet on fresh deploy
+    `).catch(()=>{});
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS token_traits_name_value_idx ON token_traits(LOWER(trait_name), LOWER(trait_value))
     `).catch(()=>{});
