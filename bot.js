@@ -735,12 +735,28 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
     dbMeta = (cached && Date.now() < cached.expires) ? cached.meta : null;
   }
 
-  // Image — always fetch fresh for burn embeds (bypass image cache)
+  // Image — contract tokenURI first (always current), fall back to OS
   imageCache?.delete?.(`${contract}:${survivorId}`);
   let imgResult = null;
   try{
-    imgResult = await resolveImage({identifier:String(survivorId)}, contract, 'ethereum');
-    if(imgResult) setCachedImage(`${contract}:${survivorId}`, imgResult);
+    // Use contract image from traits cache if available
+    const contractImgSrc = dbMeta?.traits?.__image;
+    if(contractImgSrc){
+      if(contractImgSrc.startsWith('<svg') || contractImgSrc.startsWith('data:image/svg') || contractImgSrc.toLowerCase().includes('image/svg')){
+        try{
+          const buf = await extractPngFromSvg(contractImgSrc);
+          if(buf) imgResult = { type:'buffer', buffer:buf, filename:`token-${survivorId}.png` };
+        }catch(_){}
+      }
+      if(!imgResult && contractImgSrc.startsWith('http') && isDiscordOk(contractImgSrc)){
+        imgResult = { type:'url', url:contractImgSrc };
+      }
+    }
+    // Fall back to OpenSea if contract image unavailable
+    if(!imgResult){
+      imgResult = await resolveImage({identifier:String(survivorId)}, contract, 'ethereum');
+      if(imgResult) setCachedImage(`${contract}:${survivorId}`, imgResult);
+    }
   }catch(e){ console.warn('[Burn embed image]', e.message); }
 
   const embed = new EmbedBuilder()
@@ -755,8 +771,9 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
     );
 
   // Single Traits field in 2 columns — same layout as sales/listings
-  if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
+  if(dbMeta?.traits && Object.keys(dbMeta.traits).filter(k=>k!=='__image').length){
     const traitLines = Object.entries(dbMeta.traits)
+      .filter(([k]) => k !== '__image')
       .slice(0, 14)
       .map(([k,v]) => `**${cleanTraitLabel(k)}:** ${v}`);
     const half = Math.ceil(traitLines.length / 2);
@@ -3524,6 +3541,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
               tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
               tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
             }
+            return buildBurnEmbed(finalEvent, startEvent, freshTraits || undefined);
           } else {
             // Older burn — read from DB, fall back to contract if missing
             const dbMeta = await fetchTokenMetaFromDb(row.survivor_token_id).catch(()=>null);
@@ -3546,17 +3564,19 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
                     )
                   ))
                 ).catch(e => console.warn(`[burnlatest] DB backfill failed for #${tid}:`, e.message));
+                return buildBurnEmbed(finalEvent, startEvent, freshTraits);
               }
             }
           }
         } else if(burnAge < THIRTY_MIN){
-          // Recent burn — fetch from contract for guaranteed accuracy, fall back to OS
+          // Recent burn not yet posted — fetch from contract, pass directly
           let freshTraits = await fetchTokenUriFromContract(row.survivor_token_id).catch(()=>null);
           if(!freshTraits) freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
           if(freshTraits){
             const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
             tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
             tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+            return buildBurnEmbed(finalEvent, startEvent, freshTraits);
           }
         }
         return buildBurnEmbed(finalEvent, startEvent);
