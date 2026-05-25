@@ -3515,30 +3515,38 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         // For burns < 30 min old: bypass DB cache and fetch fresh OS metadata
         const burnAge = row.burned_at ? Date.now() - new Date(row.burned_at).getTime() : Infinity;
         if(row.already_posted){
-          // Post-burn traits were written to token_traits by processPendingBurnAlerts — read from DB.
-          // Fall back to OS only if rows are missing (pre-fix historical burns or failed write).
-          const dbMeta = await fetchTokenMetaFromDb(row.survivor_token_id).catch(()=>null);
-          if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
-            tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
-            tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
-          } else {
-            // DB missing post-burn traits — try contract first (always current), then OS
+          // For recent burns always use contract — DB may still have pre-burn traits
+          if(burnAge < THIRTY_MIN){
             let freshTraits = await fetchTokenUriFromContract(row.survivor_token_id).catch(()=>null);
             if(!freshTraits) freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
             if(freshTraits){
               const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
               tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
               tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
-              // Backfill DB so future calls skip this OS hit
-              const tid = parseInt(row.survivor_token_id);
-              pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [tid]).then(() =>
-                Promise.all(Object.entries(freshTraits).map(([n,v]) =>
-                  pgPool.query(
-                    `INSERT INTO token_traits (token_id, trait_name, trait_value) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-                    [tid, String(n), String(v)]
-                  )
-                ))
-              ).catch(e => console.warn(`[burnlatest] DB backfill failed for #${tid}:`, e.message));
+            }
+          } else {
+            // Older burn — read from DB, fall back to contract if missing
+            const dbMeta = await fetchTokenMetaFromDb(row.survivor_token_id).catch(()=>null);
+            if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
+              tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
+              tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
+            } else {
+              let freshTraits = await fetchTokenUriFromContract(row.survivor_token_id).catch(()=>null);
+              if(!freshTraits) freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
+              if(freshTraits){
+                const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
+                tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+                tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
+                const tid = parseInt(row.survivor_token_id);
+                pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [tid]).then(() =>
+                  Promise.all(Object.entries(freshTraits).map(([n,v]) =>
+                    pgPool.query(
+                      `INSERT INTO token_traits (token_id, trait_name, trait_value) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+                      [tid, String(n), String(v)]
+                    )
+                  ))
+                ).catch(e => console.warn(`[burnlatest] DB backfill failed for #${tid}:`, e.message));
+              }
             }
           }
         } else if(burnAge < THIRTY_MIN){
@@ -3642,7 +3650,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       //           2) resolveImage via OpenSea (fallback)
       async function fetchThumbForToken(tid){
         try{
-          // Try contract tokenURI first — returns traits + __image field
+          // Bust image cache so stale pre-burn images never get served
+          imageCache?.delete?.(`${contract}:${tid}`);
+          // Contract tokenURI returns traits + __image field — always current post-burn state
           const contractTraits = await fetchTokenUriFromContract(tid).catch(()=>null);
           if(contractTraits?.__image){
             const imgSrc = contractTraits.__image;
