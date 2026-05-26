@@ -73,7 +73,7 @@ const BURN_CONTRACT = '0x1095c73C337CC5e03f9E1D426c524CC3e32a50f6';
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BURN_START_BLOCK, 10) : null;
 const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
-const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '2000', 10));
+const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10));
 const BURN_ALERT_CHANNEL_ID = process.env.BURN_ALERT_CHANNEL_ID || '';
 const BURN_METADATA_REFRESH_ENABLED = true; // always on — needed for correct post-burn traits in alert
 const BURN_COLORS = {
@@ -236,10 +236,28 @@ async function ensureBotStateTable(){
       ON burn_alert_posts(tx_hash, log_index, channel_id)
     `);
     await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS token_traits (
+        id          SERIAL PRIMARY KEY,
+        token_id    INT NOT NULL,
+        trait_name  TEXT NOT NULL,
+        trait_value TEXT NOT NULL,
+        UNIQUE (token_id, trait_name)
+      )
+    `);
+    await pgPool.query(`
       CREATE INDEX IF NOT EXISTS token_traits_token_id_idx ON token_traits(token_id)
-    `).catch(()=>{}); // table may not exist yet on fresh deploy
+    `).catch(()=>{});
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS token_traits_name_value_idx ON token_traits(LOWER(trait_name), LOWER(trait_value))
+    `).catch(()=>{});
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS token_image_snapshots (
+        token_id    INT PRIMARY KEY,
+        image_data  TEXT,
+        traits_json JSONB,
+        source      TEXT,
+        updated_at  TIMESTAMPTZ DEFAULT NOW()
+      )
     `).catch(()=>{});
     console.log('[DB] burn tables ready');
   }catch(e){ console.error('[DB] ensureBotStateTable error:', e.message); }
@@ -726,12 +744,28 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
     dbMeta = (cached && Date.now() < cached.expires) ? cached.meta : null;
   }
 
-  // Image — always fetch fresh for burn embeds (bypass image cache)
+  // Image — contract tokenURI first (always current), fall back to OS
   imageCache?.delete?.(`${contract}:${survivorId}`);
   let imgResult = null;
   try{
-    imgResult = await resolveImage({identifier:String(survivorId)}, contract, 'ethereum');
-    if(imgResult) setCachedImage(`${contract}:${survivorId}`, imgResult);
+    // Use contract image from traits cache if available
+    const contractImgSrc = dbMeta?.traits?.__image;
+    if(contractImgSrc){
+      if(contractImgSrc.startsWith('<svg') || contractImgSrc.startsWith('data:image/svg') || contractImgSrc.toLowerCase().includes('image/svg')){
+        try{
+          const buf = await extractPngFromSvg(contractImgSrc);
+          if(buf) imgResult = { type:'buffer', buffer:buf, filename:`token-${survivorId}.png` };
+        }catch(_){}
+      }
+      if(!imgResult && contractImgSrc.startsWith('http') && isDiscordOk(contractImgSrc)){
+        imgResult = { type:'url', url:contractImgSrc };
+      }
+    }
+    // Fall back to OpenSea if contract image unavailable
+    if(!imgResult){
+      imgResult = await resolveImage({identifier:String(survivorId)}, contract, 'ethereum');
+      if(imgResult) setCachedImage(`${contract}:${survivorId}`, imgResult);
+    }
   }catch(e){ console.warn('[Burn embed image]', e.message); }
 
   const embed = new EmbedBuilder()
@@ -746,8 +780,9 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
     );
 
   // Single Traits field in 2 columns — same layout as sales/listings
-  if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
+  if(dbMeta?.traits && Object.keys(dbMeta.traits).filter(k=>k!=='__image').length){
     const traitLines = Object.entries(dbMeta.traits)
+      .filter(([k]) => k !== '__image')
       .slice(0, 14)
       .map(([k,v]) => `**${cleanTraitLabel(k)}:** ${v}`);
     const half = Math.ceil(traitLines.length / 2);
@@ -854,6 +889,8 @@ async function fetchTokenUriFromContract(tokenId){
     }
     if(Object.keys(traits).length){
       console.log(`[Contract] tokenURI #${id} → Type=${traits.Type||traits.type||'?'} (${Object.keys(traits).length} traits)`);
+      // Attach image to traits object so callers can use it directly
+      if(meta.image) traits.__image = meta.image;
       return traits;
     }
     return null;
@@ -898,6 +935,14 @@ async function storeBurnStarted(event){
     const preBurnMeta = await fetchTokenMetaFromDb(event.survivorTokenId).catch(()=>null);
     const preBurnTraits = preBurnMeta?.traits ? { ...preBurnMeta.traits } : null;
     if(preBurnTraits) console.log(`[BurnMeta] Pre-burn snapshot for #${event.survivorTokenId}: Type=${preBurnTraits.Type||preBurnTraits.type||'?'}`);
+
+    // Snapshot every selected token while it still exists on-chain. This gives /burn
+    // historical thumbnails for tokens that are later consumed and no longer have a useful tokenURI.
+    for(const tid of (event.tokenIds || [])){
+      snapshotTokenFromContract(tid, 'burn-start-input').catch(e =>
+        console.warn(`[BurnMeta] input snapshot failed for #${tid}:`, e.message)
+      );
+    }
 
     // Cache in memory for cross-referencing with BurnFinalized
     pendingBurns.set(String(event.survivorTokenId), {
@@ -1267,138 +1312,67 @@ async function processBurnLogs(logs, shouldAlert){
 
 // ── Pending burn alert processor ─────────────────────────────────────────────
 // Runs every 30s. For each queued burn event, fetches fresh OS metadata and
-// compares to the pre-burn snapshot. Posts alert only when traits have changed.
-// Switches to 2-min retry after 10 min. Keeps retrying until metadata changes.
+// Reads traits directly from contract tokenURI — no OS polling or snapshot wait needed.
+// Contract always has current on-chain state the moment BurnFinalized is confirmed.
+// Falls back to OS metadata if contract call fails. Retries up to 2 hours on post failure.
 async function processPendingBurnAlerts(){
   if(!pendingBurnAlerts.size) return;
   const now = Date.now();
-  const THIRTY_SECS  = 30_000;
-  const TWO_MINS     = 2 * 60_000;
-  const TEN_MINS     = 10 * 60_000;
-  const TWO_HOURS    = 2 * 60 * 60_000;
+  const TWO_HOURS = 2 * 60 * 60_000;
 
   for(const [key, entry] of pendingBurnAlerts){
-    const { finalEvent, startEvent, preBurnTraits, addedAt, attempts, slowMode } = entry;
+    const { finalEvent, startEvent, addedAt, attempts } = entry;
     const survivorId = finalEvent.survivorTokenId;
     const ageMs      = now - addedAt;
-
-    // Throttle: in slow mode check every 2 min, normal every 30s
-    const minInterval = slowMode ? TWO_MINS : THIRTY_SECS;
-    if(entry.lastChecked && (now - entry.lastChecked) < minInterval) continue;
-    entry.lastChecked = now;
     entry.attempts++;
 
-    // Switch to slow mode after 10 minutes
-    if(ageMs > TEN_MINS && !slowMode){
-      entry.slowMode = true;
-      console.log(`[BurnMeta] #${survivorId} switching to slow retry (2 min) after 10 min`);
-    }
-
-    // Hard cap: 2 hours — post minimal fallback alert and remove
+    // Hard cap: 2 hours — post minimal fallback and remove
     if(ageMs > TWO_HOURS){
-      console.warn(`[BurnMeta] #${survivorId} metadata still stale after 2 hours — posting minimal fallback alert`);
-      try{
-        await postBurnFallbackAlert(finalEvent, startEvent);
-      }catch(e){ console.error(`[BurnMeta] fallback alert failed for #${survivorId}:`, e.message); }
+      console.warn(`[BurnMeta] #${survivorId} failed to post after 2 hours — posting minimal fallback`);
+      try{ await postBurnFallbackAlert(finalEvent, startEvent); }catch(e){ console.error(`[BurnMeta] fallback failed for #${survivorId}:`, e.message); }
       pendingBurnAlerts.delete(key);
       continue;
     }
 
-    // Fetch fresh OS metadata — bypasses all caches
+    // Fetch traits from contract — always current post-burn state
     let freshTraits = null;
     try{
-      freshTraits = await fetchFreshOsMeta(survivorId);
+      freshTraits = await fetchTokenUriFromContract(survivorId);
+      if(freshTraits) console.log(`[BurnMeta] #${survivorId} contract traits OK → Type=${freshTraits.Type||freshTraits.type||'?'}`);
     }catch(e){
-      console.warn(`[BurnMeta] fetchFreshOsMeta error for #${survivorId}:`, e.message);
-      continue; // retry next tick
+      console.warn(`[BurnMeta] contract tokenURI failed for #${survivorId}:`, e.message);
+    }
+
+    // Fallback to OS if contract call failed
+    if(!freshTraits){
+      console.log(`[BurnMeta] #${survivorId} contract failed — trying OS fallback`);
+      try{ freshTraits = await fetchFreshOsMeta(survivorId); }catch(e){ console.warn(`[BurnMeta] OS fallback also failed for #${survivorId}:`, e.message); }
     }
 
     if(!freshTraits){
-      console.log(`[BurnMeta] #${survivorId} OS returned no traits yet (attempt ${entry.attempts})`);
+      console.log(`[BurnMeta] #${survivorId} no traits yet (attempt ${entry.attempts}) — retrying next tick`);
       continue;
     }
 
-    const typeStr = freshTraits.Type || freshTraits.type || '?';
-    const oldType = preBurnTraits ? (preBurnTraits.Type || preBurnTraits.type || '?') : 'unknown';
-
-    if(preBurnTraits){
-      // Have a snapshot — compare full trait object to detect when OS has updated
-      const changed = traitsDiffer(preBurnTraits, freshTraits);
-      if(!changed){
-        console.log(`[BurnMeta] #${survivorId} still stale (attempt ${entry.attempts}) Type=${typeStr} (was ${oldType})`);
-        entry.candidateTraits = null; // reset candidate if OS reverted
-        continue;
-      }
-      // Traits differ from pre-burn — but OS may still be mid-refresh (partial update).
-      // Require stability: store as candidate and only post if identical on next tick.
-      if(!entry.candidateTraits){
-        entry.candidateTraits = freshTraits;
-        entry.candidateAt = now;
-        console.log(`[BurnMeta] #${survivorId} traits changed from pre-burn (${oldType} → ${typeStr}) — waiting one more tick to confirm stability`);
-        continue;
-      }
-      // We have a candidate from last tick — check if traits are stable
-      if(traitsDiffer(entry.candidateTraits, freshTraits)){
-        entry.candidateTraits = freshTraits;
-        entry.candidateAt = now;
-        console.log(`[BurnMeta] #${survivorId} traits still changing (Type=${typeStr}) — waiting for stability`);
-        continue;
-      }
-      // Stable across two consecutive polls — safe to post
-      console.log(`[BurnMeta] #${survivorId} metadata stable! ${oldType} → ${typeStr} (attempt ${entry.attempts}, ${Math.round(ageMs/1000)}s)`);
-    } else {
-      // No snapshot — enforce a 90s minimum wait after addedAt before trusting any traits.
-      // This gives the OS refresh request time to propagate before we accept whatever OS returns.
-      const MIN_WAIT_MS = 90_000;
-      if(ageMs < MIN_WAIT_MS){
-        console.log(`[BurnMeta] #${survivorId} no snapshot — waiting ${Math.round((MIN_WAIT_MS - ageMs)/1000)}s more before accepting traits`);
-        continue;
-      }
-      // No snapshot, apply same stability check
-      if(!entry.candidateTraits){
-        entry.candidateTraits = freshTraits;
-        entry.candidateAt = now;
-        console.log(`[BurnMeta] #${survivorId} no snapshot — traits received, waiting one tick to confirm stability, Type=${typeStr}`);
-        continue;
-      }
-      if(traitsDiffer(entry.candidateTraits, freshTraits)){
-        entry.candidateTraits = freshTraits;
-        entry.candidateAt = now;
-        console.log(`[BurnMeta] #${survivorId} no snapshot — traits still changing (Type=${typeStr})`);
-        continue;
-      }
-      console.log(`[BurnMeta] #${survivorId} no snapshot — traits stable after ${Math.round(ageMs/1000)}s wait, Type=${typeStr}`);
-    }
-
-    // Set the fresh traits into cache so buildBurnEmbed picks them up
+    // Set traits into cache so buildBurnEmbed picks them up
     const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
     tokenMetaCache.set(parseInt(survivorId), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
     tokenMetaCache.set(`os:${parseInt(survivorId)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
-    // Bust image cache so embed fetches new image
     imageCache?.delete?.(`${OCAS_CONTRACT}:${survivorId}`);
 
     try{
       await postBurnAlertToConfiguredChannels(finalEvent, startEvent, freshTraits);
-      // Write fresh post-burn traits back to token_traits DB so /burnlatest works after restarts.
-      // token_traits is row-per-trait: delete stale rows then insert fresh ones.
+      // Write post-burn traits to DB so /burnlatest and /burn work after restarts
       try{
-        const tid = parseInt(survivorId);
-        await pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [tid]);
-        for(const [traitName, traitValue] of Object.entries(freshTraits)){
-          await pgPool.query(
-            `INSERT INTO token_traits (token_id, trait_name, trait_value)
-             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-            [tid, String(traitName), String(traitValue)]
-          );
-        }
+        await upsertTokenTraitRows(survivorId, freshTraits, 'burn-finalized-survivor');
         console.log(`[BurnMeta] Wrote ${Object.keys(freshTraits).length} post-burn trait rows to DB for #${survivorId}`);
       }catch(dbErr){
         console.warn(`[BurnMeta] Failed to write post-burn traits for #${survivorId}:`, dbErr.message);
       }
       pendingBurnAlerts.delete(key);
     }catch(e){
-      console.error(`[BurnMeta] postBurnAlertToConfiguredChannels failed for #${survivorId}:`, e.message);
-      // Keep in queue and retry next tick
+      console.error(`[BurnMeta] post failed for #${survivorId}:`, e.message);
+      // Keep in queue — retry next tick
     }
   }
 }
@@ -1586,11 +1560,10 @@ function timeSince(ts){
   const s=Math.floor(Date.now()/1000-ts);
   if(s<60)   return s+'s ago';
   if(s<3600) return Math.floor(s/60)+'m ago';
-  // Anything older than 1 hour: show readable date + time
-  const d=new Date(ts*1000);
-  const date=d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
-  const time=d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true});
-  return date+' at '+time;
+  if(s<86400) return Math.floor(s/3600)+'h ago';
+  if(s<2592000) return Math.floor(s/86400)+'d ago';
+  if(s<31536000) return Math.floor(s/2592000)+'mo ago';
+  return Math.floor(s/31536000)+'y ago';
 }
 function isSvg(url){ if(!url) return false; const s=String(url).trim(); return s.startsWith('<svg')||s.startsWith('data:image/svg')||s.toLowerCase().endsWith('.svg')||s.includes('image/svg'); }
 function isDiscordOk(url){ if(!url||isSvg(url)) return false; const s=url.toLowerCase(); return (s.startsWith('http://')||s.startsWith('https://'))&&!s.startsWith('data:'); }
@@ -1747,9 +1720,120 @@ async function fetchTokenMetaFromOpenSea(tokenId){
   }
 }
 
+
+async function fetchTokenMetaFromLocalDb(tokenId){
+  const id = parseInt(tokenId);
+  if(!id) return null;
+  try{
+    const r = await pgPool.query(
+      `SELECT trait_name, trait_value FROM token_traits WHERE token_id=$1`,
+      [id]
+    );
+    if(!r.rows.length) return null;
+    const traits = {};
+    for(const row of r.rows){
+      if(row.trait_name && row.trait_value != null) traits[String(row.trait_name)] = String(row.trait_value);
+    }
+    return Object.keys(traits).length ? { os_rank:null, traits, trait_count:Object.keys(traits).filter(k=>k !== '__image').length } : null;
+  }catch(e){
+    console.warn('[Token local meta]', id, e.message);
+    return null;
+  }
+}
+
+async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
+  const id = parseInt(tokenId);
+  if(!id || !traits || typeof traits !== 'object' || !Object.keys(traits).length) return false;
+  try{
+    await pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [id]);
+    for(const [traitName, traitValue] of Object.entries(traits)){
+      // __image is not a real trait. Keep it only in token_image_snapshots/cache
+      // so trait searches and trait displays do not get polluted.
+      if(traitName === '__image' || traitValue == null) continue;
+      await pgPool.query(
+        `INSERT INTO token_traits (token_id, trait_name, trait_value)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+        [id, String(traitName), String(traitValue)]
+      );
+    }
+    if(traits.__image){
+      await pgPool.query(
+        `INSERT INTO token_image_snapshots (token_id, image_data, traits_json, source, updated_at)
+         VALUES ($1,$2,$3,$4,NOW())
+         ON CONFLICT (token_id) DO UPDATE SET
+           image_data=EXCLUDED.image_data,
+           traits_json=EXCLUDED.traits_json,
+           source=EXCLUDED.source,
+           updated_at=NOW()`,
+        [id, String(traits.__image), JSON.stringify(traits), source]
+      ).catch(()=>{});
+    }
+    return true;
+  }catch(e){
+    console.warn(`[Token snapshot] failed for #${id}:`, e.message);
+    return false;
+  }
+}
+
+async function snapshotTokenFromContract(tokenId, source='burn-start'){
+  const id = parseInt(tokenId);
+  if(!id) return null;
+  const traits = await fetchTokenUriFromContract(id).catch(()=>null);
+  if(traits && Object.keys(traits).length){
+    await upsertTokenTraitRows(id, traits, source);
+    return traits;
+  }
+  return null;
+}
+
+async function fetchSnapshotImageForToken(tokenId){
+  const id = parseInt(tokenId);
+  if(!id) return null;
+  try{
+    const snap = await pgPool.query('SELECT image_data FROM token_image_snapshots WHERE token_id=$1', [id]);
+    let imgSrc = snap.rows[0]?.image_data || null;
+    if(!imgSrc){
+      const meta = await fetchTokenMetaFromLocalDb(id);
+      imgSrc = meta?.traits?.__image || null;
+    }
+    if(!imgSrc) return null;
+    if(imgSrc.startsWith('<svg') || imgSrc.startsWith('data:image/svg') || imgSrc.toLowerCase().includes('image/svg')){
+      const buf = await extractPngFromSvg(imgSrc);
+      if(buf) return { type:'buffer', buffer:buf, filename:`token-${id}.png` };
+    }
+    if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)) return { type:'url', url:imgSrc };
+  }catch(e){
+    console.warn(`[Token snapshot image] #${id}:`, e.message);
+  }
+  return null;
+}
+
+async function fetchBurnDisplayTraits(tokenId){
+  const id = parseInt(tokenId);
+  if(!id) return null;
+  let traits = await fetchTokenUriFromContract(id).catch(()=>null);
+  if(!traits) traits = await fetchFreshOsMeta(id).catch(()=>null);
+  if(!traits){
+    const local = await fetchTokenMetaFromLocalDb(id).catch(()=>null);
+    traits = local?.traits || null;
+  }
+  if(traits && Object.keys(traits).length){
+    const freshMeta = { os_rank:null, traits, trait_count:Object.keys(traits).filter(k=>k !== '__image').length };
+    tokenMetaCache.set(id, { meta:freshMeta, expires:Date.now() + 5 * 60_000 });
+    tokenMetaCache.set(`os:${id}`, { meta:freshMeta, expires:Date.now() + 5 * 60_000 });
+  }
+  return traits;
+}
+
 async function fetchCreatedTokenMeta(tokenId){
+  const contractTraits = await fetchTokenUriFromContract(tokenId).catch(()=>null);
+  if(contractTraits && Object.keys(contractTraits).length){
+    return { os_rank:null, traits:contractTraits, trait_count:Object.keys(contractTraits).filter(k=>k !== '__image').length };
+  }
   const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
   if(dbMeta?.traits && Object.keys(dbMeta.traits).length) return dbMeta;
+  const localMeta = await fetchTokenMetaFromLocalDb(tokenId).catch(()=>null);
+  if(localMeta?.traits && Object.keys(localMeta.traits).length) return localMeta;
   const osMeta = await fetchTokenMetaFromOpenSea(tokenId).catch(()=>null);
   return osMeta?.traits ? { ...(dbMeta || {}), ...osMeta } : dbMeta;
 }
@@ -2389,6 +2473,36 @@ client.on('interactionCreate', async (interaction)=>{
     }
     return;
   }
+
+  if(interaction.isButton() && interaction.customId.startsWith('burn_all_tokens:')){
+    const survivorId = parseInt(interaction.customId.split(':')[1], 10);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const r = await pgPool.query(`
+        SELECT be.burned_at, be.points_used,
+               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+        FROM burn_events be
+        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        WHERE be.survivor_token_id = $1
+        GROUP BY be.id
+        ORDER BY be.burned_at ASC NULLS LAST
+      `, [survivorId]);
+      if(!r.rows.length){ await interaction.editReply({ content:'No burn history found.' }); return; }
+      const lines = r.rows.map((b, i) => {
+        const burnNum = i + 1;
+        const ids = (b.burned_ids||[]).filter(Boolean);
+        const idsStr = ids.length ? ids.map(id=>`#${id}`).join(', ') : '?';
+        return `**Burn ${burnNum}:** ${idsStr} → #${survivorId}`;
+      });
+      const msgContent = lines.join('\n').slice(0, 1900);
+      await interaction.editReply({ content: msgContent });
+    }catch(e){
+      console.error('[Burn All Tokens]', e.message);
+      try{ await interaction.editReply({ content:'Error loading token history.' }); }catch(_){}
+    }
+    return;
+  }
+
 
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
@@ -3529,52 +3643,15 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         LIMIT $1
       `, [count]);
       if(!r.rows.length){ await interaction.editReply('No burn events recorded yet.'); return; }
-      const THIRTY_MIN = 30 * 60 * 1000;
       const embeds = await Promise.all(r.rows.map(async row => {
         const finalEvent = { survivorTokenId: row.survivor_token_id, resultBodyType: row.result_body_type,
           resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash,
           blockNumber: row.block_number, logIndex: row.log_index, burnEventId: row.id };
         const startEvent = { owner: row.burner_wallet, tokenIds: (row.burned_ids||[]).filter(Boolean) };
-        // For burns < 30 min old: bypass DB cache and fetch fresh OS metadata
-        const burnAge = row.burned_at ? Date.now() - new Date(row.burned_at).getTime() : Infinity;
-        if(row.already_posted){
-          // Post-burn traits were written to token_traits by processPendingBurnAlerts — read from DB.
-          // Fall back to OS only if rows are missing (pre-fix historical burns or failed write).
-          const dbMeta = await fetchTokenMetaFromDb(row.survivor_token_id).catch(()=>null);
-          if(dbMeta?.traits && Object.keys(dbMeta.traits).length){
-            tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
-            tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: dbMeta, expires: Date.now() + 5 * 60_000 });
-          } else {
-            // DB missing post-burn traits — try contract first (always current), then OS
-            let freshTraits = await fetchTokenUriFromContract(row.survivor_token_id).catch(()=>null);
-            if(!freshTraits) freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
-            if(freshTraits){
-              const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
-              tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
-              tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
-              // Backfill DB so future calls skip this OS hit
-              const tid = parseInt(row.survivor_token_id);
-              pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [tid]).then(() =>
-                Promise.all(Object.entries(freshTraits).map(([n,v]) =>
-                  pgPool.query(
-                    `INSERT INTO token_traits (token_id, trait_name, trait_value) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-                    [tid, String(n), String(v)]
-                  )
-                ))
-              ).catch(e => console.warn(`[burnlatest] DB backfill failed for #${tid}:`, e.message));
-            }
-          }
-        } else if(burnAge < THIRTY_MIN){
-          // Recent burn — fetch from contract for guaranteed accuracy, fall back to OS
-          let freshTraits = await fetchTokenUriFromContract(row.survivor_token_id).catch(()=>null);
-          if(!freshTraits) freshTraits = await fetchFreshOsMeta(row.survivor_token_id).catch(()=>null);
-          if(freshTraits){
-            const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
-            tokenMetaCache.set(parseInt(row.survivor_token_id), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
-            tokenMetaCache.set(`os:${parseInt(row.survivor_token_id)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
-          }
-        }
-        return buildBurnEmbed(finalEvent, startEvent);
+        // Burn commands should always prefer the contract tokenURI for survivor/created tokens.
+        // DB is only a final fallback because it may contain pre-burn traits.
+        const freshTraits = await fetchBurnDisplayTraits(row.survivor_token_id).catch(()=>null);
+        return buildBurnEmbed(finalEvent, startEvent, freshTraits || undefined);
       }));
 
       if(count === 1){
@@ -3656,10 +3733,56 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const contract = OCAS_CONTRACT;
-      // Check if token was burned (appears in burn_event_inputs)
-      const burnedRes = await pgPool.query(`
-        SELECT be.survivor_token_id, be.burner_wallet, be.burned_at, be.result_body_type, be.result_is_angel,
-               be.points_used, array_agg(bei2.burned_token_id ORDER BY bei2.burned_token_id) AS burned_ids
+      const osUrl  = `https://opensea.io/assets/ethereum/${contract}/${tokenInput}`;
+      const tvUrl  = `https://traitview.com/?token=${tokenInput}`;
+      const ethUrl = `https://etherscan.io/token/${contract}?a=${tokenInput}`;
+
+      // Helper: fetch thumbnail for any token ID
+      // Priority: 1) contract tokenURI image field (fastest, always current)
+      //           2) resolveImage via OpenSea (fallback)
+      async function fetchThumbForToken(tid, opts = {}){
+        try{
+          // Burned/consumed tokens may no longer have valid contract metadata.
+          // For those, prefer the historical snapshot captured at BurnStarted.
+          if(opts.historicalFromDb){
+            const snap = await fetchSnapshotImageForToken(tid);
+            if(snap) return snap;
+            return null;
+          }
+          // Bust image cache so stale pre-burn images never get served for survivor/current tokens
+          imageCache?.delete?.(`${contract}:${tid}`);
+          const contractTraits = await fetchTokenUriFromContract(tid).catch(()=>null);
+          if(contractTraits?.__image){
+            const imgSrc = contractTraits.__image;
+            if(imgSrc.startsWith('<svg') || imgSrc.startsWith('data:image/svg') || imgSrc.toLowerCase().includes('image/svg')){
+              try{
+                const buf = await extractPngFromSvg(imgSrc);
+                if(buf) return { type:'buffer', buffer:buf, filename:`token-${tid}.png` };
+              }catch(_){}
+            }
+            if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)) return { type:'url', url:imgSrc };
+          }
+          return await resolveImage({ identifier: String(tid) }, contract, 'ethereum');
+        }catch(e){ return null; }
+      }
+
+      async function replyWithEmbed(embed, tid, opts = {}){
+        const ir = await fetchThumbForToken(tid, opts);
+        if(ir?.type==='buffer'){
+          const att = new AttachmentBuilder(ir.buffer, { name:`token-${tid}.png` });
+          embed.setThumbnail(`attachment://token-${tid}.png`);
+          await interaction.editReply({ embeds:[embed], files:[att] });
+        } else {
+          if(ir?.type==='url') embed.setThumbnail(ir.url);
+          await interaction.editReply({ embeds:[embed] });
+        }
+      }
+
+      // Check if this token was consumed in a burn
+      const consumedRes = await pgPool.query(`
+        SELECT be.survivor_token_id, be.burner_wallet, be.burned_at,
+               be.points_used, be.tx_hash,
+               array_agg(bei2.burned_token_id ORDER BY bei2.burned_token_id) AS burned_ids
         FROM burn_event_inputs bei
         JOIN burn_events be ON be.id = bei.burn_event_id
         LEFT JOIN burn_event_inputs bei2 ON bei2.burn_event_id = be.id
@@ -3667,55 +3790,116 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         GROUP BY be.id
         LIMIT 1
       `, [tokenInput]);
-      // Check if token was created via burn (appears as survivor)
-      const createdRes = await pgPool.query(`
-        SELECT be.tx_hash, be.burner_wallet, be.burned_at, be.result_body_type, be.result_is_angel,
-               be.points_used, array_agg(bei.burned_token_id) AS burned_ids
+
+      // Check if this token was ever a survivor
+      const survivorCheckRes = await pgPool.query(
+        `SELECT COUNT(*)::int AS cnt FROM burn_events WHERE survivor_token_id=$1`, [tokenInput]
+      );
+      const isSurvivor = (survivorCheckRes.rows[0]?.cnt || 0) > 0;
+
+      if(!consumedRes.rows.length && !isSurvivor){
+        const embed = new EmbedBuilder()
+          .setColor(BURN_COLORS.FIRE)
+          .setTitle(`#${tokenInput} — no burn activity`)
+          .setDescription(`This token has not been burned and was not created via the burn machine.`)
+          .addFields({ name:'Links', value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl})`, inline:false })
+          .setURL(osUrl)
+          .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
+        await replyWithEmbed(embed, tokenInput);
+        return;
+      }
+
+      if(consumedRes.rows.length && !isSurvivor){
+        // Token was consumed — show the single burn it was part of + pointer to survivor chain
+        const b = consumedRes.rows[0];
+        const survivorId  = b.survivor_token_id;
+        const survivorUrl = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
+        const ago         = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
+        const burnedIds   = (b.burned_ids||[]).filter(Boolean);
+        const tokensStr   = burnedIds.length ? burnedIds.map(id=>`#${id}`).join(', ') : '?';
+        const embed = new EmbedBuilder()
+          .setColor(BURN_COLORS.FIRE)
+          .setTitle(`#${tokenInput} — consumed in burn`)
+          .setDescription(`This token was burned **${ago}** and helped create [#${survivorId}](${survivorUrl}).`)
+          .addFields(
+            { name:'Burner',           value:`[${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`, inline:true },
+            { name:'Created',          value:`[#${survivorId}](${survivorUrl})`, inline:true },
+            { name:'Tokens burned',    value:String(burnedIds.length || '?'), inline:true },
+            { name:'Points used',      value:String(b.points_used || 0), inline:true },
+            { name:'All tokens',       value:tokensStr.length > 1024 ? tokensStr.slice(0,1021)+'...' : tokensStr, inline:false },
+            { name:'See full history', value:`\`/burn token:${survivorId}\``, inline:false },
+            { name:'Links',            value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl}) | [Etherscan](https://etherscan.io/tx/${b.tx_hash||''})`, inline:false },
+          )
+          .setURL(osUrl)
+          .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
+        await replyWithEmbed(embed, tokenInput, { historicalFromDb:true });
+        return;
+      }
+
+      // Token is a survivor — fetch full burn chain
+      const chainRes = await pgPool.query(`
+        SELECT be.tx_hash, be.burner_wallet, be.burned_at, be.points_used,
+               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
         WHERE be.survivor_token_id = $1
-        GROUP BY be.id LIMIT 1
+        GROUP BY be.id
+        ORDER BY be.burned_at ASC NULLS LAST
       `, [tokenInput]);
 
-      const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenInput}`;
-      const tvUrl = `https://traitview.com/?token=${tokenInput}`;
+      const burns            = chainRes.rows;
+      const totalPts         = burns.reduce((s,r)=>s+(r.points_used||0), 0);
+      const totalTokensBurned = burns.reduce((s,r)=>s+((r.burned_ids||[]).filter(Boolean).length), 0);
+
       const embed = new EmbedBuilder()
         .setColor(BURN_COLORS.FIRE)
+        .setTitle(`🔥 #${tokenInput} burn history`)
+        .setDescription(
+          `Burned **${burns.length} time${burns.length===1?'':'s'}** · **${totalTokensBurned} tokens** consumed · **${totalPts} pts** total`
+        )
         .setURL(osUrl)
         .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
 
-      if(burnedRes.rows.length){
-        const b = burnedRes.rows[0];
-        const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-        const survivorUrl = `https://opensea.io/assets/ethereum/${contract}/${b.survivor_token_id}`;
-        const burnedIds = (b.burned_ids||[]).filter(Boolean);
-        embed.setTitle(`#${tokenInput} Burn Status`)
-          .setDescription(`This token was burned ${ago}.
-It helped create [#${b.survivor_token_id}](${survivorUrl}).`)
-          .addFields(
-            { name:'Burner', value:`[${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`, inline:true },
-            { name:'Created', value:`[#${b.survivor_token_id}](${survivorUrl})`, inline:true },
-            { name:'Burn Tier', value:burnTypeLabel(b.result_body_type, b.result_is_angel), inline:true },
-            { name:'Tokens Burned', value:String(burnedIds.length || '?'), inline:true },
-            { name:'Points Used', value:String(b.points_used || 0), inline:true },
-            { name:'Links', value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl})`, inline:false },
-          );
-      } else if(createdRes.rows.length){
-        const cr = createdRes.rows[0];
-        const burnedIds = (cr.burned_ids||[]).filter(Boolean);
-        const burnEmbed = await buildBurnEmbed(
-          { survivorTokenId: tokenInput, resultBodyType: cr.result_body_type, resultIsAngel: cr.result_is_angel, points: cr.points_used, txHash: cr.tx_hash },
-          { owner: cr.burner_wallet, tokenIds: burnedIds }
-        );
-        await interaction.editReply(buildEmbedPayload(burnEmbed));
-        return;
-      } else {
-        embed.setTitle(`#${tokenInput} - No Burn Activity`)
-          .setDescription(`This token has no recorded burn events.
-It has not been burned and was not created via the burn machine.`)
-          .addFields({ name:'Links', value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl})`, inline:false });
+      // Most recent first, up to 10
+      const displayBurns = [...burns].slice(0, 10);
+      displayBurns.forEach((b, i) => {
+        const burnNum = i + 1;
+        const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
+        const ids      = (b.burned_ids||[]).filter(Boolean);
+        const fieldVal = [
+          `**Burner:** [${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`,
+          `**Tokens:** ${ids.length || '?'}`,
+          `**Points:** ${b.points_used||0}`,
+        ].join('\n');
+        embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:true });
+      });
+
+      if(burns.length > 10){
+        embed.addFields({ name:`+${burns.length-10} earlier burns`, value:'Only the 10 most recent burns are shown.', inline:false });
       }
-      await interaction.editReply({ embeds:[embed] });
+
+      embed.addFields({
+        name:'Links',
+        value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl}) | [Etherscan](${ethUrl})`,
+        inline:false
+      });
+
+      const showTokensBtn = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`burn_all_tokens:${tokenInput}`)
+          .setLabel('Show all burned tokens')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      const ir = await fetchThumbForToken(tokenInput);
+      if(ir?.type==='buffer'){
+        const att = new AttachmentBuilder(ir.buffer, { name:`token-${tokenInput}.png` });
+        embed.setThumbnail(`attachment://token-${tokenInput}.png`);
+        await interaction.editReply({ embeds:[embed], files:[att], components:[showTokensBtn] });
+      } else {
+        if(ir?.type==='url') embed.setThumbnail(ir.url);
+        await interaction.editReply({ embeds:[embed], components:[showTokensBtn] });
+      }
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
@@ -3757,7 +3941,7 @@ It has not been burned and was not created via the burn machine.`)
           { name:'Tokens Burned',   value:String(totalBurned),  inline:true },
           { name:'Tokens Created',  value:String(totalCreated), inline:true },
           { name:'Total Points',    value:String(totalPoints),  inline:true },
-          { name:'Best Created',    value:`[#${best.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${best.survivor_token_id}) - burn tier ${burnTypeLabel(best.result_body_type, best.result_is_angel)}`, inline:false },
+          { name:'Best Created',    value:`[#${best.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${best.survivor_token_id})`, inline:false },
         );
       const recentLines = r.rows.slice(0,5).map(row=>{
         const ids = (row.burned_ids||[]).filter(Boolean);
