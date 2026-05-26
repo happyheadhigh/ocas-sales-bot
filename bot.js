@@ -73,7 +73,7 @@ const BURN_CONTRACT = '0x1095c73C337CC5e03f9E1D426c524CC3e32a50f6';
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BURN_START_BLOCK, 10) : null;
 const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
-const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10));
+const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10)); // Alchemy free tier max 10 blocks per eth_getLogs
 const BURN_ALERT_CHANNEL_ID = process.env.BURN_ALERT_CHANNEL_ID || '';
 const BURN_METADATA_REFRESH_ENABLED = true; // always on — needed for correct post-burn traits in alert
 const BURN_COLORS = {
@@ -734,6 +734,10 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
     : 'unknown';
 
   const burnedCount = burnedIds.length || '?';
+  // Type breakdown: "3 · 3x Human" or "2 · 1x Zombie, 1x Ape"
+  const burnedCountStr = burnedIds.length
+    ? await burnTypeBreakdown(burnedIds).catch(()=>String(burnedCount))
+    : String(burnedCount);
 
   // Prefer directly-passed freshTraits over cache to avoid stale-cache races.
   let dbMeta = null;
@@ -774,9 +778,9 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
     .setURL(osUrl)
     // No description — all info is in fields
     .addFields(
-      { name:'Burner',         value:burnerLink,             inline:true },
-      { name:'Tokens Burned',  value:String(burnedCount),    inline:true },
-      { name:'Points Used',    value:`${points || 0} pts`,   inline:true },
+      { name:'Burner',         value:burnerLink,                inline:true },
+      { name:'Tokens Burned',  value:burnedCountStr,            inline:true },
+      { name:'Points Used',    value:`${points || 0} pts`,      inline:true },
     );
 
   // Single Traits field in 2 columns — same layout as sales/listings
@@ -1806,6 +1810,36 @@ async function fetchSnapshotImageForToken(tokenId){
     console.warn(`[Token snapshot image] #${id}:`, e.message);
   }
   return null;
+}
+
+// Returns a compact type breakdown string for a list of burned token IDs.
+// Looks up each token's Type trait from token_traits DB.
+// Example output: "3 · 3x Human" or "2 · 1x Zombie, 1x Ape"
+async function burnTypeBreakdown(tokenIds){
+  if(!tokenIds || !tokenIds.length) return String(tokenIds?.length || '?');
+  try{
+    const ids = tokenIds.filter(Boolean).map(Number);
+    if(!ids.length) return String(tokenIds.length);
+    const r = await pgPool.query(
+      `SELECT token_id, trait_value FROM token_traits
+       WHERE token_id = ANY($1) AND LOWER(trait_name) = 'type'`,
+      [ids]
+    );
+    const typeMap = {};
+    for(const row of r.rows) typeMap[row.token_id] = row.trait_value;
+    const counts = {};
+    for(const id of ids){
+      const t = typeMap[id] || 'Unknown';
+      counts[t] = (counts[t] || 0) + 1;
+    }
+    const breakdown = Object.entries(counts)
+      .sort((a,b) => b[1] - a[1])
+      .map(([type, n]) => `${n}x ${type}`)
+      .join(', ');
+    return `${ids.length} · ${breakdown}`;
+  }catch(e){
+    return String(tokenIds.length);
+  }
 }
 
 async function fetchBurnDisplayTraits(tokenId){
@@ -3862,17 +3896,18 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
       // Most recent first, up to 10
       const displayBurns = [...burns].slice(0, 10);
-      displayBurns.forEach((b, i) => {
+      await Promise.all(displayBurns.map(async (b, i) => {
         const burnNum = i + 1;
         const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const ids      = (b.burned_ids||[]).filter(Boolean);
+        const tokensStr = await burnTypeBreakdown(ids).catch(()=>String(ids.length || '?'));
         const fieldVal = [
           `**Burner:** [${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`,
-          `**Tokens:** ${ids.length || '?'}`,
+          `**Tokens:** ${tokensStr}`,
           `**Points:** ${b.points_used||0}`,
         ].join('\n');
         embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:true });
-      });
+      }));
 
       if(burns.length > 10){
         embed.addFields({ name:`+${burns.length-10} earlier burns`, value:'Only the 10 most recent burns are shown.', inline:false });
