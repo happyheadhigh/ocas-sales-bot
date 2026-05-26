@@ -86,7 +86,14 @@ const BURN_COLORS = {
 };
 // E_1_Type enum — confirmed from on-chain events and contract source
 // 0=Human, 1=Zombie, 2=Skeleton, 3=Radioactive (angel variants overlap)
-const E1_TYPE_NAMES = { 0:'Human', 1:'Zombie', 2:'Skeleton', 3:'Radioactive', 4:'Angel' };
+// E_1_Type enum integers from TraitContextGenerated.sol (confirmed from contract source)
+// Human_1=0, Human_2=1, Human_3=2, Human_4=3, Human_5=4, Human_6=5
+// Zombie=6, Ape=7, Skeleton=8, Alien=9, Radioactive=10, Demonic=11
+// Angel = isAngel flag, not a separate integer
+const E1_TYPE_NAMES = {
+  0:'Human', 1:'Human', 2:'Human', 3:'Human', 4:'Human', 5:'Human',
+  6:'Zombie', 7:'Ape', 8:'Skeleton', 9:'Alien', 10:'Radioactive', 11:'Demonic',
+};
 function burnTypeLabel(bodyType, isAngel){
   const base = E1_TYPE_NAMES[bodyType] || ('Type '+bodyType);
   return isAngel ? base+' Angel' : base;
@@ -94,19 +101,22 @@ function burnTypeLabel(bodyType, isAngel){
 function burnTypeColor(bodyType, isAngel){
   if(isAngel) return BURN_COLORS.ANGEL;
   switch(Number(bodyType)){
-    case 3: return BURN_COLORS.RADIOACTIVE;
-    case 2: return BURN_COLORS.SKELETON;
-    case 1: return BURN_COLORS.ZOMBIE;
+    case 10: return BURN_COLORS.RADIOACTIVE;
+    case 8:  return BURN_COLORS.SKELETON;
+    case 6:  return BURN_COLORS.ZOMBIE;
     default: return BURN_COLORS.HUMAN;
   }
 }
 function burnTypeEmoji(bodyType, isAngel){
-  if(isAngel) return '😇';
+  if(isAngel) return 'Angel';
   switch(Number(bodyType)){
-    case 3: return '☢️';
-    case 2: return '💀';
-    case 1: return '🧟';
-    default: return '🔥';
+    case 10: return 'Radioactive';
+    case 11: return 'Demonic';
+    case 9:  return 'Alien';
+    case 8:  return 'Skeleton';
+    case 7:  return 'Ape';
+    case 6:  return 'Zombie';
+    default: return 'Human';
   }
 }
 function normAddr(addr){
@@ -3737,10 +3747,10 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             SELECT id FROM burn_events
           ),
           finalized_inputs AS (
-            SELECT DISTINCT bei.burn_event_id, bei.burned_token_id
-            FROM burn_event_inputs bei
-            JOIN finalized f ON f.id = bei.burn_event_id
-          )
+  SELECT DISTINCT bei.burned_token_id
+  FROM burn_event_inputs bei
+  JOIN finalized f ON f.id = bei.burn_event_id
+)
           SELECT
             (SELECT COUNT(*)::int FROM finalized) AS total_burns,
             (SELECT COUNT(*)::int FROM finalized_inputs) AS total_burned,
