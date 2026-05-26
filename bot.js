@@ -3767,21 +3767,22 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const created = stats.total_created || 0;
       const estimatedSupply = 10000 - burned + created;
 
+      const tokensUsed = burned + created;
       const embed = new EmbedBuilder()
         .setTitle('OCAS Burn Machine Stats')
         .setColor(BURN_COLORS.FIRE)
         .addFields(
-          { name:'Total Burns',       value:String(stats.total_burns||0),   inline:true },
-          { name:'Tokens Burned',     value:String(burned),                  inline:true },
-          { name:'Tokens Created',    value:String(created),                 inline:true },
-          { name:'Supply Reduced By', value:String(burned - created),        inline:true },
-          { name:'Est. Supply',       value:String(estimatedSupply),         inline:true },
-          { name:'Links',             value:`[Burn Machine](https://www.onchainallstars.xyz/burn-machine) | [TraitView](https://traitview.com/) | [Etherscan](https://etherscan.io/address/${BURN_CONTRACT})`, inline:false },
+          { name:'OCAS Burned',  value:String(burned),               inline:true },
+          { name:'Total Burns',  value:String(stats.total_burns||0), inline:true },
+          { name:'Tokens Used',  value:String(tokensUsed),           inline:true },
+          { name:'Est. Supply',  value:String(estimatedSupply),      inline:false },
+          { name:'Links',        value:`[Burn Machine](https://www.onchainallstars.xyz/burn-machine) | [TraitView](https://traitview.com/) | [Etherscan](https://etherscan.io/address/${BURN_CONTRACT})`, inline:false },
         );
       if(latest){
         const ago       = latest.burned_at ? timeSince(Math.floor(new Date(latest.burned_at).getTime()/1000)) : '?';
+        const typeLabel = burnTypeLabel(latest.result_body_type, latest.result_is_angel);
         embed.addFields({ name:'Latest Burn',
-          value:`[#${latest.survivor_token_id}](https://opensea.io/assets/ethereum/${OCAS_CONTRACT}/${latest.survivor_token_id}) - ${latest.burned_count || '?'} burned - ${ago}`,
+          value:`[#${latest.survivor_token_id}](https://opensea.io/assets/ethereum/${OCAS_CONTRACT}/${latest.survivor_token_id}) · ${typeLabel} · ${latest.burned_count || '?'} tokens used · ${ago}`,
           inline:false });
       }
       embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
