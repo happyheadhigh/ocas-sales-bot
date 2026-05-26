@@ -1812,6 +1812,15 @@ async function fetchSnapshotImageForToken(tokenId){
   return null;
 }
 
+// Normalize raw OCAS Type trait to clean display name.
+// "Human 5" → "Human", "Human Trait Booster" → "Human", "Zombie 2" → "Zombie"
+function normalizeOcasType(raw){
+  if(!raw) return null;
+  const s = String(raw).trim();
+  const words = s.split(/\s+/).filter(w => !/^(trait|booster|\d+)$/i.test(w));
+  return words.join(' ') || s.split(/\s+/)[0] || s;
+}
+
 // Returns a compact type breakdown string for a list of burned token IDs.
 // Looks up each token's Type trait from token_traits DB.
 // Example output: "3 · 3x Human" or "2 · 1x Zombie, 1x Ape"
@@ -1820,23 +1829,44 @@ async function burnTypeBreakdown(tokenIds){
   try{
     const ids = tokenIds.filter(Boolean).map(Number);
     if(!ids.length) return String(tokenIds.length);
+
+    // Primary: token_traits table
     const r = await pgPool.query(
       `SELECT token_id, trait_value FROM token_traits
        WHERE token_id = ANY($1) AND LOWER(trait_name) = 'type'`,
       [ids]
     );
     const typeMap = {};
-    for(const row of r.rows) typeMap[row.token_id] = row.trait_value;
+    for(const row of r.rows) typeMap[row.token_id] = normalizeOcasType(row.trait_value);
+
+    // Fallback: token_image_snapshots.traits_json for any IDs still missing
+    const missing = ids.filter(id => !typeMap[id]);
+    if(missing.length){
+      const snap = await pgPool.query(
+        `SELECT token_id, traits_json FROM token_image_snapshots WHERE token_id = ANY($1)`,
+        [missing]
+      );
+      for(const row of snap.rows){
+        if(!row.traits_json) continue;
+        const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
+        const rawType = tj?.Type || tj?.type || null;
+        if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
+      }
+    }
+
     const counts = {};
     for(const id of ids){
-      const t = typeMap[id] || 'Unknown';
-      counts[t] = (counts[t] || 0) + 1;
+      const t = typeMap[id] || null;
+      if(t) counts[t] = (counts[t] || 0) + 1;
     }
-    const breakdown = Object.entries(counts)
-      .sort((a,b) => b[1] - a[1])
-      .map(([type, n]) => `${n}x ${type}`)
-      .join(', ');
-    return `${ids.length} · ${breakdown}`;
+
+    const known = Object.entries(counts).sort((a,b) => b[1] - a[1]);
+    const unknownCount = ids.length - Object.values(counts).reduce((s,n)=>s+n, 0);
+    const parts = known.map(([type, n]) => `${n}x ${type}`);
+    if(unknownCount > 0) parts.push(`${unknownCount}x ?`);
+
+    const breakdown = parts.join(', ');
+    return breakdown ? `${ids.length} · ${breakdown}` : String(ids.length);
   }catch(e){
     return String(tokenIds.length);
   }
@@ -3737,28 +3767,23 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const created = stats.total_created || 0;
       const estimatedSupply = 10000 - burned + created;
 
-      // OCAS Burned = net supply reduction (inputs - survivors) — matches website
-      // Tokens Used = gross inputs fed into the machine
-      const ocasBurned = burned - created;
-      const tokensUsed = burned;
-
       const embed = new EmbedBuilder()
-        .setTitle('🔥 OCAS Burn Machine Stats')
+        .setTitle('OCAS Burn Machine Stats')
         .setColor(BURN_COLORS.FIRE)
         .addFields(
-          { name:'OCAS Burned',  value:String(ocasBurned),           inline:true },
-          { name:'Total Burns',  value:String(stats.total_burns||0), inline:true },
-          { name:'Tokens Used',  value:String(tokensUsed),           inline:true },
-          { name:'Est. Supply',  value:String(estimatedSupply),      inline:true },
+          { name:'Total Burns',       value:String(stats.total_burns||0),   inline:true },
+          { name:'Tokens Burned',     value:String(burned),                  inline:true },
+          { name:'Tokens Created',    value:String(created),                 inline:true },
+          { name:'Supply Reduced By', value:String(burned - created),        inline:true },
+          { name:'Est. Supply',       value:String(estimatedSupply),         inline:true },
+          { name:'Links',             value:`[Burn Machine](https://www.onchainallstars.xyz/burn-machine) | [TraitView](https://traitview.com/) | [Etherscan](https://etherscan.io/address/${BURN_CONTRACT})`, inline:false },
         );
       if(latest){
         const ago       = latest.burned_at ? timeSince(Math.floor(new Date(latest.burned_at).getTime()/1000)) : '?';
-        const typeLabel = burnTypeLabel(latest.result_body_type, latest.result_is_angel);
         embed.addFields({ name:'Latest Burn',
-          value:`[#${latest.survivor_token_id}](https://opensea.io/assets/ethereum/${OCAS_CONTRACT}/${latest.survivor_token_id}) · ${typeLabel} · ${latest.burned_count || '?'} tokens used · ${ago}`,
+          value:`[#${latest.survivor_token_id}](https://opensea.io/assets/ethereum/${OCAS_CONTRACT}/${latest.survivor_token_id}) - ${latest.burned_count || '?'} burned - ${ago}`,
           inline:false });
       }
-      embed.addFields({ name:'Links', value:`[Burn Machine](https://www.onchainallstars.xyz/burn-machine) | [TraitView](https://traitview.com/) | [Etherscan](https://etherscan.io/address/${BURN_CONTRACT})`, inline:false });
       embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
       await interaction.editReply({ embeds:[embed] });
     }catch(e){ await interaction.editReply('Error: '+e.message); }
