@@ -3748,6 +3748,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         .addFields(
           { name:'OCAS Burned',  value:String(ocasBurned),           inline:true },
           { name:'Total Burns',  value:String(stats.total_burns||0), inline:true },
+          { name:'\u200b',       value:'\u200b',                     inline:false },
           { name:'Tokens Used',  value:String(tokensUsed),           inline:true },
           { name:'Est. Supply',  value:String(estimatedSupply),      inline:true },
         );
