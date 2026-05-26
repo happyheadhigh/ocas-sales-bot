@@ -1815,28 +1815,61 @@ async function fetchSnapshotImageForToken(tokenId){
 // Returns a compact type breakdown string for a list of burned token IDs.
 // Looks up each token's Type trait from token_traits DB.
 // Example output: "3 · 3x Human" or "2 · 1x Zombie, 1x Ape"
+// Normalize raw OCAS Type trait value to a clean display name.
+// "Human 5" → "Human", "Human Trait Booster" → "Human", "Zombie 2" → "Zombie", etc.
+function normalizeOcasType(raw){
+  if(!raw) return null;
+  const s = String(raw).trim();
+  // Strip trailing numbers and the words Trait/Booster, then rejoin
+  const words = s.split(/\s+/).filter(w => !/^(trait|booster|\d+)$/i.test(w));
+  return words.join(' ') || s.split(/\s+/)[0] || s;
+}
+
 async function burnTypeBreakdown(tokenIds){
   if(!tokenIds || !tokenIds.length) return String(tokenIds?.length || '?');
   try{
     const ids = tokenIds.filter(Boolean).map(Number);
     if(!ids.length) return String(tokenIds.length);
+
+    // Primary: token_traits table
     const r = await pgPool.query(
       `SELECT token_id, trait_value FROM token_traits
        WHERE token_id = ANY($1) AND LOWER(trait_name) = 'type'`,
       [ids]
     );
     const typeMap = {};
-    for(const row of r.rows) typeMap[row.token_id] = row.trait_value;
+    for(const row of r.rows) typeMap[row.token_id] = normalizeOcasType(row.trait_value);
+
+    // Fallback: token_image_snapshots.traits_json for any IDs still missing
+    const missing = ids.filter(id => !typeMap[id]);
+    if(missing.length){
+      const snap = await pgPool.query(
+        `SELECT token_id, traits_json FROM token_image_snapshots
+         WHERE token_id = ANY($1)`,
+        [missing]
+      );
+      for(const row of snap.rows){
+        if(!row.traits_json) continue;
+        const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
+        const rawType = tj?.Type || tj?.type || null;
+        if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
+      }
+    }
+
     const counts = {};
     for(const id of ids){
-      const t = typeMap[id] || 'Unknown';
-      counts[t] = (counts[t] || 0) + 1;
+      const t = typeMap[id] || null;
+      if(t) counts[t] = (counts[t] || 0) + 1;
     }
-    const breakdown = Object.entries(counts)
-      .sort((a,b) => b[1] - a[1])
-      .map(([type, n]) => `${n}x ${type}`)
-      .join(', ');
-    return `${ids.length} · ${breakdown}`;
+
+    const known = Object.entries(counts).sort((a,b) => b[1] - a[1]);
+    const unknownCount = ids.length - Object.values(counts).reduce((s,n)=>s+n, 0);
+
+    const parts = known.map(([type, n]) => `${n}x ${type}`);
+    if(unknownCount > 0) parts.push(`${unknownCount}x ?`);
+
+    const breakdown = parts.join(', ');
+    return breakdown ? `${ids.length} · ${breakdown}` : String(ids.length);
   }catch(e){
     return String(tokenIds.length);
   }
