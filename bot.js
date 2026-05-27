@@ -3733,23 +3733,20 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     try{
       const [statsRes, latestRes] = await Promise.all([
         pgPool.query(`
-          WITH finalized AS (
-            SELECT id FROM burn_events
-          ),
-          finalized_inputs AS (
-            SELECT DISTINCT bei.burned_token_id
-            FROM burn_event_inputs bei
-            JOIN finalized f ON f.id = bei.burn_event_id
-          )
           SELECT
-            (SELECT COUNT(*)::int FROM finalized) AS total_burns,
-            (SELECT COUNT(*)::int FROM finalized_inputs) AS total_burned,
-            (SELECT COUNT(*)::int FROM finalized) AS total_created,
+            (SELECT COUNT(*)::int FROM burn_events) AS total_burns,
+            (
+              SELECT COUNT(DISTINCT bei.burned_token_id)::int
+              FROM burn_event_inputs bei
+              JOIN burn_events be ON be.id = bei.burn_event_id
+              WHERE bei.burned_token_id != be.survivor_token_id
+            ) AS total_burned,
+            (SELECT COUNT(*)::int FROM burn_events) AS total_created,
             (
               SELECT COUNT(*)::int
-              FROM finalized f
+              FROM burn_events be
               WHERE NOT EXISTS (
-                SELECT 1 FROM burn_event_inputs bei WHERE bei.burn_event_id = f.id
+                SELECT 1 FROM burn_event_inputs bei WHERE bei.burn_event_id = be.id
               )
             ) AS missing_input_burns
         `),
@@ -3766,7 +3763,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const latest  = latestRes.rows[0];
       const burned  = stats.total_burned || 0;
       const created = stats.total_created || 0;
-      const estimatedSupply = 10000 - burned + created;
+      const estimatedSupply = 10000 - burned;
 
       const tokensUsed = burned + created;
       const embed = new EmbedBuilder()
