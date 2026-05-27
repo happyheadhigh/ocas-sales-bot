@@ -2600,6 +2600,110 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
 
+  // ── Pre-burn history slideshow button ─────────────────────────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('burn_preburn:')){
+    const survivorId = parseInt(interaction.customId.split(':')[1], 10);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      // Fetch all burn events for this token in chronological order
+      const r = await pgPool.query(`
+        SELECT be.id, be.burned_at, be.result_body_type, be.result_is_angel, be.points_used,
+               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+        FROM burn_events be
+        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        WHERE be.survivor_token_id = $1
+        GROUP BY be.id
+        ORDER BY be.burned_at ASC NULLS LAST
+      `, [survivorId]);
+      if(!r.rows.length){ await interaction.editReply({ content:'No burn history found.' }); return; }
+      const contract = OCAS_CONTRACT;
+      // Build one embed per burn showing what the token looked like BEFORE that burn.
+      // Burn 1 → pre-state = backfill-chunks (original mint)
+      // Burn N → pre-state = burn-finalized-survivor written after burn N-1
+      // Since token_image_snapshots only keeps one row per token, we store burn-finalized-survivor
+      // snapshots in a separate query using burn event ordering.
+      // Strategy: fetch ALL snapshots for this token, use backfill-chunks for burn 1,
+      // and for subsequent burns we show 'pre-burn state unavailable' if not stored separately.
+      const snapRes = await pgPool.query(
+        `SELECT source, image_data, traits_json FROM token_image_snapshots WHERE token_id=$1`,
+        [survivorId]
+      );
+      const snapBySource = {};
+      for(const row of snapRes.rows) snapBySource[row.source] = row;
+      const embeds = [];
+      for(let i = 0; i < r.rows.length; i++){
+        const b = r.rows[i];
+        const burnNum = i + 1;
+        const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
+        const ids = (b.burned_ids||[]).filter(Boolean);
+        const tokensStr = await burnTypeBreakdown(ids).catch(()=>String(ids.length||'?'));
+        // Get pre-burn snapshot: burn 1 uses backfill-chunks, others use burn-finalized-survivor
+        // (which represents the state AFTER the previous burn = BEFORE this burn)
+        const snapSource = i === 0 ? 'backfill-chunks' : 'burn-finalized-survivor';
+        const snap = snapBySource[snapSource] || null;
+        let preBurnType = null;
+        if(snap?.traits_json){
+          const tj = typeof snap.traits_json==='string' ? JSON.parse(snap.traits_json) : snap.traits_json;
+          const raw = tj?.Type || tj?.type || null;
+          if(raw) preBurnType = normalizeOcasType(typeof raw==='string' ? raw.replace(/^"|"$/g,'') : String(raw));
+        }
+        const osUrl = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
+        const slideEmbed = new EmbedBuilder()
+          .setColor(BURN_COLORS.FIRE)
+          .setTitle(`Before Burn ${burnNum} — ${ago}`)
+          .setURL(osUrl)
+          .addFields(
+            { name:'Tokens Burned', value:tokensStr, inline:true },
+            { name:'Points Used',   value:String(b.points_used||0)+' pts', inline:true },
+            { name:'Type Before',   value:preBurnType || '—', inline:true },
+          )
+          .setFooter({ text:`#${survivorId} · Burn ${burnNum} of ${r.rows.length}` });
+        // Attach image if available
+        if(snap?.image_data){
+          const imgSrc = snap.image_data;
+          if(imgSrc.startsWith('<svg') || imgSrc.startsWith('data:image/svg') || imgSrc.toLowerCase().includes('image/svg')){
+            try{
+              const buf = await extractPngFromSvg(imgSrc);
+              if(buf) slideEmbed._imageResult = { type:'buffer', buffer:buf, filename:`token-${survivorId}-burn${burnNum}.png` };
+            }catch(_){}
+          } else if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)){
+            slideEmbed._imageResult = { type:'url', url:imgSrc };
+          }
+        }
+        embeds.push(slideEmbed);
+      }
+      if(!embeds.length){ await interaction.editReply({ content:'No pre-burn snapshots found.' }); return; }
+      // Post first slide immediately
+      const first = embeds[0];
+      const ir = first._imageResult; delete first._imageResult;
+      const row = embeds.length > 1 ? buildNavRow(0, embeds.length) : null;
+      const components = row ? [row] : [];
+      let firstPayload;
+      if(ir?.type==='buffer'){
+        const att = new AttachmentBuilder(ir.buffer, { name:ir.filename });
+        first.setThumbnail(`attachment://${ir.filename}`);
+        firstPayload = { embeds:[first], files:[att], components };
+      } else {
+        if(ir?.type==='url') first.setThumbnail(ir.url);
+        firstPayload = { embeds:[first], components };
+      }
+      const msg = await interaction.editReply(firstPayload);
+      // Store remaining slides in slideshow session keyed to the reply message
+      if(embeds.length > 1){
+        slideshowSessions.set(msg.id, {
+          embeds,
+          index: 0,
+          userId: interaction.user.id,
+          expiresAt: Date.now() + 15 * 60 * 1000,
+        });
+      }
+    }catch(e){
+      console.error('[BurnPreburn]', e.message);
+      try{ await interaction.editReply({ content:'Error loading pre-burn history.' }); }catch(_){}
+    }
+    return;
+  }
+
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
   const config=getConfig(guildId);
@@ -3998,17 +4102,22 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         inline:false
       });
 
-      const showTokensBtn = new ActionRowBuilder().addComponents(
+
+      // Two buttons: Show all burned tokens + Show Pre-Burn History slideshow
+      const actionRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`burn_all_tokens:${tokenInput}`)
-          .setLabel('Show all burned tokens')
-          .setStyle(ButtonStyle.Secondary)
+          .setLabel('Show All Burned Tokens')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`burn_preburn:${tokenInput}`)
+          .setLabel('Pre-Burn History')
+          .setStyle(ButtonStyle.Primary),
       );
 
-      // Current state as thumbnail (top right), pre-burn original as main image (bottom)
+      // Current state as thumbnail only — no large image
       const ir = await fetchThumbForToken(tokenInput);
       const files = [];
-
       if(ir?.type==='buffer'){
         const att = new AttachmentBuilder(ir.buffer, { name:`token-${tokenInput}.png` });
         embed.setThumbnail(`attachment://token-${tokenInput}.png`);
@@ -4017,30 +4126,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         embed.setThumbnail(ir.url);
       }
 
-      // Fetch pre-burn image from backfill-chunks snapshot — shows what token looked like at mint
-      try{
-        const preBurnSnap = await pgPool.query(
-          `SELECT image_data FROM token_image_snapshots WHERE token_id=$1 AND source='backfill-chunks'`,
-          [tokenInput]
-        );
-        const imgSrc = preBurnSnap.rows[0]?.image_data || null;
-        if(imgSrc){
-          if(imgSrc.startsWith('<svg') || imgSrc.startsWith('data:image/svg') || imgSrc.toLowerCase().includes('image/svg')){
-            const buf = await extractPngFromSvg(imgSrc);
-            if(buf){
-              const att = new AttachmentBuilder(buf, { name:`token-${tokenInput}-before.png` });
-              embed.setImage(`attachment://token-${tokenInput}-before.png`);
-              files.push(att);
-            }
-          } else if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)){
-            embed.setImage(imgSrc);
-          }
-        }
-      }catch(preBurnErr){
-        console.warn(`[Burn] pre-burn image fetch failed for #${tokenInput}:`, preBurnErr.message);
-      }
-
-      await interaction.editReply({ embeds:[embed], files, components:[showTokensBtn] });
+      await interaction.editReply({ embeds:[embed], files, components:[actionRow] });
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
