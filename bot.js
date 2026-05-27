@@ -3763,7 +3763,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const latest  = latestRes.rows[0];
       const burned  = stats.total_burned || 0;
       const created = stats.total_created || 0;
-      const estimatedSupply = 10000 - burned + created;
+      const estimatedSupply = 10000 - burned;
 
       const tokensUsed = burned + created;
       const embed = new EmbedBuilder()
