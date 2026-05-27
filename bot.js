@@ -1830,28 +1830,48 @@ async function burnTypeBreakdown(tokenIds){
     const ids = tokenIds.filter(Boolean).map(Number);
     if(!ids.length) return String(tokenIds.length);
 
-    // Primary: token_traits table
-    const r = await pgPool.query(
-      `SELECT token_id, trait_value FROM token_traits
-       WHERE token_id = ANY($1) AND LOWER(trait_name) = 'type'`,
+    const typeMap = {};
+
+    // Step 1: burn-start-input snapshots — most accurate for re-burned tokens,
+    // captured at the exact moment the token was selected for burning.
+    const snapBurn = await pgPool.query(
+      `SELECT token_id, traits_json FROM token_image_snapshots
+       WHERE token_id = ANY($1) AND source = 'burn-start-input'`,
       [ids]
     );
-    const typeMap = {};
-    for(const row of r.rows) typeMap[row.token_id] = normalizeOcasType(row.trait_value);
+    for(const row of snapBurn.rows){
+      if(!row.traits_json) continue;
+      const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
+      const rawType = tj?.Type || tj?.type || null;
+      if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
+    }
 
-    // Fallback: token_image_snapshots.traits_json for any IDs still missing
-    const missing = ids.filter(id => !typeMap[id]);
-    if(missing.length){
-      const snap = await pgPool.query(
-        `SELECT token_id, traits_json FROM token_image_snapshots WHERE token_id = ANY($1)`,
-        [missing]
+    // Step 2: backfill-chunks snapshots — original mint traits, correct when
+    // no burn-start-input exists (token was never snapshotted at burn time).
+    const missing1 = ids.filter(id => !typeMap[id]);
+    if(missing1.length){
+      const snapBackfill = await pgPool.query(
+        `SELECT token_id, traits_json FROM token_image_snapshots
+         WHERE token_id = ANY($1) AND source = 'backfill-chunks'`,
+        [missing1]
       );
-      for(const row of snap.rows){
+      for(const row of snapBackfill.rows){
         if(!row.traits_json) continue;
         const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
         const rawType = tj?.Type || tj?.type || null;
         if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
       }
+    }
+
+    // Step 3: token_traits — last resort, may reflect current state after re-burns
+    const missing2 = ids.filter(id => !typeMap[id]);
+    if(missing2.length){
+      const r = await pgPool.query(
+        `SELECT token_id, trait_value FROM token_traits
+         WHERE token_id = ANY($1) AND LOWER(trait_name) = 'type'`,
+        [missing2]
+      );
+      for(const row of r.rows) typeMap[row.token_id] = normalizeOcasType(row.trait_value);
     }
 
     const counts = {};
