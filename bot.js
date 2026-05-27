@@ -86,7 +86,9 @@ const BURN_COLORS = {
 };
 // E_1_Type enum — confirmed from on-chain events and contract source
 // 0=Human, 1=Zombie, 2=Skeleton, 3=Radioactive (angel variants overlap)
-const E1_TYPE_NAMES = { 0:'Human', 1:'Zombie', 2:'Skeleton', 3:'Radioactive', 4:'Angel' };
+// E_1_Type enum — confirmed from contract source
+// 0-5=Human variants, 6=Zombie, 7=Ape, 8=Skeleton, 9=Alien, 10=Radioactive, 11=Demonic, Angel=isAngel flag
+const E1_TYPE_NAMES = { 0:'Human', 1:'Human', 2:'Human', 3:'Human', 4:'Human', 5:'Human', 6:'Zombie', 7:'Ape', 8:'Skeleton', 9:'Alien', 10:'Radioactive', 11:'Demonic' };
 function burnTypeLabel(bodyType, isAngel){
   const base = E1_TYPE_NAMES[bodyType] || ('Type '+bodyType);
   return isAngel ? base+' Angel' : base;
@@ -258,6 +260,23 @@ async function ensureBotStateTable(){
         source      TEXT,
         updated_at  TIMESTAMPTZ DEFAULT NOW()
       )
+    `).catch(()=>{});
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS burn_state_snapshots (
+        id            SERIAL PRIMARY KEY,
+        burn_event_id INT NOT NULL,
+        token_id      INT NOT NULL,
+        image_data    TEXT,
+        traits_json   JSONB,
+        created_at    TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(burn_event_id, token_id)
+      )
+    `).catch(()=>{});
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS burn_state_snapshots_token_idx ON burn_state_snapshots(token_id)
+    `).catch(()=>{});
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS burn_state_snapshots_event_idx ON burn_state_snapshots(burn_event_id)
     `).catch(()=>{});
     console.log('[DB] burn tables ready');
   }catch(e){ console.error('[DB] ensureBotStateTable error:', e.message); }
@@ -1373,6 +1392,27 @@ async function processPendingBurnAlerts(){
       }catch(dbErr){
         console.warn(`[BurnMeta] Failed to write post-burn traits for #${survivorId}:`, dbErr.message);
       }
+      // Write to burn_state_snapshots — permanent record of post-burn state per burn event
+      try{
+        const burnEventId = finalEvent.burnEventId;
+        console.log(`[BurnMeta] burn_state_snapshots write attempt: burnEventId=${burnEventId} survivorId=${survivorId} hasImage=${!!freshTraits?.__image}`);
+        if(burnEventId){
+          const snapImg = freshTraits?.__image || null;
+          await pgPool.query(
+            `INSERT INTO burn_state_snapshots (burn_event_id, token_id, image_data, traits_json)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (burn_event_id, token_id) DO UPDATE SET
+               image_data=EXCLUDED.image_data,
+               traits_json=EXCLUDED.traits_json`,
+            [burnEventId, survivorId, snapImg, JSON.stringify(freshTraits)]
+          );
+          console.log(`[BurnMeta] Saved burn_state_snapshot for burn_event_id=${burnEventId} token=#${survivorId}`);
+        } else {
+          console.warn(`[BurnMeta] Skipped burn_state_snapshot for #${survivorId} — burnEventId is null/falsy`);
+        }
+      }catch(snapErr){
+        console.warn(`[BurnMeta] Failed to write burn_state_snapshot for #${survivorId}:`, snapErr.message);
+      }
       pendingBurnAlerts.delete(key);
     }catch(e){
       console.error(`[BurnMeta] post failed for #${survivorId}:`, e.message);
@@ -1765,7 +1805,7 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
       // Priority order: burn-start-input > backfill-chunks > burn-finalized-survivor
       // This ensures original mint traits (backfill-chunks) are never lost when
       // a token later becomes a burn survivor and gets new post-burn traits written.
-      const SOURCE_PRIORITY = { 'backfill-chunks': 3, 'burn-start-input': 2, 'burn-finalized-survivor': 1 };
+      const SOURCE_PRIORITY = { 'burn-start-input': 3, 'backfill-chunks': 2, 'burn-finalized-survivor': 1 };
       const newPriority = SOURCE_PRIORITY[source] || 0;
       await pgPool.query(
         `INSERT INTO token_image_snapshots (token_id, image_data, traits_json, source, updated_at)
@@ -1776,8 +1816,8 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
            source=EXCLUDED.source,
            updated_at=NOW()
          WHERE (
-           CASE WHEN token_image_snapshots.source = 'backfill-chunks' THEN 3
-                WHEN token_image_snapshots.source = 'burn-start-input' THEN 2
+           CASE WHEN token_image_snapshots.source = 'burn-start-input' THEN 3
+                WHEN token_image_snapshots.source = 'backfill-chunks' THEN 2
                 WHEN token_image_snapshots.source = 'burn-finalized-survivor' THEN 1
                 ELSE 0 END
          ) < $5`,
@@ -2463,9 +2503,21 @@ client.on('interactionCreate', async (interaction)=>{
     if(interaction.customId === 'slide_prev') session.index = Math.max(0, session.index - 1);
     if(interaction.customId === 'slide_next') session.index = Math.min(session.embeds.length - 1, session.index + 1);
     const embed = session.embeds[session.index];
-    const ir = embed._imageResult;
     const row = buildNavRow(session.index, session.embeds.length);
     try{
+      // Re-fetch image from source data stored on embed to avoid buffer loss on nav
+      let ir = embed._imageResult;
+      if(!ir && embed._imageSource){
+        const src = embed._imageSource;
+        if(src.startsWith('<svg') || src.startsWith('data:image/svg') || src.toLowerCase().includes('image/svg')){
+          try{
+            const buf = await extractPngFromSvg(src);
+            if(buf) ir = { type:'buffer', buffer:buf, filename:embed._imageFilename||'token.png' };
+          }catch(_){}
+        } else if(src.startsWith('http') && isDiscordOk(src)){
+          ir = { type:'url', url:src };
+        }
+      }
       if(ir?.type === 'buffer'){
         const att = new AttachmentBuilder(ir.buffer, {name: ir.filename});
         embed.setThumbnail(`attachment://${ir.filename}`);
@@ -2620,16 +2672,21 @@ client.on('interactionCreate', async (interaction)=>{
       // Build one embed per burn showing what the token looked like BEFORE that burn.
       // Burn 1 → pre-state = backfill-chunks (original mint)
       // Burn N → pre-state = burn-finalized-survivor written after burn N-1
-      // Since token_image_snapshots only keeps one row per token, we store burn-finalized-survivor
-      // snapshots in a separate query using burn event ordering.
-      // Strategy: fetch ALL snapshots for this token, use backfill-chunks for burn 1,
-      // and for subsequent burns we show 'pre-burn state unavailable' if not stored separately.
-      const snapRes = await pgPool.query(
-        `SELECT source, image_data, traits_json FROM token_image_snapshots WHERE token_id=$1`,
+      // Fetch backfill-chunks snapshot (original mint — used for Burn 1 pre-state)
+      const mintSnap = await pgPool.query(
+        `SELECT image_data, traits_json FROM token_image_snapshots WHERE token_id=$1 AND source='backfill-chunks'`,
         [survivorId]
-      );
-      const snapBySource = {};
-      for(const row of snapRes.rows) snapBySource[row.source] = row;
+      ).then(res => res.rows[0] || null).catch(()=>null);
+      // Fetch burn_state_snapshots — post-burn state per burn event = pre-burn state of next burn
+      const stateSnaps = await pgPool.query(
+        `SELECT bss.burn_event_id, bss.image_data, bss.traits_json
+         FROM burn_state_snapshots bss
+         WHERE bss.token_id=$1
+         ORDER BY bss.created_at ASC`,
+        [survivorId]
+      ).then(res => res.rows).catch(()=>[]);
+      const stateSnapMap = {};
+      for(const s of stateSnaps) stateSnapMap[s.burn_event_id] = s;
       const embeds = [];
       for(let i = 0; i < r.rows.length; i++){
         const b = r.rows[i];
@@ -2637,10 +2694,14 @@ client.on('interactionCreate', async (interaction)=>{
         const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const ids = (b.burned_ids||[]).filter(Boolean);
         const tokensStr = await burnTypeBreakdown(ids).catch(()=>String(ids.length||'?'));
-        // Get pre-burn snapshot: burn 1 uses backfill-chunks, others use burn-finalized-survivor
-        // (which represents the state AFTER the previous burn = BEFORE this burn)
-        const snapSource = i === 0 ? 'backfill-chunks' : 'burn-finalized-survivor';
-        const snap = snapBySource[snapSource] || null;
+        // Pre-burn state: Burn 1 = original mint (backfill-chunks), Burn N = post-state of burn N-1
+        let snap = null;
+        if(i === 0){
+          snap = mintSnap;
+        } else {
+          const prevBurnId = r.rows[i-1].id;
+          snap = stateSnapMap[prevBurnId] || null;
+        }
         let preBurnType = null;
         if(snap?.traits_json){
           const tj = typeof snap.traits_json==='string' ? JSON.parse(snap.traits_json) : snap.traits_json;
@@ -2664,15 +2725,27 @@ client.on('interactionCreate', async (interaction)=>{
           if(imgSrc.startsWith('<svg') || imgSrc.startsWith('data:image/svg') || imgSrc.toLowerCase().includes('image/svg')){
             try{
               const buf = await extractPngFromSvg(imgSrc);
-              if(buf) slideEmbed._imageResult = { type:'buffer', buffer:buf, filename:`token-${survivorId}-burn${burnNum}.png` };
+              if(buf){
+                slideEmbed._imageResult = { type:'buffer', buffer:buf, filename:`token-${survivorId}-burn${burnNum}.png` };
+                slideEmbed._imageSource = imgSrc;
+                slideEmbed._imageFilename = `token-${survivorId}-burn${burnNum}.png`;
+              }
             }catch(_){}
           } else if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)){
             slideEmbed._imageResult = { type:'url', url:imgSrc };
+            slideEmbed._imageSource = imgSrc;
           }
         }
         embeds.push(slideEmbed);
       }
       if(!embeds.length){ await interaction.editReply({ content:'No pre-burn snapshots found.' }); return; }
+      // Store image source on each embed for re-fetch on slideshow navigation
+      for(const e of embeds){
+        if(e._imageResult){
+          if(e._imageResult.type === 'url') e._imageSource = e._imageResult.url;
+          // For buffer type, source is the SVG data from snap.image_data — store it separately
+        }
+      }
       // Post first slide immediately
       const first = embeds[0];
       const ir = first._imageResult; delete first._imageResult;
