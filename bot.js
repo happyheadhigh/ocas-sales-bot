@@ -3933,7 +3933,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
       // Token is a survivor — fetch full burn chain
       const chainRes = await pgPool.query(`
-        SELECT be.tx_hash, be.burner_wallet, be.burned_at, be.points_used,
+        SELECT be.id, be.tx_hash, be.burner_wallet, be.burned_at, be.points_used,
                array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
@@ -3950,22 +3950,40 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         .setColor(BURN_COLORS.FIRE)
         .setTitle(`🔥 #${tokenInput} burn history`)
         .setDescription(
-          `Burned **${burns.length} time${burns.length===1?'':'s'}** · **${totalTokensBurned} tokens** consumed · **${totalPts} pts** total`
+          `Burned **${burns.length} time${burns.length===1?"":"s"}** · **${totalTokensBurned} tokens** consumed · **${totalPts} pts** total`
         )
         .setURL(osUrl)
         .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
 
       // Most recent first, up to 10
       const displayBurns = [...burns].slice(0, 10);
+
       await Promise.all(displayBurns.map(async (b, i) => {
         const burnNum = i + 1;
         const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const ids      = (b.burned_ids||[]).filter(Boolean);
         const tokensStr = await burnTypeBreakdown(ids).catch(()=>String(ids.length || '?'));
+        // For the first burn, show what the token was before (original mint type)
+        let preBurnNote = '';
+        if(i === 0){
+          try{
+            const snapRow = await pgPool.query(
+              `SELECT traits_json->'Type' as type FROM token_image_snapshots
+               WHERE token_id=$1 AND source='backfill-chunks'`,
+              [tokenInput]
+            );
+            if(snapRow.rows[0]?.type){
+              const raw = typeof snapRow.rows[0].type === 'string'
+                ? snapRow.rows[0].type.replace(/^"|"$/g,'')
+                : String(snapRow.rows[0].type);
+              preBurnNote = ` · was ${normalizeOcasType(raw)}`;
+            }
+          }catch(_){}
+        }
         const fieldVal = [
           `**Burner:** [${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`,
           `**Tokens:** ${tokensStr}`,
-          `**Points:** ${b.points_used||0}`,
+          `**Points:** ${b.points_used||0}${preBurnNote}`,
         ].join('\n');
         embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:true });
       }));
@@ -3987,14 +4005,42 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           .setStyle(ButtonStyle.Secondary)
       );
 
+      // Current state as thumbnail (top right), pre-burn original as main image (bottom)
       const ir = await fetchThumbForToken(tokenInput);
+      const files = [];
+
       if(ir?.type==='buffer'){
         const att = new AttachmentBuilder(ir.buffer, { name:`token-${tokenInput}.png` });
         embed.setThumbnail(`attachment://token-${tokenInput}.png`);
-        await interaction.editReply({ embeds:[embed], files:[att], components:[showTokensBtn] });
-      } else {
-        if(ir?.type==='url') embed.setThumbnail(ir.url);
-        await interaction.editReply({ embeds:[embed], components:[showTokensBtn] });
+        files.push(att);
+      } else if(ir?.type==='url'){
+        embed.setThumbnail(ir.url);
+      }
+
+      // Fetch pre-burn image from backfill-chunks snapshot — shows what token looked like at mint
+      try{
+        const preBurnSnap = await pgPool.query(
+          `SELECT image_data FROM token_image_snapshots WHERE token_id=$1 AND source='backfill-chunks'`,
+          [tokenInput]
+        );
+        const imgSrc = preBurnSnap.rows[0]?.image_data || null;
+        if(imgSrc){
+          if(imgSrc.startsWith('<svg') || imgSrc.startsWith('data:image/svg') || imgSrc.toLowerCase().includes('image/svg')){
+            const buf = await extractPngFromSvg(imgSrc);
+            if(buf){
+              const att = new AttachmentBuilder(buf, { name:`token-${tokenInput}-before.png` });
+              embed.setImage(`attachment://token-${tokenInput}-before.png`);
+              files.push(att);
+            }
+          } else if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)){
+            embed.setImage(imgSrc);
+          }
+        }
+      }catch(preBurnErr){
+        console.warn(`[Burn] pre-burn image fetch failed for #${tokenInput}:`, preBurnErr.message);
+      }
+
+      await interaction.editReply({ embeds:[embed], files, components:[showTokensBtn] });
       }
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
