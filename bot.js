@@ -1761,6 +1761,12 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
       );
     }
     if(traits.__image){
+      // Never overwrite a higher-priority snapshot source with a lower one.
+      // Priority order: burn-start-input > backfill-chunks > burn-finalized-survivor
+      // This ensures original mint traits (backfill-chunks) are never lost when
+      // a token later becomes a burn survivor and gets new post-burn traits written.
+      const SOURCE_PRIORITY = { 'burn-start-input': 3, 'backfill-chunks': 2, 'burn-finalized-survivor': 1 };
+      const newPriority = SOURCE_PRIORITY[source] || 0;
       await pgPool.query(
         `INSERT INTO token_image_snapshots (token_id, image_data, traits_json, source, updated_at)
          VALUES ($1,$2,$3,$4,NOW())
@@ -1768,8 +1774,14 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
            image_data=EXCLUDED.image_data,
            traits_json=EXCLUDED.traits_json,
            source=EXCLUDED.source,
-           updated_at=NOW()`,
-        [id, String(traits.__image), JSON.stringify(traits), source]
+           updated_at=NOW()
+         WHERE (
+           CASE WHEN token_image_snapshots.source = 'burn-start-input' THEN 3
+                WHEN token_image_snapshots.source = 'backfill-chunks' THEN 2
+                WHEN token_image_snapshots.source = 'burn-finalized-survivor' THEN 1
+                ELSE 0 END
+         ) < $5`,
+        [id, String(traits.__image), JSON.stringify(traits), source, newPriority]
       ).catch(()=>{});
     }
     return true;
