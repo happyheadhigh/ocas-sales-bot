@@ -1830,48 +1830,28 @@ async function burnTypeBreakdown(tokenIds){
     const ids = tokenIds.filter(Boolean).map(Number);
     if(!ids.length) return String(tokenIds.length);
 
-    const typeMap = {};
-
-    // Step 1: burn-start-input snapshots — most accurate for re-burned tokens,
-    // captured at the exact moment the token was selected for burning.
-    const snapBurn = await pgPool.query(
-      `SELECT token_id, traits_json FROM token_image_snapshots
-       WHERE token_id = ANY($1) AND source = 'burn-start-input'`,
+    // Primary: token_traits table
+    const r = await pgPool.query(
+      `SELECT token_id, trait_value FROM token_traits
+       WHERE token_id = ANY($1) AND LOWER(trait_name) = 'type'`,
       [ids]
     );
-    for(const row of snapBurn.rows){
-      if(!row.traits_json) continue;
-      const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
-      const rawType = tj?.Type || tj?.type || null;
-      if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
-    }
+    const typeMap = {};
+    for(const row of r.rows) typeMap[row.token_id] = normalizeOcasType(row.trait_value);
 
-    // Step 2: backfill-chunks snapshots — original mint traits, correct when
-    // no burn-start-input exists (token was never snapshotted at burn time).
-    const missing1 = ids.filter(id => !typeMap[id]);
-    if(missing1.length){
-      const snapBackfill = await pgPool.query(
-        `SELECT token_id, traits_json FROM token_image_snapshots
-         WHERE token_id = ANY($1) AND source = 'backfill-chunks'`,
-        [missing1]
+    // Fallback: token_image_snapshots.traits_json for any IDs still missing
+    const missing = ids.filter(id => !typeMap[id]);
+    if(missing.length){
+      const snap = await pgPool.query(
+        `SELECT token_id, traits_json FROM token_image_snapshots WHERE token_id = ANY($1)`,
+        [missing]
       );
-      for(const row of snapBackfill.rows){
+      for(const row of snap.rows){
         if(!row.traits_json) continue;
         const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
         const rawType = tj?.Type || tj?.type || null;
         if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
       }
-    }
-
-    // Step 3: token_traits — last resort, may reflect current state after re-burns
-    const missing2 = ids.filter(id => !typeMap[id]);
-    if(missing2.length){
-      const r = await pgPool.query(
-        `SELECT token_id, trait_value FROM token_traits
-         WHERE token_id = ANY($1) AND LOWER(trait_name) = 'type'`,
-        [missing2]
-      );
-      for(const row of r.rows) typeMap[row.token_id] = normalizeOcasType(row.trait_value);
     }
 
     const counts = {};
@@ -3753,23 +3733,20 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     try{
       const [statsRes, latestRes] = await Promise.all([
         pgPool.query(`
-          WITH finalized AS (
-            SELECT id FROM burn_events
-          ),
-          finalized_inputs AS (
-            SELECT DISTINCT bei.burned_token_id
-            FROM burn_event_inputs bei
-            JOIN finalized f ON f.id = bei.burn_event_id
-          )
           SELECT
-            (SELECT COUNT(*)::int FROM finalized) AS total_burns,
-            (SELECT COUNT(*)::int FROM finalized_inputs) AS total_burned,
-            (SELECT COUNT(*)::int FROM finalized) AS total_created,
+            (SELECT COUNT(*)::int FROM burn_events) AS total_burns,
+            (
+              SELECT COUNT(DISTINCT bei.burned_token_id)::int
+              FROM burn_event_inputs bei
+              JOIN burn_events be ON be.id = bei.burn_event_id
+              WHERE bei.burned_token_id != be.survivor_token_id
+            ) AS total_burned,
+            (SELECT COUNT(*)::int FROM burn_events) AS total_created,
             (
               SELECT COUNT(*)::int
-              FROM finalized f
+              FROM burn_events be
               WHERE NOT EXISTS (
-                SELECT 1 FROM burn_event_inputs bei WHERE bei.burn_event_id = f.id
+                SELECT 1 FROM burn_event_inputs bei WHERE bei.burn_event_id = be.id
               )
             ) AS missing_input_burns
         `),
@@ -3786,7 +3763,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const latest  = latestRes.rows[0];
       const burned  = stats.total_burned || 0;
       const created = stats.total_created || 0;
-      const estimatedSupply = 10000 - burned + created;
+      const estimatedSupply = 10000 - burned;
 
       const tokensUsed = burned + created;
       const embed = new EmbedBuilder()
