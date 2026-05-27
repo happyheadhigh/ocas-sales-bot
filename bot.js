@@ -4041,7 +4041,6 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       }
 
       await interaction.editReply({ embeds:[embed], files, components:[showTokensBtn] });
-      }
     }catch(e){ await interaction.editReply('Error: '+e.message); }
     return;
   }
