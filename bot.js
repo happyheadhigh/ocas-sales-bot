@@ -3733,6 +3733,14 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     try{
       const [statsRes, latestRes] = await Promise.all([
         pgPool.query(`
+          WITH finalized AS (
+            SELECT id FROM burn_events
+          ),
+          finalized_inputs AS (
+            SELECT DISTINCT bei.burn_event_id, bei.burned_token_id
+            FROM burn_event_inputs bei
+            JOIN finalized f ON f.id = bei.burn_event_id
+          )
           SELECT
             (SELECT COUNT(*)::int FROM burn_events) AS total_burns,
             (
@@ -3744,10 +3752,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             (SELECT COUNT(*)::int FROM burn_events) AS total_created,
             (
               SELECT COUNT(*)::int
-              FROM burn_events be
-              WHERE NOT EXISTS (
-                SELECT 1 FROM burn_event_inputs bei WHERE bei.burn_event_id = be.id
-              )
+              FROM finalized f
+              LEFT JOIN finalized_inputs fi ON fi.burn_event_id = f.id
+              WHERE fi.burn_event_id IS NULL
             ) AS missing_input_burns
         `),
         pgPool.query(`
