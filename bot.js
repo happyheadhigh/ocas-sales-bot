@@ -262,6 +262,20 @@ async function ensureBotStateTable(){
       )
     `).catch(()=>{});
     await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS token_original_snapshots (
+        token_id   INT PRIMARY KEY,
+        image_data TEXT,
+        traits_json JSONB,
+        source     TEXT DEFAULT 'traitview-original-archive',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(()=>{});
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS token_original_snapshots_updated_idx
+      ON token_original_snapshots(updated_at)
+    `).catch(()=>{});
+    await pgPool.query(`
       CREATE TABLE IF NOT EXISTS burn_state_snapshots (
         id            SERIAL PRIMARY KEY,
         burn_event_id INT NOT NULL,
@@ -2670,11 +2684,11 @@ client.on('interactionCreate', async (interaction)=>{
       if(!r.rows.length){ await interaction.editReply({ content:'No burn history found.' }); return; }
       const contract = OCAS_CONTRACT;
       // Build one embed per burn showing what the token looked like BEFORE that burn.
-      // Burn 1 → pre-state = backfill-chunks (original mint)
-      // Burn N → pre-state = burn-finalized-survivor written after burn N-1
-      // Fetch backfill-chunks snapshot (original mint — used for Burn 1 pre-state)
+      // Burn 1 → pre-state = permanent original archive snapshot.
+      // Burn N → pre-state = post-state snapshot written after Burn N-1.
+      // This avoids relying on token_image_snapshots.source as historical truth.
       const mintSnap = await pgPool.query(
-        `SELECT image_data, traits_json FROM token_image_snapshots WHERE token_id=$1 AND source='backfill-chunks'`,
+        `SELECT image_data, traits_json FROM token_original_snapshots WHERE token_id=$1`,
         [survivorId]
       ).then(res => res.rows[0] || null).catch(()=>null);
       // Fetch burn_state_snapshots — post-burn state per burn event = pre-burn state of next burn
@@ -2694,7 +2708,7 @@ client.on('interactionCreate', async (interaction)=>{
         const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const ids = (b.burned_ids||[]).filter(Boolean);
         const tokensStr = await burnTypeBreakdown(ids).catch(()=>String(ids.length||'?'));
-        // Pre-burn state: Burn 1 = original mint (backfill-chunks), Burn N = post-state of burn N-1
+        // Pre-burn state: Burn 1 = original archive, Burn N = post-state of Burn N-1
         let snap = null;
         if(i === 0){
           snap = mintSnap;
@@ -4145,8 +4159,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         if(i === 0){
           try{
             const snapRow = await pgPool.query(
-              `SELECT traits_json->'Type' as type FROM token_image_snapshots
-               WHERE token_id=$1 AND source='backfill-chunks'`,
+              `SELECT traits_json->'Type' as type FROM token_original_snapshots
+               WHERE token_id=$1`,
               [tokenInput]
             );
             if(snapRow.rows[0]?.type){
