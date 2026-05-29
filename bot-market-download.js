@@ -348,19 +348,20 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
   const meta = await loadJsonFromUri(uri);
   let src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
 
-if(typeof src === 'string' && transparent){
-  src = makeSvgTransparent(src);
-}
+  if(typeof src === 'string' && transparent){
+    src = makeSvgTransparent(src);
+  }
 
-if(typeof src === 'string' && isSvgSource(src)){
-  const buffer = await extractPngFromSvg(src, size);
+  if(typeof src === 'string' && isSvgSource(src)){
+    const buffer = await extractPngFromSvg(src, size);
+    return { buffer, meta };
+  }
+
+  let pipeline = sharp(Buffer.isBuffer(src) ? src : Buffer.from(src));
+  pipeline = pipeline.resize(size, size, { fit:'contain', withoutEnlargement:false });
+  const buffer = await pipeline.png().toBuffer();
   return { buffer, meta };
 }
-
-let pipeline = sharp(Buffer.isBuffer(src) ? src : Buffer.from(src));
-pipeline = pipeline.resize(size, size, { fit:'contain', withoutEnlargement:false });
-const buffer = await pipeline.png().toBuffer();
-return { buffer, meta };
 
 async function handleDownloadCommand(interaction, forced={}){
   const tokenId = forced.tokenId || interaction.options?.getInteger?.('token');
