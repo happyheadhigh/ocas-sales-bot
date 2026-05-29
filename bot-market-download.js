@@ -112,6 +112,23 @@ function saleEventKey(sale){
   return String(sale?.event_id || sale?.id || sale?.transaction || sale?.transaction_hash || sale?.event_timestamp || JSON.stringify(sale).slice(0,120));
 }
 
+function isDiscordFriendlyImageUrl(url){
+  const s = String(url || '').trim().toLowerCase();
+  if(!s) return false;
+  if(!s.startsWith('http://') && !s.startsWith('https://')) return false;
+  if(s.includes('image/svg') || s.endsWith('.svg')) return false;
+  return true;
+}
+
+function marketSaleOpenSeaImage(sale){
+  return sale?.nft?.image_url ||
+    sale?.nft?.display_image_url ||
+    sale?.nft?.animation_url ||
+    sale?.asset?.image_url ||
+    sale?.image_url ||
+    '';
+}
+
 function buildMarketSaleEmbed(sale, cfg, alias){
   const tokenId = tokenIdFromSale(sale);
   const { eth, symbol } = priceFromSale(sale);
@@ -132,9 +149,44 @@ function buildMarketSaleEmbed(sale, cfg, alias){
     )
     .setFooter({ text:'Market sales feed' })
     .setTimestamp();
-  const img = sale?.nft?.image_url || sale?.nft?.display_image_url || sale?.asset?.image_url || sale?.image_url;
-  if(img && String(img).startsWith('http')) embed.setThumbnail(img);
+
+  const img = marketSaleOpenSeaImage(sale);
+  if(isDiscordFriendlyImageUrl(img)) embed.setThumbnail(img);
   return embed;
+}
+
+async function buildMarketSalePayload(sale, cfg, alias){
+  const embed = buildMarketSaleEmbed(sale, cfg, alias);
+  const tokenId = tokenIdFromSale(sale);
+  const payload = { embeds:[embed] };
+
+  // If OpenSea gave Discord a normal PNG/JPG/GIF/webp URL, keep it.
+  // If it gave SVG/data/missing image, render contract tokenURI to PNG and attach it.
+  const img = marketSaleOpenSeaImage(sale);
+  const needsFallback = !isDiscordFriendlyImageUrl(img);
+
+  if(needsFallback && cfg?.contract && tokenId !== '?'){
+    try{
+      const size = 512;
+      const { buffer } = await renderTokenPng({
+        contract: cfg.contract,
+        tokenId,
+        chain: cfg.chain || DEFAULT_CHAIN,
+        size,
+        transparent: false
+      });
+      const safeAlias = String(alias || cfg.slug || 'collection').replace(/[^a-z0-9_.-]+/gi,'-');
+      const safeToken = String(tokenId).replace(/[^a-z0-9_.-]+/gi,'-');
+      const filename = `${safeAlias}-${safeToken}-thumb.png`;
+      const att = new AttachmentBuilder(buffer, { name: filename });
+      embed.setThumbnail(`attachment://${filename}`);
+      payload.files = [att];
+    }catch(e){
+      console.warn('[Market thumbnail fallback]', alias, tokenId, e.message);
+    }
+  }
+
+  return payload;
 }
 
 async function fetchLatestSales(slug, limit=5){
@@ -203,8 +255,15 @@ async function handleMarketCommand(interaction){
     try{
       const sales = await fetchLatestSales(resolved.cfg.slug, count);
       if(!sales.length) return interaction.editReply('No recent sales found.');
-      const embeds = sales.reverse().map(s => buildMarketSaleEmbed(s, resolved.cfg, resolved.alias));
-      return interaction.editReply({ content:`Latest ${embeds.length} sale${embeds.length===1?'':'s'} for **${resolved.alias}**:`, embeds: embeds.slice(0,10) });
+      const reversed = sales.reverse().slice(0,10);
+      const embeds = [];
+      const files = [];
+      for(const sale of reversed){
+        const payload = await buildMarketSalePayload(sale, resolved.cfg, resolved.alias);
+        embeds.push(...(payload.embeds || []));
+        files.push(...(payload.files || []));
+      }
+      return interaction.editReply({ content:`Latest ${embeds.length} sale${embeds.length===1?'':'s'} for **${resolved.alias}**:`, embeds, files });
     }catch(e){ return interaction.editReply('Error: '+e.message); }
   }
 }
@@ -455,7 +514,8 @@ async function startMarketPoller(client){
           const channel = await client.channels.fetch(c.salesChannelId).catch(()=>null);
           if(!channel){ console.warn(`[Market] channel not found guild=${guildId} alias=${alias} channel=${c.salesChannelId}`); continue; }
           for(const sale of newSales.reverse()){
-            await channel.send({ embeds:[buildMarketSaleEmbed(sale, c, alias)] }).catch(e=>console.warn('[Market post]', e.message));
+            const payload = await buildMarketSalePayload(sale, c, alias);
+            await channel.send(payload).catch(e=>console.warn('[Market post]', e.message));
             await new Promise(r=>setTimeout(r, 500));
           }
           cursors[cursorKey] = latestKey;
