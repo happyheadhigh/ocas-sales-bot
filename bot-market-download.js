@@ -138,42 +138,6 @@ function parseMarketSalesSearch(search, guildCfg){
   return { alias, count };
 }
 
-async function fetchOpenSeaCollectionInfo(slug){
-  const cleanSlug = String(slug || '').trim();
-  if(!cleanSlug) throw new Error('Missing collection slug');
-
-  const url = `https://api.opensea.io/api/v2/collections/${encodeURIComponent(cleanSlug)}`;
-  const r = await fetch(url, { headers: osHeaders() });
-  if(!r.ok) throw new Error(`OpenSea collection lookup failed ${r.status}`);
-
-  const j = await r.json();
-  const root = j.collection || j;
-  const contracts = root.contracts || root.primary_asset_contracts || root.asset_contracts || [];
-  const first = Array.isArray(contracts) ? contracts[0] : contracts;
-
-  const address = normalizeContract(
-    first?.address ||
-    first?.contract_address ||
-    root?.contract_address ||
-    root?.primary_asset_contract?.address ||
-    ''
-  );
-
-  const chain =
-    first?.chain ||
-    first?.chain_identifier ||
-    root?.chain ||
-    root?.primary_asset_contract?.chain ||
-    DEFAULT_CHAIN;
-
-  return {
-    name: root?.name || root?.collection || cleanSlug,
-    slug: root?.collection || root?.slug || cleanSlug,
-    contract: address,
-    chain: String(chain || DEFAULT_CHAIN).toLowerCase(),
-  };
-}
-
 function buildHelpEmbed(){
   return new EmbedBuilder()
     .setTitle('OCAS Sales Bot Help')
@@ -204,7 +168,7 @@ function buildHelpEmbed(){
       {
         name:'Universal Multi-Collection Market',
         value:[
-          '`/market add slug:collection-slug alias:name` — Add a sales feed',
+          '`/market add alias:name slug:collection-slug contract:0x...` — Add a sales feed',
           '`/market list` — Show configured collections',
           '`/market channel alias:name` — Set sales channel',
           '`/market remove alias:name` — Remove a collection',
@@ -276,7 +240,7 @@ function buildWelcomeEmbed(){
         name:'Multi-Collection Sales Feeds',
         value:[
           'Use:',
-          '`/market add slug:collection-slug alias:name`',
+          '`/market add alias:name slug:collection-slug contract:0x...`',
           '',
           'Then test:',
           '`/market sales search:name 5`',
@@ -436,39 +400,25 @@ async function handleMarketCommand(interaction){
   if(sub === 'add'){
     if(!isAdmin(interaction)) return interaction.reply({ content:'Need Manage Server permission.', flags:MessageFlags.Ephemeral });
 
+    const alias = normalizeAlias(interaction.options.getString('alias'));
     const slug = String(interaction.options.getString('slug') || '').trim();
-    let alias = normalizeAlias(interaction.options.getString('alias') || slug);
-    let contract = normalizeContract(interaction.options.getString('contract'));
-    let chain = interaction.options.getString('chain') || '';
+    const contract = normalizeContract(interaction.options.getString('contract'));
+    const chain = String(interaction.options.getString('chain') || DEFAULT_CHAIN).toLowerCase();
     const channel = interaction.options.getChannel('sales_channel') || interaction.channel;
 
-    if(!slug) return interaction.reply({ content:'Collection slug is required.', flags:MessageFlags.Ephemeral });
-
-    let detected = null;
-    if(!contract || !chain){
-      try{
-        detected = await fetchOpenSeaCollectionInfo(slug);
-        contract = contract || detected.contract;
-        chain = chain || detected.chain || DEFAULT_CHAIN;
-      }catch(e){
-        if(!contract){
-          return interaction.reply({
-            content:`I could not auto-detect the contract for \`${slug}\`. Try again with \`contract:0x...\`. Error: ${e.message}`,
-            flags:MessageFlags.Ephemeral
-          });
-        }
-      }
+    if(!alias || !slug || !contract){
+      return interaction.reply({
+        content:'Alias, slug, and a valid contract are required. Example: `/market add alias:flux slug:fluxeto contract:0x...`',
+        flags:MessageFlags.Ephemeral
+      });
     }
-
-    chain = String(chain || DEFAULT_CHAIN).toLowerCase();
-    if(!alias || !contract) return interaction.reply({ content:'Alias and a valid contract are required.', flags:MessageFlags.Ephemeral });
 
     guildCfg.collections[alias] = {
       alias,
       slug,
       contract,
       chain,
-      name: detected?.name || alias,
+      name: alias,
       salesChannelId: channel.id,
       paused:false,
       addedAt:Date.now()
@@ -476,8 +426,7 @@ async function handleMarketCommand(interaction){
     guildCfg.channelDefaults[channel.id] = alias;
     await saveMarketConfig(cfg);
 
-    const detectedText = detected ? `\nDetected: **${detected.name || slug}** · \`${chain}\` · \`${contract}\`` : '';
-    return interaction.reply({ content:`Added **${alias}** → \`${slug}\` sales in <#${channel.id}>.${detectedText}`, flags:MessageFlags.Ephemeral });
+    return interaction.reply({ content:`Added **${alias}** → \`${slug}\` sales in <#${channel.id}>.`, flags:MessageFlags.Ephemeral });
   }
 
   if(sub === 'list'){
