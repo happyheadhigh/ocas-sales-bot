@@ -7,3 +7,4 @@ user-alerts.json.env
 .env
 .env.staging
 .env.production
+market-download-mvp

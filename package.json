@@ -2,11 +2,13 @@
   "name": "nft-sales-bot",
   "version": "2.0.0",
   "description": "Public multi-server NFT sales bot — works with any OpenSea collection",
-  "main": "bot.js",
+  "main": "bot-market-download.js",
   "scripts": {
-    "start": "node bot.js",
+    "start": "node bot-market-download.js",
+    "start:legacy": "node bot.js",
     "register": "node register-commands.js",
-    "dev": "node --watch bot.js",
+    "dev": "node --watch bot-market-download.js",
+    "dev:legacy": "node --watch bot.js",
     "burn:repair": "node burn-backfill-repair.js"
   },
   "dependencies": {
