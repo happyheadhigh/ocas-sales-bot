@@ -39,20 +39,24 @@ const commands = [
   new SlashCommandBuilder().setName('market')
     .setDescription('Universal multi-collection market tools')
     .addSubcommand(sc=>sc.setName('add').setDescription('Add a collection sales feed to this server')
-      .addStringOption(o=>o.setName('alias').setDescription('Short name, e.g. ocas, cats, punks').setRequired(true))
       .addStringOption(o=>o.setName('slug').setDescription('OpenSea collection slug').setRequired(true))
-      .addStringOption(o=>o.setName('contract').setDescription('Contract address').setRequired(true))
+      .addStringOption(o=>o.setName('alias').setDescription('Short name, e.g. ocas, flux, rocks. Defaults to slug').setRequired(false))
+      .addStringOption(o=>o.setName('contract').setDescription('Contract address. Optional if OpenSea can detect it').setRequired(false))
       .addChannelOption(o=>o.setName('sales_channel').setDescription('Sales channel; defaults to current channel').setRequired(false))
-      .addStringOption(o=>o.setName('chain').setDescription('Blockchain').setRequired(false).addChoices(...chainChoices)))
+      .addStringOption(o=>o.setName('chain').setDescription('Blockchain. Optional if OpenSea can detect it').setRequired(false).addChoices(...chainChoices)))
     .addSubcommand(sc=>sc.setName('list').setDescription('List configured market collections'))
     .addSubcommand(sc=>sc.setName('remove').setDescription('Remove a collection from this server').addStringOption(o=>o.setName('alias').setDescription('Collection alias to remove').setRequired(true)))
     .addSubcommand(sc=>sc.setName('channel').setDescription('Set a collection sales/default channel').addStringOption(o=>o.setName('alias').setDescription('Collection alias').setRequired(true)).addChannelOption(o=>o.setName('sales_channel').setDescription('Sales/default channel; defaults to current channel').setRequired(false)))
-    .addSubcommand(sc=>sc.setName('sales').setDescription('Show recent sales for a configured collection').addStringOption(o=>o.setName('alias').setDescription('Collection alias; defaults by channel or OCAS').setRequired(false)).addIntegerOption(o=>o.setName('count').setDescription('Number of sales, max 10').setRequired(false).setMinValue(1).setMaxValue(10))),
+    .addSubcommand(sc=>sc.setName('sales').setDescription('Show recent sales for a configured collection')
+      .addStringOption(o=>o.setName('search').setDescription('Example: flux 5').setRequired(false))
+      .addStringOption(o=>o.setName('alias').setDescription('Collection alias; defaults by channel or OCAS').setRequired(false))
+      .addIntegerOption(o=>o.setName('count').setDescription('Number of sales, max 10').setRequired(false).setMinValue(1).setMaxValue(10))),
 
   new SlashCommandBuilder().setName('download')
   .setDescription('Download a high-res PNG for OCAS or another configured collection')
-  .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(true).setMinValue(1))
-  .addStringOption(o=>o.setName('collection').setDescription('Alias, e.g. ocas or cats. Defaults to OCAS').setRequired(false))
+  .addStringOption(o=>o.setName('search').setDescription('Example: flux #337 2048 no bg').setRequired(false))
+  .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(false).setMinValue(1))
+  .addStringOption(o=>o.setName('collection').setDescription('Alias, e.g. ocas, flux, rocks. Defaults to OCAS').setRequired(false))
   .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(512).setMaxValue(4096))
   .addBooleanOption(o=>o.setName('transparent').setDescription('Export with transparent/no background').setRequired(false)),
 

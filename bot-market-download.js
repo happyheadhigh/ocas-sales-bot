@@ -94,6 +94,235 @@ function resolveCollectionFromGuild(guildCfg, alias, channelId){
   return first ? { alias:first, cfg:collections[first] } : null;
 }
 
+function findCollectionAliasInText(guildCfg, text){
+  const cleanText = String(text || '').toLowerCase();
+  const words = cleanText.split(/[\s,]+/).map(w => normalizeAlias(w.replace(/^#/, ''))).filter(Boolean);
+  const collections = guildCfg?.collections || {};
+  for(const w of words){
+    if(w === 'ocas') return 'ocas';
+    if(collections[w]) return w;
+  }
+  for(const [alias,c] of Object.entries(collections)){
+    const slug = normalizeAlias(c?.slug || '');
+    if(words.includes(slug)) return alias;
+  }
+  return null;
+}
+
+function parseDownloadSearch(search, guildCfg){
+  const raw = String(search || '').trim();
+  const lower = raw.toLowerCase();
+  const alias = findCollectionAliasInText(guildCfg, raw) || null;
+  const transparent = /\b(no\s*bg|nobg|no\s*background|transparent|alpha|clear)\b/i.test(raw);
+  const sizeMatch = raw.match(/\b(512|1024|2048|4096)\b/);
+  const size = sizeMatch ? parseInt(sizeMatch[1], 10) : null;
+  let tokenId = null;
+
+  const hashMatch = raw.match(/#\s*(\d{1,10})/);
+  if(hashMatch){
+    tokenId = parseInt(hashMatch[1], 10);
+  }else{
+    const nums = [...raw.matchAll(/\b(\d{1,10})\b/g)].map(m => parseInt(m[1], 10));
+    const nonSize = nums.find(n => ![512,1024,2048,4096].includes(n));
+    tokenId = nonSize || nums[0] || null;
+  }
+
+  return { alias, tokenId, size, transparent };
+}
+
+function parseMarketSalesSearch(search, guildCfg){
+  const raw = String(search || '').trim();
+  const alias = findCollectionAliasInText(guildCfg, raw) || null;
+  const countMatch = raw.match(/\b([1-9]|10)\b/);
+  const count = countMatch ? parseInt(countMatch[1], 10) : null;
+  return { alias, count };
+}
+
+async function fetchOpenSeaCollectionInfo(slug){
+  const cleanSlug = String(slug || '').trim();
+  if(!cleanSlug) throw new Error('Missing collection slug');
+
+  const url = `https://api.opensea.io/api/v2/collections/${encodeURIComponent(cleanSlug)}`;
+  const r = await fetch(url, { headers: osHeaders() });
+  if(!r.ok) throw new Error(`OpenSea collection lookup failed ${r.status}`);
+
+  const j = await r.json();
+  const root = j.collection || j;
+  const contracts = root.contracts || root.primary_asset_contracts || root.asset_contracts || [];
+  const first = Array.isArray(contracts) ? contracts[0] : contracts;
+
+  const address = normalizeContract(
+    first?.address ||
+    first?.contract_address ||
+    root?.contract_address ||
+    root?.primary_asset_contract?.address ||
+    ''
+  );
+
+  const chain =
+    first?.chain ||
+    first?.chain_identifier ||
+    root?.chain ||
+    root?.primary_asset_contract?.chain ||
+    DEFAULT_CHAIN;
+
+  return {
+    name: root?.name || root?.collection || cleanSlug,
+    slug: root?.collection || root?.slug || cleanSlug,
+    contract: address,
+    chain: String(chain || DEFAULT_CHAIN).toLowerCase(),
+  };
+}
+
+function buildHelpEmbed(){
+  return new EmbedBuilder()
+    .setTitle('OCAS Sales Bot Help')
+    .setDescription('Search tokens, track sales/listings, download images, monitor burns, and manage multi-collection sales feeds.')
+    .setColor(0x0786FF)
+    .addFields(
+      {
+        name:'OCAS Search & Market',
+        value:[
+          '`/ocas search:zombie hoodie` — Random or searched OCAS token',
+          '`/ocas token:1234` — Show a specific OCAS token',
+          '`/sweep search:10` — Cost to sweep 10 cheapest listed',
+          '`/sweep search:2eth zombie` — Budget sweep with trait filter',
+          '`/sweep search:0.05 floor zombie` — Clear below target floor',
+          '`/traitfind search:zombie listings` — Listed tokens with that trait',
+          '`/rankfind search:1-100 sales` — Sales history by OS rank range',
+        ].join('\n')
+      },
+      {
+        name:'Sales & Listings',
+        value:[
+          '`/lastsale` — Most recent sale',
+          '`/recentsales count:10` — Last N sales',
+          '`/sale token:1234` — Last sale for a token',
+          '`/listings count:5` — Recent new listings',
+        ].join('\n')
+      },
+      {
+        name:'Universal Multi-Collection Market',
+        value:[
+          '`/market add slug:collection-slug alias:name` — Add a sales feed',
+          '`/market list` — Show configured collections',
+          '`/market channel alias:name` — Set sales channel',
+          '`/market remove alias:name` — Remove a collection',
+          '`/market sales search:name 5` — Show last 5 sales',
+        ].join('\n')
+      },
+      {
+        name:'Image Downloads',
+        value:[
+          '`/download search:ocas #4361` — Download OCAS image',
+          '`/download search:flux #337 2048` — Download at 2048px',
+          '`/download search:ocas #4361 no bg` — Transparent PNG when supported',
+        ].join('\n')
+      },
+      {
+        name:'Burn Machine',
+        value:[
+          '`/burnstats` — Burned, created, estimated supply',
+          '`/burnlatest` — Most recent finalized burn',
+          '`/burn token:1234` — Token burn status and lineage',
+          '`/burnwallet wallet:0x...` — Wallet burn history',
+          '`/burnleaderboard` — Top burners',
+          '`/burnrefresh token:1234` — Refresh metadata + re-post alert',
+        ].join('\n')
+      },
+      {
+        name:'Alerts & Admin',
+        value:[
+          '`/myalert trait:Type value:Zombie` — Personal DM alert',
+          '`/myalertstatus` / `/myalertclear` — Manage personal alerts',
+          '`/setuphere` — Set sales channel here',
+          '`/setlistingshere` — Set listings channel here',
+          '`/setupburn` — Set burn channel here',
+          '`/salesfilter` / `/traitlistingfilter` — Filter server alerts',
+          '`/clearallfilters` — Clear server filters',
+          '`/pause` / `/resume` — Pause or resume auto-posts',
+          '`/status` — Show server config',
+        ].join('\n')
+      }
+    )
+    .setFooter({ text:'Tip: OCAS stays native. /market and /download also support other configured collections.' });
+}
+
+async function handleHelpCommand(interaction){
+  return interaction.reply({ embeds:[buildHelpEmbed()], flags: MessageFlags.Ephemeral });
+}
+
+function buildWelcomeEmbed(){
+  return new EmbedBuilder()
+    .setTitle('Thanks for adding OCAS Sales Bot!')
+    .setDescription('I post NFT sales and listing alerts with token images, prices, buyer/seller links, traits when available, and more.')
+    .setColor(0x0786FF)
+    .addFields(
+      {
+        name:'Quick Setup',
+        value:[
+          '**For OCAS / standard sales setup:**',
+          '1. Go to your sales channel and run:',
+          '`/setuphere collection:your-slug contract:0x...`',
+          '',
+          '2. Go to your listings channel and run:',
+          '`/setlistingshere`',
+          '',
+          '3. Test it:',
+          '`/lastsale` and `/listings`',
+        ].join('\n')
+      },
+      {
+        name:'Multi-Collection Sales Feeds',
+        value:[
+          'Use:',
+          '`/market add slug:collection-slug alias:name`',
+          '',
+          'Then test:',
+          '`/market sales search:name 5`',
+        ].join('\n')
+      },
+      {
+        name:'Recommended Channel Layout',
+        value:[
+          '`#all-sales` — auto-posts sales',
+          '`#all-listings` — auto-posts listings',
+          '`#market` — search/sweep/download commands',
+          '`#sales-history` — recent sales lookups',
+          '',
+          'For read-only alert channels: Channel Settings > Permissions > @everyone > disable Send Messages',
+        ].join('\n')
+      },
+      {
+        name:'Personal DM Alerts & Burn Machine',
+        value:[
+          '`/myalert trait:Type value:Zombie` — personal sale/listing DMs',
+          '`/myalertstatus` / `/myalertclear` — manage DM alerts',
+          '`/setupburn` — set OCAS burn alert channel',
+          '',
+          'Use `/help` anytime to see all commands.',
+        ].join('\n')
+      }
+    );
+}
+
+async function sendWelcomeMessage(guild){
+  try{
+    const me = guild.members?.me || await guild.members.fetchMe().catch(()=>null);
+    let channel = guild.systemChannel || null;
+    if(!channel){
+      channel = guild.channels.cache.find(c =>
+        c?.isTextBased?.() &&
+        c?.permissionsFor?.(me)?.has?.('SendMessages')
+      );
+    }
+    if(channel?.send) await channel.send({ embeds:[buildWelcomeEmbed()] });
+  }catch(e){
+    console.warn('[Welcome message]', e.message);
+  }
+}
+
+
 function tokenIdFromSale(sale){
   return sale?.nft?.identifier || sale?.nft?.token_id || sale?.asset?.token_id || sale?.asset?.identifier || '?';
 }
@@ -206,16 +435,49 @@ async function handleMarketCommand(interaction){
 
   if(sub === 'add'){
     if(!isAdmin(interaction)) return interaction.reply({ content:'Need Manage Server permission.', flags:MessageFlags.Ephemeral });
-    const alias = normalizeAlias(interaction.options.getString('alias'));
+
     const slug = String(interaction.options.getString('slug') || '').trim();
-    const contract = normalizeContract(interaction.options.getString('contract'));
-    const chain = interaction.options.getString('chain') || DEFAULT_CHAIN;
+    let alias = normalizeAlias(interaction.options.getString('alias') || slug);
+    let contract = normalizeContract(interaction.options.getString('contract'));
+    let chain = interaction.options.getString('chain') || '';
     const channel = interaction.options.getChannel('sales_channel') || interaction.channel;
-    if(!alias || !slug || !contract) return interaction.reply({ content:'Alias, slug, and valid contract are required.', flags:MessageFlags.Ephemeral });
-    guildCfg.collections[alias] = { alias, slug, contract, chain, salesChannelId: channel.id, paused:false, addedAt:Date.now() };
+
+    if(!slug) return interaction.reply({ content:'Collection slug is required.', flags:MessageFlags.Ephemeral });
+
+    let detected = null;
+    if(!contract || !chain){
+      try{
+        detected = await fetchOpenSeaCollectionInfo(slug);
+        contract = contract || detected.contract;
+        chain = chain || detected.chain || DEFAULT_CHAIN;
+      }catch(e){
+        if(!contract){
+          return interaction.reply({
+            content:`I could not auto-detect the contract for \`${slug}\`. Try again with \`contract:0x...\`. Error: ${e.message}`,
+            flags:MessageFlags.Ephemeral
+          });
+        }
+      }
+    }
+
+    chain = String(chain || DEFAULT_CHAIN).toLowerCase();
+    if(!alias || !contract) return interaction.reply({ content:'Alias and a valid contract are required.', flags:MessageFlags.Ephemeral });
+
+    guildCfg.collections[alias] = {
+      alias,
+      slug,
+      contract,
+      chain,
+      name: detected?.name || alias,
+      salesChannelId: channel.id,
+      paused:false,
+      addedAt:Date.now()
+    };
     guildCfg.channelDefaults[channel.id] = alias;
     await saveMarketConfig(cfg);
-    return interaction.reply({ content:`Added **${alias}** → \`${slug}\` sales in <#${channel.id}>.`, flags:MessageFlags.Ephemeral });
+
+    const detectedText = detected ? `\nDetected: **${detected.name || slug}** · \`${chain}\` · \`${contract}\`` : '';
+    return interaction.reply({ content:`Added **${alias}** → \`${slug}\` sales in <#${channel.id}>.${detectedText}`, flags:MessageFlags.Ephemeral });
   }
 
   if(sub === 'list'){
@@ -247,8 +509,10 @@ async function handleMarketCommand(interaction){
   }
 
   if(sub === 'sales'){
-    const aliasOpt = interaction.options.getString('alias');
-    const count = Math.max(1, Math.min(interaction.options.getInteger('count') || 5, 10));
+    const searchText = interaction.options.getString('search') || '';
+    const parsed = parseMarketSalesSearch(searchText, guildCfg);
+    const aliasOpt = parsed.alias || interaction.options.getString('alias');
+    const count = Math.max(1, Math.min(parsed.count || interaction.options.getInteger('count') || 5, 10));
     const resolved = resolveCollectionFromGuild(guildCfg, aliasOpt, interaction.channelId);
     if(!resolved) return interaction.reply({ content:'No market collection configured. Use `/market add` first.', flags:MessageFlags.Ephemeral });
     await interaction.deferReply();
@@ -423,12 +687,17 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
 }
 
 async function handleDownloadCommand(interaction, forced={}){
-  const tokenId = forced.tokenId || interaction.options?.getInteger?.('token');
-  const sizeRaw = forced.size || interaction.options?.getInteger?.('size') || 2048;
+  const cfgForParse = await loadMarketConfig();
+  const guildCfgForParse = getGuildMarket(cfgForParse, interaction.guildId || 'dm');
+  const searchText = interaction.options?.getString?.('search') || '';
+  const parsed = parseDownloadSearch(searchText, guildCfgForParse);
+
+  const tokenId = forced.tokenId || interaction.options?.getInteger?.('token') || parsed.tokenId;
+  const sizeRaw = forced.size || interaction.options?.getInteger?.('size') || parsed.size || 2048;
   const size = Math.max(512, Math.min(sizeRaw, 4096));
-  const transparent = forced.transparent ?? interaction.options?.getBoolean?.('transparent') ?? false;
-  const collection = interaction.options?.getString?.('collection') || 'ocas';
-  if(!tokenId) return interaction.reply({ content:'Provide a token ID.', flags:MessageFlags.Ephemeral });
+  const transparent = forced.transparent ?? interaction.options?.getBoolean?.('transparent') ?? parsed.transparent ?? false;
+  const collection = interaction.options?.getString?.('collection') || parsed.alias || 'ocas';
+  if(!tokenId) return interaction.reply({ content:'Provide a token ID. Example: `/download search:flux #337 2048 no bg`', flags:MessageFlags.Ephemeral });
 
   if(!interaction.deferred && !interaction.replied){
     if(forced.ephemeral) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -550,6 +819,10 @@ function wrapInteractionListener(listener){
         await handleDownloadCommand(interaction);
         return;
       }
+      if(interaction.isChatInputCommand?.() && interaction.commandName === 'help'){
+        await handleHelpCommand(interaction);
+        return;
+      }
       if(interaction.isButton?.() && interaction.customId?.startsWith('ocas_download:')){
         const [, token, size, transparentFlag] = interaction.customId.split(':');
         await handleDownloadCommand(interaction, {
@@ -588,6 +861,11 @@ Client.prototype.on = function(event, listener){
   if(event === 'interactionCreate'){
     return originalOn.call(this, event, wrapInteractionListener(listener));
   }
+  if(event === 'guildCreate'){
+    return originalOn.call(this, event, async function(guild){
+      await sendWelcomeMessage(guild);
+    });
+  }
   return originalOn.call(this, event, listener);
 };
 
@@ -597,6 +875,11 @@ Client.prototype.once = function(event, listener){
   }
   if(event === 'interactionCreate'){
     return originalOnce.call(this, event, wrapInteractionListener(listener));
+  }
+  if(event === 'guildCreate'){
+    return originalOnce.call(this, event, async function(guild){
+      await sendWelcomeMessage(guild);
+    });
   }
   return originalOnce.call(this, event, listener);
 };
