@@ -50,12 +50,11 @@ const commands = [
     .addSubcommand(sc=>sc.setName('sales').setDescription('Show recent sales for a configured collection').addStringOption(o=>o.setName('alias').setDescription('Collection alias; defaults by channel or OCAS').setRequired(false)).addIntegerOption(o=>o.setName('count').setDescription('Number of sales, max 10').setRequired(false).setMinValue(1).setMaxValue(10))),
 
   new SlashCommandBuilder().setName('download')
-    .setDescription('Download a high-res PNG for OCAS or another configured collection')
-    .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(true).setMinValue(1))
-    .addStringOption(o=>o.setName('collection').setDescription('Alias, e.g. ocas or cats. Defaults to OCAS').setRequired(false))
-    .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(512).setMaxValue(4096))
-    .addBooleanOption(o=>o.setName('transparent').setDescription('Try to remove SVG background for transparent PNG').setRequired(false))
-    .addBooleanOption(o=>o.setName('background').setDescription('Set false for transparent/no-background mode').setRequired(false)),
+  .setDescription('Download a high-res PNG for OCAS or another configured collection')
+  .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(true).setMinValue(1))
+  .addStringOption(o=>o.setName('collection').setDescription('Alias, e.g. ocas or cats. Defaults to OCAS').setRequired(false))
+  .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(512).setMaxValue(4096))
+  .addBooleanOption(o=>o.setName('transparent').setDescription('Export with transparent/no background').setRequired(false)),
 
   new SlashCommandBuilder().setName('lastsale').setDescription('Show the most recent sale').addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
   new SlashCommandBuilder().setName('recentsales').setDescription('Show the last N sales').addIntegerOption(o=>o.setName('count').setDescription('Number of sales (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),

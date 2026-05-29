@@ -368,7 +368,6 @@ async function handleDownloadCommand(interaction, forced={}){
   const sizeRaw = forced.size || interaction.options?.getInteger?.('size') || 2048;
   const size = Math.max(512, Math.min(sizeRaw, 4096));
   const transparent = forced.transparent ?? interaction.options?.getBoolean?.('transparent') ?? false;
-  const background = interaction.options?.getBoolean?.('background');
   const collection = interaction.options?.getString?.('collection') || 'ocas';
   if(!tokenId) return interaction.reply({ content:'Provide a token ID.', flags:MessageFlags.Ephemeral });
 
@@ -385,7 +384,7 @@ async function handleDownloadCommand(interaction, forced={}){
       const resolved = resolveCollectionFromGuild(guildCfg, collection, interaction.channelId);
       if(resolved){ contract = resolved.cfg.contract || contract; slug = resolved.cfg.slug || slug; chain = resolved.cfg.chain || chain; alias = resolved.alias; }
     }
-    const finalTransparent = transparent || background === false;
+    const finalTransparent = transparent;
     const { buffer } = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent });
     const filename = `${alias}-${tokenId}-${size}${finalTransparent?'-transparent':''}.png`.replace(/[^a-z0-9_.-]+/gi,'-');
     const att = new AttachmentBuilder(buffer, { name:filename });
