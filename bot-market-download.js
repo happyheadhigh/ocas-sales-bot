@@ -283,16 +283,84 @@ function makeSvgTransparent(svg){
   return out;
 }
 
+function isSvgSource(src){
+  if(!src) return false;
+  const s = String(src).trim().toLowerCase();
+  return (
+    s.startsWith('<svg') ||
+    s.startsWith('data:image/svg') ||
+    s.endsWith('.svg') ||
+    s.includes('image/svg')
+  );
+}
+
+async function extractPngFromSvg(svgSource, size=2048){
+  let svgText;
+  const src = String(svgSource || '');
+
+  if(src.trim().startsWith('<svg')){
+    svgText = src;
+  }else if(src.startsWith('data:image/svg+xml;base64,')){
+    const b64 = src.split(',')[1];
+    if(!b64) throw new Error('Empty SVG');
+    svgText = Buffer.from(b64, 'base64').toString('utf-8');
+  }else if(src.startsWith('data:image/svg+xml;utf8,')){
+    svgText = decodeURIComponent(src.split(',').slice(1).join(','));
+  }else{
+    const r = await fetch(src);
+    if(!r.ok) throw new Error('SVG fetch ' + r.status);
+    svgText = await r.text();
+  }
+
+  let bgBuf;
+  try{
+    bgBuf = await sharp(Buffer.from(svgText))
+      .resize(size, size, { kernel:'nearest', fit:'fill' })
+      .png()
+      .toBuffer();
+  }catch(e){
+    throw new Error('SVG render failed: ' + e.message);
+  }
+
+  const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
+  if(pngMatch){
+    try{
+      const rawPng = Buffer.from(pngMatch[1].replace(/\s/g,''), 'base64');
+      const charBuf = await sharp(rawPng)
+        .resize(size, size, { kernel:'nearest' })
+        .png()
+        .toBuffer();
+
+      return await sharp(bgBuf)
+        .composite([{ input: charBuf, blend:'over' }])
+        .png()
+        .toBuffer();
+    }catch(e){
+      console.warn('[extractPngFromSvg] char composite failed, using full SVG render:', e.message);
+    }
+  }
+
+  return bgBuf;
+}
+
 async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
   const uri = await fetchTokenUri(contract, tokenId, chain);
   const meta = await loadJsonFromUri(uri);
   let src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
-  if(typeof src === 'string' && transparent) src = makeSvgTransparent(src);
-  let pipeline = sharp(Buffer.isBuffer(src) ? src : Buffer.from(src));
-  pipeline = pipeline.resize(size, size, { fit:'contain', withoutEnlargement:false });
-  const buffer = await pipeline.png().toBuffer();
+
+if(typeof src === 'string' && transparent){
+  src = makeSvgTransparent(src);
+}
+
+if(typeof src === 'string' && isSvgSource(src)){
+  const buffer = await extractPngFromSvg(src, size);
   return { buffer, meta };
 }
+
+let pipeline = sharp(Buffer.isBuffer(src) ? src : Buffer.from(src));
+pipeline = pipeline.resize(size, size, { fit:'contain', withoutEnlargement:false });
+const buffer = await pipeline.png().toBuffer();
+return { buffer, meta };
 
 async function handleDownloadCommand(interaction, forced={}){
   const tokenId = forced.tokenId || interaction.options?.getInteger?.('token');
