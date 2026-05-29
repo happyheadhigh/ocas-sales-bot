@@ -468,42 +468,77 @@ async function startMarketPoller(client){
   setTimeout(tick, 5000);
 }
 
-const originalOn = Client.prototype.on;
-Client.prototype.on = function(event, listener){
-  if(event === 'ready'){
-    return originalOn.call(this, event, async (...args) => {
-      try{ await listener.apply(this, args); }catch(e){ console.error('[Wrapped ready original]', e.message); }
-      startMarketPoller(this).catch(e=>console.error('[Market start]', e.message));
-    });
-  }
-  if(event === 'interactionCreate'){
-    return originalOn.call(this, event, async (interaction, ...args) => {
-      try{
-        if(interaction.isChatInputCommand?.() && interaction.commandName === 'market'){
-          await handleMarketCommand(interaction);
-          return;
-        }
-        if(interaction.isChatInputCommand?.() && interaction.commandName === 'download'){
-          await handleDownloadCommand(interaction);
-          return;
-        }
-        if(interaction.isButton?.() && interaction.customId?.startsWith('ocas_download:')){
-          const [, token, size, transparentFlag] = interaction.customId.split(':');
-          await handleDownloadCommand(interaction, { tokenId:parseInt(token,10), size:parseInt(size||'2048',10), transparent:transparentFlag === '1', ephemeral:true });
-          return;
-        }
-        if(interaction.isChatInputCommand?.() && interaction.commandName === 'ocas'){
-          patchOcasInteraction(interaction);
-        }
-      }catch(e){
-        console.error('[Market/download wrapper]', e.message);
-        try{ if(!interaction.replied && !interaction.deferred) await interaction.reply({content:'Error: '+e.message, flags:MessageFlags.Ephemeral}); }catch(_){}
+function wrapReadyListener(listener){
+  return async function(...args){
+    try{
+      await listener.apply(this, args);
+    }catch(e){
+      console.error('[Wrapped ready original]', e.message);
+    }
+    startMarketPoller(this).catch(e=>console.error('[Market start]', e.message));
+  };
+}
+
+function wrapInteractionListener(listener){
+  return async function(interaction, ...args){
+    try{
+      if(interaction.isChatInputCommand?.() && interaction.commandName === 'market'){
+        await handleMarketCommand(interaction);
         return;
       }
-      return listener.call(this, interaction, ...args);
-    });
+      if(interaction.isChatInputCommand?.() && interaction.commandName === 'download'){
+        await handleDownloadCommand(interaction);
+        return;
+      }
+      if(interaction.isButton?.() && interaction.customId?.startsWith('ocas_download:')){
+        const [, token, size, transparentFlag] = interaction.customId.split(':');
+        await handleDownloadCommand(interaction, {
+          tokenId:parseInt(token,10),
+          size:parseInt(size||'2048',10),
+          transparent:transparentFlag === '1',
+          ephemeral:true
+        });
+        return;
+      }
+      if(interaction.isChatInputCommand?.() && interaction.commandName === 'ocas'){
+        patchOcasInteraction(interaction);
+      }
+    }catch(e){
+      console.error('[Market/download wrapper]', e.message);
+      try{
+        if(!interaction.replied && !interaction.deferred){
+          await interaction.reply({content:'Error: '+e.message, flags:MessageFlags.Ephemeral});
+        }
+      }catch(_){}
+      return;
+    }
+    return listener.call(this, interaction, ...args);
+  };
+}
+
+const originalOn = Client.prototype.on;
+const originalOnce = Client.prototype.once;
+
+// Existing bot boots with client.once('clientReady'), not client.on('ready').
+// Patch both on() and once(), and support both event names, so the market poller actually starts.
+Client.prototype.on = function(event, listener){
+  if(event === 'ready' || event === 'clientReady'){
+    return originalOn.call(this, event, wrapReadyListener(listener));
+  }
+  if(event === 'interactionCreate'){
+    return originalOn.call(this, event, wrapInteractionListener(listener));
   }
   return originalOn.call(this, event, listener);
+};
+
+Client.prototype.once = function(event, listener){
+  if(event === 'ready' || event === 'clientReady'){
+    return originalOnce.call(this, event, wrapReadyListener(listener));
+  }
+  if(event === 'interactionCreate'){
+    return originalOnce.call(this, event, wrapInteractionListener(listener));
+  }
+  return originalOnce.call(this, event, listener);
 };
 
 require('./bot.js');
