@@ -286,7 +286,7 @@ function makeSvgTransparent(svg){
 async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
   const uri = await fetchTokenUri(contract, tokenId, chain);
   const meta = await loadJsonFromUri(uri);
-  let src = await imageSourceToSvgOrBuffer(meta.image || meta.image_data || meta.image_url);
+  let src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
   if(typeof src === 'string' && transparent) src = makeSvgTransparent(src);
   let pipeline = sharp(Buffer.isBuffer(src) ? src : Buffer.from(src));
   pipeline = pipeline.resize(size, size, { fit:'contain', withoutEnlargement:false });

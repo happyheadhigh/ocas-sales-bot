@@ -1,4 +1,6 @@
 node_modules/
 .env
 server-configs.json
-user-alerts.json
+user-alerts.json.env
+.env.staging
+.env.production
