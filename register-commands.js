@@ -48,13 +48,13 @@ const commands = [
     .addSubcommand(sc=>sc.setName('remove').setDescription('Remove a collection from this server').addStringOption(o=>o.setName('alias').setDescription('Collection alias to remove').setRequired(true)))
     .addSubcommand(sc=>sc.setName('channel').setDescription('Set a collection sales/default channel').addStringOption(o=>o.setName('alias').setDescription('Collection alias').setRequired(true)).addChannelOption(o=>o.setName('sales_channel').setDescription('Sales/default channel; defaults to current channel').setRequired(false)))
     .addSubcommand(sc=>sc.setName('sales').setDescription('Show recent sales for a configured collection')
-      .addStringOption(o=>o.setName('search').setDescription('Example: flux 5').setRequired(false))
+      .addStringOption(o=>o.setName('search').setDescription('Example: ocas 5').setRequired(false))
       .addStringOption(o=>o.setName('alias').setDescription('Collection alias; defaults by channel or OCAS').setRequired(false))
       .addIntegerOption(o=>o.setName('count').setDescription('Number of sales, max 10').setRequired(false).setMinValue(1).setMaxValue(10))),
 
   new SlashCommandBuilder().setName('download')
   .setDescription('Download a high-res PNG for OCAS or another configured collection')
-  .addStringOption(o=>o.setName('search').setDescription('Example: flux #337 2048 no bg').setRequired(false))
+  .addStringOption(o=>o.setName('search').setDescription('Example: ocas #337 2048 no bg').setRequired(false))
   .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(false).setMinValue(1))
   .addStringOption(o=>o.setName('collection').setDescription('Alias, e.g. ocas, flux, rocks. Defaults to OCAS').setRequired(false))
   .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(512).setMaxValue(4096))

@@ -179,7 +179,7 @@ function buildHelpEmbed(){
         name:'Image Downloads',
         value:[
           '`/download search:ocas #4361` — Download OCAS image',
-          '`/download search:flux #337 2048` — Download at 2048px',
+          '`/download search:ocas #337 2048` — Download at 2048px',
           '`/download search:ocas #4361 no bg` — Transparent PNG when supported',
         ].join('\n')
       },
@@ -408,7 +408,7 @@ async function handleMarketCommand(interaction){
 
     if(!alias || !slug || !contract){
       return interaction.reply({
-        content:'Alias, slug, and a valid contract are required. Example: `/market add alias:flux slug:fluxeto contract:0x...`',
+        content:'Alias, slug, and a valid contract are required. Example: `/market add alias:ocas slug:on-chain-all-stars contract:0x...`',
         flags:MessageFlags.Ephemeral
       });
     }
@@ -646,7 +646,7 @@ async function handleDownloadCommand(interaction, forced={}){
   const size = Math.max(512, Math.min(sizeRaw, 4096));
   const transparent = forced.transparent ?? interaction.options?.getBoolean?.('transparent') ?? parsed.transparent ?? false;
   const collection = interaction.options?.getString?.('collection') || parsed.alias || 'ocas';
-  if(!tokenId) return interaction.reply({ content:'Provide a token ID. Example: `/download search:flux #337 2048 no bg`', flags:MessageFlags.Ephemeral });
+  if(!tokenId) return interaction.reply({ content:'Provide a token ID. Example: `/download search:ocas #337 2048 no bg`', flags:MessageFlags.Ephemeral });
 
   if(!interaction.deferred && !interaction.replied){
     if(forced.ephemeral) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
