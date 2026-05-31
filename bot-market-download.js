@@ -199,7 +199,8 @@ function buildHelpEmbed(){
       {
         name:'Universal Multi-Collection Market',
         value:[
-          '`/market add alias:name slug:collection-slug contract:0x...` — Add a sales feed',
+          '`/market addhere alias:name slug:collection-slug contract:0x...` — Mobile-friendly: add feed to this channel',
+          '`/market add alias:name slug:collection-slug contract:0x...` — Add feed; optional channel picker',
           '`/market list` — Show configured collections',
           '`/market channel alias:name` — Set sales channel',
           '`/market remove alias:name` — Remove a collection',
@@ -270,7 +271,10 @@ function buildWelcomeEmbed(){
       {
         name:'Multi-Collection Sales Feeds',
         value:[
-          'Use:',
+          'Mobile/easiest: go to the sales channel and run:',
+          '`/market addhere alias:name slug:collection-slug contract:0x...`',
+          '',
+          'Desktop optional:',
           '`/market add alias:name slug:collection-slug contract:0x...`',
           '',
           'Then test:',
@@ -520,18 +524,20 @@ async function handleMarketCommand(interaction){
   const cfg = await loadMarketConfig();
   const guildCfg = getGuildMarket(cfg, guildId);
 
-  if(sub === 'add'){
+  if(sub === 'add' || sub === 'addhere'){
     if(!isAdmin(interaction)) return interaction.reply({ content:'Need Manage Server permission.', flags:MessageFlags.Ephemeral });
 
     const alias = normalizeAlias(interaction.options.getString('alias'));
     const slug = String(interaction.options.getString('slug') || '').trim();
     const contract = normalizeContract(interaction.options.getString('contract'));
     const chain = String(interaction.options.getString('chain') || DEFAULT_CHAIN).toLowerCase();
-    const channel = interaction.options.getChannel('sales_channel') || interaction.channel;
+    const channel = sub === 'addhere'
+      ? interaction.channel
+      : (interaction.options.getChannel('sales_channel') || interaction.channel);
 
     if(!alias || !slug || !contract){
       return interaction.reply({
-        content:'Alias, slug, and a valid contract are required. Example: `/market add alias:ocas slug:on-chain-all-stars contract:0x...`',
+        content:'Alias, slug, and a valid contract are required. Example: `/market addhere alias:ocas slug:on-chain-all-stars contract:0x...`',
         flags:MessageFlags.Ephemeral
       });
     }

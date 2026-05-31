@@ -1211,7 +1211,8 @@ async function pollBurnEventsLegacy(){
         const existing = await pgPool.query(
           'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
         );
-        if(existing.rows.length) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; still checking alert fanout`);
+        const wasAlreadyStored = existing.rows.length > 0;
+        if(wasAlreadyStored) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; skipping replay alert`);
 
         // Cross-reference with BurnStarted data
         const startEvent = pendingBurns.get(String(survivorTokenId)) ||
@@ -1225,20 +1226,23 @@ async function pollBurnEventsLegacy(){
         finalEvent.burnEventId = await storeBurnFinalized(finalEvent, startEvent);
         console.log(`[Burn] BurnFinalized: #${survivorTokenId} → ${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
-        // Queue to pending alert system — same as processBurnLogs
-        const alertKey = String(survivorTokenId);
-        if(!pendingBurnAlerts.has(alertKey)){
-          pendingBurnAlerts.set(alertKey, {
-            finalEvent: { ...finalEvent },
-            startEvent: { ...startEvent },
-            preBurnTraits: startEvent?.preBurnTraits || null,
-            addedAt:  Date.now(),
-            attempts: 0,
-            slowMode: false,
-          });
-          console.log(`[BurnMeta] Queued pending alert for #${survivorTokenId} — awaiting metadata refresh`);
-          // Fire-and-forget OS metadata refresh — helps speed up metadata propagation
-          triggerOsMetadataRefresh(survivorTokenId);
+        // Queue to pending alert system — same as processBurnLogs.
+        // Do not re-alert already-stored historical burns during staging/repair catch-up.
+        if(!wasAlreadyStored){
+          const alertKey = String(survivorTokenId);
+          if(!pendingBurnAlerts.has(alertKey)){
+            pendingBurnAlerts.set(alertKey, {
+              finalEvent: { ...finalEvent },
+              startEvent: { ...startEvent },
+              preBurnTraits: startEvent?.preBurnTraits || null,
+              addedAt:  Date.now(),
+              attempts: 0,
+              slowMode: false,
+            });
+            console.log(`[BurnMeta] Queued pending alert for #${survivorTokenId} — awaiting metadata refresh`);
+            // Fire-and-forget OS metadata refresh — helps speed up metadata propagation
+            triggerOsMetadataRefresh(survivorTokenId);
+          }
         }
         pendingBurns.delete(String(survivorTokenId));
       }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
@@ -1311,7 +1315,8 @@ async function processBurnLogs(logs, shouldAlert){
       const existing = await pgPool.query(
         'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
       );
-      if(existing.rows.length) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; still checking alert fanout`);
+      const wasAlreadyStored = existing.rows.length > 0;
+      if(wasAlreadyStored) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; skipping replay alert`);
 
       const startEvent = pendingBurns.get(String(survivorTokenId)) ||
         await loadBurnStartFromDB(survivorTokenId);
@@ -1323,9 +1328,10 @@ async function processBurnLogs(logs, shouldAlert){
       finalEvent.burnEventId = await storeBurnFinalized(finalEvent, startEvent);
       console.log(`[Burn] BurnFinalized: #${survivorTokenId} tier=${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
 
-      if(shouldAlert){
+      if(shouldAlert && !wasAlreadyStored){
         // Queue to pending alert system — do NOT post immediately.
         // processPendingBurnAlerts() will wait for metadata to refresh before posting.
+        // Already-stored burns are DB replays/backfills and should not repost to Discord.
         const preBurnTraits = startEvent?.preBurnTraits || null;
         const alertKey = String(survivorTokenId);
         if(!pendingBurnAlerts.has(alertKey)){
