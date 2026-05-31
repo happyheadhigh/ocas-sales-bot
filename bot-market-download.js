@@ -100,10 +100,27 @@ function getGuildMarket(cfg, guildId){
 function resolveCollectionFromGuild(guildCfg, alias, channelId){
   const collections = guildCfg?.collections || {};
   const cleanAlias = normalizeAlias(alias);
+
+  // OCAS should always resolve, even if it was never added through /market add.
+  if(cleanAlias === 'ocas'){
+    return {
+      alias:'ocas',
+      cfg:{
+        alias:'ocas',
+        slug:DEFAULT_SLUG,
+        contract:OCAS_CONTRACT,
+        chain:DEFAULT_CHAIN
+      }
+    };
+  }
+
   if(cleanAlias && collections[cleanAlias]) return { alias: cleanAlias, cfg: collections[cleanAlias] };
+
   const byChannel = channelId ? guildCfg?.channelDefaults?.[channelId] : null;
   if(byChannel && collections[byChannel]) return { alias: byChannel, cfg: collections[byChannel] };
+
   if(collections.ocas) return { alias:'ocas', cfg: collections.ocas };
+
   const first = Object.keys(collections)[0];
   return first ? { alias:first, cfg:collections[first] } : null;
 }
