@@ -1,4 +1,14 @@
-require('dotenv').config();
+const path = require('path');
+
+const envName = String(process.argv[2] || '').trim().toLowerCase();
+const envFile =
+  envName === 'staging' ? '.env.staging' :
+  envName === 'production' || envName === 'prod' ? '.env.production' :
+  '.env';
+
+require('dotenv').config({ path: path.join(__dirname, envFile), override: true });
+
+console.log(`Using environment file: ${envFile}`);
 const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 
 const chainChoices = [
@@ -48,13 +58,13 @@ const commands = [
     .addSubcommand(sc=>sc.setName('remove').setDescription('Remove a collection from this server').addStringOption(o=>o.setName('alias').setDescription('Collection alias to remove').setRequired(true)))
     .addSubcommand(sc=>sc.setName('channel').setDescription('Set a collection sales/default channel').addStringOption(o=>o.setName('alias').setDescription('Collection alias').setRequired(true)).addChannelOption(o=>o.setName('sales_channel').setDescription('Sales/default channel; defaults to current channel').setRequired(false)))
     .addSubcommand(sc=>sc.setName('sales').setDescription('Show recent sales for a configured collection')
-      .addStringOption(o=>o.setName('search').setDescription('Example: flux 5').setRequired(false))
+      .addStringOption(o=>o.setName('search').setDescription('Example: ocas 5').setRequired(false))
       .addStringOption(o=>o.setName('alias').setDescription('Collection alias; defaults by channel or OCAS').setRequired(false))
       .addIntegerOption(o=>o.setName('count').setDescription('Number of sales, max 10').setRequired(false).setMinValue(1).setMaxValue(10))),
 
   new SlashCommandBuilder().setName('download')
   .setDescription('Download a high-res PNG for OCAS or another configured collection')
-  .addStringOption(o=>o.setName('search').setDescription('Example: flux #337 2048 no bg').setRequired(false))
+  .addStringOption(o=>o.setName('search').setDescription('Example: ocas #337 2048 no bg').setRequired(false))
   .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(false).setMinValue(1))
   .addStringOption(o=>o.setName('collection').setDescription('Alias, e.g. ocas, flux, rocks. Defaults to OCAS').setRequired(false))
   .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(512).setMaxValue(4096))
@@ -86,6 +96,19 @@ const commands = [
   new SlashCommandBuilder().setName('burnleaderboard').setDescription('Top OCAS burners ranked by tokens burned'),
   new SlashCommandBuilder().setName('burnrefresh').setDescription('Refresh metadata and re-post burn alert for a created token (5 min cooldown)').addIntegerOption(o=>o.setName('token').setDescription('Survivor/created token ID').setRequired(true).setMinValue(1).setMaxValue(10000)),
 ].map(c=>c.toJSON());
+
+if(!process.env.DISCORD_TOKEN){
+  console.error(`Missing DISCORD_TOKEN in ${envFile}`);
+  process.exit(1);
+}
+if(!process.env.CLIENT_ID){
+  console.error(`Missing CLIENT_ID in ${envFile}`);
+  process.exit(1);
+}
+if(!/^\d{17,22}$/.test(String(process.env.CLIENT_ID))){
+  console.error(`CLIENT_ID in ${envFile} does not look like a Discord application/client ID. Do not use a channel ID or server ID here.`);
+  process.exit(1);
+}
 
 const rest = new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
 
