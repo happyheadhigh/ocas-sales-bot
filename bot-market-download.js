@@ -613,14 +613,37 @@ async function handleMarketCommand(interaction){
       const sales = await fetchLatestSales(resolved.cfg.slug, count);
       if(!sales.length) return interaction.editReply('No recent sales found.');
       const reversed = sales.reverse().slice(0,10);
-      const embeds = [];
-      const files = [];
+      const payloads = [];
       for(const sale of reversed){
-        const payload = await buildMarketSalePayload(sale, resolved.cfg, resolved.alias);
-        embeds.push(...(payload.embeds || []));
-        files.push(...(payload.files || []));
+        payloads.push(await buildMarketSalePayload(sale, resolved.cfg, resolved.alias));
       }
-      return interaction.editReply({ content:`Latest ${embeds.length} sale${embeds.length===1?'':'s'} for **${resolved.alias}**:`, embeds, files });
+
+      const total = payloads.reduce((n,p)=>n + ((p.embeds || []).length || 0), 0);
+      const hasAttachmentThumbnails = payloads.some(p => (p.files || []).length);
+
+      // Discord can be flaky with multiple embeds that each reference different
+      // attachment:// thumbnails in one interaction reply. If we rendered fallback
+      // thumbnails, send each sale as its own message so every thumbnail resolves.
+      if(hasAttachmentThumbnails){
+        const first = payloads[0] || { embeds:[] };
+        await interaction.editReply({
+          content:`Latest ${total} sale${total===1?'':'s'} for **${resolved.alias}**:`,
+          embeds:first.embeds || [],
+          files:first.files || []
+        });
+        for(const payload of payloads.slice(1)){
+          await interaction.followUp({
+            embeds:payload.embeds || [],
+            files:payload.files || []
+          });
+          await new Promise(r=>setTimeout(r, 350));
+        }
+        return;
+      }
+
+      const embeds = [];
+      for(const payload of payloads) embeds.push(...(payload.embeds || []));
+      return interaction.editReply({ content:`Latest ${embeds.length} sale${embeds.length===1?'':'s'} for **${resolved.alias}**:`, embeds });
     }catch(e){ return interaction.editReply('Error: '+e.message); }
   }
 }
