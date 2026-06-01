@@ -18,6 +18,7 @@ const DEFAULT_CHAIN = 'ethereum';
 const DEFAULT_SLUG = 'on-chain-all-stars';
 const OPENSEA_KEY = process.env.OPENSEA_KEY || '';
 const MARKET_POLL_MS = Math.max(30000, parseInt(process.env.MARKET_POLL_MS || '60000', 10));
+const MARKET_IMAGE_DEBUG = String(process.env.MARKET_IMAGE_DEBUG || 'false').toLowerCase() === 'true';
 
 // Market infra guardrails.
 // OCAS keeps priority. Other collections adapt based on recent sale activity and rate limits.
@@ -523,11 +524,16 @@ async function buildMarketSalePayload(sale, cfg, alias){
       const att = new AttachmentBuilder(buffer, { name: filename });
       embed.setThumbnail(`attachment://${filename}`);
       payload.files = [att];
+      if(MARKET_IMAGE_DEBUG){
+        console.log(`[Market image] ${alias} #${tokenId}: tokenURI rendered thumbnail (${filename})`);
+      }
     }catch(e){
       // Keep the OpenSea thumbnail already set by buildMarketSaleEmbed when tokenURI fails.
       // This is expected for historical sales of tokens that were later burned/removed.
-      console.warn('[Market tokenURI thumbnail fallback]', alias, tokenId, e.message);
+      console.warn(`[Market image] ${alias} #${tokenId}: tokenURI failed; using OpenSea image if available — ${e.message}`);
     }
+  }else if(MARKET_IMAGE_DEBUG){
+    console.log(`[Market image] ${alias} #${tokenId}: using OpenSea image${hasOpenSeaImage ? '' : ' (no tokenURI fallback available)'}`);
   }
 
   return payload;
