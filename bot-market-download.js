@@ -435,6 +435,19 @@ function isDiscordFriendlyImageUrl(url){
   return true;
 }
 
+function formatMarketPrice(eth){
+  const n = Number(eth || 0);
+  if(!Number.isFinite(n) || n <= 0) return '0';
+  // Preserve precise small NFT sale prices like 0.00999 instead of rounding to 0.0100.
+  return n.toFixed(6).replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
+}
+
+function shouldForceMarketThumbnailFallback(cfg, alias){
+  // OCAS is fully on-chain/dynamic. OpenSea image URLs can be inconsistent in
+  // Discord embeds, so use the contract-rendered PNG fallback for market sales too.
+  return isOcasMarketCollection(cfg, alias);
+}
+
 function marketSaleOpenSeaImage(sale){
   return sale?.nft?.image_url ||
     sale?.nft?.display_image_url ||
@@ -457,7 +470,7 @@ function buildMarketSaleEmbed(sale, cfg, alias){
     .setURL(osUrl)
     .setColor(0x0786FF)
     .addFields(
-      { name:'Price', value:`Ξ ${Number(eth || 0).toFixed(4)} ${symbol || ''}`.trim(), inline:true },
+      { name:'Price', value:`Ξ ${formatMarketPrice(eth)} ${symbol || ''}`.trim(), inline:true },
       { name:'Seller', value:shortAddr(sale?.seller), inline:true },
       { name:'Buyer', value:shortAddr(sale?.buyer), inline:true },
       { name:'Collection', value:`${alias || slug}`, inline:true },
@@ -475,10 +488,12 @@ async function buildMarketSalePayload(sale, cfg, alias){
   const tokenId = tokenIdFromSale(sale);
   const payload = { embeds:[embed] };
 
-  // If OpenSea gave Discord a normal PNG/JPG/GIF/webp URL, keep it.
-  // If it gave SVG/data/missing image, render contract tokenURI to PNG and attach it.
+  // If OpenSea gave Discord a normal PNG/JPG/GIF/webp URL, keep it for normal collections.
+  // For OCAS/on-chain dynamic collections, force the contract-rendered PNG fallback so
+  // /market sales thumbnails are as reliable as /download and the native OCAS feed.
   const img = marketSaleOpenSeaImage(sale);
-  const needsFallback = !isDiscordFriendlyImageUrl(img);
+  const forceFallback = shouldForceMarketThumbnailFallback(cfg, alias);
+  const needsFallback = forceFallback || !isDiscordFriendlyImageUrl(img);
 
   if(needsFallback && cfg?.contract && tokenId !== '?'){
     try{
