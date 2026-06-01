@@ -442,11 +442,6 @@ function formatMarketPrice(eth){
   return n.toFixed(6).replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
 }
 
-function shouldForceMarketThumbnailFallback(cfg, alias){
-  // OCAS is fully on-chain/dynamic. OpenSea image URLs can be inconsistent in
-  // Discord embeds, so use the contract-rendered PNG fallback for market sales too.
-  return isOcasMarketCollection(cfg, alias);
-}
 
 function marketSaleOpenSeaImage(sale){
   return sale?.nft?.image_url ||
@@ -488,12 +483,12 @@ async function buildMarketSalePayload(sale, cfg, alias){
   const tokenId = tokenIdFromSale(sale);
   const payload = { embeds:[embed] };
 
-  // If OpenSea gave Discord a normal PNG/JPG/GIF/webp URL, keep it for normal collections.
-  // For OCAS/on-chain dynamic collections, force the contract-rendered PNG fallback so
-  // /market sales thumbnails are as reliable as /download and the native OCAS feed.
+  // /market sales is historical market data.
+  // Use the marketplace sale image first. Only call current contract tokenURI if
+  // OpenSea did not provide a Discord-friendly image. This avoids current-state
+  // tokenURI failures for OCAS/other dynamic tokens that were later burned or changed.
   const img = marketSaleOpenSeaImage(sale);
-  const forceFallback = shouldForceMarketThumbnailFallback(cfg, alias);
-  const needsFallback = forceFallback || !isDiscordFriendlyImageUrl(img);
+  const needsFallback = !isDiscordFriendlyImageUrl(img);
 
   if(needsFallback && cfg?.contract && tokenId !== '?'){
     try{
@@ -613,37 +608,14 @@ async function handleMarketCommand(interaction){
       const sales = await fetchLatestSales(resolved.cfg.slug, count);
       if(!sales.length) return interaction.editReply('No recent sales found.');
       const reversed = sales.reverse().slice(0,10);
-      const payloads = [];
-      for(const sale of reversed){
-        payloads.push(await buildMarketSalePayload(sale, resolved.cfg, resolved.alias));
-      }
-
-      const total = payloads.reduce((n,p)=>n + ((p.embeds || []).length || 0), 0);
-      const hasAttachmentThumbnails = payloads.some(p => (p.files || []).length);
-
-      // Discord can be flaky with multiple embeds that each reference different
-      // attachment:// thumbnails in one interaction reply. If we rendered fallback
-      // thumbnails, send each sale as its own message so every thumbnail resolves.
-      if(hasAttachmentThumbnails){
-        const first = payloads[0] || { embeds:[] };
-        await interaction.editReply({
-          content:`Latest ${total} sale${total===1?'':'s'} for **${resolved.alias}**:`,
-          embeds:first.embeds || [],
-          files:first.files || []
-        });
-        for(const payload of payloads.slice(1)){
-          await interaction.followUp({
-            embeds:payload.embeds || [],
-            files:payload.files || []
-          });
-          await new Promise(r=>setTimeout(r, 350));
-        }
-        return;
-      }
-
       const embeds = [];
-      for(const payload of payloads) embeds.push(...(payload.embeds || []));
-      return interaction.editReply({ content:`Latest ${embeds.length} sale${embeds.length===1?'':'s'} for **${resolved.alias}**:`, embeds });
+      const files = [];
+      for(const sale of reversed){
+        const payload = await buildMarketSalePayload(sale, resolved.cfg, resolved.alias);
+        embeds.push(...(payload.embeds || []));
+        files.push(...(payload.files || []));
+      }
+      return interaction.editReply({ content:`Latest ${embeds.length} sale${embeds.length===1?'':'s'} for **${resolved.alias}**:`, embeds, files });
     }catch(e){ return interaction.editReply('Error: '+e.message); }
   }
 }
