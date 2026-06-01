@@ -19,6 +19,20 @@ const DEFAULT_SLUG = 'on-chain-all-stars';
 const OPENSEA_KEY = process.env.OPENSEA_KEY || '';
 const MARKET_POLL_MS = Math.max(30000, parseInt(process.env.MARKET_POLL_MS || '60000', 10));
 
+// Market infra guardrails.
+// OCAS keeps priority. Other collections adapt based on recent sale activity and rate limits.
+const MARKET_TICK_MS = Math.max(30000, parseInt(process.env.MARKET_TICK_MS || '30000', 10));
+const MARKET_OCAS_INTERVAL_MS = Math.max(30000, parseInt(process.env.MARKET_OCAS_INTERVAL_MS || '60000', 10));
+const MARKET_ACTIVE_INTERVAL_MS = Math.max(30000, parseInt(process.env.MARKET_ACTIVE_INTERVAL_MS || '60000', 10));
+const MARKET_NORMAL_INTERVAL_MS = Math.max(60000, parseInt(process.env.MARKET_NORMAL_INTERVAL_MS || '180000', 10));
+const MARKET_QUIET_INTERVAL_MS = Math.max(60000, parseInt(process.env.MARKET_QUIET_INTERVAL_MS || '300000', 10));
+const MARKET_SLOW_INTERVAL_MS = Math.max(60000, parseInt(process.env.MARKET_SLOW_INTERVAL_MS || '900000', 10));
+const MARKET_MAX_BACKOFF_MS = Math.max(300000, parseInt(process.env.MARKET_MAX_BACKOFF_MS || '3600000', 10));
+
+const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
+const DOWNLOAD_GUILD_WINDOW_MS = Math.max(10000, parseInt(process.env.DOWNLOAD_GUILD_WINDOW_MS || '60000', 10));
+const DOWNLOAD_GUILD_MAX_PER_WINDOW = Math.max(1, parseInt(process.env.DOWNLOAD_GUILD_MAX_PER_WINDOW || '8', 10));
+
 const pgPool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('railway.internal') ? false : { rejectUnauthorized: false },
@@ -185,7 +199,8 @@ function buildHelpEmbed(){
       {
         name:'Universal Multi-Collection Market',
         value:[
-          '`/market add alias:name slug:collection-slug contract:0x...` — Add a sales feed',
+          '`/market addhere alias:name slug:collection-slug contract:0x...` — Mobile-friendly: add feed to this channel',
+          '`/market add alias:name slug:collection-slug contract:0x...` — Add feed; optional channel picker',
           '`/market list` — Show configured collections',
           '`/market channel alias:name` — Set sales channel',
           '`/market remove alias:name` — Remove a collection',
@@ -256,7 +271,10 @@ function buildWelcomeEmbed(){
       {
         name:'Multi-Collection Sales Feeds',
         value:[
-          'Use:',
+          'Mobile/easiest: go to the sales channel and run:',
+          '`/market addhere alias:name slug:collection-slug contract:0x...`',
+          '',
+          'Desktop optional:',
           '`/market add alias:name slug:collection-slug contract:0x...`',
           '',
           'Then test:',
@@ -321,6 +339,93 @@ function priceFromSale(sale){
 function saleEventKey(sale){
   return String(sale?.event_id || sale?.id || sale?.transaction || sale?.transaction_hash || sale?.event_timestamp || JSON.stringify(sale).slice(0,120));
 }
+
+function collectionPollKey(c){
+  const slug = String(c?.slug || '').trim().toLowerCase();
+  const chain = String(c?.chain || DEFAULT_CHAIN).trim().toLowerCase();
+  const contract = String(c?.contract || '').trim().toLowerCase();
+  return `${chain}:${contract || slug}:${slug}`;
+}
+
+function saleTimestampMs(sale){
+  const raw = sale?.event_timestamp || sale?.created_date || sale?.created_at || sale?.timestamp || sale?.closing_date;
+  const t = raw ? Date.parse(raw) : NaN;
+  return Number.isFinite(t) ? t : 0;
+}
+
+function isOcasMarketCollection(c, alias){
+  const contract = String(c?.contract || '').toLowerCase();
+  const slug = String(c?.slug || '').toLowerCase();
+  const a = String(alias || c?.alias || '').toLowerCase();
+  return a === 'ocas' || slug === DEFAULT_SLUG || contract === OCAS_CONTRACT;
+}
+
+function intervalForCollectionActivity(c, alias, latestSaleMs){
+  if(isOcasMarketCollection(c, alias)) return MARKET_OCAS_INTERVAL_MS;
+  if(!latestSaleMs) return MARKET_QUIET_INTERVAL_MS;
+  const age = Date.now() - latestSaleMs;
+  if(age <= 60 * 60 * 1000) return MARKET_ACTIVE_INTERVAL_MS;
+  if(age <= 6 * 60 * 60 * 1000) return MARKET_NORMAL_INTERVAL_MS;
+  if(age <= 24 * 60 * 60 * 1000) return MARKET_QUIET_INTERVAL_MS;
+  return MARKET_SLOW_INTERVAL_MS;
+}
+
+function nextBackoffMs(errorCount){
+  const step = Math.max(1, Number(errorCount || 1));
+  return Math.min(MARKET_MAX_BACKOFF_MS, 5 * 60 * 1000 * Math.pow(2, step - 1));
+}
+
+function summarizeMarketWatchers(cfg){
+  const byKey = {};
+  for(const [guildId,guildCfg] of Object.entries(cfg || {})){
+    for(const [alias,c] of Object.entries(guildCfg.collections || {})){
+      if(c.paused || !c.slug || !c.salesChannelId) continue;
+      const key = collectionPollKey(c);
+      if(!byKey[key]){
+        byKey[key] = {
+          key,
+          slug:c.slug,
+          chain:c.chain || DEFAULT_CHAIN,
+          contract:c.contract || '',
+          aliasHint:alias,
+          cfg:c,
+          watchers:[]
+        };
+      }
+      byKey[key].watchers.push({ guildId, alias, cfg:c, salesChannelId:c.salesChannelId });
+      if(isOcasMarketCollection(c, alias)) byKey[key].aliasHint = 'ocas';
+    }
+  }
+  return byKey;
+}
+
+const downloadUserLastAt = new Map();
+const downloadGuildHits = new Map();
+
+function checkDownloadCooldown(interaction){
+  if(!DOWNLOAD_USER_COOLDOWN_MS && !DOWNLOAD_GUILD_MAX_PER_WINDOW) return null;
+  const now = Date.now();
+  const userKey = interaction.user?.id || interaction.member?.user?.id || 'unknown';
+
+  if(DOWNLOAD_USER_COOLDOWN_MS > 0){
+    const last = downloadUserLastAt.get(userKey) || 0;
+    const wait = DOWNLOAD_USER_COOLDOWN_MS - (now - last);
+    if(wait > 0) return `Slow down a little — try again in ${Math.ceil(wait / 1000)}s.`;
+    downloadUserLastAt.set(userKey, now);
+  }
+
+  const guildKey = interaction.guildId || interaction.channelId || 'dm';
+  const hits = (downloadGuildHits.get(guildKey) || []).filter(t => now - t < DOWNLOAD_GUILD_WINDOW_MS);
+  if(hits.length >= DOWNLOAD_GUILD_MAX_PER_WINDOW){
+    const wait = DOWNLOAD_GUILD_WINDOW_MS - (now - hits[0]);
+    downloadGuildHits.set(guildKey, hits);
+    return `This server is hitting the download limit. Try again in ${Math.ceil(wait / 1000)}s.`;
+  }
+  hits.push(now);
+  downloadGuildHits.set(guildKey, hits);
+  return null;
+}
+
 
 function isDiscordFriendlyImageUrl(url){
   const s = String(url || '').trim().toLowerCase();
@@ -402,7 +507,12 @@ async function buildMarketSalePayload(sale, cfg, alias){
 async function fetchLatestSales(slug, limit=5){
   const url = `https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=sale&limit=${limit}`;
   const r = await fetch(url, { headers: osHeaders() });
-  if(!r.ok) throw new Error(`OpenSea error ${r.status}`);
+  if(!r.ok){
+    const err = new Error(`OpenSea error ${r.status}`);
+    err.status = r.status;
+    err.retryAfter = Number(r.headers?.get?.('retry-after') || 0);
+    throw err;
+  }
   const j = await r.json();
   return j.asset_events || [];
 }
@@ -414,18 +524,20 @@ async function handleMarketCommand(interaction){
   const cfg = await loadMarketConfig();
   const guildCfg = getGuildMarket(cfg, guildId);
 
-  if(sub === 'add'){
+  if(sub === 'add' || sub === 'addhere'){
     if(!isAdmin(interaction)) return interaction.reply({ content:'Need Manage Server permission.', flags:MessageFlags.Ephemeral });
 
     const alias = normalizeAlias(interaction.options.getString('alias'));
     const slug = String(interaction.options.getString('slug') || '').trim();
     const contract = normalizeContract(interaction.options.getString('contract'));
     const chain = String(interaction.options.getString('chain') || DEFAULT_CHAIN).toLowerCase();
-    const channel = interaction.options.getChannel('sales_channel') || interaction.channel;
+    const channel = sub === 'addhere'
+      ? interaction.channel
+      : (interaction.options.getChannel('sales_channel') || interaction.channel);
 
     if(!alias || !slug || !contract){
       return interaction.reply({
-        content:'Alias, slug, and a valid contract are required. Example: `/market add alias:ocas slug:on-chain-all-stars contract:0x...`',
+        content:'Alias, slug, and a valid contract are required. Example: `/market addhere alias:ocas slug:on-chain-all-stars contract:0x...`',
         flags:MessageFlags.Ephemeral
       });
     }
@@ -665,6 +777,11 @@ async function handleDownloadCommand(interaction, forced={}){
   const collection = interaction.options?.getString?.('collection') || parsed.alias || 'ocas';
   if(!tokenId) return interaction.reply({ content:'Provide a token ID. Example: `/download search:ocas #337 2048 no bg`', flags:MessageFlags.Ephemeral });
 
+  const cooldownMessage = forced.skipCooldown ? null : checkDownloadCooldown(interaction);
+  if(cooldownMessage){
+    return interaction.reply({ content:cooldownMessage, flags:MessageFlags.Ephemeral }).catch(()=>{});
+  }
+
   if(!interaction.deferred && !interaction.replied){
     if(forced.ephemeral) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     else await interaction.deferReply();
@@ -725,41 +842,134 @@ let marketPollStarted = false;
 async function startMarketPoller(client){
   if(marketPollStarted) return;
   marketPollStarted = true;
-  console.log(`[Market] Starting multi-collection sales poller every ${MARKET_POLL_MS}ms`);
+  console.log(`[Market] Starting shared collection sales poller every ${MARKET_TICK_MS}ms`);
+
   const tick = async () => {
     try{
       const cfg = await loadMarketConfig();
-      const cursors = await dbLoad('market_sale_cursors_v1') || {};
-      for(const [guildId,guildCfg] of Object.entries(cfg || {})){
-        for(const [alias,c] of Object.entries(guildCfg.collections || {})){
-          if(c.paused || !c.slug || !c.salesChannelId) continue;
-          let sales = [];
-          try{ sales = await fetchLatestSales(c.slug, 10); }catch(e){ console.warn('[Market poll fetch]', alias, e.message); continue; }
-          if(!sales.length) continue;
-          const latestKey = saleEventKey(sales[0]);
-          const cursorKey = `${guildId}:${alias}`;
-          if(!cursors[cursorKey]){ cursors[cursorKey] = latestKey; continue; }
-          const newSales = [];
-          for(const s of sales){
-            const k = saleEventKey(s);
-            if(k === cursors[cursorKey]) break;
-            newSales.push(s);
-          }
-          if(!newSales.length) continue;
-          const channel = await client.channels.fetch(c.salesChannelId).catch(()=>null);
-          if(!channel){ console.warn(`[Market] channel not found guild=${guildId} alias=${alias} channel=${c.salesChannelId}`); continue; }
-          for(const sale of newSales.reverse()){
-            const payload = await buildMarketSalePayload(sale, c, alias);
-            await channel.send(payload).catch(e=>console.warn('[Market post]', e.message));
-            await new Promise(r=>setTimeout(r, 500));
-          }
-          cursors[cursorKey] = latestKey;
+      const state = await dbLoad('market_collection_state_v1') || {};
+      const watchersByCollection = summarizeMarketWatchers(cfg);
+      const now = Date.now();
+
+      for(const [pollKey, entry] of Object.entries(watchersByCollection)){
+        const s = state[pollKey] || {};
+        const backoffUntil = Number(s.backoffUntil || 0);
+        const nextPollAt = Number(s.nextPollAt || 0);
+
+        if(backoffUntil && now < backoffUntil) continue;
+        if(nextPollAt && now < nextPollAt) continue;
+
+        let sales = [];
+        try{
+          sales = await fetchLatestSales(entry.slug, 10);
+        }catch(e){
+          const nextErrorCount = Number(s.errorCount || 0) + 1;
+          const retryAfterMs = e.retryAfter ? e.retryAfter * 1000 : 0;
+          const backoffMs = e.status === 429
+            ? Math.max(retryAfterMs, nextBackoffMs(nextErrorCount))
+            : Math.min(nextBackoffMs(nextErrorCount), 10 * 60 * 1000);
+          state[pollKey] = {
+            ...s,
+            slug:entry.slug,
+            chain:entry.chain,
+            contract:entry.contract,
+            errorCount:nextErrorCount,
+            lastError:e.message,
+            lastErrorAt:now,
+            backoffUntil:now + backoffMs,
+            nextPollAt:now + backoffMs,
+            updatedAt:now
+          };
+          console.warn(`[Market poll fetch] ${entry.aliasHint}/${entry.slug} ${e.message}; backoff ${Math.round(backoffMs/1000)}s`);
+          continue;
         }
+
+        const latestSale = sales[0] || null;
+        const latestKey = latestSale ? saleEventKey(latestSale) : (s.latestKey || null);
+        const latestSaleMs = latestSale ? saleTimestampMs(latestSale) : Number(s.latestSaleAt || 0);
+        const intervalMs = intervalForCollectionActivity(entry.cfg, entry.aliasHint, latestSaleMs);
+        const previousKey = s.latestKey || null;
+
+        if(!sales.length){
+          state[pollKey] = {
+            ...s,
+            slug:entry.slug,
+            chain:entry.chain,
+            contract:entry.contract,
+            errorCount:0,
+            lastPolledAt:now,
+            nextPollAt:now + intervalMs,
+            pollIntervalMs:intervalMs,
+            updatedAt:now
+          };
+          continue;
+        }
+
+        if(!previousKey){
+          state[pollKey] = {
+            ...s,
+            slug:entry.slug,
+            chain:entry.chain,
+            contract:entry.contract,
+            latestKey,
+            latestSaleAt:latestSaleMs || now,
+            errorCount:0,
+            backoffUntil:0,
+            lastPolledAt:now,
+            nextPollAt:now + intervalMs,
+            pollIntervalMs:intervalMs,
+            updatedAt:now
+          };
+          continue;
+        }
+
+        const newSales = [];
+        for(const sale of sales){
+          const k = saleEventKey(sale);
+          if(k === previousKey) break;
+          newSales.push(sale);
+        }
+
+        if(newSales.length){
+          console.log(`[Market] ${entry.slug}: ${newSales.length} new sale(s), ${entry.watchers.length} watcher(s)`);
+          for(const watcher of entry.watchers){
+            const channel = await client.channels.fetch(watcher.salesChannelId).catch(()=>null);
+            if(!channel){
+              console.warn(`[Market] channel not found guild=${watcher.guildId} alias=${watcher.alias} channel=${watcher.salesChannelId}`);
+              continue;
+            }
+            for(const sale of newSales.slice().reverse()){
+              const payload = await buildMarketSalePayload(sale, watcher.cfg, watcher.alias);
+              await channel.send(payload).catch(e=>console.warn('[Market post]', e.message));
+              await new Promise(r=>setTimeout(r, 500));
+            }
+          }
+        }
+
+        state[pollKey] = {
+          ...s,
+          slug:entry.slug,
+          chain:entry.chain,
+          contract:entry.contract,
+          latestKey,
+          latestSaleAt:latestSaleMs || Number(s.latestSaleAt || 0) || now,
+          errorCount:0,
+          backoffUntil:0,
+          lastError:'',
+          lastPolledAt:now,
+          nextPollAt:now + intervalMs,
+          pollIntervalMs:intervalMs,
+          updatedAt:now
+        };
       }
-      await dbSave('market_sale_cursors_v1', cursors);
-    }catch(e){ console.warn('[Market poll]', e.message); }
+
+      await dbSave('market_collection_state_v1', state);
+    }catch(e){
+      console.warn('[Market poll]', e.message);
+    }
   };
-  setInterval(tick, MARKET_POLL_MS);
+
+  setInterval(tick, MARKET_TICK_MS);
   setTimeout(tick, 5000);
 }
 
