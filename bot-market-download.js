@@ -360,6 +360,19 @@ function isOcasMarketCollection(c, alias){
   return a === 'ocas' || slug === DEFAULT_SLUG || contract === OCAS_CONTRACT;
 }
 
+function prefersCurrentTokenUriForMarketImage(c, alias){
+  const slug = String(c?.slug || '').toLowerCase();
+  const a = String(alias || c?.alias || '').toLowerCase();
+  const mode = String(c?.imageMode || c?.image_mode || '').toLowerCase();
+
+  // Future-proof override for any collection added later.
+  if(['tokenuri', 'tokenuri-first', 'current-tokenuri', 'current-tokenuri-first', 'onchain', 'dynamic'].includes(mode)) return true;
+  if(['opensea', 'opensea-first', 'marketplace'].includes(mode)) return false;
+
+  // Known dynamic/on-chain collections where current contract metadata is the best first source.
+  return isOcasMarketCollection(c, alias) || a === 'heraldia' || slug === 'heraldia';
+}
+
 function intervalForCollectionActivity(c, alias, latestSaleMs){
   if(isOcasMarketCollection(c, alias)) return MARKET_OCAS_INTERVAL_MS;
   if(!latestSaleMs) return MARKET_QUIET_INTERVAL_MS;
@@ -444,8 +457,8 @@ function formatMarketPrice(eth){
 
 
 function marketSaleOpenSeaImage(sale){
-  return sale?.nft?.image_url ||
-    sale?.nft?.display_image_url ||
+  return sale?.nft?.display_image_url ||
+    sale?.nft?.image_url ||
     sale?.nft?.animation_url ||
     sale?.asset?.image_url ||
     sale?.image_url ||
@@ -483,14 +496,18 @@ async function buildMarketSalePayload(sale, cfg, alias){
   const tokenId = tokenIdFromSale(sale);
   const payload = { embeds:[embed] };
 
-  // /market sales is historical market data.
-  // Use the marketplace sale image first. Only call current contract tokenURI if
-  // OpenSea did not provide a Discord-friendly image. This avoids current-state
-  // tokenURI failures for OCAS/other dynamic tokens that were later burned or changed.
+  // Image policy:
+  // - Dynamic/on-chain collections should try current contract tokenURI first.
+  //   This is the best source for current metadata/background changes.
+  // - If tokenURI fails, for example an OCAS token was burned after the historical
+  //   sale, keep/fallback to OpenSea's sale image when available.
+  // - Static/default collections use OpenSea image first, with tokenURI only as a fallback.
   const img = marketSaleOpenSeaImage(sale);
-  const needsFallback = !isDiscordFriendlyImageUrl(img);
+  const hasOpenSeaImage = isDiscordFriendlyImageUrl(img);
+  const preferTokenUri = prefersCurrentTokenUriForMarketImage(cfg, alias);
+  const shouldTryTokenUri = cfg?.contract && tokenId !== '?' && (preferTokenUri || !hasOpenSeaImage);
 
-  if(needsFallback && cfg?.contract && tokenId !== '?'){
+  if(shouldTryTokenUri){
     try{
       const size = 512;
       const { buffer } = await renderTokenPng({
@@ -507,7 +524,9 @@ async function buildMarketSalePayload(sale, cfg, alias){
       embed.setThumbnail(`attachment://${filename}`);
       payload.files = [att];
     }catch(e){
-      console.warn('[Market thumbnail fallback]', alias, tokenId, e.message);
+      // Keep the OpenSea thumbnail already set by buildMarketSaleEmbed when tokenURI fails.
+      // This is expected for historical sales of tokens that were later burned/removed.
+      console.warn('[Market tokenURI thumbnail fallback]', alias, tokenId, e.message);
     }
   }
 
