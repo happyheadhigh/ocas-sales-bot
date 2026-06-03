@@ -1896,22 +1896,21 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
   const id = parseInt(tokenId);
   const attrs = traitsArrayFromInput(traits);
   if(!id || !attrs.length) return false;
+  const client = await pgPool.connect();
   try{
-    await pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [id]);
+    await client.query('BEGIN');
+    await client.query('DELETE FROM token_traits WHERE token_id=$1', [id]);
     for(let i = 0; i < attrs.length; i++){
       const t = attrs[i];
-      await pgPool.query(
+      await client.query(
         `INSERT INTO token_traits (token_id, trait_name, trait_value, trait_index)
          VALUES ($1, $2, $3, $4)`,
         [id, String(t.trait_type), String(t.value), i]
       );
     }
+    await client.query('COMMIT');
     const img = getTraitImageSource(traits);
     if(img){
-      // Never overwrite a higher-priority snapshot source with a lower one.
-      // Priority order: burn-start-input > backfill-chunks > burn-finalized-survivor
-      // This ensures original mint traits (backfill-chunks) are never lost when
-      // a token later becomes a burn survivor and gets new post-burn traits written.
       const SOURCE_PRIORITY = { 'burn-start-input': 3, 'backfill-chunks': 2, 'burn-finalized-survivor': 1 };
       const newPriority = SOURCE_PRIORITY[source] || 0;
       const traitsForSnapshot = traitsObjectFromArray(attrs, img);
@@ -1934,8 +1933,11 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
     }
     return true;
   }catch(e){
+    await client.query('ROLLBACK').catch(()=>{});
     console.warn(`[Token snapshot] failed for #${id}:`, e.message);
     return false;
+  }finally{
+    client.release();
   }
 }
 
