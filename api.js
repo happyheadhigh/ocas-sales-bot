@@ -45,7 +45,9 @@ function traitsFromRows(rows) {
 
 const ACTIVE_TOKEN_CONDITION = `NOT EXISTS (
   SELECT 1 FROM burn_event_inputs active_burned
+  JOIN burn_events active_be ON active_be.id = active_burned.burn_event_id
   WHERE active_burned.burned_token_id = t.id
+    AND active_burned.burned_token_id != active_be.survivor_token_id
 )`;
 
 
@@ -206,7 +208,9 @@ app.get('/db/trait-floor', auth, async (req, res) => {
       WHERE tt.trait_name = $1 AND tt.trait_value = $2
         AND NOT EXISTS (
           SELECT 1 FROM burn_event_inputs active_burned
+          JOIN burn_events active_be ON active_be.id = active_burned.burn_event_id
           WHERE active_burned.burned_token_id = t.id
+            AND active_burned.burned_token_id != active_be.survivor_token_id
         )
       ORDER BY l.price_eth ASC
       LIMIT 1
@@ -246,7 +250,9 @@ app.get('/db/holders/trait', auth, async (req, res) => {
       WHERE trait_name = $1 AND trait_value = $2
         AND NOT EXISTS (
           SELECT 1 FROM burn_event_inputs active_burned
+          JOIN burn_events active_be ON active_be.id = active_burned.burn_event_id
           WHERE active_burned.burned_token_id = token_traits.token_id
+            AND active_burned.burned_token_id != active_be.survivor_token_id
         )
     `, [trait_name, trait_value]);
 
@@ -521,7 +527,9 @@ app.get('/db/trait-index', auth, async (req, res) => {
         AND TRIM(trait_value) <> ''
         AND NOT EXISTS (
           SELECT 1 FROM burn_event_inputs active_burned
+          JOIN burn_events active_be ON active_be.id = active_burned.burn_event_id
           WHERE active_burned.burned_token_id = tt.token_id
+            AND active_burned.burned_token_id != active_be.survivor_token_id
         )
       GROUP BY trait_name, trait_value
       ORDER BY LENGTH(trait_value) DESC, trait_value ASC
