@@ -243,11 +243,17 @@ async function ensureBotStateTable(){
         token_id    INT NOT NULL,
         trait_name  TEXT NOT NULL,
         trait_value TEXT NOT NULL,
-        UNIQUE (token_id, trait_name)
+        trait_index INT DEFAULT 0
       )
     `);
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS token_traits_token_id_idx ON token_traits(token_id)
+    `).catch(()=>{});
+    await pgPool.query(`ALTER TABLE token_traits ADD COLUMN IF NOT EXISTS trait_index INT DEFAULT 0`).catch(()=>{});
+    await pgPool.query(`ALTER TABLE token_traits DROP CONSTRAINT IF EXISTS token_traits_token_id_trait_name_key`).catch(()=>{});
+    await pgPool.query(`DROP INDEX IF EXISTS token_traits_token_id_trait_name_key`).catch(()=>{});
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS token_traits_token_id_trait_index_idx ON token_traits(token_id, trait_index)
     `).catch(()=>{});
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS token_traits_name_value_idx ON token_traits(LOWER(trait_name), LOWER(trait_value))
@@ -747,6 +753,68 @@ function cleanTraitLabel(label){
   return String(label || '').replace(/\d+$/, '').trim() || String(label || '');
 }
 
+const TRAIT_META_KEYS = new Set(['__image', '__attributes']);
+
+function normalizeTraitAttribute(t){
+  if(!t || typeof t !== 'object') return null;
+  const trait_type = t.trait_type || t.traitType || t.type || t.name;
+  const value = t.value;
+  if(!trait_type || value == null) return null;
+  return { trait_type:String(trait_type), value:String(value) };
+}
+
+function traitsArrayFromInput(input){
+  if(!input) return [];
+  if(Array.isArray(input)) return input.map(normalizeTraitAttribute).filter(Boolean);
+  if(typeof input === 'object'){
+    const embedded = input.__attributes || input.attributes || input.traits_array || input.trait_array;
+    if(Array.isArray(embedded)){
+      const arr = embedded.map(normalizeTraitAttribute).filter(Boolean);
+      if(arr.length) return arr;
+    }
+    return Object.entries(input)
+      .filter(([k,v]) => !TRAIT_META_KEYS.has(k) && v != null && typeof v !== 'object')
+      .map(([trait_type,value]) => ({ trait_type:String(trait_type), value:String(value) }));
+  }
+  return [];
+}
+
+function traitsObjectFromArray(attrs, image=null){
+  const clean = traitsArrayFromInput(attrs);
+  const obj = {};
+  for(const t of clean){
+    // Compatibility object lookup for old code. Duplicate trait names are preserved
+    // in __attributes even though this object key will contain the last value.
+    obj[t.trait_type] = t.value;
+  }
+  if(clean.length) obj.__attributes = clean;
+  if(image) obj.__image = image;
+  return obj;
+}
+
+function realTraitCount(traits){
+  return traitsArrayFromInput(traits).length;
+}
+
+function traitValue(traits, name){
+  const wanted = String(name || '').toLowerCase();
+  const attrs = traitsArrayFromInput(traits);
+  const found = attrs.find(t => String(t.trait_type || '').toLowerCase() === wanted);
+  if(found) return found.value;
+  return traits && typeof traits === 'object' ? (traits[name] || traits[String(name).toLowerCase()]) : null;
+}
+
+function traitDisplayLines(traits, limit=14){
+  return traitsArrayFromInput(traits)
+    .slice(0, limit)
+    .map(t => `**${cleanTraitLabel(t.trait_type)}:** ${t.value}`);
+}
+
+function getTraitImageSource(traits){
+  return traits && typeof traits === 'object' ? traits.__image : null;
+}
+
+
 async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
   const survivorId   = finalEvent.survivorTokenId;
   const bodyType     = finalEvent.resultBodyType;
@@ -774,8 +842,8 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
 
   // Prefer directly-passed freshTraits over cache to avoid stale-cache races.
   let dbMeta = null;
-  if(overrideTraits && Object.keys(overrideTraits).length){
-    dbMeta = { traits: overrideTraits, trait_count: Object.keys(overrideTraits).length };
+  if(overrideTraits && realTraitCount(overrideTraits)){
+    dbMeta = { traits: overrideTraits, trait_count: realTraitCount(overrideTraits) };
   } else {
     const cached = tokenMetaCache.get(parseInt(survivorId)) || tokenMetaCache.get(`os:${parseInt(survivorId)}`);
     dbMeta = (cached && Date.now() < cached.expires) ? cached.meta : null;
@@ -786,7 +854,7 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
   let imgResult = null;
   try{
     // Use contract image from traits cache if available
-    const contractImgSrc = dbMeta?.traits?.__image;
+    const contractImgSrc = getTraitImageSource(dbMeta?.traits);
     if(contractImgSrc){
       if(contractImgSrc.startsWith('<svg') || contractImgSrc.startsWith('data:image/svg') || contractImgSrc.toLowerCase().includes('image/svg')){
         try{
@@ -816,16 +884,14 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
       { name:'Points Used',    value:`${points || 0} pts`,      inline:true },
     );
 
-  // Single Traits field in 2 columns — same layout as sales/listings
-  if(dbMeta?.traits && Object.keys(dbMeta.traits).filter(k=>k!=='__image').length){
-    const traitLines = Object.entries(dbMeta.traits)
-      .filter(([k]) => k !== '__image')
-      .slice(0, 14)
-      .map(([k,v]) => `**${cleanTraitLabel(k)}:** ${v}`);
-    const half = Math.ceil(traitLines.length / 2);
+  // Single Traits field in 2 columns — same layout as sales/listings.
+  // Use __attributes when available so duplicate categories like Clothes are preserved.
+  const burnTraitLines = traitDisplayLines(dbMeta?.traits, 14);
+  if(burnTraitLines.length){
+    const half = Math.ceil(burnTraitLines.length / 2);
     embed.addFields(
-      { name:'Traits',    value: traitLines.slice(0, half).join('\n') || '\u200b', inline:true },
-      { name:'\u200b',   value: traitLines.slice(half).join('\n')   || '\u200b', inline:true },
+      { name:'Traits',    value: burnTraitLines.slice(0, half).join('\n') || '\u200b', inline:true },
+      { name:'\u200b',   value: burnTraitLines.slice(half).join('\n')   || '\u200b', inline:true },
     );
   } else {
     embed.addFields({ name:'Traits', value:'_Syncing — check TraitView or OpenSea shortly_', inline:false });
@@ -877,13 +943,8 @@ async function fetchFreshOsMeta(tokenId){
     const j = await r.json();
     const n = j.nft || j;
     const rawTraits = Array.isArray(n.traits) ? n.traits : (Array.isArray(n.attributes) ? n.attributes : []);
-    const traits = {};
-    for(const t of rawTraits){
-      const name  = t.trait_type || t.traitType || t.type || t.name;
-      const value = t.value;
-      if(name && value != null) traits[String(name)] = String(value);
-    }
-    return Object.keys(traits).length ? traits : null;
+    const traits = traitsObjectFromArray(rawTraits, n.image || n.image_url || n.display_image_url || null);
+    return realTraitCount(traits) ? traits : null;
   }catch(e){
     console.warn(`[BurnMeta] fetchFreshOsMeta error for #${id}:`, e.message);
     return null;
@@ -918,16 +979,9 @@ async function fetchTokenUriFromContract(tokenId){
       uri = decodeURIComponent(uri.slice('data:application/json,'.length));
     const meta = JSON.parse(uri);
     const rawAttrs = Array.isArray(meta.attributes) ? meta.attributes : (Array.isArray(meta.traits) ? meta.traits : []);
-    const traits = {};
-    for(const a of rawAttrs){
-      const name = a.trait_type || a.traitType || a.type || a.name;
-      const value = a.value;
-      if(name && value != null) traits[String(name)] = String(value);
-    }
-    if(Object.keys(traits).length){
-      console.log(`[Contract] tokenURI #${id} → Type=${traits.Type||traits.type||'?'} (${Object.keys(traits).length} traits)`);
-      // Attach image to traits object so callers can use it directly
-      if(meta.image) traits.__image = meta.image;
+    const traits = traitsObjectFromArray(rawAttrs, meta.image || meta.image_data || meta.image_url || null);
+    if(realTraitCount(traits)){
+      console.log(`[Contract] tokenURI #${id} → Type=${traitValue(traits,'Type')||'?'} (${realTraitCount(traits)} traits)`);
       return traits;
     }
     return null;
@@ -957,12 +1011,14 @@ async function triggerOsMetadataRefresh(tokenId){
 
 // Returns true if two trait objects differ (or one is null and the other isn't).
 function traitsDiffer(a, b){
-  if(!a && !b) return false;
-  if(!a || !b) return true;
-  const keysA = Object.keys(a).sort();
-  const keysB = Object.keys(b).sort();
-  if(keysA.length !== keysB.length) return true;
-  for(const k of keysA){ if(String(a[k]) !== String(b[k])) return true; }
+  const arrA = traitsArrayFromInput(a);
+  const arrB = traitsArrayFromInput(b);
+  if(!arrA.length && !arrB.length) return false;
+  if(arrA.length !== arrB.length) return true;
+  for(let i = 0; i < arrA.length; i++){
+    if(String(arrA[i].trait_type) !== String(arrB[i].trait_type)) return true;
+    if(String(arrA[i].value) !== String(arrB[i].value)) return true;
+  }
   return false;
 }
 
@@ -1398,7 +1454,7 @@ async function processPendingBurnAlerts(){
     }
 
     // Set traits into cache so buildBurnEmbed picks them up
-    const freshMeta = { os_rank: null, traits: freshTraits, trait_count: Object.keys(freshTraits).length };
+    const freshMeta = { os_rank: null, traits: freshTraits, trait_count: realTraitCount(freshTraits) };
     tokenMetaCache.set(parseInt(survivorId), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
     tokenMetaCache.set(`os:${parseInt(survivorId)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
     imageCache?.delete?.(`${OCAS_CONTRACT}:${survivorId}`);
@@ -1408,16 +1464,16 @@ async function processPendingBurnAlerts(){
       // Write post-burn traits to DB so /burnlatest and /burn work after restarts
       try{
         await upsertTokenTraitRows(survivorId, freshTraits, 'burn-finalized-survivor');
-        console.log(`[BurnMeta] Wrote ${Object.keys(freshTraits).length} post-burn trait rows to DB for #${survivorId}`);
+        console.log(`[BurnMeta] Wrote ${realTraitCount(freshTraits)} post-burn trait rows to DB for #${survivorId}`);
       }catch(dbErr){
         console.warn(`[BurnMeta] Failed to write post-burn traits for #${survivorId}:`, dbErr.message);
       }
       // Write to burn_state_snapshots — permanent record of post-burn state per burn event
       try{
         const burnEventId = finalEvent.burnEventId;
-        console.log(`[BurnMeta] burn_state_snapshots write attempt: burnEventId=${burnEventId} survivorId=${survivorId} hasImage=${!!freshTraits?.__image}`);
+        console.log(`[BurnMeta] burn_state_snapshots write attempt: burnEventId=${burnEventId} survivorId=${survivorId} hasImage=${!!getTraitImageSource(freshTraits)}`);
         if(burnEventId){
-          const snapImg = freshTraits?.__image || null;
+          const snapImg = getTraitImageSource(freshTraits) || null;
           await pgPool.query(
             `INSERT INTO burn_state_snapshots (burn_event_id, token_id, image_data, traits_json)
              VALUES ($1, $2, $3, $4)
@@ -1740,10 +1796,13 @@ async function fetchTokenMetaFromDb(tokenId){
     if(!r.ok) return null;
     const j = await r.json();
     if(!j.ok || !j.token) return null;
+    const localMeta = await fetchTokenMetaFromLocalDb(id).catch(()=>null);
+    const apiTraits = j.token.traits || null;
+    const bestTraits = realTraitCount(localMeta?.traits) > realTraitCount(apiTraits) ? localMeta.traits : apiTraits;
     const meta = {
       os_rank: j.token.os_rank ? parseInt(j.token.os_rank) : null,
-      traits:  j.token.traits || null,
-      trait_count: j.token.trait_count ? parseInt(j.token.trait_count) : null,
+      traits:  bestTraits || null,
+      trait_count: realTraitCount(bestTraits) || (j.token.trait_count ? parseInt(j.token.trait_count) : null),
     };
     tokenMetaCache.set(id, { meta, expires: Date.now() + 5 * 60 * 1000 });
     return meta;
@@ -1765,16 +1824,11 @@ async function fetchTokenMetaFromOpenSea(tokenId){
     const j = await r.json();
     const n = j.nft || j;
     const rawTraits = Array.isArray(n.traits) ? n.traits : (Array.isArray(n.attributes) ? n.attributes : []);
-    const traits = {};
-    for(const t of rawTraits){
-      const name = t.trait_type || t.traitType || t.type || t.name;
-      const value = t.value;
-      if(name && value != null) traits[String(name)] = String(value);
-    }
+    const traits = traitsObjectFromArray(rawTraits, n.image || n.image_url || n.display_image_url || null);
     const meta = {
       os_rank: null,
-      traits: Object.keys(traits).length ? traits : null,
-      trait_count: Object.keys(traits).length || null,
+      traits: realTraitCount(traits) ? traits : null,
+      trait_count: realTraitCount(traits) || null,
     };
     tokenMetaCache.set(cacheKey, { meta, expires: Date.now() + 2 * 60 * 1000 });
     return meta;
@@ -1789,16 +1843,35 @@ async function fetchTokenMetaFromLocalDb(tokenId){
   const id = parseInt(tokenId);
   if(!id) return null;
   try{
-    const r = await pgPool.query(
-      `SELECT trait_name, trait_value FROM token_traits WHERE token_id=$1`,
+    // Prefer snapshot JSON when available because it preserves the full __attributes array.
+    const snap = await pgPool.query(
+      `SELECT traits_json FROM token_image_snapshots WHERE token_id=$1 AND traits_json IS NOT NULL LIMIT 1`,
       [id]
-    );
-    if(!r.rows.length) return null;
-    const traits = {};
-    for(const row of r.rows){
-      if(row.trait_name && row.trait_value != null) traits[String(row.trait_name)] = String(row.trait_value);
+    ).catch(()=>({ rows:[] }));
+    const snapTraits = snap.rows[0]?.traits_json || null;
+    if(snapTraits && realTraitCount(snapTraits)){
+      return { os_rank:null, traits:snapTraits, trait_count:realTraitCount(snapTraits) };
     }
-    return Object.keys(traits).length ? { os_rank:null, traits, trait_count:Object.keys(traits).filter(k=>k !== '__image').length } : null;
+
+    let r;
+    try{
+      r = await pgPool.query(
+        `SELECT trait_name, trait_value FROM token_traits WHERE token_id=$1 ORDER BY trait_index ASC, id ASC`,
+        [id]
+      );
+    }catch(_){
+      // Backwards compatibility before trait_index column exists.
+      r = await pgPool.query(
+        `SELECT trait_name, trait_value FROM token_traits WHERE token_id=$1 ORDER BY id ASC`,
+        [id]
+      );
+    }
+    if(!r.rows.length) return null;
+    const attrs = r.rows
+      .filter(row => row.trait_name && row.trait_value != null)
+      .map(row => ({ trait_type:String(row.trait_name), value:String(row.trait_value) }));
+    const traits = traitsObjectFromArray(attrs);
+    return realTraitCount(traits) ? { os_rank:null, traits, trait_count:realTraitCount(traits) } : null;
   }catch(e){
     console.warn('[Token local meta]', id, e.message);
     return null;
@@ -1807,26 +1880,27 @@ async function fetchTokenMetaFromLocalDb(tokenId){
 
 async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
   const id = parseInt(tokenId);
-  if(!id || !traits || typeof traits !== 'object' || !Object.keys(traits).length) return false;
+  const attrs = traitsArrayFromInput(traits);
+  if(!id || !attrs.length) return false;
   try{
     await pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [id]);
-    for(const [traitName, traitValue] of Object.entries(traits)){
-      // __image is not a real trait. Keep it only in token_image_snapshots/cache
-      // so trait searches and trait displays do not get polluted.
-      if(traitName === '__image' || traitValue == null) continue;
+    for(let i = 0; i < attrs.length; i++){
+      const t = attrs[i];
       await pgPool.query(
-        `INSERT INTO token_traits (token_id, trait_name, trait_value)
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-        [id, String(traitName), String(traitValue)]
+        `INSERT INTO token_traits (token_id, trait_name, trait_value, trait_index)
+         VALUES ($1, $2, $3, $4)`,
+        [id, String(t.trait_type), String(t.value), i]
       );
     }
-    if(traits.__image){
+    const img = getTraitImageSource(traits);
+    if(img){
       // Never overwrite a higher-priority snapshot source with a lower one.
       // Priority order: burn-start-input > backfill-chunks > burn-finalized-survivor
       // This ensures original mint traits (backfill-chunks) are never lost when
       // a token later becomes a burn survivor and gets new post-burn traits written.
       const SOURCE_PRIORITY = { 'burn-start-input': 3, 'backfill-chunks': 2, 'burn-finalized-survivor': 1 };
       const newPriority = SOURCE_PRIORITY[source] || 0;
+      const traitsForSnapshot = traitsObjectFromArray(attrs, img);
       await pgPool.query(
         `INSERT INTO token_image_snapshots (token_id, image_data, traits_json, source, updated_at)
          VALUES ($1,$2,$3,$4,NOW())
@@ -1841,7 +1915,7 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
                 WHEN token_image_snapshots.source = 'burn-finalized-survivor' THEN 1
                 ELSE 0 END
          ) < $5`,
-        [id, String(traits.__image), JSON.stringify(traits), source, newPriority]
+        [id, String(img), JSON.stringify(traitsForSnapshot), source, newPriority]
       ).catch(()=>{});
     }
     return true;
@@ -1855,7 +1929,7 @@ async function snapshotTokenFromContract(tokenId, source='burn-start'){
   const id = parseInt(tokenId);
   if(!id) return null;
   const traits = await fetchTokenUriFromContract(id).catch(()=>null);
-  if(traits && Object.keys(traits).length){
+  if(traits && realTraitCount(traits)){
     await upsertTokenTraitRows(id, traits, source);
     return traits;
   }
@@ -1973,8 +2047,8 @@ async function fetchBurnDisplayTraits(tokenId){
     const local = await fetchTokenMetaFromLocalDb(id).catch(()=>null);
     traits = local?.traits || null;
   }
-  if(traits && Object.keys(traits).length){
-    const freshMeta = { os_rank:null, traits, trait_count:Object.keys(traits).filter(k=>k !== '__image').length };
+  if(traits && realTraitCount(traits)){
+    const freshMeta = { os_rank:null, traits, trait_count:realTraitCount(traits) };
     tokenMetaCache.set(id, { meta:freshMeta, expires:Date.now() + 5 * 60_000 });
     tokenMetaCache.set(`os:${id}`, { meta:freshMeta, expires:Date.now() + 5 * 60_000 });
   }
@@ -1983,20 +2057,19 @@ async function fetchBurnDisplayTraits(tokenId){
 
 async function fetchCreatedTokenMeta(tokenId){
   const contractTraits = await fetchTokenUriFromContract(tokenId).catch(()=>null);
-  if(contractTraits && Object.keys(contractTraits).length){
-    return { os_rank:null, traits:contractTraits, trait_count:Object.keys(contractTraits).filter(k=>k !== '__image').length };
+  if(contractTraits && realTraitCount(contractTraits)){
+    return { os_rank:null, traits:contractTraits, trait_count:realTraitCount(contractTraits) };
   }
   const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-  if(dbMeta?.traits && Object.keys(dbMeta.traits).length) return dbMeta;
+  if(dbMeta?.traits && realTraitCount(dbMeta.traits)) return dbMeta;
   const localMeta = await fetchTokenMetaFromLocalDb(tokenId).catch(()=>null);
-  if(localMeta?.traits && Object.keys(localMeta.traits).length) return localMeta;
+  if(localMeta?.traits && realTraitCount(localMeta.traits)) return localMeta;
   const osMeta = await fetchTokenMetaFromOpenSea(tokenId).catch(()=>null);
   return osMeta?.traits ? { ...(dbMeta || {}), ...osMeta } : dbMeta;
 }
 
 function traitObjectToArray(traitsObj){
-  if(!traitsObj || typeof traitsObj !== 'object') return [];
-  return Object.entries(traitsObj).map(([trait_type, value]) => ({ trait_type, value }));
+  return traitsArrayFromInput(traitsObj);
 }
 
 function osRankBadge(osRank){
@@ -2060,7 +2133,7 @@ async function buildSaleEmbed(sale, config){
   let traits=sale.nft?.traits||[];
   if((!traits || traits.length===0) && dbMeta?.traits) traits = traitObjectToArray(dbMeta.traits);
   if(traits.length>0){
-    const traitLines = traits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`);
+    const traitLines = traitDisplayLines(traits, 12);
     const half = Math.ceil(traitLines.length/2);
     const col1 = traitLines.slice(0,half).join('\n');
     const col2 = traitLines.slice(half).join('\n');
@@ -2154,7 +2227,7 @@ async function buildListingEmbed(listing, config){
   let traits = asset.traits || [];
   if((!traits || traits.length === 0) && dbMeta?.traits) traits = traitObjectToArray(dbMeta.traits);
   if(traits.length > 0){
-    const traitLines = traits.slice(0,12).map(t=>`**${t.trait_type}**: ${t.value}`);
+    const traitLines = traitDisplayLines(traits, 12);
     const half = Math.ceil(traitLines.length/2);
     const col1 = traitLines.slice(0,half).join('\n');
     const col2 = traitLines.slice(half).join('\n');
@@ -2218,11 +2291,11 @@ async function buildTokenSearchEmbed(token, config, footerLabel){
   const stats = [];
   if(osRank) stats.push(`OS Rank: ${Number(osRank).toLocaleString()}`);
   if(token.obs_rank) stats.push(`TraitView Rank: ${Number(token.obs_rank).toLocaleString()}`);
-  if(dbMeta?.trait_count || token.trait_count) stats.push(`Traits: ${dbMeta?.trait_count || token.trait_count}`);
+  if(realTraitCount(dbMeta?.traits) || dbMeta?.trait_count || token.trait_count) stats.push(`Traits: ${realTraitCount(dbMeta?.traits) || dbMeta?.trait_count || token.trait_count}`);
   if(stats.length) embed.addFields({ name:'Stats', value:stats.join('\n'), inline:false });
 
   if(traits.length){
-    const traitLines = traits.slice(0, 12).map(t => `**${t.trait_type}**: ${t.value}`);
+    const traitLines = traitDisplayLines(traits, 12);
     const half = Math.ceil(traitLines.length / 2);
     embed.addFields(
       { name:'Traits', value:traitLines.slice(0, half).join('\n'), inline:true },
@@ -2601,15 +2674,24 @@ client.on('interactionCreate', async (interaction)=>{
       const cached = ocasTraitsCache.get(tokenId);
       if(cached && Date.now() < cached.expires){
         traits = cached.traits;
-      } else {
-        const tqs = new URLSearchParams({ key: API_SECRET||'' });
-        const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
-        if(tr.ok){ const tj = await tr.json(); if(tj.ok && tj.token?.traits) traits = tj.token.traits; }
-        if(traits) ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+      } else if(RAILWAY_URL) {
+        try{
+          const tqs = new URLSearchParams({ key: API_SECRET||'' });
+          const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
+          if(tr.ok){ const tj = await tr.json(); if(tj.ok && tj.token?.traits) traits = tj.token.traits; }
+          if(traits) ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+        }catch(apiErr){
+          console.warn('[ShowTraits API]', apiErr.message);
+        }
       }
-      if(!traits){ await interaction.editReply({ content: 'Could not load traits.' }); return; }
-      const traitLines = Object.entries(traits).map(([k,v]) => `**${k}:** ${v}`).join('\n');
-      await interaction.editReply({ content: `**OCAS #${tokenId} Traits**\n${traitLines}` });
+      if(!traits || !realTraitCount(traits)){
+        // Staging/API fallback: read local DB/snapshot, then contract tokenURI.
+        const local = await fetchTokenMetaFromLocalDb(tokenId).catch(()=>null);
+        traits = local?.traits || await fetchTokenUriFromContract(tokenId).catch(()=>null);
+      }
+      if(!traits || !realTraitCount(traits)){ await interaction.editReply({ content: 'Could not load traits.' }); return; }
+      const traitLines = traitDisplayLines(traits, 25).join('\n');
+      await interaction.editReply({ content: `**OCAS #${tokenId} Traits (${realTraitCount(traits)})**\n${traitLines}`.slice(0, 1900) });
     } catch(e) {
       console.error('[ShowTraits]', e.message);
       try { await interaction.editReply({ content: 'Error loading traits.' }); } catch(_){}
@@ -3165,7 +3247,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             const fakeListingObj = {
               token_id: tokenId,
               asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
-                       traits: dbMeta?.traits ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v})) : [] },
+                       traits: dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [] },
               payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
               maker: t.seller || '',
               url: t.url || null,
@@ -3203,7 +3285,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             const fakeListingObj = {
               token_id: tokenId,
               asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
-                       traits: dbMeta?.traits ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v})) : [] },
+                       traits: dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [] },
               payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
               maker: t.seller || '',
               url: t.url || null,
@@ -3232,7 +3314,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           const toShow = sales.slice(0, want);
           const saleEmbeds = await Promise.all(toShow.map(async sale => {
             const dbMeta = await fetchTokenMetaFromDb(sale.token_id).catch(()=>null);
-            const tokenTraits = dbMeta?.traits ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v})) : [];
+            const tokenTraits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
             const syntheticSale = {
               nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
               buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
@@ -3457,7 +3539,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const cfg = {...config};
         const saleEmbeds = await Promise.all(sales.map(async sale => {
           const tokenTraits = sale.traits && typeof sale.traits==='object'
-            ? Object.entries(sale.traits).map(([k,v])=>({trait_type:k,value:v}))
+            ? traitObjectToArray(sale.traits)
             : [];
           const isWethSale = (sale.currency||'ETH').toUpperCase() === 'WETH';
           const syntheticSale = {
@@ -3484,8 +3566,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const tokenId = l.token_id ?? l.id ?? l.identifier;
         const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
         const tokenTraits = dbMeta?.traits
-          ? Object.entries(dbMeta.traits).map(([k,v])=>({trait_type:k,value:v}))
-          : (l.traits && typeof l.traits==='object' ? Object.entries(l.traits).map(([k,v])=>({trait_type:k,value:v})) : []);
+          ? traitObjectToArray(dbMeta.traits)
+          : (l.traits && typeof l.traits==='object' ? traitObjectToArray(l.traits) : []);
         const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
         const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
         const listingUrl = l.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
@@ -3499,7 +3581,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           .setTimestamp();
         const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
         if(tokenTraits.length){
-          embed.setDescription(tokenTraits.slice(0,8).map(t=>`**${t.trait_type}:** ${t.value}`).join('\n') + '\n\n**Links**\n' + tvLink);
+          embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
         } else { embed.setDescription('**Links**\n' + tvLink); }
         try{ embed._imageResult = await resolveImage({ identifier: String(tokenId) }, contract, 'ethereum'); }catch(e){}
         return embed;

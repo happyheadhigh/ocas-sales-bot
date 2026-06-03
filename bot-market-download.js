@@ -7,9 +7,6 @@ const {
   Client,
   EmbedBuilder,
   AttachmentBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   MessageFlags,
 } = require('discord.js');
 
@@ -841,37 +838,6 @@ async function handleDownloadCommand(interaction, forced={}){
   }
 }
 
-function extractTokenIdFromPayload(payload){
-  const embeds = payload?.embeds || [];
-  for(const e of embeds){
-    const raw = [e?.data?.title, e?.data?.url, e?.data?.description].filter(Boolean).join(' ');
-    const m = raw.match(/#(\d{1,5})|token[=/](\d{1,5})|assets\/ethereum\/0x[0-9a-f]{40}\/(\d{1,5})/i);
-    if(m) return parseInt(m[1] || m[2] || m[3], 10);
-  }
-  return null;
-}
-
-function appendOcasDownloadButton(payload){
-  if(!payload || typeof payload !== 'object') return payload;
-  const tokenId = extractTokenIdFromPayload(payload);
-  if(!tokenId) return payload;
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`ocas_download:${tokenId}:2048:0`).setLabel('Download PNG').setStyle(ButtonStyle.Secondary)
-  );
-  const existing = Array.isArray(payload.components) ? payload.components : [];
-  return { ...payload, components:[...existing, row].slice(0,5) };
-}
-
-function patchOcasInteraction(interaction){
-  const originalReply = interaction.reply?.bind(interaction);
-  const originalEditReply = interaction.editReply?.bind(interaction);
-  if(originalReply){
-    interaction.reply = (options) => originalReply(typeof options === 'object' ? appendOcasDownloadButton(options) : options);
-  }
-  if(originalEditReply){
-    interaction.editReply = (options) => originalEditReply(typeof options === 'object' ? appendOcasDownloadButton(options) : options);
-  }
-}
 
 let marketPollStarted = false;
 async function startMarketPoller(client){
@@ -1033,19 +999,6 @@ function wrapInteractionListener(listener){
       if(interaction.isChatInputCommand?.() && interaction.commandName === 'help'){
         await handleHelpCommand(interaction);
         return;
-      }
-      if(interaction.isButton?.() && interaction.customId?.startsWith('ocas_download:')){
-        const [, token, size, transparentFlag] = interaction.customId.split(':');
-        await handleDownloadCommand(interaction, {
-          tokenId:parseInt(token,10),
-          size:parseInt(size||'2048',10),
-          transparent:transparentFlag === '1',
-          ephemeral:true
-        });
-        return;
-      }
-      if(interaction.isChatInputCommand?.() && interaction.commandName === 'ocas'){
-        patchOcasInteraction(interaction);
       }
     }catch(e){
       console.error('[Market/download wrapper]', e.message);
