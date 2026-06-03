@@ -324,6 +324,20 @@ async function dbSave(key, value){
   }catch(e){ console.warn('[DB] save error', key, e.message); }
 }
 
+function getRailwayApiUrl(){
+  // Primary expected env var is RAILWAY_API_URL.
+  // Fallback names are accepted so staging/prod do not break if the same API URL
+  // was saved under a slightly different variable name.
+  return String(
+    process.env.RAILWAY_API_URL ||
+    process.env.TRAITVIEW_API_URL ||
+    process.env.RAILWAY_URL ||
+    process.env.API_URL ||
+    process.env.BOT_API_URL ||
+    ''
+  ).trim().replace(/\/+$/, '');
+}
+
 // ── Config helpers ────────────────────────────────────────────────────────────
 async function loadAllConfigs(){
   // Try Railway Postgres first, then Supabase fallback, then local file
@@ -1786,7 +1800,7 @@ async function fetchTokenMetaFromDb(tokenId){
   const cached = tokenMetaCache.get(id);
   if(cached && Date.now() < cached.expires) return cached.meta;
 
-  const RAILWAY_URL = process.env.RAILWAY_API_URL;
+  const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET  = process.env.API_SECRET;
   if(!RAILWAY_URL) return null;
 
@@ -2491,7 +2505,7 @@ async function pollListings(){
       // passed trait listing filters. Bot uses OS rank only.
       const rankAlertCfg = config.rankAlert;
       if(rankAlertCfg?.min && rankAlertCfg?.max){
-        const RAILWAY_URL = process.env.RAILWAY_API_URL;
+        const RAILWAY_URL = getRailwayApiUrl();
         if(RAILWAY_URL){
           for(const listing of toPost){
             const id = parseInt(
@@ -2668,27 +2682,49 @@ client.on('interactionCreate', async (interaction)=>{
     const tokenId = parseInt(interaction.customId.split(':')[1]);
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const RAILWAY_URL = process.env.RAILWAY_API_URL;
+      const RAILWAY_URL = getRailwayApiUrl();
       const API_SECRET  = process.env.API_SECRET;
       let traits = null;
+
       const cached = ocasTraitsCache.get(tokenId);
       if(cached && Date.now() < cached.expires){
         traits = cached.traits;
-      } else if(RAILWAY_URL) {
+      }
+
+      // For OCAS, current contract tokenURI is the true source and preserves
+      // duplicate trait categories through the raw attributes[] array.
+      // Try it before API/DB so stale flattened DB traits do not hide duplicates.
+      if(!traits || realTraitCount(traits) < 10){
+        const contractTraits = await fetchTokenUriFromContract(tokenId).catch(e => {
+          console.warn('[ShowTraits contract]', e.message);
+          return null;
+        });
+        if(contractTraits && realTraitCount(contractTraits)){
+          traits = contractTraits;
+          ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+        }
+      }
+
+      // API fallback for cases where contract RPC is temporarily unavailable.
+      if((!traits || !realTraitCount(traits)) && RAILWAY_URL){
         try{
           const tqs = new URLSearchParams({ key: API_SECRET||'' });
           const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
-          if(tr.ok){ const tj = await tr.json(); if(tj.ok && tj.token?.traits) traits = tj.token.traits; }
+          if(tr.ok){
+            const tj = await tr.json();
+            if(tj.ok && tj.token?.traits) traits = tj.token.traits;
+          }
           if(traits) ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
         }catch(apiErr){
           console.warn('[ShowTraits API]', apiErr.message);
         }
       }
+
       if(!traits || !realTraitCount(traits)){
-        // Staging/API fallback: read local DB/snapshot, then contract tokenURI.
         const local = await fetchTokenMetaFromLocalDb(tokenId).catch(()=>null);
-        traits = local?.traits || await fetchTokenUriFromContract(tokenId).catch(()=>null);
+        traits = local?.traits || null;
       }
+
       if(!traits || !realTraitCount(traits)){ await interaction.editReply({ content: 'Could not load traits.' }); return; }
       const traitLines = traitDisplayLines(traits, 25).join('\n');
       await interaction.editReply({ content: `**OCAS #${tokenId} Traits (${realTraitCount(traits)})**\n${traitLines}`.slice(0, 1900) });
@@ -3185,7 +3221,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   if(commandName==='traitfind'){
     const slug       = interaction.options.getString('collection') || config.slug;
     const rawSearch  = (interaction.options.getString('search') || '').trim();
-    const RAILWAY_URL = process.env.RAILWAY_API_URL;
+    const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
 
     // Detect mode: tokens default, or explicit listings/sales.
@@ -3214,7 +3250,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     if(!workingSearch) return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie`, `/traitfind search:zombie listings`, or `/traitfind search:zombie sales`', flags: MessageFlags.Ephemeral});
-    if(!RAILWAY_URL) return interaction.reply({content:'Trait search needs the internal TraitView API (`RAILWAY_API_URL`) so it can read the token DB/cache.', flags: MessageFlags.Ephemeral});
+    if(!RAILWAY_URL) return interaction.reply({content:'Trait search needs the internal TraitView API URL so it can read the token DB/cache. Set `RAILWAY_API_URL` in this Railway service.', flags: MessageFlags.Ephemeral});
     if(traitParseError) return interaction.reply({content:`I could not load the trait index from the TraitView API. ${traitParseError.message}`, flags: MessageFlags.Ephemeral});
     if(!groups.length){
       const extra = unmatched.length ? ` Unmatched words: ${unmatched.join(', ')}.` : '';
@@ -3505,7 +3541,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   // /rankfilter — show currently listed tokens filtered by OS rank range
   if(commandName==='rankfind'){
     const rawSearch  = (interaction.options.getString('search') || '').trim();
-    const RAILWAY_URL = process.env.RAILWAY_API_URL;
+    const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
 
     // Detect mode: sales or listings (default)
@@ -3522,7 +3558,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     // Parse sort for listings mode: 'rank'/'best' or default 'price'/'cheapest'
     const sortBy = /\b(rank|best)\b/i.test(workingSearch) ? 'rank' : 'price';
 
-    if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured.', flags: MessageFlags.Ephemeral });
+    if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured. Set it to your internal/public TraitView API URL in this Railway service.', flags: MessageFlags.Ephemeral });
     if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. Try: "1-100" or "1-500 rank"', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
@@ -3602,7 +3638,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     const tokenInput = interaction.options.getInteger('token');
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const contract   = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
-    const RAILWAY_URL = process.env.RAILWAY_API_URL;
+    const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
 
     await interaction.deferReply();
@@ -3767,7 +3803,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
   // ── /sweep ──────────────────────────────────────────────────────────────
   if(commandName==='sweep'){
-    const RAILWAY_URL = process.env.RAILWAY_API_URL;
+    const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
     const rawSearch   = (interaction.options.getString('search')||'').trim();
     console.log('[/sweep] RAILWAY_URL set:', !!RAILWAY_URL, 'search:', rawSearch);
