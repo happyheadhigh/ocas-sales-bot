@@ -1896,19 +1896,24 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
   const id = parseInt(tokenId);
   const attrs = traitsArrayFromInput(traits);
   if(!id || !attrs.length) return false;
-  const client = await pgPool.connect();
   try{
-    await client.query('BEGIN');
-    await client.query('DELETE FROM token_traits WHERE token_id=$1', [id]);
+    // Delete rows beyond the new trait count (handles shrinking trait sets).
+    // Then upsert each trait by (token_id, trait_index) — no race window, no serial collision.
+    await pgPool.query(
+      `DELETE FROM token_traits WHERE token_id=$1 AND trait_index >= $2`,
+      [id, attrs.length]
+    );
     for(let i = 0; i < attrs.length; i++){
       const t = attrs[i];
-      await client.query(
+      await pgPool.query(
         `INSERT INTO token_traits (token_id, trait_name, trait_value, trait_index)
-         VALUES ($1, $2, $3, $4)`,
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (token_id, trait_index) DO UPDATE SET
+           trait_name  = EXCLUDED.trait_name,
+           trait_value = EXCLUDED.trait_value`,
         [id, String(t.trait_type), String(t.value), i]
       );
     }
-    await client.query('COMMIT');
     const img = getTraitImageSource(traits);
     if(img){
       const SOURCE_PRIORITY = { 'burn-start-input': 3, 'backfill-chunks': 2, 'burn-finalized-survivor': 1 };
@@ -1933,11 +1938,8 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
     }
     return true;
   }catch(e){
-    await client.query('ROLLBACK').catch(()=>{});
     console.warn(`[Token snapshot] failed for #${id}:`, e.message);
     return false;
-  }finally{
-    client.release();
   }
 }
 
