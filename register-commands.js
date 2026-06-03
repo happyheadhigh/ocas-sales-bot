@@ -100,6 +100,10 @@ const commands = [
   new SlashCommandBuilder().setName('burnwallet').setDescription('Show burn history for a wallet address').addStringOption(o=>o.setName('wallet').setDescription('Wallet address (0x...)').setRequired(true)),
   new SlashCommandBuilder().setName('burnleaderboard').setDescription('Top OCAS burners ranked by tokens burned'),
   new SlashCommandBuilder().setName('burnrefresh').setDescription('Refresh metadata and re-post burn alert for a created token (5 min cooldown)').addIntegerOption(o=>o.setName('token').setDescription('Survivor/created token ID').setRequired(true).setMinValue(1).setMaxValue(10000)),
+
+  new SlashCommandBuilder().setName('synctraits').setDescription('Refresh token traits from contract — fixes missing/stale traits in DB (admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption(o=>o.setName('mode').setDescription('survivors = refresh all burn survivors; token = single token (default)').setRequired(false).addChoices({name:'Single token',value:'token'},{name:'All burn survivors',value:'survivors'}))
+    .addIntegerOption(o=>o.setName('token').setDescription('Token ID (required for single token mode)').setRequired(false).setMinValue(1).setMaxValue(10000)),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){

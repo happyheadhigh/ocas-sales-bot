@@ -2702,6 +2702,9 @@ client.on('interactionCreate', async (interaction)=>{
         if(contractTraits && realTraitCount(contractTraits)){
           traits = contractTraits;
           ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+          upsertTokenTraitRows(tokenId, contractTraits, 'show-traits-contract').catch(e =>
+            console.warn(`[ShowTraits] DB trait refresh failed for #${tokenId}:`, e.message)
+          );
         }
       }
 
@@ -3277,7 +3280,16 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const cfg = {...config, slug};
         const embeds = await Promise.all(tokens.map(async t => {
           const tokenId = t.token_id ?? t.id ?? t.identifier;
-          const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+          // Use inline traits from API response when available — avoids a per-token HTTP call.
+          // Fall back to fetchTokenMetaFromDb only when traits are missing from the response.
+          const inlineTraits = t.traits && typeof t.traits === 'object' && (t.traits.__attributes?.length || Object.keys(t.traits).length > 0)
+            ? t.traits : null;
+          const inlineMeta = inlineTraits ? {
+            os_rank: t.os_rank || null,
+            traits: inlineTraits,
+            trait_count: t.trait_count || null,
+          } : null;
+          const dbMeta = inlineMeta || await fetchTokenMetaFromDb(tokenId).catch(()=>null);
           if(listedOnly){
             const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
             const fakeListingObj = {
@@ -3297,42 +3309,6 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         await postEmbeds(interaction, embeds.filter(Boolean),
           `Found **${tokens.length}** ${listedOnly ? 'listing' : 'token'}${tokens.length===1?'':'s'} matching **${matchLabel}**${listedOnly ? ' (cheapest first)' : ''}:`);
         return;
-      }
-
-      // ── Listings mode ──────────────────────────────────────────────────────
-      if(wantListings && RAILWAY_URL){
-        await interaction.editReply(`🔍 Searching listed tokens with **${trait ? trait+': ' : ''}${value}**...`);
-        // Use multi-trait-tokens with listed=1 — build a single-group filter
-        const groups = [[{ trait_name: trait || '_any', trait_value: value }]];
-        // For single known trait, use groups param; otherwise fall back to trait-sales endpoint
-        const qs = new URLSearchParams({ listed:'1', limit: String(want), key: API_SECRET||'' });
-        if(trait) qs.set('groups', JSON.stringify([[{ trait_name: trait, trait_value: value }]]));
-        const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
-        if(r.ok){
-          const j = await r.json();
-          if(!j.ok) throw new Error(j.error || 'API error');
-          const tokens = j.tokens || [];
-          if(!tokens.length){ await interaction.editReply(`No listed tokens found with **${trait ? trait+': ' : ''}${value}**.`); return; }
-          const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
-          const listEmbeds = await Promise.all(tokens.map(async t => {
-            const tokenId = t.token_id ?? t.id ?? t.identifier;
-            const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-            const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
-            const fakeListingObj = {
-              token_id: tokenId,
-              asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
-                       traits: dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [] },
-              payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
-              maker: t.seller || '',
-              url: t.url || null,
-              _dbToken: dbMeta,
-            };
-            return buildListingEmbed(fakeListingObj, {...config, slug}).catch(()=>null);
-          }));
-          await postEmbeds(interaction, listEmbeds.filter(Boolean),
-            `Found **${tokens.length}** listing${tokens.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (cheapest first):`);
-          return;
-        }
       }
 
       // ── Sales mode (default) ───────────────────────────────────────────────
@@ -4532,6 +4508,63 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       await interaction.editReply('Error: ' + e.message);
     }
     return;
+  }
+
+  // /synctraits — admin command to refresh token traits from contract tokenURI
+  if(commandName==='synctraits'){
+    if(!interaction.memberPermissions?.has?.('ManageGuild'))
+      return interaction.reply({ content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral });
+
+    const tokenInput = interaction.options.getInteger('token');
+    const mode       = interaction.options.getString('mode') || 'token';
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    try{
+      // ── Single token mode ─────────────────────────────────────────────────
+      if(tokenInput || mode === 'token'){
+        const tokenId = tokenInput;
+        if(!tokenId || tokenId < 1 || tokenId > 10000)
+          return interaction.editReply('Provide a valid token ID (1–10000).');
+        const traits = await snapshotTokenFromContract(tokenId, 'synctraits');
+        if(!traits)
+          return interaction.editReply(`Could not fetch traits for #${tokenId} from contract. Token may be burned or RPC unavailable.`);
+        const count = realTraitCount(traits);
+        // Bust trait index cache so next traitfind sees updated data
+        global.__ocasTraitIndexCache = null;
+        return interaction.editReply(`✅ Synced #${tokenId} — ${count} trait${count===1?'':'s'} written to DB.`);
+      }
+
+      // ── Survivors mode — refresh all burn survivor tokens ─────────────────
+      if(mode === 'survivors'){
+        const r = await pgPool.query(
+          `SELECT DISTINCT survivor_token_id FROM burn_events ORDER BY survivor_token_id ASC`
+        );
+        const survivorIds = r.rows.map(row => row.survivor_token_id);
+        if(!survivorIds.length)
+          return interaction.editReply('No burn survivor tokens found in DB.');
+
+        await interaction.editReply(`Syncing ${survivorIds.length} survivor token${survivorIds.length===1?'':'s'} from contract... this may take a minute.`);
+
+        let ok = 0, failed = 0;
+        for(const id of survivorIds){
+          const traits = await snapshotTokenFromContract(id, 'synctraits').catch(()=>null);
+          if(traits && realTraitCount(traits)) ok++;
+          else failed++;
+          // Small delay to avoid hammering RPC
+          await new Promise(r=>setTimeout(r, 300));
+        }
+        // Bust trait index cache so next traitfind sees updated data
+        global.__ocasTraitIndexCache = null;
+        return interaction.editReply(
+          `✅ Survivors sync complete — ${ok} updated, ${failed} failed (burned/unavailable).\nTrait index cache cleared — next /traitfind will use fresh data.`
+        );
+      }
+
+      return interaction.editReply('Unknown mode. Use `token` with a token ID, or `mode:survivors`.');
+    }catch(e){
+      console.error('[synctraits]', e.message);
+      return interaction.editReply('Error: ' + e.message);
+    }
   }
 
   if(commandName==='help'){

@@ -22,6 +22,33 @@ function normalizeEthAddress(addr) {
 
 const OCAS_CONTRACT = normalizeEthAddress(process.env.OCAS_CONTRACT || DEFAULT_OCAS_CONTRACT);
 
+function traitsFromRows(rows) {
+  const attrs = (rows || [])
+    .filter(r => r && r.trait_name && r.trait_value != null)
+    .sort((a, b) => {
+      const ai = Number(a.trait_index || 0);
+      const bi = Number(b.trait_index || 0);
+      if (ai !== bi) return ai - bi;
+      return String(a.trait_name).localeCompare(String(b.trait_name));
+    })
+    .map(r => ({ trait_type: String(r.trait_name), value: String(r.trait_value) }));
+
+  const traits = {};
+  for (const t of attrs) {
+    // Compatibility for old consumers. Duplicate trait names are preserved in
+    // __attributes even though this key stores the last value for a trait name.
+    traits[t.trait_type] = t.value;
+  }
+  if (attrs.length) traits.__attributes = attrs;
+  return traits;
+}
+
+const ACTIVE_TOKEN_CONDITION = `NOT EXISTS (
+  SELECT 1 FROM burn_event_inputs active_burned
+  WHERE active_burned.burned_token_id = t.id
+)`;
+
+
 // ── Database connection pool ──────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -99,7 +126,7 @@ app.get('/db/tokens', auth, async (req, res) => {
 
     if (listedOnly) query += ` JOIN listings l ON l.token_id = t.id`;
 
-    const conditions = [];
+    const conditions = [ACTIVE_TOKEN_CONDITION];
     if (rankMin !== null) { conditions.push(`t.obs_rank >= $${p++}`); params.push(rankMin); }
     if (rankMax !== null) { conditions.push(`t.obs_rank <= $${p++}`); params.push(rankMax); }
     if (traitCountFilter !== null) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCountFilter); }
@@ -132,14 +159,14 @@ app.get('/db/token/:id', auth, async (req, res) => {
 
     const [tokenRes, traitsRes] = await Promise.all([
       pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count FROM tokens WHERE id = $1`, [tokenId]),
-      pool.query(`SELECT trait_name, trait_value FROM token_traits WHERE token_id = $1 ORDER BY trait_name`, [tokenId])
+      pool.query(`SELECT trait_name, trait_value, COALESCE(trait_index,0) AS trait_index FROM token_traits WHERE token_id = $1 ORDER BY COALESCE(trait_index,0), trait_name`, [tokenId])
     ]);
 
     if (!tokenRes.rows.length) return res.status(404).json({ ok: false, error: 'not found' });
 
     const t = tokenRes.rows[0];
-    const traits = {};
-    traitsRes.rows.forEach(r => { traits[r.trait_name] = r.trait_value; });
+    const traits = traitsFromRows(traitsRes.rows);
+    const actualTraitCount = traits.__attributes?.length || parseInt(t.trait_count || 0);
 
     res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
     res.json({
@@ -150,7 +177,7 @@ app.get('/db/token/:id', auth, async (req, res) => {
         os_rank:  t.os_rank  ? parseInt(t.os_rank)    : null,
         os_score: t.os_score ? parseFloat(t.os_score) : null,
         rarity_score: parseFloat(t.rarity_score),
-        trait_count: parseInt(t.trait_count),
+        trait_count: actualTraitCount,
         traits
       }
     });
@@ -177,6 +204,10 @@ app.get('/db/trait-floor', auth, async (req, res) => {
       JOIN token_traits tt ON tt.token_id = t.id
       JOIN listings l ON l.token_id = t.id
       WHERE tt.trait_name = $1 AND tt.trait_value = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM burn_event_inputs active_burned
+          WHERE active_burned.burned_token_id = t.id
+        )
       ORDER BY l.price_eth ASC
       LIMIT 1
     `, [trait_name, trait_value]);
@@ -213,6 +244,10 @@ app.get('/db/holders/trait', auth, async (req, res) => {
     const traitResult = await pool.query(`
       SELECT token_id FROM token_traits
       WHERE trait_name = $1 AND trait_value = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM burn_event_inputs active_burned
+          WHERE active_burned.burned_token_id = token_traits.token_id
+        )
     `, [trait_name, trait_value]);
 
     const traitTokenIds = new Set(traitResult.rows.map(r => parseInt(r.token_id)));
@@ -480,10 +515,14 @@ app.get('/db/trait-index', auth, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT trait_name, trait_value, COUNT(*)::int AS token_count
-      FROM token_traits
+      FROM token_traits tt
       WHERE trait_name IS NOT NULL
         AND trait_value IS NOT NULL
         AND TRIM(trait_value) <> ''
+        AND NOT EXISTS (
+          SELECT 1 FROM burn_event_inputs active_burned
+          WHERE active_burned.burned_token_id = tt.token_id
+        )
       GROUP BY trait_name, trait_value
       ORDER BY LENGTH(trait_value) DESC, trait_value ASC
     `);
@@ -571,13 +610,25 @@ app.get('/db/multi-trait-tokens', auth, async (req, res) => {
 
     let query = `SELECT t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count`;
     if (listedOnly) query += `, l.price_eth, l.url`;
+    query += `,
+      jsonb_build_object(
+        '__attributes',
+        COALESCE(
+          jsonb_agg(
+            jsonb_build_object('trait_type', tt.trait_name, 'value', tt.trait_value)
+            ORDER BY COALESCE(tt.trait_index, 0), tt.trait_name
+          ) FILTER (WHERE tt.trait_name IS NOT NULL),
+          '[]'::jsonb
+        )
+      ) AS traits`;
     query += ` FROM tokens t`;
 
     const params = [];
     let p = 1;
     if (listedOnly) query += ` JOIN listings l ON l.token_id = t.id`;
+    query += ` LEFT JOIN token_traits tt ON tt.token_id = t.id`;
 
-    const conditions = [];
+    const conditions = [ACTIVE_TOKEN_CONDITION];
     groups.forEach((group, i) => {
       const ors = [];
       group.forEach(m => {
@@ -591,7 +642,9 @@ app.get('/db/multi-trait-tokens', auth, async (req, res) => {
     if (rankMax !== null && !isNaN(rankMax)) { conditions.push(`${rankCol} <= $${p++}`); params.push(rankMax); }
     if (conditions.length) query += ` WHERE ${conditions.join(' AND ')}`;
 
-    query += listedOnly ? ` ORDER BY l.price_eth ASC, t.obs_rank ASC` : ` ORDER BY t.obs_rank ASC`;
+    query += listedOnly
+      ? ` GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count, l.price_eth, l.url ORDER BY l.price_eth ASC, t.obs_rank ASC`
+      : ` GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count ORDER BY t.obs_rank ASC`;
     query += ` LIMIT $${p++}`;
     params.push(limit);
 
@@ -610,6 +663,7 @@ app.get('/db/multi-trait-tokens', auth, async (req, res) => {
         trait_count: r.trait_count ? parseInt(r.trait_count) : null,
         price_eth: r.price_eth != null ? parseFloat(r.price_eth) : null,
         url: r.url || null,
+        traits: r.traits || {},
       })),
       count: result.rows.length
     });
@@ -643,7 +697,7 @@ app.get('/db/multi-trait-floor', auth, async (req, res) => {
     const params = [];
     let p = 1;
 
-    const conditions = [];
+    const conditions = [ACTIVE_TOKEN_CONDITION];
     groups.forEach((group, i) => {
       const ors = [];
       group.forEach(m => {
@@ -700,9 +754,15 @@ app.get('/db/rank-sales', auth, async (req, res) => {
 
     const result = await pool.query(
       `SELECT s.token_id, t.os_rank, t.obs_rank, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller,
-              COALESCE(
-                json_object_agg(tt.trait_name, tt.trait_value) FILTER (WHERE tt.trait_name IS NOT NULL),
-                '{}'::json
+              jsonb_build_object(
+                '__attributes',
+                COALESCE(
+                  jsonb_agg(
+                    jsonb_build_object('trait_type', tt.trait_name, 'value', tt.trait_value)
+                    ORDER BY COALESCE(tt.trait_index, 0), tt.trait_name
+                  ) FILTER (WHERE tt.trait_name IS NOT NULL),
+                  '[]'::jsonb
+                )
               ) AS traits
        FROM sales s
        JOIN tokens t ON t.id = s.token_id
@@ -758,14 +818,21 @@ app.get('/db/rank-listings', auth, async (req, res) => {
     const result = await pool.query(
       `SELECT t.id AS token_id, t.obs_rank, t.os_rank, t.os_score, t.trait_count,
               l.price_eth, l.url,
-              COALESCE(
-                json_object_agg(tt.trait_name, tt.trait_value) FILTER (WHERE tt.trait_name IS NOT NULL),
-                '{}'::json
+              jsonb_build_object(
+                '__attributes',
+                COALESCE(
+                  jsonb_agg(
+                    jsonb_build_object('trait_type', tt.trait_name, 'value', tt.trait_value)
+                    ORDER BY COALESCE(tt.trait_index, 0), tt.trait_name
+                  ) FILTER (WHERE tt.trait_name IS NOT NULL),
+                  '[]'::jsonb
+                )
               ) AS traits
        FROM tokens t
        JOIN listings l ON l.token_id = t.id
        LEFT JOIN token_traits tt ON tt.token_id = t.id
        WHERE ${rankCol} >= $1 AND ${rankCol} <= $2
+         AND ${ACTIVE_TOKEN_CONDITION}
        GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.trait_count, l.price_eth, l.url
        ORDER BY l.price_eth ASC
        LIMIT $3`,
