@@ -952,6 +952,46 @@ function emptyWalletResponse(address, extra = {}) {
   return { ok: true, address, synced: false, ...extra };
 }
 
+function isMissingBurnTable(e) {
+  return e?.code === '42P01' || /burn_events|burn_event_inputs/i.test(e?.message || '');
+}
+function isMissingBurnRankData(e) {
+  return e?.code === '42P01' || e?.code === '42703' || /tokens|os_rank|obs_rank/i.test(e?.message || '');
+}
+function burnLimitParam(value, fallback = 25, max = 100) {
+  const n = parseInt(value || fallback, 10);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(n, max);
+}
+function burnNum(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+function burnIdArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(v => parseInt(v, 10)).filter(Number.isFinite);
+}
+function burnEventJson(row) {
+  const inputTokenIds = burnIdArray(row.input_token_ids);
+  return {
+    tx_hash: row.tx_hash || null,
+    log_index: burnNum(row.log_index),
+    block_number: burnNum(row.block_number),
+    burn_ts: row.burned_at || row.burn_ts || null,
+    wallet: row.burner_wallet || row.wallet || null,
+    created_token_id: burnNum(row.survivor_token_id || row.created_token_id),
+    input_token_ids: inputTokenIds,
+    input_count: burnNum(row.input_count) ?? inputTokenIds.length,
+  };
+}
+function burnEndpointError(res, route, e, fallback = {}) {
+  console.error(`${route} error:`, e.message);
+  if (isMissingBurnTable(e)) {
+    return res.status(500).json({ ok: false, error: 'burn analytics tables are not available', ...fallback });
+  }
+  return res.status(500).json({ ok: false, error: e.message, ...fallback });
+}
+
 // ── GET /db/wallet/:address/summary ──────────────────────────────────────────
 // Current derived wallet summary. Returns empty data if wallet sync has not run.
 app.get('/db/wallet/:address/summary', auth, async (req, res) => {
@@ -1161,6 +1201,232 @@ app.get('/db/token/:id/history', auth, async (req, res) => {
     if (isMissingWalletAnalyticsTable(e)) return res.json({ ok: true, token_id: tokenId, synced: false, history: [], count: 0 });
     console.error('/db/token/:id/history error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Burn analytics endpoints ─────────────────────────────────────────────────
+// GET /db/burn-stats
+app.get('/db/burn-stats', auth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        (
+          SELECT COUNT(DISTINCT bei.burned_token_id)::int
+          FROM burn_event_inputs bei
+          JOIN burn_events be ON be.id = bei.burn_event_id
+          WHERE bei.burned_token_id != be.survivor_token_id
+        ) AS tokens_burned,
+        (SELECT COUNT(*)::int FROM burn_events) AS tokens_created
+    `);
+    const tokensBurned = parseInt(result.rows[0]?.tokens_burned || 0, 10);
+    const tokensCreated = parseInt(result.rows[0]?.tokens_created || 0, 10);
+    // Mirrors /burnstats distinct burned-token logic and burn repair net-supply math.
+    const supplyReducedBy = tokensBurned - tokensCreated;
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      tokens_burned: tokensBurned,
+      tokens_created: tokensCreated,
+      supply_reduced_by: supplyReducedBy,
+      estimated_supply: 10000 - supplyReducedBy,
+    });
+  } catch (e) {
+    burnEndpointError(res, '/db/burn-stats', e, {
+      tokens_burned: null,
+      tokens_created: null,
+      supply_reduced_by: null,
+      estimated_supply: null,
+    });
+  }
+});
+
+// GET /db/burn-latest
+app.get('/db/burn-latest', auth, async (req, res) => {
+  const limit = burnLimitParam(req.query.limit, 25, 100);
+  try {
+    const result = await pool.query(`
+      SELECT be.tx_hash, be.log_index, be.block_number, be.burner_wallet,
+             be.survivor_token_id, be.burned_at,
+             COALESCE(
+               array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
+                 FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id),
+               '{}'
+             ) AS input_token_ids,
+             (COUNT(DISTINCT bei.burned_token_id)
+               FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id))::int AS input_count
+      FROM burn_events be
+      LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+      GROUP BY be.id
+      ORDER BY be.burned_at DESC NULLS LAST, be.block_number DESC NULLS LAST, be.log_index DESC NULLS LAST
+      LIMIT $1
+    `, [limit]);
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({ ok: true, burns: result.rows.map(burnEventJson), count: result.rows.length });
+  } catch (e) {
+    burnEndpointError(res, '/db/burn-latest', e, { burns: [], count: 0 });
+  }
+});
+
+// GET /db/burn-leaderboard
+app.get('/db/burn-leaderboard', auth, async (req, res) => {
+  const limit = burnLimitParam(req.query.limit, 25, 100);
+  try {
+    const result = await pool.query(`
+      WITH per_burn AS (
+        SELECT be.id, be.burner_wallet,
+               (COUNT(DISTINCT bei.burned_token_id)
+                 FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id))::int AS input_count
+        FROM burn_events be
+        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        GROUP BY be.id
+      )
+      SELECT burner_wallet,
+             COUNT(id)::int AS burn_events,
+             COALESCE(SUM(input_count), 0)::int AS tokens_burned,
+             COALESCE(MAX(input_count), 0)::int AS biggest_burn
+      FROM per_burn
+      GROUP BY burner_wallet
+      ORDER BY tokens_burned DESC, burn_events DESC, burner_wallet ASC
+      LIMIT $1
+    `, [limit]);
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      leaders: result.rows.map(r => ({
+        wallet: r.burner_wallet || null,
+        burn_events: parseInt(r.burn_events || 0, 10),
+        tokens_burned: parseInt(r.tokens_burned || 0, 10),
+        biggest_burn: parseInt(r.biggest_burn || 0, 10),
+      })),
+      count: result.rows.length,
+    });
+  } catch (e) {
+    burnEndpointError(res, '/db/burn-leaderboard', e, { leaders: [], count: 0 });
+  }
+});
+
+// GET /db/burn-best
+app.get('/db/burn-best', auth, async (req, res) => {
+  try {
+    const biggest = await pool.query(`
+      SELECT be.tx_hash, be.log_index, be.block_number, be.burner_wallet,
+             be.survivor_token_id, be.burned_at,
+             COALESCE(
+               array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
+                 FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id),
+               '{}'
+             ) AS input_token_ids,
+             (COUNT(DISTINCT bei.burned_token_id)
+               FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id))::int AS input_count
+      FROM burn_events be
+      LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+      GROUP BY be.id
+      ORDER BY input_count DESC, be.burned_at DESC NULLS LAST, be.block_number DESC NULLS LAST
+      LIMIT 10
+    `);
+
+    let rarestBurnedInputs = [];
+    let bestCreatedTokens = [];
+    try {
+      const rarest = await pool.query(`
+        SELECT be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
+               bei.burned_token_id,
+               t.os_rank, t.obs_rank,
+               COALESCE(t.os_rank, t.obs_rank) AS rank
+        FROM burn_event_inputs bei
+        JOIN burn_events be ON be.id = bei.burn_event_id
+        LEFT JOIN tokens t ON t.id = bei.burned_token_id
+        WHERE bei.burned_token_id != be.survivor_token_id
+        ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC, be.burned_at DESC NULLS LAST
+        LIMIT 25
+      `);
+      rarestBurnedInputs = rarest.rows.map(r => ({
+        tx_hash: r.tx_hash || null,
+        block_number: burnNum(r.block_number),
+        wallet: r.burner_wallet || null,
+        burn_ts: r.burned_at || null,
+        token_id: burnNum(r.burned_token_id),
+        os_rank: burnNum(r.os_rank),
+        obs_rank: burnNum(r.obs_rank),
+        rank: burnNum(r.rank),
+      }));
+
+      const created = await pool.query(`
+        SELECT be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
+               be.survivor_token_id,
+               t.os_rank, t.obs_rank,
+               COALESCE(t.os_rank, t.obs_rank) AS rank
+        FROM burn_events be
+        LEFT JOIN tokens t ON t.id = be.survivor_token_id
+        ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC, be.burned_at DESC NULLS LAST
+        LIMIT 25
+      `);
+      bestCreatedTokens = created.rows.map(r => ({
+        tx_hash: r.tx_hash || null,
+        block_number: burnNum(r.block_number),
+        wallet: r.burner_wallet || null,
+        burn_ts: r.burned_at || null,
+        token_id: burnNum(r.survivor_token_id),
+        os_rank: burnNum(r.os_rank),
+        obs_rank: burnNum(r.obs_rank),
+        rank: burnNum(r.rank),
+      }));
+    } catch (rankError) {
+      if (!isMissingBurnRankData(rankError)) throw rankError;
+      console.warn('/db/burn-best rank data unavailable:', rankError.message);
+    }
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      biggest_burns: biggest.rows.map(burnEventJson),
+      rarest_burned_inputs: rarestBurnedInputs,
+      best_created_tokens: bestCreatedTokens,
+    });
+  } catch (e) {
+    burnEndpointError(res, '/db/burn-best', e, {
+      biggest_burns: [],
+      rarest_burned_inputs: [],
+      best_created_tokens: [],
+    });
+  }
+});
+
+// GET /db/burn-activity
+app.get('/db/burn-activity', auth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT to_char(be.burned_at::date, 'YYYY-MM-DD') AS date,
+             COUNT(DISTINCT be.id)::int AS burn_events,
+             (COUNT(DISTINCT bei.burned_token_id)
+               FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id))::int AS tokens_burned,
+             COUNT(DISTINCT be.id)::int AS tokens_created
+      FROM burn_events be
+      LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+      WHERE be.burned_at IS NOT NULL
+      GROUP BY be.burned_at::date
+      ORDER BY be.burned_at::date ASC
+    `);
+
+    const activity = result.rows.map(r => {
+      const tokensBurned = parseInt(r.tokens_burned || 0, 10);
+      const tokensCreated = parseInt(r.tokens_created || 0, 10);
+      return {
+        date: r.date,
+        burn_events: parseInt(r.burn_events || 0, 10),
+        tokens_burned: tokensBurned,
+        tokens_created: tokensCreated,
+        supply_reduced_by: tokensBurned - tokensCreated,
+      };
+    });
+
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json({ ok: true, activity, count: activity.length });
+  } catch (e) {
+    burnEndpointError(res, '/db/burn-activity', e, { activity: [], count: 0 });
   }
 });
 
