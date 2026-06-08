@@ -2781,6 +2781,26 @@ function formatZonedLotteryTime(d, timeZone){
 }
 
 function lotteryTime(d){ return `<t:${Math.floor(new Date(d).getTime()/1000)}:f>`; }
+function etherscanAddressLink(addr){
+  const a = String(addr || '').toLowerCase();
+  if(!/^0x[a-f0-9]{40}$/.test(a)) return String(addr || 'unknown');
+  return `[${shortAddr(a)}](https://etherscan.io/address/${a})`;
+}
+
+function buildBurnLotteryComponents(lotteryId){
+  if(!lotteryId) return [];
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`burnlottery_proof:${lotteryId}`)
+      .setLabel('Show Draw Proof')
+      .setStyle(ButtonStyle.Secondary)
+  )];
+}
+
+function formatBurnLotteryWindow(start, end, timeZone){
+  return `${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\nTimezone: ${timeZone}`;
+}
+
 async function getBurnLotteryEntries(start, end, mode='wallet'){
   const r = await pgPool.query(`
     SELECT id, burner_wallet, survivor_token_id, tx_hash, burned_at
@@ -2797,25 +2817,36 @@ async function getBurnLotteryEntries(start, end, mode='wallet'){
 function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, end, seed, entries, wallets, burns, pick, lotteryId, timezone=DEFAULT_LOTTERY_TIMEZONE}){
   const timeZone = normalizeLotteryTimezone(timezone);
   const embed = new EmbedBuilder().setTitle(`🎟️ ${title}`).setColor(COLORS.OCAS_GREEN).addFields(
-    { name:`Window (${timeZone})`, value:`${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\n${lotteryTime(start)} → ${lotteryTime(end)}`, inline:false },
+    { name:'Window', value:formatBurnLotteryWindow(start, end, timeZone), inline:false },
     { name:'Mode', value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet', inline:true },
     { name:'Qualified Wallets', value:String(wallets.length), inline:true },
     { name:'Total Burns', value:String(burns.length), inline:true },
   );
   if(prize) embed.addFields({ name:'Prize', value:String(prize).slice(0,1024), inline:false });
-  if(pick?.winner) embed.addFields({ name:'Winner', value:`${shortAddr(pick.winner)}\n\`${pick.winner}\``, inline:false });
-  embed.addFields({ name:'Seed', value:`\`${String(seed).slice(0,256)}\``, inline:false });
-  if(pick?.proof) embed.addFields({ name:'Proof Hash', value:`\`${pick.proof.slice(0,32)}...\``, inline:false });
+  if(pick?.winner) embed.addFields({ name:'Winner', value:etherscanAddressLink(pick.winner), inline:false });
+  if(pick?.proof) embed.addFields({ name:'Draw Proof', value:`Proof: \`${pick.proof.slice(0,32)}...\`\nClick **Show Draw Proof** for seed + full hash.`, inline:false });
   embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
   return embed;
 }
 async function drawAndPostBurnLottery(row){
   const start = new Date(row.start_time), end = new Date(row.end_time);
+  const timeZone = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
   const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
   const pick = lotteryPick(entries, row.seed);
-  await pgPool.query(`UPDATE burn_lotteries SET status='completed', winner_wallet=$1, qualified_wallets=$2, total_burns=$3, result_json=$4, completed_at=NOW() WHERE id=$5`, [pick?.winner||null, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick?.proof||null}), row.id]);
+  await pgPool.query(
+    `UPDATE burn_lotteries
+     SET status='completed', winner_wallet=$1, qualified_wallets=$2, total_burns=$3,
+         result_json=$4, completed_at=NOW()
+     WHERE id=$5`,
+    [pick?.winner||null, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick?.proof||null}), row.id]
+  );
   const ch = await resolveDiscordChannel(row.channel_id);
-  if(ch){ await ch.send({ embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:row.seed, entries, wallets, burns, pick, lotteryId:row.id, timezone:row.timezone || DEFAULT_LOTTERY_TIMEZONE})] }); }
+  if(ch){
+    await ch.send({
+      embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:row.seed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone})],
+      components:buildBurnLotteryComponents(row.id)
+    });
+  }
 }
 async function processDueBurnLotteries(){
   const r = await pgPool.query(`SELECT * FROM burn_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]}));
@@ -3018,6 +3049,42 @@ client.on('interactionCreate', async (interaction)=>{
     } catch(e) {
       console.error('[ShowTraits]', e.message);
       try { await interaction.editReply({ content: 'Error loading traits.' }); } catch(_){}
+    }
+    return;
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('burnlottery_proof:')){
+    const lotteryId = parseInt(interaction.customId.split(':')[1], 10);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if(!lotteryId){ await interaction.editReply({ content:'Lottery proof is unavailable.' }); return; }
+      const r = await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1', [lotteryId]);
+      if(!r.rows.length){ await interaction.editReply({ content:`No burn lottery #${lotteryId} found.` }); return; }
+      const row = r.rows[0];
+      const start = new Date(row.start_time), end = new Date(row.end_time);
+      const timeZone = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
+      const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
+      const pick = lotteryPick(entries, row.seed);
+      const proof = pick?.proof || row.result_json?.proof || 'unknown';
+      const winner = row.winner_wallet || pick?.winner || null;
+      const sampleWallets = wallets.slice(0, 20).map(w => `• ${shortAddr(w)} — \`${w}\``).join('\n');
+      const more = wallets.length > 20 ? `\n…and ${wallets.length - 20} more wallet(s).` : '';
+      const content =
+        `**🎟️ OCAS Burn Lottery #${lotteryId} Draw Proof**\n` +
+        `**Window:** ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\n` +
+        `**Timezone:** ${timeZone}\n` +
+        `**Mode:** ${row.mode === 'burn' ? 'One entry per burn' : 'One entry per wallet'}\n` +
+        `**Qualified wallets:** ${wallets.length}\n` +
+        `**Total burns:** ${burns.length}\n` +
+        `**Entries used for draw:** ${entries.length}\n` +
+        (winner ? `**Winner:** ${etherscanAddressLink(winner)}\n\`${winner}\`\n` : `**Winner:** none\n`) +
+        `**Seed:**\n\`${String(row.seed || '').slice(0, 900)}\`\n` +
+        `**Full proof hash:**\n\`${String(proof).slice(0, 128)}\`` +
+        (sampleWallets ? `\n\n**Eligible wallets sample:**\n${sampleWallets}${more}` : '');
+      await interaction.editReply({ content:content.slice(0, 1900) });
+    }catch(e){
+      console.error('[BurnLottery Proof]', e.message);
+      try{ await interaction.editReply({ content:'Error loading draw proof.' }); }catch(_){}
     }
     return;
   }
@@ -4851,7 +4918,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           .setColor(COLORS.OCAS_GREEN)
           .addFields(
             {name:'ID',value:String(row.id),inline:true},
-            {name:'Window',value:`${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\n${lotteryTime(start)} → ${lotteryTime(end)}`,inline:false},
+            {name:'Window',value:formatBurnLotteryWindow(start, end, timeZone),inline:false},
             {name:'Timezone',value:timeZone,inline:true},
             {name:'Duration',value:`${hours} hour${Number(hours)===1?'':'s'}`,inline:true},
             {name:'Mode',value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet',inline:true},
@@ -4896,7 +4963,20 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
       const pick = lotteryPick(entries, seed);
       if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)} (${timeZone})`);
-      return interaction.editReply({ embeds:[buildBurnLotteryEmbed({mode,start,end,seed,entries,wallets,burns,pick,timezone:timeZone})] });
+      const r = await pgPool.query(
+        `INSERT INTO burn_lotteries
+           (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status,
+            winner_wallet, qualified_wallets, total_burns, result_json, timezone, completed_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed',$10,$11,$12,$13,$14,NOW())
+         RETURNING id`,
+        [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, seed,
+         pick.winner, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick.proof||null}), timeZone]
+      );
+      const lotteryId = r.rows[0]?.id;
+      return interaction.editReply({
+        embeds:[buildBurnLotteryEmbed({mode,start,end,seed,entries,wallets,burns,pick,lotteryId,timezone:timeZone})],
+        components:buildBurnLotteryComponents(lotteryId)
+      });
     }catch(e){ console.error('[/burnlottery]', e); return interaction.editReply('Burn lottery error: '+e.message); }
   }
 
