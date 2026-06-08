@@ -2634,6 +2634,22 @@ function lotteryPick(entries, seed){
   const idx = Number(BigInt('0x' + h.slice(0,16)) % BigInt(entries.length));
   return { winner: entries[idx], index: idx, position: idx + 1, proof: h };
 }
+
+const PENDING_DRAW_SEED_PREFIX = '__PENDING_DRAW_SEED__';
+
+function randomLotterySeed(){
+  return require('crypto').randomBytes(32).toString('hex');
+}
+
+function pendingDrawSeed(){
+  // Stored only so scheduled lotteries can be created before the final random seed exists.
+  // The real public draw seed is generated at draw time.
+  return `${PENDING_DRAW_SEED_PREFIX}:${require('crypto').randomBytes(16).toString('hex')}`;
+}
+
+function isPendingDrawSeed(seed){
+  return String(seed || '').startsWith(PENDING_DRAW_SEED_PREFIX);
+}
 function parseLotteryDate(s, fallback=null){
   if(!s) return fallback;
   const v = String(s).trim().toLowerCase();
@@ -2863,18 +2879,27 @@ async function drawAndPostBurnLottery(row){
   const start = new Date(row.start_time), end = new Date(row.end_time);
   const timeZone = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
   const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
-  const pick = lotteryPick(entries, row.seed);
+
+  // For scheduled lotteries, generate the final public seed at draw time,
+  // after the entry window is closed and the final eligible list is known.
+  // If an admin explicitly supplied a seed, keep it. If the lottery was already
+  // completed and re-viewed, keep the stored seed so proof stays repeatable.
+  const drawSeed = (row.status === 'active' && isPendingDrawSeed(row.seed))
+    ? randomLotterySeed()
+    : String(row.seed || randomLotterySeed());
+
+  const pick = lotteryPick(entries, drawSeed);
   await pgPool.query(
     `UPDATE burn_lotteries
-     SET status='completed', winner_wallet=$1, qualified_wallets=$2, total_burns=$3,
-         result_json=$4, completed_at=NOW()
-     WHERE id=$5`,
-    [pick?.winner||null, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick?.proof||null, winner_index:pick?.index ?? null, winner_position:pick?.position ?? null}), row.id]
+     SET status='completed', seed=$1, winner_wallet=$2, qualified_wallets=$3, total_burns=$4,
+         result_json=$5, completed_at=NOW()
+     WHERE id=$6`,
+    [drawSeed, pick?.winner||null, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick?.proof||null, winner_index:pick?.index ?? null, winner_position:pick?.position ?? null, seed_generated_at:'draw_time'}), row.id]
   );
   const ch = await resolveDiscordChannel(row.channel_id);
   if(ch){
     await ch.send({
-      embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:row.seed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone})],
+      embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone})],
       components:buildBurnLotteryComponents(row.id)
     });
   }
@@ -3095,7 +3120,7 @@ client.on('interactionCreate', async (interaction)=>{
       const start = new Date(row.start_time), end = new Date(row.end_time);
       const timeZone = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
-      const pick = lotteryPick(entries, row.seed);
+      const pick = isPendingDrawSeed(row.seed) ? null : lotteryPick(entries, row.seed);
       const proof = pick?.proof || row.result_json?.proof || 'unknown';
       const winner = row.winner_wallet || pick?.winner || null;
       const winnerPosition = pick?.position || row.result_json?.winner_position || null;
@@ -3111,7 +3136,7 @@ client.on('interactionCreate', async (interaction)=>{
         (winnerPosition ? `**Winning entry:** ${Number(winnerPosition).toLocaleString()} of ${entries.length.toLocaleString()}\n` : '') +
         `\n**How to verify:**\n` +
         `The bot hashes the public seed plus the exact ordered entry list. That hash selects the winning entry number above. Same seed + same entries = same winner every time.\n\n` +
-        `**Seed:**\n\`${String(row.seed || '').slice(0, 900)}\`\n` +
+        `**Seed:**\n\`${isPendingDrawSeed(row.seed) ? 'Pending — final seed is generated at draw time.' : String(row.seed || '').slice(0, 900)}\`\n` +
         `**Full proof hash:**\n\`${String(proof).slice(0, 128)}\``;
       await interaction.editReply({
         content:content.slice(0, 1900),
@@ -4983,7 +5008,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           timezone: timezoneInput || DEFAULT_LOTTERY_TIMEZONE
         });
         const { start, end, hours, timeZone } = resolved;
-        const seed = interaction.options.getString('seed') || require('crypto').randomBytes(32).toString('hex');
+        const customSeed = interaction.options.getString('seed');
+        const seed = customSeed || pendingDrawSeed();
         const title = interaction.options.getString('title') || 'OCAS Burn Lottery';
         const prize = interaction.options.getString('prize') || null;
         const channel = interaction.options.getChannel('channel') || interaction.channel;
@@ -5000,7 +5026,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             {name:'Duration',value:`${hours} hour${Number(hours)===1?'':'s'}`,inline:true},
             {name:'Mode',value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet',inline:true},
             {name:'Channel',value:`<#${channel.id}>`,inline:true},
-            {name:'Seed',value:`\`${seed}\``,inline:false}
+            {name:'Draw Seed',value:customSeed ? `Custom seed set: \`${String(customSeed).slice(0,256)}\`` : 'Generated automatically at draw time after the entry window closes.',inline:false}
           )
           .setTimestamp()] });
       }
@@ -5036,7 +5062,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         timezone: timezoneInput || DEFAULT_LOTTERY_TIMEZONE
       });
       const { start, end, timeZone } = resolved;
-      const seed = interaction.options.getString('seed') || require('crypto').randomBytes(32).toString('hex');
+      const seed = interaction.options.getString('seed') || randomLotterySeed();
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
       const pick = lotteryPick(entries, seed);
       if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)} (${timeZone})`);
@@ -5047,7 +5073,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed',$10,$11,$12,$13,$14,NOW())
          RETURNING id`,
         [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, seed,
-         pick.winner, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null}), timeZone]
+         pick.winner, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null, seed_generated_at:'draw_time'}), timeZone]
       );
       const lotteryId = r.rows[0]?.id;
       return interaction.editReply({
