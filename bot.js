@@ -2625,9 +2625,14 @@ async function sendPersonalAlerts(event, type, config){
 function lotteryHash(seed){ return require('crypto').createHash('sha256').update(String(seed)).digest('hex'); }
 function lotteryPick(entries, seed){
   if(!entries.length) return null;
+  // Deterministic proof:
+  // 1) Build the final ordered entry list.
+  // 2) Hash public seed + exact ordered entries.
+  // 3) Convert part of the hash into a number and pick index modulo entry count.
+  // Same seed + same ordered entries = same winner every time.
   const h = lotteryHash(seed + '\n' + entries.join('|'));
   const idx = Number(BigInt('0x' + h.slice(0,16)) % BigInt(entries.length));
-  return { winner: entries[idx], index: idx, proof: h };
+  return { winner: entries[idx], index: idx, position: idx + 1, proof: h };
 }
 function parseLotteryDate(s, fallback=null){
   if(!s) return fallback;
@@ -2793,7 +2798,27 @@ function buildBurnLotteryComponents(lotteryId){
     new ButtonBuilder()
       .setCustomId(`burnlottery_proof:${lotteryId}`)
       .setLabel('Show Draw Proof')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`burnlottery_wallets:${lotteryId}:0`)
+      .setLabel('Show Eligible Wallets')
       .setStyle(ButtonStyle.Secondary)
+  )];
+}
+
+function buildBurnLotteryWalletPageComponents(lotteryId, page, totalPages){
+  if(!lotteryId || totalPages <= 1) return [];
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`burnlottery_wallets:${lotteryId}:${Math.max(0, page - 1)}`)
+      .setLabel('Prev')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(`burnlottery_wallets:${lotteryId}:${Math.min(totalPages - 1, page + 1)}`)
+      .setLabel('Next')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= totalPages - 1)
   )];
 }
 
@@ -2826,7 +2851,11 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   );
   if(prize) embed.addFields({ name:'Prize', value:String(prize).slice(0,1024), inline:false });
   if(pick?.winner) embed.addFields({ name:'Winner', value:etherscanAddressLink(pick.winner), inline:false });
-  if(pick?.proof) embed.addFields({ name:'Draw Proof', value:`Proof: \`${pick.proof.slice(0,32)}...\`\nClick **Show Draw Proof** for seed + full hash.`, inline:false });
+  if(pick?.proof) embed.addFields({
+    name:'Draw Proof',
+    value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`\nUse the buttons below to check the seed, full hash, and eligible wallets.`,
+    inline:false
+  });
   embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
   return embed;
 }
@@ -2840,7 +2869,7 @@ async function drawAndPostBurnLottery(row){
      SET status='completed', winner_wallet=$1, qualified_wallets=$2, total_burns=$3,
          result_json=$4, completed_at=NOW()
      WHERE id=$5`,
-    [pick?.winner||null, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick?.proof||null}), row.id]
+    [pick?.winner||null, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick?.proof||null, winner_index:pick?.index ?? null, winner_position:pick?.position ?? null}), row.id]
   );
   const ch = await resolveDiscordChannel(row.channel_id);
   if(ch){
@@ -3069,24 +3098,70 @@ client.on('interactionCreate', async (interaction)=>{
       const pick = lotteryPick(entries, row.seed);
       const proof = pick?.proof || row.result_json?.proof || 'unknown';
       const winner = row.winner_wallet || pick?.winner || null;
-      const sampleWallets = wallets.slice(0, 20).map(w => `• ${shortAddr(w)} — \`${w}\``).join('\n');
-      const more = wallets.length > 20 ? `\n…and ${wallets.length - 20} more wallet(s).` : '';
+      const winnerPosition = pick?.position || row.result_json?.winner_position || null;
       const content =
         `**🎟️ OCAS Burn Lottery #${lotteryId} Draw Proof**\n` +
         `**Window:** ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\n` +
         `**Timezone:** ${timeZone}\n` +
-        `**Mode:** ${row.mode === 'burn' ? 'One entry per burn' : 'One entry per wallet'}\n` +
+        `**Mode:** ${row.mode === 'burn' ? 'One entry per burn — wallets can appear multiple times' : 'One entry per wallet'}\n` +
         `**Qualified wallets:** ${wallets.length}\n` +
         `**Total burns:** ${burns.length}\n` +
         `**Entries used for draw:** ${entries.length}\n` +
         (winner ? `**Winner:** ${etherscanAddressLink(winner)}\n\`${winner}\`\n` : `**Winner:** none\n`) +
+        (winnerPosition ? `**Winning entry:** ${Number(winnerPosition).toLocaleString()} of ${entries.length.toLocaleString()}\n` : '') +
+        `\n**How to verify:**\n` +
+        `The bot hashes the public seed plus the exact ordered entry list. That hash selects the winning entry number above. Same seed + same entries = same winner every time.\n\n` +
         `**Seed:**\n\`${String(row.seed || '').slice(0, 900)}\`\n` +
-        `**Full proof hash:**\n\`${String(proof).slice(0, 128)}\`` +
-        (sampleWallets ? `\n\n**Eligible wallets sample:**\n${sampleWallets}${more}` : '');
-      await interaction.editReply({ content:content.slice(0, 1900) });
+        `**Full proof hash:**\n\`${String(proof).slice(0, 128)}\``;
+      await interaction.editReply({
+        content:content.slice(0, 1900),
+        components:buildBurnLotteryWalletPageComponents(lotteryId, 0, Math.ceil(wallets.length / 20))
+      });
     }catch(e){
       console.error('[BurnLottery Proof]', e.message);
       try{ await interaction.editReply({ content:'Error loading draw proof.' }); }catch(_){}
+    }
+    return;
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('burnlottery_wallets:')){
+    const parts = interaction.customId.split(':');
+    const lotteryId = parseInt(parts[1], 10);
+    const page = Math.max(0, parseInt(parts[2] || '0', 10) || 0);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if(!lotteryId){ await interaction.editReply({ content:'Eligible wallets are unavailable.' }); return; }
+      const r = await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1', [lotteryId]);
+      if(!r.rows.length){ await interaction.editReply({ content:`No burn lottery #${lotteryId} found.` }); return; }
+      const row = r.rows[0];
+      const start = new Date(row.start_time), end = new Date(row.end_time);
+      const { entries, wallets } = await getBurnLotteryEntries(start, end, row.mode);
+      const pick = lotteryPick(entries, row.seed);
+      const winner = row.winner_wallet || pick?.winner || null;
+      const pageSize = 20;
+      const totalPages = Math.max(1, Math.ceil(wallets.length / pageSize));
+      const safePage = Math.min(page, totalPages - 1);
+      const startIndex = safePage * pageSize;
+      const pageWallets = wallets.slice(startIndex, startIndex + pageSize);
+      const lines = pageWallets.map((w, i) => {
+        const pos = startIndex + i + 1;
+        const isWinner = winner && String(w).toLowerCase() === String(winner).toLowerCase();
+        return `${pos}. ${isWinner ? '🏆 ' : ''}${shortAddr(w)} — \`${w}\``;
+      });
+      const modeNote = row.mode === 'burn'
+        ? '\n_Mode is one entry per burn, so a wallet may have extra chances even though this list shows each wallet once._'
+        : '';
+      const content =
+        `**Eligible Wallets — Lottery #${lotteryId}**\n` +
+        `Page ${safePage + 1} / ${totalPages} · ${wallets.length} wallet${wallets.length===1?'':'s'}${modeNote}\n\n` +
+        (lines.join('\n') || 'No eligible wallets found.');
+      await interaction.editReply({
+        content:content.slice(0, 1900),
+        components:buildBurnLotteryWalletPageComponents(lotteryId, safePage, totalPages)
+      });
+    }catch(e){
+      console.error('[BurnLottery Wallets]', e.message);
+      try{ await interaction.editReply({ content:'Error loading eligible wallets.' }); }catch(_){}
     }
     return;
   }
@@ -4908,7 +4983,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           timezone: timezoneInput || DEFAULT_LOTTERY_TIMEZONE
         });
         const { start, end, hours, timeZone } = resolved;
-        const seed = interaction.options.getString('seed') || require('crypto').randomBytes(12).toString('hex');
+        const seed = interaction.options.getString('seed') || require('crypto').randomBytes(32).toString('hex');
         const title = interaction.options.getString('title') || 'OCAS Burn Lottery';
         const prize = interaction.options.getString('prize') || null;
         const channel = interaction.options.getChannel('channel') || interaction.channel;
@@ -4961,7 +5036,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         timezone: timezoneInput || DEFAULT_LOTTERY_TIMEZONE
       });
       const { start, end, timeZone } = resolved;
-      const seed = interaction.options.getString('seed') || `burnlottery:${guildId}:${start.toISOString()}:${end.toISOString()}:${mode}:${timeZone}`;
+      const seed = interaction.options.getString('seed') || require('crypto').randomBytes(32).toString('hex');
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
       const pick = lotteryPick(entries, seed);
       if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)} (${timeZone})`);
@@ -4972,7 +5047,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed',$10,$11,$12,$13,$14,NOW())
          RETURNING id`,
         [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, seed,
-         pick.winner, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick.proof||null}), timeZone]
+         pick.winner, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null}), timeZone]
       );
       const lotteryId = r.rows[0]?.id;
       return interaction.editReply({
