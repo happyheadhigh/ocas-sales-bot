@@ -125,11 +125,27 @@ const commands = [
     .addSubcommand(sc=>sc.setName('status').setDescription('Show recent/scheduled burn lotteries').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(false)))
     .addSubcommand(sc=>sc.setName('cancel').setDescription('Cancel an active scheduled burn lottery').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(true))),
 
-  new SlashCommandBuilder().setName('lottery').setDescription('Pick a random winner from names or a number range').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addStringOption(o=>o.setName('entries').setDescription('Comma-separated entries, e.g. Johnny, Steve, Matt').setRequired(false))
-    .addIntegerOption(o=>o.setName('min').setDescription('Minimum number for number lottery').setRequired(false))
-    .addIntegerOption(o=>o.setName('max').setDescription('Maximum number for number lottery').setRequired(false))
-    .addStringOption(o=>o.setName('seed').setDescription('Optional seed. Change seed to reroll.').setRequired(false)),
+  new SlashCommandBuilder().setName('lottery').setDescription('Generic giveaways, number guessing games, and instant random picks')
+    .addSubcommand(sc=>sc.setName('start').setDescription('Start a timed giveaway or number-guessing event')
+      .addStringOption(o=>o.setName('type').setDescription('Lottery type').setRequired(true).addChoices({name:'Giveaway button entries',value:'giveaway'},{name:'Guess the number',value:'guess'}))
+      .addIntegerOption(o=>o.setName('minutes').setDescription('How long entries stay open, default 10').setRequired(false).setMinValue(1).setMaxValue(10080))
+      .addIntegerOption(o=>o.setName('min').setDescription('Minimum number for guess events').setRequired(false))
+      .addIntegerOption(o=>o.setName('max').setDescription('Maximum number for guess events').setRequired(false))
+      .addStringOption(o=>o.setName('winner').setDescription('Guess winner mode').setRequired(false).addChoices({name:'Exact guess only',value:'exact'},{name:'Closest guess wins',value:'closest'}))
+      .addStringOption(o=>o.setName('title').setDescription('Public title').setRequired(false))
+      .addStringOption(o=>o.setName('prize').setDescription('Prize note').setRequired(false))
+      .addStringOption(o=>o.setName('seed').setDescription('Optional public seed').setRequired(false))
+      .addChannelOption(o=>o.setName('channel').setDescription('Where to post; defaults here').setRequired(false)))
+    .addSubcommand(sc=>sc.setName('enter').setDescription('Enter the active giveaway').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(false)))
+    .addSubcommand(sc=>sc.setName('guess').setDescription('Submit or update your number guess').addIntegerOption(o=>o.setName('number').setDescription('Your guess').setRequired(true)).addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(false)))
+    .addSubcommand(sc=>sc.setName('status').setDescription('Show active/recent lotteries').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(false)))
+    .addSubcommand(sc=>sc.setName('draw').setDescription('Admin: draw/end a lottery now').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(true)))
+    .addSubcommand(sc=>sc.setName('cancel').setDescription('Admin: cancel an active lottery').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(true)))
+    .addSubcommand(sc=>sc.setName('instant').setDescription('Admin: instantly pick from names or a number range')
+      .addStringOption(o=>o.setName('entries').setDescription('Comma-separated entries').setRequired(false))
+      .addIntegerOption(o=>o.setName('min').setDescription('Minimum number').setRequired(false))
+      .addIntegerOption(o=>o.setName('max').setDescription('Maximum number').setRequired(false))
+      .addStringOption(o=>o.setName('seed').setDescription('Optional seed').setRequired(false))),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){
