@@ -298,6 +298,30 @@ async function ensureBotStateTable(){
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS burn_state_snapshots_event_idx ON burn_state_snapshots(burn_event_id)
     `).catch(()=>{});
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS burn_lotteries (
+        id SERIAL PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        created_by TEXT,
+        title TEXT,
+        prize TEXT,
+        mode TEXT NOT NULL DEFAULT 'wallet',
+        start_time TIMESTAMPTZ NOT NULL,
+        end_time TIMESTAMPTZ NOT NULL,
+        seed TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        winner_wallet TEXT,
+        qualified_wallets INT DEFAULT 0,
+        total_burns INT DEFAULT 0,
+        result_json JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
+      )
+    `).catch(()=>{});
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS burn_lotteries_status_end_idx ON burn_lotteries(status, end_time)
+    `).catch(()=>{});
     console.log('[DB] burn tables ready');
   }catch(e){ console.error('[DB] ensureBotStateTable error:', e.message); }
 }
@@ -1897,25 +1921,21 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
   const attrs = traitsArrayFromInput(traits);
   if(!id || !attrs.length) return false;
   try{
-    // Delete rows beyond the new trait count (handles shrinking trait sets).
-    // Then upsert each trait by (token_id, trait_index) — no race window, no serial collision.
-    await pgPool.query(
-      `DELETE FROM token_traits WHERE token_id=$1 AND trait_index >= $2`,
-      [id, attrs.length]
-    );
+    await pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [id]);
     for(let i = 0; i < attrs.length; i++){
       const t = attrs[i];
       await pgPool.query(
         `INSERT INTO token_traits (token_id, trait_name, trait_value, trait_index)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (token_id, trait_index) DO UPDATE SET
-           trait_name  = EXCLUDED.trait_name,
-           trait_value = EXCLUDED.trait_value`,
+         VALUES ($1, $2, $3, $4)`,
         [id, String(t.trait_type), String(t.value), i]
       );
     }
     const img = getTraitImageSource(traits);
     if(img){
+      // Never overwrite a higher-priority snapshot source with a lower one.
+      // Priority order: burn-start-input > backfill-chunks > burn-finalized-survivor
+      // This ensures original mint traits (backfill-chunks) are never lost when
+      // a token later becomes a burn survivor and gets new post-burn traits written.
       const SOURCE_PRIORITY = { 'burn-start-input': 3, 'backfill-chunks': 2, 'burn-finalized-survivor': 1 };
       const newPriority = SOURCE_PRIORITY[source] || 0;
       const traitsForSnapshot = traitsObjectFromArray(attrs, img);
@@ -2583,6 +2603,63 @@ async function sendPersonalAlerts(event, type, config){
 }
 
 // ── Slash commands ────────────────────────────────────────────────────────────
+
+// ── Lottery helpers ───────────────────────────────────────────────────────────
+function lotteryHash(seed){ return require('crypto').createHash('sha256').update(String(seed)).digest('hex'); }
+function lotteryPick(entries, seed){
+  if(!entries.length) return null;
+  const h = lotteryHash(seed + '\n' + entries.join('|'));
+  const idx = Number(BigInt('0x' + h.slice(0,16)) % BigInt(entries.length));
+  return { winner: entries[idx], index: idx, proof: h };
+}
+function parseLotteryDate(s, fallback=null){
+  if(!s) return fallback;
+  const v = String(s).trim().toLowerCase();
+  if(v === 'now') return new Date();
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? fallback : d;
+}
+function lotteryTime(d){ return `<t:${Math.floor(new Date(d).getTime()/1000)}:f>`; }
+async function getBurnLotteryEntries(start, end, mode='wallet'){
+  const r = await pgPool.query(`
+    SELECT id, burner_wallet, survivor_token_id, tx_hash, burned_at
+    FROM burn_events
+    WHERE burned_at >= $1 AND burned_at < $2
+      AND burner_wallet IS NOT NULL AND TRIM(burner_wallet) <> ''
+    ORDER BY burned_at ASC, id ASC
+  `, [start, end]);
+  const burns = r.rows;
+  const wallets = [...new Set(burns.map(b=>String(b.burner_wallet).toLowerCase()).filter(Boolean))];
+  const entries = mode === 'burn' ? burns.map(b=>String(b.burner_wallet).toLowerCase()).filter(Boolean) : wallets;
+  return { entries, wallets, burns };
+}
+function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, end, seed, entries, wallets, burns, pick, lotteryId}){
+  const embed = new EmbedBuilder().setTitle(`🎟️ ${title}`).setColor(COLORS.OCAS_GREEN).addFields(
+    { name:'Window', value:`${lotteryTime(start)} → ${lotteryTime(end)}`, inline:false },
+    { name:'Mode', value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet', inline:true },
+    { name:'Qualified Wallets', value:String(wallets.length), inline:true },
+    { name:'Total Burns', value:String(burns.length), inline:true },
+  );
+  if(prize) embed.addFields({ name:'Prize', value:String(prize).slice(0,1024), inline:false });
+  if(pick?.winner) embed.addFields({ name:'Winner', value:`${shortAddr(pick.winner)}\n\`${pick.winner}\``, inline:false });
+  embed.addFields({ name:'Seed', value:`\`${String(seed).slice(0,256)}\``, inline:false });
+  if(pick?.proof) embed.addFields({ name:'Proof Hash', value:`\`${pick.proof.slice(0,32)}...\``, inline:false });
+  embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
+  return embed;
+}
+async function drawAndPostBurnLottery(row){
+  const start = new Date(row.start_time), end = new Date(row.end_time);
+  const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
+  const pick = lotteryPick(entries, row.seed);
+  await pgPool.query(`UPDATE burn_lotteries SET status='completed', winner_wallet=$1, qualified_wallets=$2, total_burns=$3, result_json=$4, completed_at=NOW() WHERE id=$5`, [pick?.winner||null, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick?.proof||null}), row.id]);
+  const ch = await resolveDiscordChannel(row.channel_id);
+  if(ch){ await ch.send({ embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:row.seed, entries, wallets, burns, pick, lotteryId:row.id})] }); }
+}
+async function processDueBurnLotteries(){
+  const r = await pgPool.query(`SELECT * FROM burn_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]}));
+  for(const row of r.rows){ try{ await drawAndPostBurnLottery(row); }catch(e){ console.warn('[BurnLottery auto]', row.id, e.message); } }
+}
+
 client.on('interactionCreate', async (interaction)=>{
   // ── Slideshow button handler ───────────────────────────────────────────────
   // ── Show More button — opens slideshow of remaining results ──────────────
@@ -2706,9 +2783,6 @@ client.on('interactionCreate', async (interaction)=>{
         if(contractTraits && realTraitCount(contractTraits)){
           traits = contractTraits;
           ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
-          upsertTokenTraitRows(tokenId, contractTraits, 'show-traits-contract').catch(e =>
-            console.warn(`[ShowTraits] DB trait refresh failed for #${tokenId}:`, e.message)
-          );
         }
       }
 
@@ -3284,16 +3358,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const cfg = {...config, slug};
         const embeds = await Promise.all(tokens.map(async t => {
           const tokenId = t.token_id ?? t.id ?? t.identifier;
-          // Use inline traits from API response when available — avoids a per-token HTTP call.
-          // Fall back to fetchTokenMetaFromDb only when traits are missing from the response.
-          const inlineTraits = t.traits && typeof t.traits === 'object' && (t.traits.__attributes?.length || Object.keys(t.traits).length > 0)
-            ? t.traits : null;
-          const inlineMeta = inlineTraits ? {
-            os_rank: t.os_rank || null,
-            traits: inlineTraits,
-            trait_count: t.trait_count || null,
-          } : null;
-          const dbMeta = inlineMeta || await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+          const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
           if(listedOnly){
             const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
             const fakeListingObj = {
@@ -3313,6 +3378,42 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         await postEmbeds(interaction, embeds.filter(Boolean),
           `Found **${tokens.length}** ${listedOnly ? 'listing' : 'token'}${tokens.length===1?'':'s'} matching **${matchLabel}**${listedOnly ? ' (cheapest first)' : ''}:`);
         return;
+      }
+
+      // ── Listings mode ──────────────────────────────────────────────────────
+      if(wantListings && RAILWAY_URL){
+        await interaction.editReply(`🔍 Searching listed tokens with **${trait ? trait+': ' : ''}${value}**...`);
+        // Use multi-trait-tokens with listed=1 — build a single-group filter
+        const groups = [[{ trait_name: trait || '_any', trait_value: value }]];
+        // For single known trait, use groups param; otherwise fall back to trait-sales endpoint
+        const qs = new URLSearchParams({ listed:'1', limit: String(want), key: API_SECRET||'' });
+        if(trait) qs.set('groups', JSON.stringify([[{ trait_name: trait, trait_value: value }]]));
+        const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
+        if(r.ok){
+          const j = await r.json();
+          if(!j.ok) throw new Error(j.error || 'API error');
+          const tokens = j.tokens || [];
+          if(!tokens.length){ await interaction.editReply(`No listed tokens found with **${trait ? trait+': ' : ''}${value}**.`); return; }
+          const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+          const listEmbeds = await Promise.all(tokens.map(async t => {
+            const tokenId = t.token_id ?? t.id ?? t.identifier;
+            const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+            const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
+            const fakeListingObj = {
+              token_id: tokenId,
+              asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
+                       traits: dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [] },
+              payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
+              maker: t.seller || '',
+              url: t.url || null,
+              _dbToken: dbMeta,
+            };
+            return buildListingEmbed(fakeListingObj, {...config, slug}).catch(()=>null);
+          }));
+          await postEmbeds(interaction, listEmbeds.filter(Boolean),
+            `Found **${tokens.length}** listing${tokens.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (cheapest first):`);
+          return;
+        }
       }
 
       // ── Sales mode (default) ───────────────────────────────────────────────
@@ -4514,61 +4615,70 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     return;
   }
 
-  // /synctraits — admin command to refresh token traits from contract tokenURI
-  if(commandName==='synctraits'){
-    if(!interaction.memberPermissions?.has?.('ManageGuild'))
-      return interaction.reply({ content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral });
 
-    const tokenInput = interaction.options.getInteger('token');
-    const mode       = interaction.options.getString('mode') || 'token';
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
+  if(commandName==='burnlottery'){
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
+    const sub = interaction.options.getSubcommand(false) || 'draw';
     try{
-      // ── Single token mode ─────────────────────────────────────────────────
-      if(tokenInput || mode === 'token'){
-        const tokenId = tokenInput;
-        if(!tokenId || tokenId < 1 || tokenId > 10000)
-          return interaction.editReply('Provide a valid token ID (1–10000).');
-        const traits = await snapshotTokenFromContract(tokenId, 'synctraits');
-        if(!traits)
-          return interaction.editReply(`Could not fetch traits for #${tokenId} from contract. Token may be burned or RPC unavailable.`);
-        const count = realTraitCount(traits);
-        // Bust trait index cache so next traitfind sees updated data
-        global.__ocasTraitIndexCache = null;
-        return interaction.editReply(`✅ Synced #${tokenId} — ${count} trait${count===1?'':'s'} written to DB.`);
+      await interaction.deferReply();
+      if(sub==='start'){
+        const hours = Math.max(1, Math.min(168, interaction.options.getInteger('hours') || 24));
+        const mode = interaction.options.getString('mode') || 'wallet';
+        const start = parseLotteryDate(interaction.options.getString('start'), new Date());
+        const end = parseLotteryDate(interaction.options.getString('end'), new Date(start.getTime()+hours*3600000));
+        const seed = interaction.options.getString('seed') || require('crypto').randomBytes(12).toString('hex');
+        const title = interaction.options.getString('title') || 'OCAS Burn Lottery';
+        const prize = interaction.options.getString('prize') || null;
+        const channel = interaction.options.getChannel('channel') || interaction.channel;
+        if(end <= start) return interaction.editReply('End time must be after start time.');
+        const r = await pgPool.query(`INSERT INTO burn_lotteries (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active') RETURNING *`, [guildId, channel.id, interaction.user.id, title, prize, mode, start, end, seed]);
+        const row = r.rows[0];
+        return interaction.editReply({ embeds:[new EmbedBuilder().setTitle('🎟️ Burn lottery scheduled').setColor(COLORS.OCAS_GREEN).addFields({name:'ID',value:String(row.id),inline:true},{name:'Window',value:`${lotteryTime(start)} → ${lotteryTime(end)}`,inline:false},{name:'Mode',value:mode,inline:true},{name:'Channel',value:`<#${channel.id}>`,inline:true},{name:'Seed',value:`\`${seed}\``,inline:false}).setTimestamp()] });
       }
-
-      // ── Survivors mode — refresh all burn survivor tokens ─────────────────
-      if(mode === 'survivors'){
-        const r = await pgPool.query(
-          `SELECT DISTINCT survivor_token_id FROM burn_events ORDER BY survivor_token_id ASC`
-        );
-        const survivorIds = r.rows.map(row => row.survivor_token_id);
-        if(!survivorIds.length)
-          return interaction.editReply('No burn survivor tokens found in DB.');
-
-        await interaction.editReply(`Syncing ${survivorIds.length} survivor token${survivorIds.length===1?'':'s'} from contract... this may take a minute.`);
-
-        let ok = 0, failed = 0;
-        for(const id of survivorIds){
-          const traits = await snapshotTokenFromContract(id, 'synctraits').catch(()=>null);
-          if(traits && realTraitCount(traits)) ok++;
-          else failed++;
-          // Small delay to avoid hammering RPC
-          await new Promise(r=>setTimeout(r, 300));
-        }
-        // Bust trait index cache so next traitfind sees updated data
-        global.__ocasTraitIndexCache = null;
-        return interaction.editReply(
-          `✅ Survivors sync complete — ${ok} updated, ${failed} failed (burned/unavailable).\nTrait index cache cleared — next /traitfind will use fresh data.`
-        );
+      if(sub==='status'){
+        const id = interaction.options.getInteger('id');
+        const r = id ? await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]) : await pgPool.query("SELECT * FROM burn_lotteries WHERE guild_id=$1 ORDER BY id DESC LIMIT 10",[guildId]);
+        if(!r.rows.length) return interaction.editReply('No burn lotteries found.');
+        const lines = r.rows.map(x=>`#${x.id} · ${x.status} · ${lotteryTime(x.start_time)} → ${lotteryTime(x.end_time)}${x.winner_wallet?' · winner '+shortAddr(x.winner_wallet):''}`);
+        return interaction.editReply(lines.join('\n').slice(0,1900));
       }
+      if(sub==='cancel'){
+        const id = interaction.options.getInteger('id');
+        const r = await pgPool.query("UPDATE burn_lotteries SET status='cancelled' WHERE id=$1 AND guild_id=$2 AND status='active' RETURNING id",[id,guildId]);
+        return interaction.editReply(r.rows.length ? `Cancelled burn lottery #${id}.` : `No active lottery #${id} found.`);
+      }
+      const id = interaction.options.getInteger('id');
+      if(id){
+        const r = await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]);
+        if(!r.rows.length) return interaction.editReply('Lottery not found.');
+        await drawAndPostBurnLottery(r.rows[0]);
+        return interaction.editReply(`Drew burn lottery #${id}.`);
+      }
+      const hours = Math.max(1, Math.min(168, interaction.options.getInteger('hours') || 24));
+      const mode = interaction.options.getString('mode') || 'wallet';
+      const end = parseLotteryDate(interaction.options.getString('end'), new Date());
+      const start = parseLotteryDate(interaction.options.getString('start'), new Date(end.getTime()-hours*3600000));
+      const seed = interaction.options.getString('seed') || `burnlottery:${guildId}:${start.toISOString()}:${end.toISOString()}:${mode}`;
+      const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
+      const pick = lotteryPick(entries, seed);
+      if(!pick) return interaction.editReply('No qualifying burn entries found for that window.');
+      return interaction.editReply({ embeds:[buildBurnLotteryEmbed({mode,start,end,seed,entries,wallets,burns,pick})] });
+    }catch(e){ console.error('[/burnlottery]', e); return interaction.editReply('Burn lottery error: '+e.message); }
+  }
 
-      return interaction.editReply('Unknown mode. Use `token` with a token ID, or `mode:survivors`.');
-    }catch(e){
-      console.error('[synctraits]', e.message);
-      return interaction.editReply('Error: ' + e.message);
-    }
+  if(commandName==='lottery'){
+    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
+    try{
+      const entriesRaw = interaction.options.getString('entries') || '';
+      const min = interaction.options.getInteger('min');
+      const max = interaction.options.getInteger('max');
+      const seed = interaction.options.getString('seed') || `lottery:${guildId}:${Date.now()}`;
+      let entries = entriesRaw ? entriesRaw.split(',').map(s=>s.trim()).filter(Boolean) : [];
+      if(!entries.length && min != null && max != null){ for(let i=Math.min(min,max); i<=Math.max(min,max); i++) entries.push(String(i)); }
+      if(entries.length < 2) return interaction.reply({content:'Add at least 2 comma-separated entries, or min and max numbers.', flags:MessageFlags.Ephemeral});
+      const pick = lotteryPick(entries, seed);
+      return interaction.reply({ embeds:[new EmbedBuilder().setTitle('🎲 Lottery Winner').setColor(COLORS.OCAS_GREEN).addFields({name:'Winner',value:String(pick.winner),inline:false},{name:'Entries',value:String(entries.length),inline:true},{name:'Seed',value:`\`${seed}\``,inline:false},{name:'Proof Hash',value:`\`${pick.proof.slice(0,32)}...\``,inline:false}).setTimestamp()] });
+    }catch(e){ return interaction.reply({content:'Lottery error: '+e.message, flags:MessageFlags.Ephemeral}); }
   }
 
   if(commandName==='help'){
@@ -4766,6 +4876,8 @@ client.once('clientReady', async ()=>{
   }
   // Process pending burn alerts every 30s — waits for metadata to refresh before posting
   setInterval(processPendingBurnAlerts, 30_000);
+  processDueBurnLotteries();
+  setInterval(processDueBurnLotteries, 60_000);
 });
 
 client.on('error',e=>console.error('[Discord]',e.message));

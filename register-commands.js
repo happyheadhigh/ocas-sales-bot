@@ -104,6 +104,32 @@ const commands = [
   new SlashCommandBuilder().setName('synctraits').setDescription('Refresh token traits from contract — fixes missing/stale traits in DB (admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('mode').setDescription('survivors = refresh all burn survivors; token = single token (default)').setRequired(false).addChoices({name:'Single token',value:'token'},{name:'All burn survivors',value:'survivors'}))
     .addIntegerOption(o=>o.setName('token').setDescription('Token ID (required for single token mode)').setRequired(false).setMinValue(1).setMaxValue(10000)),
+
+  new SlashCommandBuilder().setName('burnlottery').setDescription('Schedule or draw an OCAS burn lottery').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand(sc=>sc.setName('start').setDescription('Start/schedule a burn lottery that auto-draws when time ends')
+      .addIntegerOption(o=>o.setName('hours').setDescription('Duration/lookback hours, default 24').setRequired(false).setMinValue(1).setMaxValue(168))
+      .addStringOption(o=>o.setName('mode').setDescription('Entry mode').setRequired(false).addChoices({name:'One entry per wallet',value:'wallet'},{name:'One entry per burn',value:'burn'}))
+      .addStringOption(o=>o.setName('start').setDescription('Start time ISO or now, default now').setRequired(false))
+      .addStringOption(o=>o.setName('end').setDescription('End time ISO, overrides hours').setRequired(false))
+      .addStringOption(o=>o.setName('seed').setDescription('Optional public seed').setRequired(false))
+      .addStringOption(o=>o.setName('title').setDescription('Lottery title').setRequired(false))
+      .addStringOption(o=>o.setName('prize').setDescription('Prize note').setRequired(false))
+      .addChannelOption(o=>o.setName('channel').setDescription('Where to post auto result; defaults here').setRequired(false)))
+    .addSubcommand(sc=>sc.setName('draw').setDescription('Draw immediately from a past burn window or scheduled lottery')
+      .addIntegerOption(o=>o.setName('id').setDescription('Scheduled lottery ID to draw now').setRequired(false))
+      .addIntegerOption(o=>o.setName('hours').setDescription('Past hours, default 24').setRequired(false).setMinValue(1).setMaxValue(168))
+      .addStringOption(o=>o.setName('mode').setDescription('Entry mode').setRequired(false).addChoices({name:'One entry per wallet',value:'wallet'},{name:'One entry per burn',value:'burn'}))
+      .addStringOption(o=>o.setName('start').setDescription('Exact start ISO').setRequired(false))
+      .addStringOption(o=>o.setName('end').setDescription('Exact end ISO, default now').setRequired(false))
+      .addStringOption(o=>o.setName('seed').setDescription('Optional public seed/reroll key').setRequired(false)))
+    .addSubcommand(sc=>sc.setName('status').setDescription('Show recent/scheduled burn lotteries').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(false)))
+    .addSubcommand(sc=>sc.setName('cancel').setDescription('Cancel an active scheduled burn lottery').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(true))),
+
+  new SlashCommandBuilder().setName('lottery').setDescription('Pick a random winner from names or a number range').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption(o=>o.setName('entries').setDescription('Comma-separated entries, e.g. Johnny, Steve, Matt').setRequired(false))
+    .addIntegerOption(o=>o.setName('min').setDescription('Minimum number for number lottery').setRequired(false))
+    .addIntegerOption(o=>o.setName('max').setDescription('Maximum number for number lottery').setRequired(false))
+    .addStringOption(o=>o.setName('seed').setDescription('Optional seed. Change seed to reroll.').setRequired(false)),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){
