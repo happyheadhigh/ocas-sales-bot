@@ -107,6 +107,8 @@ const commands = [
 
   new SlashCommandBuilder().setName('burnlottery').setDescription('Schedule or draw an OCAS burn lottery').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(sc=>sc.setName('start').setDescription('Start/schedule a burn lottery that auto-draws when time ends')
+      .addStringOption(o=>o.setName('window').setDescription('Easy window, e.g. yesterday-10am 24hrs, today-2pm 6hrs. Default timezone is UK').setRequired(false))
+      .addStringOption(o=>o.setName('timezone').setDescription('Optional timezone, e.g. Europe/London or America/New_York').setRequired(false))
       .addIntegerOption(o=>o.setName('hours').setDescription('Duration/lookback hours, default 24').setRequired(false).setMinValue(1).setMaxValue(168))
       .addStringOption(o=>o.setName('mode').setDescription('Entry mode').setRequired(false).addChoices({name:'One entry per wallet',value:'wallet'},{name:'One entry per burn',value:'burn'}))
       .addStringOption(o=>o.setName('start').setDescription('Start time ISO or now, default now').setRequired(false))
@@ -117,6 +119,8 @@ const commands = [
       .addChannelOption(o=>o.setName('channel').setDescription('Where to post auto result; defaults here').setRequired(false)))
     .addSubcommand(sc=>sc.setName('draw').setDescription('Draw immediately from a past burn window or scheduled lottery')
       .addIntegerOption(o=>o.setName('id').setDescription('Scheduled lottery ID to draw now').setRequired(false))
+      .addStringOption(o=>o.setName('window').setDescription('Easy window, e.g. yesterday-10am 24hrs, today-2pm 6hrs. Default timezone is UK').setRequired(false))
+      .addStringOption(o=>o.setName('timezone').setDescription('Optional timezone, e.g. Europe/London or America/New_York').setRequired(false))
       .addIntegerOption(o=>o.setName('hours').setDescription('Past hours, default 24').setRequired(false).setMinValue(1).setMaxValue(168))
       .addStringOption(o=>o.setName('mode').setDescription('Entry mode').setRequired(false).addChoices({name:'One entry per wallet',value:'wallet'},{name:'One entry per burn',value:'burn'}))
       .addStringOption(o=>o.setName('start').setDescription('Exact start ISO').setRequired(false))

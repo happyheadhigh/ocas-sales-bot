@@ -315,10 +315,12 @@ async function ensureBotStateTable(){
         qualified_wallets INT DEFAULT 0,
         total_burns INT DEFAULT 0,
         result_json JSONB,
+        timezone TEXT DEFAULT 'Europe/London',
         created_at TIMESTAMPTZ DEFAULT NOW(),
         completed_at TIMESTAMPTZ
       )
     `).catch(()=>{});
+    await pgPool.query(`ALTER TABLE burn_lotteries ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'Europe/London'`).catch(()=>{});
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS burn_lotteries_status_end_idx ON burn_lotteries(status, end_time)
     `).catch(()=>{});
@@ -2634,6 +2636,150 @@ function parseLotteryDate(s, fallback=null){
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? fallback : d;
 }
+
+const DEFAULT_LOTTERY_TIMEZONE = 'Europe/London';
+
+function normalizeLotteryTimezone(tz){
+  const v = String(tz || '').trim();
+  if(!v) return DEFAULT_LOTTERY_TIMEZONE;
+  const aliases = {
+    uk:'Europe/London',
+    london:'Europe/London',
+    gmt:'Europe/London',
+    bst:'Europe/London',
+    eastern:'America/New_York',
+    et:'America/New_York',
+    est:'America/New_York',
+    edt:'America/New_York',
+    newyork:'America/New_York',
+    'new-york':'America/New_York',
+    ny:'America/New_York',
+    utc:'UTC',
+    z:'UTC',
+  };
+  const key = v.toLowerCase().replace(/\s+/g,'').replace(/_/g,'-');
+  const out = aliases[key] || v;
+  try{
+    new Intl.DateTimeFormat('en-US', { timeZone: out }).format(new Date());
+    return out;
+  }catch(_){
+    throw new Error(`Invalid timezone "${v}". Use something like Europe/London or America/New_York.`);
+  }
+}
+
+function zonedParts(date, timeZone){
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone, year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
+  }).formatToParts(date);
+  const o = {};
+  for(const p of parts) if(p.type !== 'literal') o[p.type] = p.value;
+  return {
+    year:Number(o.year), month:Number(o.month), day:Number(o.day),
+    hour:Number(o.hour === '24' ? '0' : o.hour), minute:Number(o.minute), second:Number(o.second)
+  };
+}
+
+function timezoneOffsetMs(date, timeZone){
+  const p = zonedParts(date, timeZone);
+  const asUTC = Date.UTC(p.year, p.month-1, p.day, p.hour, p.minute, p.second);
+  return asUTC - date.getTime();
+}
+
+function zonedDateTimeToUtc(year, month, day, hour=0, minute=0, second=0, timeZone=DEFAULT_LOTTERY_TIMEZONE){
+  const localAsUTC = Date.UTC(year, month-1, day, hour, minute, second);
+  let utc = localAsUTC - timezoneOffsetMs(new Date(localAsUTC), timeZone);
+  // DST boundary correction.
+  utc = localAsUTC - timezoneOffsetMs(new Date(utc), timeZone);
+  return new Date(utc);
+}
+
+function addDaysToYmd(year, month, day, delta){
+  const d = new Date(Date.UTC(year, month-1, day + delta, 12, 0, 0));
+  return { year:d.getUTCFullYear(), month:d.getUTCMonth()+1, day:d.getUTCDate() };
+}
+
+function parseLotteryTimeToken(token){
+  const s = String(token || '').trim().toLowerCase();
+  const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+  if(!m) throw new Error(`Could not parse time "${token}". Try 10am, 10:30am, or 22:00.`);
+  let hour = Number(m[1]);
+  const minute = m[2] ? Number(m[2]) : 0;
+  const ampm = m[3];
+  if(minute < 0 || minute > 59) throw new Error(`Invalid minute in "${token}".`);
+  if(ampm){
+    if(hour < 1 || hour > 12) throw new Error(`Invalid 12-hour time "${token}".`);
+    if(ampm === 'pm' && hour !== 12) hour += 12;
+    if(ampm === 'am' && hour === 12) hour = 0;
+  }else if(hour < 0 || hour > 23){
+    throw new Error(`Invalid 24-hour time "${token}".`);
+  }
+  return { hour, minute };
+}
+
+function parseLotteryDurationHours(text, fallbackHours=24){
+  const s = String(text || '').toLowerCase();
+  const m = s.match(/(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours)\b/);
+  if(!m) return fallbackHours;
+  const n = Number(m[1]);
+  if(!Number.isFinite(n) || n <= 0) return fallbackHours;
+  return Math.min(168, n);
+}
+
+function parseLotteryWindowAnchor(anchorText, timeZone, now=new Date()){
+  let s = String(anchorText || '').trim().toLowerCase();
+  if(!s || s === 'now') return new Date(now);
+
+  // Accept "yesterday-10am", "yesterday 10am", "today-10:30am", "tomorrow-18:00".
+  s = s.replace(/\s+/g, '-');
+  const rel = s.match(/^(yesterday|today|tomorrow)-(.+)$/);
+  if(rel){
+    const today = zonedParts(now, timeZone);
+    const delta = rel[1] === 'yesterday' ? -1 : rel[1] === 'tomorrow' ? 1 : 0;
+    const ymd = addDaysToYmd(today.year, today.month, today.day, delta);
+    const tm = parseLotteryTimeToken(rel[2]);
+    return zonedDateTimeToUtc(ymd.year, ymd.month, ymd.day, tm.hour, tm.minute, 0, timeZone);
+  }
+
+  // Accept "2026-06-08-10am", "2026-06-08 10am", "2026/06/08-10am".
+  const abs = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})[- ](.+)$/);
+  if(abs){
+    const tm = parseLotteryTimeToken(abs[4]);
+    return zonedDateTimeToUtc(Number(abs[1]), Number(abs[2]), Number(abs[3]), tm.hour, tm.minute, 0, timeZone);
+  }
+
+  // Fall back to normal ISO/date parsing for advanced users.
+  const d = new Date(anchorText);
+  if(!Number.isNaN(d.getTime())) return d;
+  throw new Error(`Could not parse window "${anchorText}". Try yesterday-10am 24hrs, today-2pm 6hrs, or 2026-06-08-10am 4hrs.`);
+}
+
+function resolveLotteryWindow({ windowText, startText, endText, hours, timezone, now=new Date() }){
+  const timeZone = normalizeLotteryTimezone(timezone);
+  const fallbackHours = Math.max(1, Math.min(168, Number(hours || 24)));
+  if(windowText){
+    const durationHours = parseLotteryDurationHours(windowText, fallbackHours);
+    const anchor = String(windowText).replace(/(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours)\b/i, '').trim();
+    const start = parseLotteryWindowAnchor(anchor || 'now', timeZone, now);
+    const end = new Date(start.getTime() + durationHours * 3600000);
+    return { start, end, hours:durationHours, timeZone };
+  }
+  const start = parseLotteryDate(startText, null);
+  const end = parseLotteryDate(endText, null);
+  if(start && end) return { start, end, hours:(end-start)/3600000, timeZone };
+  if(start && !end) return { start, end:new Date(start.getTime()+fallbackHours*3600000), hours:fallbackHours, timeZone };
+  if(!start && end) return { start:new Date(end.getTime()-fallbackHours*3600000), end, hours:fallbackHours, timeZone };
+  const defaultEnd = now;
+  return { start:new Date(defaultEnd.getTime()-fallbackHours*3600000), end:defaultEnd, hours:fallbackHours, timeZone };
+}
+
+function formatZonedLotteryTime(d, timeZone){
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone, month:'short', day:'numeric', year:'numeric',
+    hour:'numeric', minute:'2-digit', timeZoneName:'short'
+  }).format(new Date(d));
+}
+
 function lotteryTime(d){ return `<t:${Math.floor(new Date(d).getTime()/1000)}:f>`; }
 async function getBurnLotteryEntries(start, end, mode='wallet'){
   const r = await pgPool.query(`
@@ -2648,9 +2794,10 @@ async function getBurnLotteryEntries(start, end, mode='wallet'){
   const entries = mode === 'burn' ? burns.map(b=>String(b.burner_wallet).toLowerCase()).filter(Boolean) : wallets;
   return { entries, wallets, burns };
 }
-function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, end, seed, entries, wallets, burns, pick, lotteryId}){
+function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, end, seed, entries, wallets, burns, pick, lotteryId, timezone=DEFAULT_LOTTERY_TIMEZONE}){
+  const timeZone = normalizeLotteryTimezone(timezone);
   const embed = new EmbedBuilder().setTitle(`🎟️ ${title}`).setColor(COLORS.OCAS_GREEN).addFields(
-    { name:'Window', value:`${lotteryTime(start)} → ${lotteryTime(end)}`, inline:false },
+    { name:`Window (${timeZone})`, value:`${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\n${lotteryTime(start)} → ${lotteryTime(end)}`, inline:false },
     { name:'Mode', value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet', inline:true },
     { name:'Qualified Wallets', value:String(wallets.length), inline:true },
     { name:'Total Burns', value:String(burns.length), inline:true },
@@ -2668,7 +2815,7 @@ async function drawAndPostBurnLottery(row){
   const pick = lotteryPick(entries, row.seed);
   await pgPool.query(`UPDATE burn_lotteries SET status='completed', winner_wallet=$1, qualified_wallets=$2, total_burns=$3, result_json=$4, completed_at=NOW() WHERE id=$5`, [pick?.winner||null, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick?.proof||null}), row.id]);
   const ch = await resolveDiscordChannel(row.channel_id);
-  if(ch){ await ch.send({ embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:row.seed, entries, wallets, burns, pick, lotteryId:row.id})] }); }
+  if(ch){ await ch.send({ embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:row.seed, entries, wallets, burns, pick, lotteryId:row.id, timezone:row.timezone || DEFAULT_LOTTERY_TIMEZONE})] }); }
 }
 async function processDueBurnLotteries(){
   const r = await pgPool.query(`SELECT * FROM burn_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]}));
@@ -4681,24 +4828,46 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     try{
       await interaction.deferReply();
       if(sub==='start'){
-        const hours = Math.max(1, Math.min(168, interaction.options.getInteger('hours') || 24));
         const mode = interaction.options.getString('mode') || 'wallet';
-        const start = parseLotteryDate(interaction.options.getString('start'), new Date());
-        const end = parseLotteryDate(interaction.options.getString('end'), new Date(start.getTime()+hours*3600000));
+        const windowText = interaction.options.getString('window');
+        const timezoneInput = interaction.options.getString('timezone');
+        const resolved = resolveLotteryWindow({
+          windowText,
+          startText: interaction.options.getString('start') || 'now',
+          endText: interaction.options.getString('end'),
+          hours: interaction.options.getInteger('hours') || 24,
+          timezone: timezoneInput || DEFAULT_LOTTERY_TIMEZONE
+        });
+        const { start, end, hours, timeZone } = resolved;
         const seed = interaction.options.getString('seed') || require('crypto').randomBytes(12).toString('hex');
         const title = interaction.options.getString('title') || 'OCAS Burn Lottery';
         const prize = interaction.options.getString('prize') || null;
         const channel = interaction.options.getChannel('channel') || interaction.channel;
         if(end <= start) return interaction.editReply('End time must be after start time.');
-        const r = await pgPool.query(`INSERT INTO burn_lotteries (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active') RETURNING *`, [guildId, channel.id, interaction.user.id, title, prize, mode, start, end, seed]);
+        const r = await pgPool.query(`INSERT INTO burn_lotteries (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status, timezone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10) RETURNING *`, [guildId, channel.id, interaction.user.id, title, prize, mode, start, end, seed, timeZone]);
         const row = r.rows[0];
-        return interaction.editReply({ embeds:[new EmbedBuilder().setTitle('🎟️ Burn lottery scheduled').setColor(COLORS.OCAS_GREEN).addFields({name:'ID',value:String(row.id),inline:true},{name:'Window',value:`${lotteryTime(start)} → ${lotteryTime(end)}`,inline:false},{name:'Mode',value:mode,inline:true},{name:'Channel',value:`<#${channel.id}>`,inline:true},{name:'Seed',value:`\`${seed}\``,inline:false}).setTimestamp()] });
+        return interaction.editReply({ embeds:[new EmbedBuilder()
+          .setTitle('🎟️ Burn lottery scheduled')
+          .setColor(COLORS.OCAS_GREEN)
+          .addFields(
+            {name:'ID',value:String(row.id),inline:true},
+            {name:'Window',value:`${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\n${lotteryTime(start)} → ${lotteryTime(end)}`,inline:false},
+            {name:'Timezone',value:timeZone,inline:true},
+            {name:'Duration',value:`${hours} hour${Number(hours)===1?'':'s'}`,inline:true},
+            {name:'Mode',value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet',inline:true},
+            {name:'Channel',value:`<#${channel.id}>`,inline:true},
+            {name:'Seed',value:`\`${seed}\``,inline:false}
+          )
+          .setTimestamp()] });
       }
       if(sub==='status'){
         const id = interaction.options.getInteger('id');
         const r = id ? await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]) : await pgPool.query("SELECT * FROM burn_lotteries WHERE guild_id=$1 ORDER BY id DESC LIMIT 10",[guildId]);
         if(!r.rows.length) return interaction.editReply('No burn lotteries found.');
-        const lines = r.rows.map(x=>`#${x.id} · ${x.status} · ${lotteryTime(x.start_time)} → ${lotteryTime(x.end_time)}${x.winner_wallet?' · winner '+shortAddr(x.winner_wallet):''}`);
+        const lines = r.rows.map(x=>{
+          const tz = x.timezone || DEFAULT_LOTTERY_TIMEZONE;
+          return `#${x.id} · ${x.status} · ${formatZonedLotteryTime(x.start_time, tz)} → ${formatZonedLotteryTime(x.end_time, tz)} (${tz})${x.winner_wallet?' · winner '+shortAddr(x.winner_wallet):''}`;
+        });
         return interaction.editReply(lines.join('\n').slice(0,1900));
       }
       if(sub==='cancel'){
@@ -4713,15 +4882,21 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         await drawAndPostBurnLottery(r.rows[0]);
         return interaction.editReply(`Drew burn lottery #${id}.`);
       }
-      const hours = Math.max(1, Math.min(168, interaction.options.getInteger('hours') || 24));
       const mode = interaction.options.getString('mode') || 'wallet';
-      const end = parseLotteryDate(interaction.options.getString('end'), new Date());
-      const start = parseLotteryDate(interaction.options.getString('start'), new Date(end.getTime()-hours*3600000));
-      const seed = interaction.options.getString('seed') || `burnlottery:${guildId}:${start.toISOString()}:${end.toISOString()}:${mode}`;
+      const timezoneInput = interaction.options.getString('timezone');
+      const resolved = resolveLotteryWindow({
+        windowText: interaction.options.getString('window'),
+        startText: interaction.options.getString('start'),
+        endText: interaction.options.getString('end'),
+        hours: interaction.options.getInteger('hours') || 24,
+        timezone: timezoneInput || DEFAULT_LOTTERY_TIMEZONE
+      });
+      const { start, end, timeZone } = resolved;
+      const seed = interaction.options.getString('seed') || `burnlottery:${guildId}:${start.toISOString()}:${end.toISOString()}:${mode}:${timeZone}`;
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
       const pick = lotteryPick(entries, seed);
-      if(!pick) return interaction.editReply('No qualifying burn entries found for that window.');
-      return interaction.editReply({ embeds:[buildBurnLotteryEmbed({mode,start,end,seed,entries,wallets,burns,pick})] });
+      if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)} (${timeZone})`);
+      return interaction.editReply({ embeds:[buildBurnLotteryEmbed({mode,start,end,seed,entries,wallets,burns,pick,timezone:timeZone})] });
     }catch(e){ console.error('[/burnlottery]', e); return interaction.editReply('Burn lottery error: '+e.message); }
   }
 
