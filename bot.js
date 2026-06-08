@@ -2798,7 +2798,9 @@ function buildBurnLotteryComponents(lotteryId){
 }
 
 function formatBurnLotteryWindow(start, end, timeZone){
-  return `${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\nTimezone: ${timeZone}`;
+  // Public embed uses Discord timestamps so each viewer sees the window in their own local time.
+  // The source timezone and full proof details stay behind the Show Draw Proof button.
+  return `${lotteryTime(start)} → ${lotteryTime(end)}`;
 }
 
 async function getBurnLotteryEntries(start, end, mode='wallet'){
