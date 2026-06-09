@@ -2740,12 +2740,17 @@ function parseLotteryTimeToken(token){
 
 function parseLotteryDurationHours(text, fallbackHours=24){
   const s = String(text || '').toLowerCase();
-  const m = s.match(/(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours)\b/);
+  const m = s.match(/(\d+(?:\.\d+)?)\s*(w|week|weeks|d|day|days|h|hr|hrs|hour|hours)\b/);
   if(!m) return fallbackHours;
   const n = Number(m[1]);
   if(!Number.isFinite(n) || n <= 0) return fallbackHours;
-  return Math.min(168, n);
+  const unit = m[2];
+  const hours = unit.startsWith('w') ? n * 168 : unit.startsWith('d') ? n * 24 : n;
+  if(hours > 168) throw new Error('Burn lottery window duration cannot exceed 168 hours (1 week).');
+  return hours;
 }
+
+const LOTTERY_DURATION_RE = /(\d+(?:\.\d+)?)\s*(w|week|weeks|d|day|days|h|hr|hrs|hour|hours)\b/i;
 
 function parseLotteryWindowAnchor(anchorText, timeZone, now=new Date()){
   let s = String(anchorText || '').trim().toLowerCase();
@@ -2792,7 +2797,7 @@ function resolveLotteryWindow({ windowText, startText, endText, hours, timezone,
   const fallbackHours = Math.max(1, Math.min(168, Number(hours || 24)));
   if(windowText){
     const durationHours = parseLotteryDurationHours(windowText, fallbackHours);
-    const anchor = String(windowText).replace(/(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours)\b/i, '').trim();
+    const anchor = String(windowText).replace(LOTTERY_DURATION_RE, '').trim();
     const start = parseLotteryWindowAnchor(anchor || 'now', timeZone, now);
     const end = new Date(start.getTime() + durationHours * 3600000);
     return { start, end, hours:durationHours, timeZone };
