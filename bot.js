@@ -2816,26 +2816,47 @@ function buildBurnLotteryComponents(lotteryId){
       .setLabel('Show Draw Proof')
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
-      .setCustomId(`burnlottery_wallets:${lotteryId}:0`)
-      .setLabel('Show Eligible Wallets')
+      .setCustomId(`burnlottery_entries:${lotteryId}:0`)
+      .setLabel('Show Entries')
       .setStyle(ButtonStyle.Secondary)
   )];
 }
 
-function buildBurnLotteryWalletPageComponents(lotteryId, page, totalPages){
-  if(!lotteryId || totalPages <= 1) return [];
+function buildActiveBurnLotteryComponents(lotteryId){
+  if(!lotteryId) return [];
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`burnlottery_wallets:${lotteryId}:${Math.max(0, page - 1)}`)
+      .setCustomId(`burnlottery_current_entries:${lotteryId}:0`)
+      .setLabel('Show Current Entries')
+      .setStyle(ButtonStyle.Secondary)
+  )];
+}
+
+function buildBurnLotteryEntryPageComponents(lotteryId, page, totalPages, live=false){
+  if(!lotteryId || totalPages <= 1) return [];
+  const prefix = live ? 'burnlottery_current_entries' : 'burnlottery_entries';
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${prefix}:${lotteryId}:${Math.max(0, page - 1)}`)
       .setLabel('Prev')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(page <= 0),
     new ButtonBuilder()
-      .setCustomId(`burnlottery_wallets:${lotteryId}:${Math.min(totalPages - 1, page + 1)}`)
+      .setCustomId(`${prefix}:${lotteryId}:${Math.min(totalPages - 1, page + 1)}`)
       .setLabel('Next')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(page >= totalPages - 1)
   )];
+}
+
+function burnLotteryModeNote(mode){
+  return mode === 'burn'
+    ? 'One entry per burn. Wallets may appear multiple times.'
+    : 'One entry per wallet.';
+}
+
+function burnLotteryDisplayEntries(entries, wallets, mode){
+  return mode === 'burn' ? entries : wallets;
 }
 
 function formatBurnLotteryWindow(start, end, timeZone){
@@ -2869,7 +2890,7 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   if(pick?.winner) embed.addFields({ name:'Winner', value:etherscanAddressLink(pick.winner), inline:false });
   if(pick?.proof) embed.addFields({
     name:'Draw Proof',
-    value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`\nUse the buttons below to check the seed, full SHA-256 hash, winning position, and eligible wallets.`,
+    value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`\nUse the buttons below to check the seed, full SHA-256 hash, winning position, and entries.`,
     inline:false
   });
   embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
@@ -3124,7 +3145,8 @@ client.on('interactionCreate', async (interaction)=>{
       const proof = pick?.proof || row.result_json?.proof || 'unknown';
       const winner = row.winner_wallet || pick?.winner || null;
       const winnerPosition = pick?.position || row.result_json?.winner_position || null;
-      const content =
+      const entryTotalPages = Math.ceil(burnLotteryDisplayEntries(entries, wallets, row.mode).length / 20);
+      let content =
         `**🎟️ OCAS Burn Lottery #${lotteryId} Draw Proof**\n` +
         `**Window:** ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\n` +
         `**Timezone:** ${timeZone}\n` +
@@ -3135,12 +3157,13 @@ client.on('interactionCreate', async (interaction)=>{
         (winner ? `**Winner:** ${etherscanAddressLink(winner)}\n\`${winner}\`\n` : `**Winner:** none\n`) +
         (winnerPosition ? `**Winning entry:** ${Number(winnerPosition).toLocaleString()} of ${entries.length.toLocaleString()}\n` : '') +
         `\n**How to verify:**\n` +
+        `The draw uses the final ordered entry list. In wallet mode, that means one entry per wallet. In burn mode, that means one entry per burn, so wallets may repeat.\n` +
         `The bot hashes the public seed plus the exact ordered entry list using SHA-256. The full 256-bit hash is converted to a number, then divided by the entry count to select the winning entry number above. Same seed + same entries = same winner every time.\n\n` +
         `**Seed:**\n\`${isPendingDrawSeed(row.seed) ? 'Pending — final seed is generated at draw time.' : String(row.seed || '').slice(0, 900)}\`\n` +
         `**Full proof hash:**\n\`${String(proof).slice(0, 128)}\``;
       await interaction.editReply({
         content:content.slice(0, 1900),
-        components:buildBurnLotteryWalletPageComponents(lotteryId, 0, Math.ceil(wallets.length / 20))
+        components:buildBurnLotteryEntryPageComponents(lotteryId, 0, entryTotalPages)
       });
     }catch(e){
       console.error('[BurnLottery Proof]', e.message);
@@ -3149,44 +3172,53 @@ client.on('interactionCreate', async (interaction)=>{
     return;
   }
 
-  if(interaction.isButton() && interaction.customId.startsWith('burnlottery_wallets:')){
+  if(interaction.isButton() && (interaction.customId.startsWith('burnlottery_entries:') || interaction.customId.startsWith('burnlottery_current_entries:') || interaction.customId.startsWith('burnlottery_wallets:'))){
     const parts = interaction.customId.split(':');
+    const isLive = parts[0] === 'burnlottery_current_entries';
     const lotteryId = parseInt(parts[1], 10);
     const page = Math.max(0, parseInt(parts[2] || '0', 10) || 0);
     try{
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      if(!lotteryId){ await interaction.editReply({ content:'Eligible wallets are unavailable.' }); return; }
+      if(!lotteryId){ await interaction.editReply({ content:'Entries are unavailable.' }); return; }
       const r = await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1', [lotteryId]);
       if(!r.rows.length){ await interaction.editReply({ content:`No burn lottery #${lotteryId} found.` }); return; }
       const row = r.rows[0];
-      const start = new Date(row.start_time), end = new Date(row.end_time);
+      const start = new Date(row.start_time);
+      const scheduledEnd = new Date(row.end_time);
+      const end = isLive ? new Date(Math.min(Date.now(), scheduledEnd.getTime())) : scheduledEnd;
       const { entries, wallets } = await getBurnLotteryEntries(start, end, row.mode);
-      const pick = lotteryPick(entries, row.seed);
-      const winner = row.winner_wallet || pick?.winner || null;
+      const pick = !isLive && !isPendingDrawSeed(row.seed) ? lotteryPick(entries, row.seed) : null;
       const pageSize = 20;
-      const totalPages = Math.max(1, Math.ceil(wallets.length / pageSize));
+      const displayEntries = burnLotteryDisplayEntries(entries, wallets, row.mode);
+      const totalPages = Math.max(1, Math.ceil(displayEntries.length / pageSize));
       const safePage = Math.min(page, totalPages - 1);
       const startIndex = safePage * pageSize;
-      const pageWallets = wallets.slice(startIndex, startIndex + pageSize);
-      const lines = pageWallets.map((w, i) => {
+      const pageEntries = displayEntries.slice(startIndex, startIndex + pageSize);
+      const winnerPosition = !isLive ? (pick?.position || row.result_json?.winner_position || null) : null;
+      const lines = pageEntries.map((w, i) => {
         const pos = startIndex + i + 1;
-        const isWinner = winner && String(w).toLowerCase() === String(winner).toLowerCase();
+        const isWinner = winnerPosition && pos === Number(winnerPosition);
         return `${pos}. ${isWinner ? '🏆 ' : ''}${shortAddr(w)} — \`${w}\``;
       });
       const modeNote = row.mode === 'burn'
         ? '\n_Mode is one entry per burn, so a wallet may have extra chances even though this list shows each wallet once._'
         : '';
-      const content =
+      let content =
         `**Eligible Wallets — Lottery #${lotteryId}**\n` +
         `Page ${safePage + 1} / ${totalPages} · ${wallets.length} wallet${wallets.length===1?'':'s'}${modeNote}\n\n` +
         (lines.join('\n') || 'No eligible wallets found.');
+      content =
+        `**${isLive ? 'Current Entries' : 'Entries'} - Lottery #${lotteryId}**\n` +
+        `${burnLotteryModeNote(row.mode)}\n` +
+        `Page ${safePage + 1} / ${totalPages} - ${displayEntries.length} entr${displayEntries.length===1?'y':'ies'}\n\n` +
+        (lines.join('\n') || 'No entries found yet.');
       await interaction.editReply({
         content:content.slice(0, 1900),
-        components:buildBurnLotteryWalletPageComponents(lotteryId, safePage, totalPages)
+        components:buildBurnLotteryEntryPageComponents(lotteryId, safePage, totalPages, isLive)
       });
     }catch(e){
-      console.error('[BurnLottery Wallets]', e.message);
-      try{ await interaction.editReply({ content:'Error loading eligible wallets.' }); }catch(_){}
+      console.error('[BurnLottery Entries]', e.message);
+      try{ await interaction.editReply({ content:'Error loading entries.' }); }catch(_){}
     }
     return;
   }
@@ -5028,7 +5060,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             {name:'Channel',value:`<#${channel.id}>`,inline:true},
             {name:'Draw Seed',value:customSeed ? `Custom seed set: \`${String(customSeed).slice(0,256)}\`` : 'Generated automatically at draw time after the entry window closes.',inline:false}
           )
-          .setTimestamp()] });
+          .setTimestamp()], components:buildActiveBurnLotteryComponents(row.id) });
       }
       if(sub==='status'){
         const id = interaction.options.getInteger('id');
