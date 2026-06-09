@@ -2849,11 +2849,15 @@ function burnLotteryWindowDetails(start, end, timeZone){
   ].join('\n');
 }
 
+function burnLotteryWindowSummary(start, end){
+  return `${lotteryTime(start)} -> ${lotteryTime(end)}\nDuration: ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} hours`;
+}
+
 function burnLotteryWindowStatusLine(row){
   const tz = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
   const start = new Date(row.start_time);
   const end = new Date(row.end_time);
-  return `#${row.id} · ${row.status} · local ${formatBurnLotteryLocalTime(start, tz)} -> ${formatBurnLotteryLocalTime(end, tz)} · UTC ${start.toISOString()} -> ${end.toISOString()} · ${tz} · ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} hours${row.winner_wallet?' · winner '+shortAddr(row.winner_wallet):''}`;
+  return `#${row.id} · ${row.status} · ${lotteryTime(start)} -> ${lotteryTime(end)} · ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} hours · ${tz}${row.winner_wallet?' · winner '+shortAddr(row.winner_wallet):''}`;
 }
 
 function burnLotteryParseErrorMessage(){
@@ -2924,7 +2928,7 @@ function burnLotteryDisplayEntries(entries, wallets, mode){
 }
 
 function formatBurnLotteryWindow(start, end, timeZone){
-  return burnLotteryWindowDetails(start, end, timeZone);
+  return burnLotteryWindowSummary(start, end);
   // Public embed uses Discord timestamps so each viewer sees the window in their own local time.
   // The source timezone and full proof details stay behind the Show Draw Proof button.
   return `${lotteryTime(start)} → ${lotteryTime(end)}`;
@@ -5114,7 +5118,6 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             {name:'ID',value:String(row.id),inline:true},
             {name:'Window',value:formatBurnLotteryWindow(start, end, timeZone),inline:false},
             {name:'Timezone',value:timeZone,inline:true},
-            {name:'Duration',value:`${hours} hour${Number(hours)===1?'':'s'}`,inline:true},
             {name:'Mode',value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet',inline:true},
             {name:'Channel',value:`<#${channel.id}>`,inline:true},
             {name:'Draw Seed',value:customSeed ? `Custom seed set: \`${String(customSeed).slice(0,256)}\`` : 'Generated automatically at draw time after the entry window closes.',inline:false}
@@ -5142,7 +5145,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const r = await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]);
         if(!r.rows.length) return interaction.editReply('Lottery not found.');
         await drawAndPostBurnLottery(r.rows[0]);
-        return interaction.editReply(`Drew burn lottery #${id}.\n${burnLotteryWindowDetails(r.rows[0].start_time, r.rows[0].end_time, r.rows[0].timezone || DEFAULT_LOTTERY_TIMEZONE)}`);
+        return interaction.editReply(`Drew burn lottery #${id}.\nWindow: ${formatBurnLotteryWindow(r.rows[0].start_time, r.rows[0].end_time, r.rows[0].timezone || DEFAULT_LOTTERY_TIMEZONE)}\nTimezone: ${r.rows[0].timezone || DEFAULT_LOTTERY_TIMEZONE}`);
       }
       const mode = interaction.options.getString('mode') || 'wallet';
       const timezoneInput = interaction.options.getString('timezone');
@@ -5157,7 +5160,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const seed = interaction.options.getString('seed') || randomLotterySeed();
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
       const pick = lotteryPick(entries, seed);
-      if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\n${burnLotteryWindowDetails(start, end, timeZone)}`);
+      if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
       if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)} (${timeZone})`);
       const r = await pgPool.query(
         `INSERT INTO burn_lotteries
