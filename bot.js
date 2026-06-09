@@ -1140,30 +1140,54 @@ async function storeBurnStarted(event){
   }catch(e){ console.warn('[Burn] storeBurnStarted error:', e.message); }
 }
 
+const burnBlockTimestampCache = new Map();
+
+function burnRpcUrl(){
+  const key = process.env.ALCHEMY_API_KEY;
+  return process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
+    (key ? `https://eth-mainnet.g.alchemy.com/v2/${key}` : '');
+}
+
+async function getBurnBlockTimestamp(blockNumber){
+  const n = Number(blockNumber);
+  if(!Number.isFinite(n) || n <= 0) return null;
+  if(burnBlockTimestampCache.has(n)) return burnBlockTimestampCache.get(n);
+  const rpcUrl = burnRpcUrl();
+  if(!rpcUrl) return null;
+  const block = await burnRpc(rpcUrl, 'eth_getBlockByNumber', ['0x' + n.toString(16), false]);
+  const ts = parseInt(block?.timestamp || '0x0', 16);
+  const burnedAt = ts ? new Date(ts * 1000) : null;
+  if(burnedAt) burnBlockTimestampCache.set(n, burnedAt);
+  return burnedAt;
+}
+
 async function storeBurnFinalized(finalEvent, startEvent){
   try{
     const burnedIds = startEvent?.tokenIds || [];
+    const burnedAt = await getBurnBlockTimestamp(finalEvent.blockNumber);
+    if(!burnedAt) throw new Error(`block timestamp unavailable for finalized tx=${finalEvent.txHash || 'unknown'} block=${finalEvent.blockNumber || 'unknown'}`);
     const r = await pgPool.query(
       `INSERT INTO burn_events
          (tx_hash, block_number, log_index, burner_wallet, survivor_token_id,
-          result_body_type, result_is_angel, points_used, boost_chance, burn_seed)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           result_body_type, result_is_angel, points_used, boost_chance, burn_seed, burned_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        ON CONFLICT (tx_hash, log_index) DO UPDATE SET
-          block_number=EXCLUDED.block_number,
-          burner_wallet=EXCLUDED.burner_wallet,
-          survivor_token_id=EXCLUDED.survivor_token_id,
-          result_body_type=EXCLUDED.result_body_type,
-          result_is_angel=EXCLUDED.result_is_angel,
-          points_used=EXCLUDED.points_used,
-          boost_chance=EXCLUDED.boost_chance,
-          burn_seed=EXCLUDED.burn_seed
+           block_number=EXCLUDED.block_number,
+           burner_wallet=EXCLUDED.burner_wallet,
+           survivor_token_id=EXCLUDED.survivor_token_id,
+           result_body_type=EXCLUDED.result_body_type,
+           result_is_angel=EXCLUDED.result_is_angel,
+           points_used=EXCLUDED.points_used,
+           boost_chance=EXCLUDED.boost_chance,
+           burn_seed=EXCLUDED.burn_seed,
+           burned_at=EXCLUDED.burned_at
        RETURNING id`,
       [
         finalEvent.txHash || '', finalEvent.blockNumber || 0, finalEvent.logIndex || 0,
         startEvent?.owner || '', finalEvent.survivorTokenId,
         finalEvent.resultBodyType, finalEvent.resultIsAngel,
         finalEvent.points, finalEvent.boostChance,
-        String(finalEvent.burnSeed || ''),
+        String(finalEvent.burnSeed || ''), burnedAt,
       ]
     );
     if(r.rows.length && burnedIds.length){
