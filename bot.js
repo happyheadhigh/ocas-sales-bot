@@ -2754,6 +2754,8 @@ const LOTTERY_DURATION_RE = /(\d+(?:\.\d+)?)\s*(w|week|weeks|d|day|days|h|hr|hrs
 
 function parseLotteryWindowAnchor(anchorText, timeZone, now=new Date()){
   let s = String(anchorText || '').trim().toLowerCase();
+  const ukStyle = s.startsWith('uk:');
+  if(ukStyle) s = s.slice(3).trim();
   if(!s || s === 'now') return new Date(now);
 
   // Accept "yesterday-10am", "yesterday 10am", "today-10:30am", "tomorrow-18:00".
@@ -2775,12 +2777,13 @@ function parseLotteryWindowAnchor(anchorText, timeZone, now=new Date()){
   }
 
   // Accept US-style "06-07-2026-10am", "06/07/2026-10am", "06/07/2026 10am".
+  // With a "uk:" prefix, parse the same forms as DD-MM-YYYY / DD/MM/YYYY.
   const usAbs = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})[- ](.+)$/);
   if(usAbs){
-    const month = Number(usAbs[1]);
-    const day = Number(usAbs[2]);
+    const day = Number(ukStyle ? usAbs[1] : usAbs[2]);
+    const month = Number(ukStyle ? usAbs[2] : usAbs[1]);
     if(month < 1 || month > 12 || day < 1 || day > 31){
-      throw new Error(`Invalid MM-DD-YYYY date in "${anchorText}".`);
+      throw new Error(`Invalid ${ukStyle ? 'DD-MM-YYYY' : 'MM-DD-YYYY'} date in "${anchorText}".`);
     }
     const tm = parseLotteryTimeToken(usAbs[4]);
     return zonedDateTimeToUtc(Number(usAbs[3]), month, day, tm.hour, tm.minute, 0, timeZone);
@@ -2789,7 +2792,7 @@ function parseLotteryWindowAnchor(anchorText, timeZone, now=new Date()){
   // Fall back to normal ISO/date parsing for advanced users.
   const d = new Date(anchorText);
   if(!Number.isNaN(d.getTime())) return d;
-  throw new Error(`Could not parse window "${anchorText}". Try yesterday-10am, today-2pm 6hrs, or 06-07-2026-10am.`);
+  throw new Error(`Could not parse window "${anchorText}".`);
 }
 
 function resolveLotteryWindow({ windowText, startText, endText, hours, timezone, now=new Date() }){
@@ -2819,6 +2822,50 @@ function formatZonedLotteryTime(d, timeZone){
 }
 
 function lotteryTime(d){ return `<t:${Math.floor(new Date(d).getTime()/1000)}:f>`; }
+function formatBurnLotteryLocalTime(d, timeZone){
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone, day:'2-digit', month:'short', year:'numeric',
+    hour:'numeric', minute:'2-digit', hour12:true
+  }).format(new Date(d)).replace(/\b(am|pm)\b/ig, m=>m.toUpperCase());
+}
+
+function formatLotteryHours(hours){
+  const n = Number(hours);
+  if(!Number.isFinite(n)) return 'unknown';
+  return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(2)));
+}
+
+function burnLotteryWindowDurationHours(start, end){
+  return (new Date(end).getTime() - new Date(start).getTime()) / 3600000;
+}
+
+function burnLotteryWindowDetails(start, end, timeZone){
+  const tz = normalizeLotteryTimezone(timeZone);
+  return [
+    `Window local: ${formatBurnLotteryLocalTime(start, tz)} -> ${formatBurnLotteryLocalTime(end, tz)}`,
+    `Window UTC: ${new Date(start).toISOString()} -> ${new Date(end).toISOString()}`,
+    `Timezone: ${tz}`,
+    `Duration: ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} hours`
+  ].join('\n');
+}
+
+function burnLotteryWindowStatusLine(row){
+  const tz = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
+  const start = new Date(row.start_time);
+  const end = new Date(row.end_time);
+  return `#${row.id} · ${row.status} · local ${formatBurnLotteryLocalTime(start, tz)} -> ${formatBurnLotteryLocalTime(end, tz)} · UTC ${start.toISOString()} -> ${end.toISOString()} · ${tz} · ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} hours${row.winner_wallet?' · winner '+shortAddr(row.winner_wallet):''}`;
+}
+
+function burnLotteryParseErrorMessage(){
+  return [
+    'I could not parse that burn lottery window.',
+    'Try:',
+    '• 06-07-2026-3pm for MM-DD-YYYY',
+    '• uk:06-07-2026-3pm for DD-MM-YYYY',
+    '• uk:08-06-2026 15:00 for 24-hour time'
+  ].join('\n');
+}
+
 function etherscanAddressLink(addr){
   const a = String(addr || '').toLowerCase();
   if(!/^0x[a-f0-9]{40}$/.test(a)) return String(addr || 'unknown');
@@ -2877,6 +2924,7 @@ function burnLotteryDisplayEntries(entries, wallets, mode){
 }
 
 function formatBurnLotteryWindow(start, end, timeZone){
+  return burnLotteryWindowDetails(start, end, timeZone);
   // Public embed uses Discord timestamps so each viewer sees the window in their own local time.
   // The source timezone and full proof details stay behind the Show Draw Proof button.
   return `${lotteryTime(start)} → ${lotteryTime(end)}`;
@@ -3167,6 +3215,7 @@ client.on('interactionCreate', async (interaction)=>{
         `**🎟️ OCAS Burn Lottery #${lotteryId} Draw Proof**\n` +
         `**Window:** ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\n` +
         `**Timezone:** ${timeZone}\n` +
+        `${burnLotteryWindowDetails(start, end, timeZone)}\n` +
         `**Mode:** ${row.mode === 'burn' ? 'One entry per burn — wallets can appear multiple times' : 'One entry per wallet'}\n` +
         `**Qualified wallets:** ${wallets.length}\n` +
         `**Total burns:** ${burns.length}\n` +
@@ -5076,10 +5125,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const id = interaction.options.getInteger('id');
         const r = id ? await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]) : await pgPool.query("SELECT * FROM burn_lotteries WHERE guild_id=$1 ORDER BY id DESC LIMIT 10",[guildId]);
         if(!r.rows.length) return interaction.editReply('No burn lotteries found.');
-        const lines = r.rows.map(x=>{
+        let lines = r.rows.map(x=>{
           const tz = x.timezone || DEFAULT_LOTTERY_TIMEZONE;
           return `#${x.id} · ${x.status} · ${formatZonedLotteryTime(x.start_time, tz)} → ${formatZonedLotteryTime(x.end_time, tz)} (${tz})${x.winner_wallet?' · winner '+shortAddr(x.winner_wallet):''}`;
         });
+        lines = r.rows.map(x=>burnLotteryWindowStatusLine(x));
         return interaction.editReply(lines.join('\n').slice(0,1900));
       }
       if(sub==='cancel'){
@@ -5092,7 +5142,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const r = await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]);
         if(!r.rows.length) return interaction.editReply('Lottery not found.');
         await drawAndPostBurnLottery(r.rows[0]);
-        return interaction.editReply(`Drew burn lottery #${id}.`);
+        return interaction.editReply(`Drew burn lottery #${id}.\n${burnLotteryWindowDetails(r.rows[0].start_time, r.rows[0].end_time, r.rows[0].timezone || DEFAULT_LOTTERY_TIMEZONE)}`);
       }
       const mode = interaction.options.getString('mode') || 'wallet';
       const timezoneInput = interaction.options.getString('timezone');
@@ -5107,6 +5157,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const seed = interaction.options.getString('seed') || randomLotterySeed();
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
       const pick = lotteryPick(entries, seed);
+      if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\n${burnLotteryWindowDetails(start, end, timeZone)}`);
       if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)} (${timeZone})`);
       const r = await pgPool.query(
         `INSERT INTO burn_lotteries
@@ -5122,7 +5173,14 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         embeds:[buildBurnLotteryEmbed({mode,start,end,seed,entries,wallets,burns,pick,lotteryId,timezone:timeZone})],
         components:buildBurnLotteryComponents(lotteryId)
       });
-    }catch(e){ console.error('[/burnlottery]', e); return interaction.editReply('Burn lottery error: '+e.message); }
+    }catch(e){
+      console.error('[/burnlottery]', e);
+      const msg = String(e.message || '');
+      if(/could not parse|invalid .*date|could not parse time|invalid .*time/i.test(msg)){
+        return interaction.editReply(`${burnLotteryParseErrorMessage()}\n\n${msg}`);
+      }
+      return interaction.editReply('Burn lottery error: '+e.message);
+    }
   }
 
   if(commandName==='lottery'){
