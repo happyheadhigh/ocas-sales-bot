@@ -8,6 +8,14 @@ const CHUNK = Math.max(1, parseInt(process.env.BURN_REPAIR_CHUNK || process.env.
 const DELAY_MS = Math.max(0, parseInt(process.env.BURN_REPAIR_DELAY_MS || '500', 10));
 const TOPIC_BURN_STARTED   = '0x4dd367d2c410889fbff76f34abdefdceb947ad0c58baaf327ead8ac9d6a38c22';
 const TOPIC_BURN_FINALIZED = '0x4c7b2090df533e8b1f7bd4ab01aadb95fedf5006f15ff4300c1709b97c4c6d5e';
+const ARGS = process.argv.slice(2);
+const DRY_RUN_BURNED_AT = ARGS.includes('--dry-run-burned-at');
+const FIX_BURNED_AT = ARGS.includes('--fix-burned-at');
+const CHECK_WALLET_INDEX = ARGS.indexOf('--check-wallet');
+const CHECK_TX_INDEX = ARGS.indexOf('--check-tx');
+const CHECK_WALLET = CHECK_WALLET_INDEX >= 0 ? normArg(ARGS[CHECK_WALLET_INDEX + 1]) : '';
+const CHECK_TX = CHECK_TX_INDEX >= 0 ? normArg(ARGS[CHECK_TX_INDEX + 1]) : '';
+const TIMESTAMP_ONLY_MODE = DRY_RUN_BURNED_AT || FIX_BURNED_AT || !!CHECK_WALLET || !!CHECK_TX;
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const ALCHEMY_URL = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://')
@@ -15,7 +23,7 @@ const ALCHEMY_URL = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https:/
 
 if(!DATABASE_URL){ console.error('[burn-repair] Missing DATABASE_URL'); process.exit(1); }
 if(!ALCHEMY_URL){ console.error('[burn-repair] Missing ALCHEMY_API_KEY or ALCHEMY_WEBSOCKET_URL'); process.exit(1); }
-if(!Number.isFinite(ZERO_START) || ZERO_START < 0){
+if(!TIMESTAMP_ONLY_MODE && (!Number.isFinite(ZERO_START) || ZERO_START < 0)){
   console.error('[burn-repair] Missing BURN_START_BLOCK. Use the Burn Machine deployment block.');
   process.exit(1);
 }
@@ -32,6 +40,7 @@ function normAddr(addr){
   const s = String(addr || '').trim().toLowerCase();
   return /^0x[a-f0-9]{40}$/.test(s) ? s : '';
 }
+function normArg(v){ return String(v || '').trim().toLowerCase(); }
 function hex(n){ return '0x' + Number(n).toString(16); }
 function intHex(v){ return parseInt(String(v || '0x0'), 16); }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
@@ -55,6 +64,131 @@ async function rpc(method, params, attempt=0){
   const j = JSON.parse(text);
   if(j.error) throw new Error(`${method} error: ${JSON.stringify(j.error)}`);
   return j.result;
+}
+
+const blockTimestampCache = new Map();
+const receiptCache = new Map();
+
+async function getBlockTimestamp(blockNumber){
+  const n = Number(blockNumber);
+  if(!Number.isFinite(n) || n <= 0) return null;
+  if(blockTimestampCache.has(n)) return blockTimestampCache.get(n);
+  const block = await rpc('eth_getBlockByNumber', [hex(n), false]);
+  const ts = intHex(block?.timestamp);
+  const date = ts ? new Date(ts * 1000) : null;
+  if(date) blockTimestampCache.set(n, date);
+  return date;
+}
+
+async function getReceipt(txHash){
+  const tx = normArg(txHash);
+  if(!/^0x[a-f0-9]{64}$/.test(tx)) return null;
+  if(receiptCache.has(tx)) return receiptCache.get(tx);
+  const receipt = await rpc('eth_getTransactionReceipt', [tx]);
+  receiptCache.set(tx, receipt || null);
+  return receipt || null;
+}
+
+async function resolveBurnEventChainTime(row){
+  let blockNumber = Number(row.block_number || 0);
+  let receiptBlockNumber = null;
+  if(!Number.isFinite(blockNumber) || blockNumber <= 0){
+    const receipt = await getReceipt(row.tx_hash);
+    receiptBlockNumber = intHex(receipt?.blockNumber);
+    if(Number.isFinite(receiptBlockNumber) && receiptBlockNumber > 0) blockNumber = receiptBlockNumber;
+  }
+  if(!Number.isFinite(blockNumber) || blockNumber <= 0){
+    return { ok:false, reason:'missing block_number and receipt blockNumber', blockNumber:null, chainBurnedAt:null };
+  }
+  const chainBurnedAt = await getBlockTimestamp(blockNumber);
+  if(!chainBurnedAt){
+    return { ok:false, reason:`could not fetch block ${blockNumber}`, blockNumber, chainBurnedAt:null };
+  }
+  return { ok:true, reason:null, blockNumber, chainBurnedAt };
+}
+
+function differsByMoreThanOneSecond(a, b){
+  if(!a || !b) return true;
+  return Math.abs(new Date(a).getTime() - new Date(b).getTime()) > 1000;
+}
+
+function fmtDate(d){
+  return d ? new Date(d).toISOString() : 'null';
+}
+
+async function loadBurnRowsForTimestampRepair(client){
+  const where = [];
+  const params = [];
+  if(CHECK_WALLET){
+    params.push(CHECK_WALLET);
+    where.push(`lower(burner_wallet) = $${params.length}`);
+  }
+  if(CHECK_TX){
+    params.push(CHECK_TX);
+    where.push(`lower(tx_hash) = $${params.length}`);
+  }
+  const q = `
+    SELECT id, tx_hash, block_number, log_index, burner_wallet, survivor_token_id, burned_at
+    FROM burn_events
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY id ASC
+  `;
+  return (await client.query(q, params)).rows;
+}
+
+async function repairBurnedAt(client, { fix=false, diagnosticOnly=false } = {}){
+  const rows = await loadBurnRowsForTimestampRepair(client);
+  let checked = 0;
+  let wouldUpdate = 0;
+  let updated = 0;
+  const skipped = [];
+  for(const row of rows){
+    checked++;
+    let resolved;
+    try{
+      resolved = await resolveBurnEventChainTime(row);
+    }catch(e){
+      skipped.push({ id:row.id, tx_hash:row.tx_hash, reason:e.message });
+      continue;
+    }
+    if(!resolved.ok){
+      skipped.push({ id:row.id, tx_hash:row.tx_hash, reason:resolved.reason });
+      continue;
+    }
+    const blockDiffers = Number(row.block_number || 0) !== Number(resolved.blockNumber);
+    const timeDiffers = differsByMoreThanOneSecond(row.burned_at, resolved.chainBurnedAt);
+    const shouldUpdate = blockDiffers || timeDiffers;
+    if(shouldUpdate) wouldUpdate++;
+
+    if(diagnosticOnly || shouldUpdate){
+      console.log([
+        `[burned-at] id=${row.id}`,
+        `tx=${row.tx_hash}`,
+        `wallet=${row.burner_wallet}`,
+        `block=${row.block_number || 'null'}`,
+        `chainBlock=${resolved.blockNumber}`,
+        `log=${row.log_index}`,
+        `current=${fmtDate(row.burned_at)}`,
+        `chain=${fmtDate(resolved.chainBurnedAt)}`,
+        `differs=${shouldUpdate}`
+      ].join(' '));
+    }
+
+    if(fix && shouldUpdate){
+      await client.query(
+        `UPDATE burn_events
+         SET burned_at=$1, block_number=CASE WHEN COALESCE(block_number,0) <= 0 THEN $2 ELSE block_number END
+         WHERE id=$3`,
+        [resolved.chainBurnedAt, resolved.blockNumber, row.id]
+      );
+      updated++;
+    }
+  }
+  console.log(`[burned-at] rows checked: ${checked}`);
+  console.log(`[burned-at] rows that would update: ${wouldUpdate}`);
+  console.log(`[burned-at] rows updated: ${updated}`);
+  console.log(`[burned-at] rows skipped: ${skipped.length}`);
+  for(const s of skipped) console.log(`[burned-at] skipped id=${s.id} tx=${s.tx_hash}: ${s.reason}`);
 }
 
 async function ensureSchema(client){
@@ -193,11 +327,13 @@ async function loadStarted(client, survivorTokenId, maxBlockNumber = null){
 
 async function upsertFinalized(client, event){
   const started = await loadStarted(client, event.survivorTokenId, event.blockNumber);
+  const burnedAt = await getBlockTimestamp(event.blockNumber);
+  if(!burnedAt) throw new Error(`block timestamp unavailable for finalized tx=${event.txHash} block=${event.blockNumber}`);
   const r = await client.query(`
     INSERT INTO burn_events
       (tx_hash, block_number, log_index, burner_wallet, survivor_token_id,
-       result_body_type, result_is_angel, points_used, boost_chance, burn_seed)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       result_body_type, result_is_angel, points_used, boost_chance, burn_seed, burned_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     ON CONFLICT (tx_hash, log_index) DO UPDATE SET
       block_number=EXCLUDED.block_number,
       burner_wallet=EXCLUDED.burner_wallet,
@@ -206,10 +342,11 @@ async function upsertFinalized(client, event){
       result_is_angel=EXCLUDED.result_is_angel,
       points_used=EXCLUDED.points_used,
       boost_chance=EXCLUDED.boost_chance,
-      burn_seed=EXCLUDED.burn_seed
+      burn_seed=EXCLUDED.burn_seed,
+      burned_at=EXCLUDED.burned_at
     RETURNING id
   `, [event.txHash, event.blockNumber, event.logIndex, started?.owner || '',
-      event.survivorTokenId, event.resultBodyType, event.resultIsAngel, event.points, event.boostChance, String(event.burnSeed || '')]);
+      event.survivorTokenId, event.resultBodyType, event.resultIsAngel, event.points, event.boostChance, String(event.burnSeed || ''), burnedAt]);
   const id = r.rows[0].id;
   for(const tokenId of started?.tokenIds || []){
     await client.query(
@@ -333,9 +470,24 @@ async function totals(client){
 async function main(){
   const client = await pool.connect();
   try{
-    await ensureSchema(client);
     const lock = await client.query('SELECT pg_try_advisory_lock($1, $2) AS locked', [1095, 735]);
     if(!lock.rows[0]?.locked){ console.log('[burn-repair] Another repair is already running.'); return; }
+
+    if(TIMESTAMP_ONLY_MODE){
+      if(CHECK_WALLET && !normAddr(CHECK_WALLET)){
+        throw new Error('--check-wallet requires a 0x wallet address');
+      }
+      if(CHECK_TX && !/^0x[a-f0-9]{64}$/.test(CHECK_TX)){
+        throw new Error('--check-tx requires a 0x transaction hash');
+      }
+      const fix = FIX_BURNED_AT;
+      const diagnosticOnly = !!CHECK_WALLET || !!CHECK_TX;
+      console.log(`[burned-at] mode=${fix ? 'fix' : 'dry-run'}${diagnosticOnly ? ' diagnostic' : ''}`);
+      await repairBurnedAt(client, { fix, diagnosticOnly });
+      return;
+    }
+
+    await ensureSchema(client);
 
     const latest = intHex(await rpc('eth_blockNumber', []));
     console.log(`[burn-repair] start=${ZERO_START} latest=${latest} chunk=${CHUNK} delayMs=${DELAY_MS}`);
