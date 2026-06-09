@@ -2627,11 +2627,11 @@ function lotteryPick(entries, seed){
   if(!entries.length) return null;
   // Deterministic proof:
   // 1) Build the final ordered entry list.
-  // 2) Hash public seed + exact ordered entries.
-  // 3) Convert part of the hash into a number and pick index modulo entry count.
+  // 2) Hash public seed + exact ordered entries using SHA-256.
+  // 3) Convert the full 256-bit hash into a number and pick index modulo entry count.
   // Same seed + same ordered entries = same winner every time.
   const h = lotteryHash(seed + '\n' + entries.join('|'));
-  const idx = Number(BigInt('0x' + h.slice(0,16)) % BigInt(entries.length));
+  const idx = Number(BigInt('0x' + h) % BigInt(entries.length));
   return { winner: entries[idx], index: idx, position: idx + 1, proof: h };
 }
 
@@ -2869,7 +2869,7 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   if(pick?.winner) embed.addFields({ name:'Winner', value:etherscanAddressLink(pick.winner), inline:false });
   if(pick?.proof) embed.addFields({
     name:'Draw Proof',
-    value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`\nUse the buttons below to check the seed, full hash, and eligible wallets.`,
+    value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`\nUse the buttons below to check the seed, full SHA-256 hash, winning position, and eligible wallets.`,
     inline:false
   });
   embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
@@ -3135,7 +3135,7 @@ client.on('interactionCreate', async (interaction)=>{
         (winner ? `**Winner:** ${etherscanAddressLink(winner)}\n\`${winner}\`\n` : `**Winner:** none\n`) +
         (winnerPosition ? `**Winning entry:** ${Number(winnerPosition).toLocaleString()} of ${entries.length.toLocaleString()}\n` : '') +
         `\n**How to verify:**\n` +
-        `The bot hashes the public seed plus the exact ordered entry list. That hash selects the winning entry number above. Same seed + same entries = same winner every time.\n\n` +
+        `The bot hashes the public seed plus the exact ordered entry list using SHA-256. The full 256-bit hash is converted to a number, then divided by the entry count to select the winning entry number above. Same seed + same entries = same winner every time.\n\n` +
         `**Seed:**\n\`${isPendingDrawSeed(row.seed) ? 'Pending — final seed is generated at draw time.' : String(row.seed || '').slice(0, 900)}\`\n` +
         `**Full proof hash:**\n\`${String(proof).slice(0, 128)}\``;
       await interaction.editReply({
