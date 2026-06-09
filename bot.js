@@ -2769,10 +2769,22 @@ function parseLotteryWindowAnchor(anchorText, timeZone, now=new Date()){
     return zonedDateTimeToUtc(Number(abs[1]), Number(abs[2]), Number(abs[3]), tm.hour, tm.minute, 0, timeZone);
   }
 
+  // Accept US-style "06-07-2026-10am", "06/07/2026-10am", "06/07/2026 10am".
+  const usAbs = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})[- ](.+)$/);
+  if(usAbs){
+    const month = Number(usAbs[1]);
+    const day = Number(usAbs[2]);
+    if(month < 1 || month > 12 || day < 1 || day > 31){
+      throw new Error(`Invalid MM-DD-YYYY date in "${anchorText}".`);
+    }
+    const tm = parseLotteryTimeToken(usAbs[4]);
+    return zonedDateTimeToUtc(Number(usAbs[3]), month, day, tm.hour, tm.minute, 0, timeZone);
+  }
+
   // Fall back to normal ISO/date parsing for advanced users.
   const d = new Date(anchorText);
   if(!Number.isNaN(d.getTime())) return d;
-  throw new Error(`Could not parse window "${anchorText}". Try yesterday-10am 24hrs, today-2pm 6hrs, or 2026-06-08-10am 4hrs.`);
+  throw new Error(`Could not parse window "${anchorText}". Try yesterday-10am, today-2pm 6hrs, or 06-07-2026-10am.`);
 }
 
 function resolveLotteryWindow({ windowText, startText, endText, hours, timezone, now=new Date() }){
@@ -3198,16 +3210,9 @@ client.on('interactionCreate', async (interaction)=>{
       const lines = pageEntries.map((w, i) => {
         const pos = startIndex + i + 1;
         const isWinner = winnerPosition && pos === Number(winnerPosition);
-        return `${pos}. ${isWinner ? '🏆 ' : ''}${shortAddr(w)} — \`${w}\``;
+        return `${pos}. ${isWinner ? '🏆 ' : ''}\`${w}\``;
       });
-      const modeNote = row.mode === 'burn'
-        ? '\n_Mode is one entry per burn, so a wallet may have extra chances even though this list shows each wallet once._'
-        : '';
-      let content =
-        `**Eligible Wallets — Lottery #${lotteryId}**\n` +
-        `Page ${safePage + 1} / ${totalPages} · ${wallets.length} wallet${wallets.length===1?'':'s'}${modeNote}\n\n` +
-        (lines.join('\n') || 'No eligible wallets found.');
-      content =
+      const content =
         `**${isLive ? 'Current Entries' : 'Entries'} - Lottery #${lotteryId}**\n` +
         `${burnLotteryModeNote(row.mode)}\n` +
         `Page ${safePage + 1} / ${totalPages} - ${displayEntries.length} entr${displayEntries.length===1?'y':'ies'}\n\n` +
