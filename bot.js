@@ -2815,17 +2815,22 @@ function parseLotteryTimeToken(token){
 
 function parseLotteryDurationHours(text, fallbackHours=24){
   const s = String(text || '').toLowerCase();
-  const m = s.match(/(\d+(?:\.\d+)?)\s*(w|week|weeks|d|day|days|h|hr|hrs|hour|hours)\b/);
+  const m = s.match(/(\d+(?:\.\d+)?)\s*(w|week|weeks|d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b/);
   if(!m) return fallbackHours;
   const n = Number(m[1]);
   if(!Number.isFinite(n) || n <= 0) return fallbackHours;
   const unit = m[2];
-  const hours = unit.startsWith('w') ? n * 168 : unit.startsWith('d') ? n * 24 : n;
+  let hours;
+  if(unit.startsWith('w')) hours = n * 168;
+  else if(unit.startsWith('d')) hours = n * 24;
+  else if(unit === 'm' || unit.startsWith('mi')) hours = n / 60;
+  else hours = n;
   if(hours > 168) throw new Error('Burn lottery window duration cannot exceed 168 hours (1 week).');
+  if(hours < (1/60)) throw new Error('Burn lottery window duration must be at least 1 minute.');
   return hours;
 }
 
-const LOTTERY_DURATION_RE = /(\d+(?:\.\d+)?)\s*(w|week|weeks|d|day|days|h|hr|hrs|hour|hours)\b/i;
+const LOTTERY_DURATION_RE = /(\d+(?:\.\d+)?)\s*(w|week|weeks|d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b/i;
 
 function parseLotteryWindowAnchor(anchorText, timeZone, now=new Date()){
   let s = String(anchorText || '').trim().toLowerCase();
@@ -2939,7 +2944,8 @@ function burnLotteryParseErrorMessage(){
     'Try:',
     '• 06-07-2026-3pm for MM-DD-YYYY',
     '• uk:06-07-2026-3pm for DD-MM-YYYY',
-    '• uk:08-06-2026 15:00 for 24-hour time'
+    '• uk:08-06-2026 15:00 for 24-hour time',
+    '• Use window: now 10minutes or window: now 2h for a quick window'
   ].join('\n');
 }
 
