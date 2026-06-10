@@ -5756,6 +5756,7 @@ client.on('guildCreate', async (guild)=>{
 client.once('clientReady', async ()=>{
   console.log('Bot online as '+client.user.tag);
   checkStartupEnvVars();
+  sendErrorWebhook('Test', new Error('Webhook is working!'), 'BOT_ENV='+process.env.BOT_ENV);
   console.log('OpenSea key: '+(OPENSEA_KEY?'set':'NOT SET'));
   // Init Railway DB table, then load all persisted state
   await ensureBotStateTable();
