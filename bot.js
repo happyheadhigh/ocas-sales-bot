@@ -3332,6 +3332,13 @@ function buildGenericLotteryResultEmbed(row, entries, result){
 async function findActiveGenericLottery(guildId,type=null){ const params=[guildId]; let q=`SELECT * FROM generic_lotteries WHERE guild_id=$1 AND status='active' AND end_time > NOW()`; if(type){params.push(type); q+=` AND type=$2`;} q+=` ORDER BY id DESC LIMIT 1`; const r=await pgPool.query(q,params); return r.rows[0]||null; }
 async function getGenericLotteryEntryCount(id){ const r=await pgPool.query('SELECT COUNT(*)::int count FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]})); return parseInt(r.rows[0]?.count||0); }
 async function drawGenericLottery(row, post=true, ethSeed=null){
+  // Claim immediately to prevent double-draw
+  const claim = await pgPool.query(
+    `UPDATE generic_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`,
+    [row.id]
+  );
+  if(!claim.rows.length) return { embed:null, entries:[], result:{winner:null,proof:null}, components:[] }; // Already claimed
+
   // Fetch entries ordered by entry time then user ID for deterministic results
   const er = await pgPool.query(
     'SELECT user_id, username, guess_number, entered_at FROM generic_lottery_entries WHERE lottery_id=$1 ORDER BY entered_at ASC, user_id ASC',
@@ -3380,7 +3387,7 @@ async function drawGenericLottery(row, post=true, ethSeed=null){
       result.winner?.username || null,
       result.winner?.guess_number ?? null,
       entries.length,
-      JSON.stringify({ proof: result.proof || null }),
+      JSON.stringify({ proof: result.proof || null, winner_index: result.index ?? null, winner_position: result.position ?? null }),
       row.winning_number ?? null,
       row.id,
     ]
