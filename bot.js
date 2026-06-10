@@ -49,7 +49,8 @@ const OPENSEA_KEY   = process.env.OPENSEA_KEY || '';
 const POLL_MS       = parseInt(process.env.POLL_MS || '30000', 10);
 const SERVER_FILE   = path.join(__dirname, 'server-configs.json');
 const ALERTS_FILE   = path.join(__dirname, 'user-alerts.json');
-const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || '';
+const ALCHEMY_KEY         = process.env.ALCHEMY_API_KEY || '';
+const ERROR_WEBHOOK_URL   = process.env.ERROR_WEBHOOK_URL || '';
 
 
 // ── Brand colors ──────────────────────────────────────────────────────────────
@@ -118,6 +119,48 @@ function normAddr(addr){
   return /^0x[a-f0-9]{40}$/.test(s) ? s : '';
 }
 
+// ── Error reporting webhook ──────────────────────────────────────────────────────
+// Posts critical errors to a private Discord channel via webhook.
+// Set ERROR_WEBHOOK_URL in Railway env vars to enable.
+async function sendErrorWebhook(label, error, context = ''){
+  if(!ERROR_WEBHOOK_URL) return;
+  try{
+    const msg = [
+      `🚨 **${label}**`,
+      `\`\`\`${String(error?.message || error).slice(0, 800)}\`\`\``,
+      context ? `**Context:** ${String(context).slice(0, 300)}` : '',
+      `**Time:** <t:${Math.floor(Date.now()/1000)}:f>`,
+    ].filter(Boolean).join('\n');
+    await fetch(ERROR_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: msg.slice(0, 2000), username: 'OCAS Bot Errors' }),
+    });
+  }catch(_){} // never let webhook errors break the bot
+}
+
+// ── Startup env var checks ────────────────────────────────────────────────────
+function checkStartupEnvVars(){
+  const required = [
+    ['DISCORD_TOKEN',    'Bot will not connect to Discord'],
+    ['DATABASE_URL',     'DB pool will fail — all features broken'],
+    ['ALCHEMY_API_KEY',  'Burn poller + lottery ETH seed disabled (set ALCHEMY_WEBSOCKET_URL as fallback)'],
+    ['OPENSEA_KEY',      'OpenSea API calls will hit rate limits quickly'],
+    ['API_SECRET',       'TraitView API auth disabled'],
+    ['RAILWAY_API_URL',  'Trait search, rank search, floor commands will not work'],
+  ];
+  for(const [key, impact] of required){
+    if(!process.env[key]){
+      console.warn(`[Startup] ⚠️  Missing env var ${key}: ${impact}`);
+    }
+  }
+  if(ERROR_WEBHOOK_URL){
+    console.log('[Startup] Error webhook: enabled');
+  } else {
+    console.warn('[Startup] ERROR_WEBHOOK_URL not set — errors will only appear in Railway logs');
+  }
+}
+
 // ── Railway Postgres pool (same DB as api.js) ─────────────────────────────────
 const { Pool } = require('pg');
 const pgPool = new Pool({
@@ -129,7 +172,7 @@ const pgPool = new Pool({
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
 });
-pgPool.on('error', e => console.error('[PG bot]', e.message));
+pgPool.on('error', e => { console.error('[PG bot]', e.message); sendErrorWebhook('DB Pool Error', e); });
 
 // ── Create bot_state table if it doesn't exist ───────────────────────────────
 async function ensureBotStateTable(){
@@ -468,6 +511,25 @@ const recentChannelPosts = new Map(); // dedup: channelId+tokenId → timestamp,
 // Rate limit for /burnrefresh: userId+tokenId → last used timestamp
 // One use per token per user per 5 minutes — prevents OS API spam
 const burnRefreshCooldowns = new Map();
+// Per-user rate limiting for heavy search commands (traitfind, rankfind, burn)
+// Prevents DB spam — 1 use per user per 8 seconds
+const commandCooldowns = new Map();
+const COMMAND_COOLDOWN_MS = 8000;
+function checkCommandCooldown(userId, command){
+  const key = `${userId}:${command}`;
+  const last = commandCooldowns.get(key);
+  if(last && Date.now() - last < COMMAND_COOLDOWN_MS){
+    const secsLeft = Math.ceil((COMMAND_COOLDOWN_MS - (Date.now() - last)) / 1000);
+    return secsLeft;
+  }
+  commandCooldowns.set(key, Date.now());
+  // Prune old entries every 2000 entries
+  if(commandCooldowns.size > 2000){
+    const cutoff = Date.now() - COMMAND_COOLDOWN_MS;
+    for(const [k,v] of commandCooldowns) if(v < cutoff) commandCooldowns.delete(k);
+  }
+  return 0;
+}
 function isRecentChannelPost(channelId, tokenId, windowMs=180000){
   const key = channelId + ':' + tokenId;
   const last = recentChannelPosts.get(key);
@@ -480,6 +542,8 @@ function isRecentChannelPost(channelId, tokenId, windowMs=180000){
 const imageCache      = new Map(); // "contract:tokenId" → {result, ts}
 const IMAGE_CACHE_TTL = 60 * 60 * 1000; // 1 hour TTL
 
+const IMAGE_CACHE_MAX = 2000; // max entries — evict oldest when exceeded
+
 function getCachedImage(key){
   const entry = imageCache.get(key);
   if(!entry) return null;
@@ -487,6 +551,11 @@ function getCachedImage(key){
   return entry.result;
 }
 function setCachedImage(key, result){
+  // Evict oldest entries if over max size
+  if(imageCache.size >= IMAGE_CACHE_MAX){
+    const oldest = [...imageCache.entries()].sort((a,b) => a[1].ts - b[1].ts).slice(0, 200);
+    for(const [k] of oldest) imageCache.delete(k);
+  }
   imageCache.set(key, { result, ts: Date.now() });
 }
 
@@ -1571,7 +1640,7 @@ async function processPendingBurnAlerts(){
       }
       pendingBurnAlerts.delete(key);
     }catch(e){
-      console.error(`[BurnMeta] post failed for #${survivorId}:`, e.message);
+      console.error(`[BurnMeta] post failed for #${survivorId}:`, e.message); sendErrorWebhook(`Burn Alert Post Failed #${survivorId}`, e);
       // Keep in queue — retry next tick
     }
   }
@@ -1675,7 +1744,7 @@ async function pollBurnEvents(){
     await processBurnLogs(logs || [], shouldAlert);
     await dbSave('burn_last_block', String(chunkTo));
     if(chunkTo < latest) console.log(`[Burn] Behind by ${latest - chunkTo} block(s)`);
-  }catch(e){ console.error('[Burn poller]', e.message); }
+  }catch(e){ console.error('[Burn poller]', e.message); sendErrorWebhook('Burn Poller Error', e); }
   } finally { _pollBurnRunning = false; }
 }
 
@@ -2528,7 +2597,7 @@ async function pollSales(){
       // Personal DM alerts
       for(const sale of toPost) await sendPersonalAlerts(sale, 'sale', config);
 
-    }catch(e){ console.error('[Poll sales]',guildId,e.message); }
+    }catch(e){ console.error('[Poll sales]',guildId,e.message); sendErrorWebhook('Poll Sales Error', e, `guild=${guildId}`); }
   }
 }
 
@@ -2635,7 +2704,7 @@ async function pollListings(){
 
       for(const l of toPost) await sendPersonalAlerts(l,'listing',config);
 
-    }catch(e){ console.error('[Poll listings]',guildId,e.message); }
+    }catch(e){ console.error('[Poll listings]',guildId,e.message); sendErrorWebhook('Poll Listings Error', e, `guild=${guildId}`); }
   }
 }
 
@@ -3044,10 +3113,10 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   if(pick?.proof){
     const blockLine = seedMeta?.block_number
       ? `\nSeed source: Ethereum block [#${seedMeta.block_number}](https://etherscan.io/block/${seedMeta.block_number})`
-      : seedMeta?.seed_type === 'random_fallback' ? `\nSeed source: random fallback (ETH RPC unavailable at draw time)` : '';
+      : seedMeta?.seed_type === 'random_fallback' ? `\nSeed source: cryptographic random (ETH RPC unavailable — result is fair but not on-chain verifiable)` : '';
     embed.addFields({
       name:'Draw Proof',
-      value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`${blockLine}\nUse the buttons below to check the seed, full SHA-256 hash, winning position, and entries.`,
+      value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`${blockLine}`,
       inline:false
     });
   }
@@ -3364,10 +3433,10 @@ client.on('interactionCreate', async (interaction)=>{
         (winner ? `**Winner:** ${etherscanAddressLink(winner)}\n\`${winner}\`\n` : `**Winner:** none\n`) +
         (winnerPosition ? `**Winning entry:** ${Number(winnerPosition).toLocaleString()} of ${entries.length.toLocaleString()}\n` : '') +
         `\n**How to verify:**\n` +
-        `The draw uses the final ordered entry list. In wallet mode, that means one entry per wallet. In burn mode, that means one entry per burn, so wallets may repeat.\n` +
-        `The seed is the hash of an Ethereum block mined 5 blocks after the lottery window closes — published on-chain before the draw runs, so no one (including the bot operator) can predict or influence it. ` +
-        `The bot hashes the seed plus the exact ordered entry list using SHA-256. The full 256-bit hash is converted to a number, then divided by the entry count to select the winning entry. Same seed + same entries = same winner every time.\n` +
-        ((() => { const rj = row.result_json || {}; return rj.block_number ? `Seed source: Ethereum block [#${rj.block_number}](https://etherscan.io/block/${rj.block_number})\n` : rj.seed_type === 'random_fallback' ? `Seed source: random fallback (ETH RPC unavailable at draw time)\n` : ''; })()) +
+        `One entry per wallet (wallet mode) or one entry per burn (burn mode). ` +
+        `The seed is an Ethereum block hash mined 5 blocks after the window closes — unpredictable by anyone including the bot operator. ` +
+        `SHA-256(seed + ordered entries) → winning index. Same seed + same entries = same winner every time.\n` +
+        ((() => { const rj = row.result_json || {}; return rj.block_number ? `Seed source: Ethereum block [#${rj.block_number}](https://etherscan.io/block/${rj.block_number})\n` : rj.seed_type === 'random_fallback' ? `Seed source: cryptographic random (ETH RPC unavailable — result is fair but not on-chain verifiable)\n` : ''; })()) +
         `\n**Seed:**\n\`${isPendingDrawSeed(row.seed) ? 'Pending — final seed is the hash of an Ethereum block mined after the window closes.' : String(row.seed || '').slice(0, 900)}\`\n` +
         `**Full proof hash:**\n\`${String(proof).slice(0, 128)}\``;
       await interaction.editReply({
@@ -3909,6 +3978,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
   // /traitfind - token search by default; add "listings" or "sales" for those modes.
   if(commandName==='traitfind'){
+    const _tfCool = checkCommandCooldown(interaction.user.id, 'traitfind');
+    if(_tfCool) return interaction.reply({content:`⏳ Please wait **${_tfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const slug       = interaction.options.getString('collection') || config.slug;
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = getRailwayApiUrl();
@@ -4230,6 +4301,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   // /help
   // /rankfilter — show currently listed tokens filtered by OS rank range
   if(commandName==='rankfind'){
+    const _rfCool = checkCommandCooldown(interaction.user.id, 'rankfind');
+    if(_rfCool) return interaction.reply({content:`⏳ Please wait **${_rfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
@@ -4828,6 +4901,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
   // /burn token:ID
   if(commandName==='burn'){
+    const _burnCool = checkCommandCooldown(interaction.user.id, 'burn');
+    if(_burnCool) return interaction.reply({content:`⏳ Please wait **${_burnCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const tokenInput = interaction.options.getInteger('token');
     if(!tokenInput) return interaction.reply({ content:'Provide a token ID.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
@@ -5318,18 +5393,23 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
           const latestBlock2 = parseInt(await burnRpc(rpcUrl2, 'eth_blockNumber', []), 16);
           const targetBlock2 = latestBlock2 + 5;
+          console.log(`[BurnLottery instant] Waiting for Ethereum block #${targetBlock2} (current: ${latestBlock2})...`);
           const arrived2 = await waitForEthBlock(targetBlock2);
           if(arrived2){
             const { hash: bHash, blockNumber: bNum } = await fetchEthBlockHashSeed(targetBlock2);
             drawSeed = bHash;
             seedMeta = { seed_type: 'eth_block_hash', block_number: bNum, block_hash: bHash };
+            console.log(`[BurnLottery instant] Seed: block #${bNum} hash ${bHash}`);
           } else {
             drawSeed = randomLotterySeed();
             seedMeta = { seed_type: 'random_fallback', reason: 'eth_block_timeout' };
+            console.warn('[BurnLottery instant] ETH block timeout — falling back to random seed');
           }
         }catch(ethErr){
           drawSeed = randomLotterySeed();
           seedMeta = { seed_type: 'random_fallback', reason: ethErr.message };
+          console.warn(`[BurnLottery instant] ETH block fetch failed: ${ethErr.message} — falling back to random seed`);
+          sendErrorWebhook('BurnLottery Instant ETH Seed Failed', ethErr, `guild=${guildId}`);
         }
       }
 
@@ -5351,7 +5431,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         components:buildBurnLotteryComponents(lotteryId)
       });
     }catch(e){
-      console.error('[/burnlottery]', e);
+      console.error('[/burnlottery]', e); sendErrorWebhook('/burnlottery Error', e, `guild=${guildId}`);
       const msg = String(e.message || '');
       if(/could not parse|invalid .*date|could not parse time|invalid .*time/i.test(msg)){
         return interaction.editReply(`${burnLotteryParseErrorMessage()}\n\n${msg}`);
@@ -5599,6 +5679,7 @@ client.on('guildCreate', async (guild)=>{
 // ── Boot ──────────────────────────────────────────────────────────────────────
 client.once('clientReady', async ()=>{
   console.log('Bot online as '+client.user.tag);
+  checkStartupEnvVars();
   console.log('OpenSea key: '+(OPENSEA_KEY?'set':'NOT SET'));
   // Init Railway DB table, then load all persisted state
   await ensureBotStateTable();
@@ -5631,6 +5712,6 @@ client.once('clientReady', async ()=>{
   setInterval(processDueGenericLotteries, 60_000);
 });
 
-client.on('error',e=>console.error('[Discord]',e.message));
-process.on('unhandledRejection',e=>console.error('[Bot]',e));
+client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
+process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
