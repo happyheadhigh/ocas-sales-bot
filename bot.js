@@ -1989,15 +1989,11 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
            source=EXCLUDED.source,
            updated_at=NOW()
          WHERE (
-           -- Always overwrite if incoming priority is higher.
-           -- Also allow same-source overwrite (e.g. burn-start-input updating burn-start-input
-           -- on a re-burned token whose type changed since the first burn).
            CASE WHEN token_image_snapshots.source = 'burn-start-input' THEN 3
                 WHEN token_image_snapshots.source = 'backfill-chunks' THEN 2
                 WHEN token_image_snapshots.source = 'burn-finalized-survivor' THEN 1
                 ELSE 0 END
-         ) < $5
-         OR token_image_snapshots.source = $4`,
+         ) < $5`,
         [id, String(img), JSON.stringify(traitsForSnapshot), source, newPriority]
       ).catch(()=>{});
     }
@@ -4909,15 +4905,16 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       // Oldest first (Burn 1 → Burn N), up to 10 most recent
       const displayBurns = burns.length > 10 ? burns.slice(burns.length - 10) : [...burns];
 
-      await Promise.all(displayBurns.map(async (b, i) => {
+      for(let i = 0; i < displayBurns.length; i++){
+        const b = displayBurns[i];
         // burnNum is the actual position in the full chain, not just the display slice
         const burnNum = burns.indexOf(b) + 1;
         const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const ids      = (b.burned_ids||[]).filter(Boolean);
         const tokensStr = await burnTypeBreakdown(ids).catch(()=>String(ids.length || '?'));
-        // For the first burn, show what the token was before (original mint type)
+        // For burn 1 in the full chain, show original mint type
         let preBurnNote = '';
-        if(i === 0){
+        if(burnNum === 1){
           try{
             const snapRow = await pgPool.query(
               `SELECT traits_json->'Type' as type FROM token_original_snapshots
@@ -4938,7 +4935,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           `**Points:** ${b.points_used||0}${preBurnNote}`,
         ].join('\n');
         embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:true });
-      }));
+      }
 
       if(burns.length > 10){
         embed.addFields({ name:`+${burns.length-10} earlier burns`, value:'Only the 10 most recent burns are shown.', inline:false });
