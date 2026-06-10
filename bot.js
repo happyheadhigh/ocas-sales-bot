@@ -2912,7 +2912,11 @@ function formatBurnLotteryLocalTime(d, timeZone){
 function formatLotteryHours(hours){
   const n = Number(hours);
   if(!Number.isFinite(n)) return 'unknown';
-  return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(2)));
+  if(n < 1){
+    const mins = Math.round(n * 60);
+    return `${mins} minute${mins === 1 ? '' : 's'}`;
+  }
+  return (Number.isInteger(n) ? String(n) : String(Number(n.toFixed(2)))) + ' hour' + (n === 1 ? '' : 's');
 }
 
 function burnLotteryWindowDurationHours(start, end){
@@ -2923,19 +2927,19 @@ function burnLotteryWindowDetails(start, end, timeZone){
   const tz = normalizeLotteryTimezone(timeZone);
   return [
     `Timezone: ${tz}`,
-    `Duration: ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} hours`
+    `Duration: ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))}`
   ].join('\n');
 }
 
 function burnLotteryWindowSummary(start, end){
-  return `${lotteryTime(start)} -> ${lotteryTime(end)}\nDuration: ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} hours`;
+  return `${lotteryTime(start)} -> ${lotteryTime(end)}\nDuration: ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))}`;
 }
 
 function burnLotteryWindowStatusLine(row){
   const tz = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
   const start = new Date(row.start_time);
   const end = new Date(row.end_time);
-  return `#${row.id} · ${row.status} · ${lotteryTime(start)} -> ${lotteryTime(end)} · ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} hours · ${tz}${row.winner_wallet?' · winner '+shortAddr(row.winner_wallet):''}`;
+  return `#${row.id} · ${row.status} · ${lotteryTime(start)} -> ${lotteryTime(end)} · ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} · ${tz}${row.winner_wallet?' · winner '+shortAddr(row.winner_wallet):''}`;
 }
 
 function burnLotteryParseErrorMessage(){
@@ -5262,8 +5266,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       if(id){
         const r = await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]);
         if(!r.rows.length) return interaction.editReply('Lottery not found.');
-        await drawAndPostBurnLottery(r.rows[0]);
-        return interaction.editReply(`Drew burn lottery #${id}.\nWindow: ${formatBurnLotteryWindow(r.rows[0].start_time, r.rows[0].end_time, r.rows[0].timezone || DEFAULT_LOTTERY_TIMEZONE)}\nTimezone: ${r.rows[0].timezone || DEFAULT_LOTTERY_TIMEZONE}`);
+        const lotteryRow = r.rows[0];
+        if(lotteryRow.status === 'completed') return interaction.editReply(`Lottery #${id} is already completed.`);
+        await interaction.editReply('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)');
+        await drawAndPostBurnLottery(lotteryRow);
+        return interaction.editReply({ content: null, embeds:[new EmbedBuilder().setColor(COLORS.OCAS_GREEN).setDescription(`✅ Drew burn lottery #${id} — result posted in <#${lotteryRow.channel_id}>`).setTimestamp()] });
       }
       const mode = interaction.options.getString('mode') || 'wallet';
       const timezoneInput = interaction.options.getString('timezone');
