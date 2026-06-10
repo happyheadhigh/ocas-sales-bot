@@ -1989,11 +1989,15 @@ async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
            source=EXCLUDED.source,
            updated_at=NOW()
          WHERE (
+           -- Always overwrite if incoming priority is higher.
+           -- Also allow same-source overwrite (e.g. burn-start-input updating burn-start-input
+           -- on a re-burned token whose type changed since the first burn).
            CASE WHEN token_image_snapshots.source = 'burn-start-input' THEN 3
                 WHEN token_image_snapshots.source = 'backfill-chunks' THEN 2
                 WHEN token_image_snapshots.source = 'burn-finalized-survivor' THEN 1
                 ELSE 0 END
-         ) < $5`,
+         ) < $5
+         OR token_image_snapshots.source = $4`,
         [id, String(img), JSON.stringify(traitsForSnapshot), source, newPriority]
       ).catch(()=>{});
     }
@@ -4902,11 +4906,12 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         .setURL(osUrl)
         .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
 
-      // Most recent first, up to 10
-      const displayBurns = [...burns].slice(0, 10);
+      // Oldest first (Burn 1 → Burn N), up to 10 most recent
+      const displayBurns = burns.length > 10 ? burns.slice(burns.length - 10) : [...burns];
 
       await Promise.all(displayBurns.map(async (b, i) => {
-        const burnNum = i + 1;
+        // burnNum is the actual position in the full chain, not just the display slice
+        const burnNum = burns.indexOf(b) + 1;
         const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const ids      = (b.burned_ids||[]).filter(Boolean);
         const tokensStr = await burnTypeBreakdown(ids).catch(()=>String(ids.length || '?'));
