@@ -4889,7 +4889,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const tokensStr   = burnedIds.length ? burnedIds.map(id=>`#${id}`).join(', ') : '?';
         const embed = new EmbedBuilder()
           .setColor(BURN_COLORS.FIRE)
-          .setTitle(`#${tokenInput} — consumed in burn`)
+          .setTitle(`#${tokenInput} — burned`)
           .setDescription(`This token was burned **${ago}** and helped create [#${survivorId}](${survivorUrl}).`)
           .addFields(
             { name:'Burner',           value:`[${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`, inline:true },
@@ -4926,7 +4926,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         .setColor(BURN_COLORS.FIRE)
         .setTitle(`🔥 #${tokenInput} burn history`)
         .setDescription(
-          `Burned **${burns.length} time${burns.length===1?"":"s"}** · **${totalTokensBurned} tokens** consumed · **${totalPts} pts** total`
+          `Burned **${burns.length} time${burns.length===1?"":"s"}** · **${totalTokensBurned} tokens** burned · **${totalPts} pts** total`
         )
         .setURL(osUrl)
         .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
