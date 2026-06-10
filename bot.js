@@ -3741,13 +3741,23 @@ client.on('interactionCreate', async (interaction)=>{
       const r = await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1', [lotteryId]);
       if(!r.rows.length){ await interaction.editReply({ content:'Lottery not found.' }); return; }
       const row = r.rows[0];
-      const isPending = row.status === 'active';
+      const isPending = row.status === 'active' || row.status === 'processing';
+      const rj = row.result_json || {};
+      const blockNum = rj.block_number || null;
+      const seedType = rj.seed_type || null;
+
       const seedDisplay = isPending
         ? 'Generated at draw time using an Ethereum block hash — unpredictable by anyone including the bot operator.'
         : `\`${String(row.seed).slice(0, 256)}\``;
-      const proofDisplay = row.result_json?.proof
-        ? `\`${String(row.result_json.proof).slice(0, 64)}...\``
+      const proofDisplay = rj.proof
+        ? `\`${String(rj.proof).slice(0, 64)}...\``
         : isPending ? 'Generated at draw time.' : 'Not available.';
+      const seedSourceLine = blockNum
+        ? `Seed source: Ethereum block [#${blockNum}](https://etherscan.io/block/${blockNum})`
+        : seedType === 'random_fallback'
+          ? 'Seed source: cryptographic random (ETH RPC unavailable — result is fair but not on-chain verifiable)'
+          : '';
+
       const content = [
         `**🎲 Draw Proof — Lottery #${lotteryId}**`,
         `**Type:** ${row.type === 'guess' ? 'Guess the number' : 'Giveaway button entries'}`,
@@ -3757,12 +3767,13 @@ client.on('interactionCreate', async (interaction)=>{
         `**How to verify:**`,
         `One entry per user. The seed is an Ethereum block hash fetched at draw time — published on-chain before the result is calculated, so no one can predict or influence it.`,
         `SHA-256(seed + ordered entry list) → winning index. Same seed + same entries = same winner every time.`,
+        seedSourceLine,
         ``,
         `**Seed:**`,
         seedDisplay,
         `**Proof Hash:**`,
         proofDisplay,
-      ].join('\n');
+      ].filter(s => s !== undefined).join('\n');
       await interaction.editReply({ content: content.slice(0, 1900) });
     }catch(e){
       console.error('[GenericLottery Proof]', e.message);
@@ -5643,9 +5654,27 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         if(!r.rows.length) return interaction.editReply('Lottery not found.');
         const lotteryRow = r.rows[0];
         if(lotteryRow.status === 'completed') return interaction.editReply(`Lottery #${id} is already completed.`);
-        await interaction.editReply('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)');
+
+        // Show the scheduled lottery embed with ⏳ fetching message
+        const drawStart = new Date(lotteryRow.start_time), drawEnd = new Date(lotteryRow.end_time);
+        const drawTz = lotteryRow.timezone || DEFAULT_LOTTERY_TIMEZONE;
+        const fetchingEmbed = new EmbedBuilder()
+          .setTitle('🎟️ OCAS Burn Lottery')
+          .setColor(COLORS.OCAS_GREEN)
+          .setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)')
+          .addFields(
+            { name:'ID', value:String(lotteryRow.id), inline:true },
+            { name:'Window', value:formatBurnLotteryWindow(drawStart, drawEnd, drawTz), inline:false },
+            { name:'Mode', value:lotteryRow.mode === 'burn' ? 'One entry per burn' : 'One entry per wallet', inline:true },
+          )
+          .setTimestamp();
+        await interaction.editReply({ embeds:[fetchingEmbed], components:[] });
+
         await drawAndPostBurnLottery(lotteryRow);
-        return interaction.editReply({ content: null, embeds:[new EmbedBuilder().setColor(COLORS.OCAS_GREEN).setDescription(`✅ Drew burn lottery #${id} — result posted in <#${lotteryRow.channel_id}>`).setTimestamp()] });
+
+        // Update to draw complete
+        const doneEmbed = EmbedBuilder.from(fetchingEmbed).setDescription('✅ Draw complete.');
+        return interaction.editReply({ embeds:[doneEmbed], components:[] });
       }
       const mode = interaction.options.getString('mode') || 'wallet';
       const timezoneInput = interaction.options.getString('timezone');
