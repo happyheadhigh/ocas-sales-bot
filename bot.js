@@ -3138,11 +3138,15 @@ function buildGenericLotteryResultEmbed(row, entries, result){
 }
 async function findActiveGenericLottery(guildId,type=null){ const params=[guildId]; let q=`SELECT * FROM generic_lotteries WHERE guild_id=$1 AND status='active' AND end_time > NOW()`; if(type){params.push(type); q+=` AND type=$2`;} q+=` ORDER BY id DESC LIMIT 1`; const r=await pgPool.query(q,params); return r.rows[0]||null; }
 async function getGenericLotteryEntryCount(id){ const r=await pgPool.query('SELECT COUNT(*)::int count FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]})); return parseInt(r.rows[0]?.count||0); }
-async function drawGenericLottery(row, post=true){
+async function drawGenericLottery(row, post=true, ethSeed=null){
   const er=await pgPool.query('SELECT user_id, username, guess_number, entered_at FROM generic_lottery_entries WHERE lottery_id=$1 ORDER BY entered_at ASC,user_id ASC',[row.id]);
   const entries=er.rows; let result={winner:null,proof:null};
-  if(row.type==='guess'){ const valid=entries.filter(x=>x.guess_number!=null); row.winning_number=row.winning_number??lotteryNumberFromSeed(`${row.seed}:winning-number`,row.min_number||1,row.max_number||100); let pool=valid.filter(x=>parseInt(x.guess_number)===parseInt(row.winning_number)); if(!pool.length && row.winner_mode!=='exact' && valid.length){ const d=Math.min(...valid.map(x=>Math.abs(parseInt(x.guess_number)-parseInt(row.winning_number)))); pool=valid.filter(x=>Math.abs(parseInt(x.guess_number)-parseInt(row.winning_number))===d); } if(pool.length){ const p=lotteryPick(pool.map(x=>x.user_id),`${row.seed}:guess:${row.id}:${row.winning_number}`); result={winner:pool.find(x=>x.user_id===p.winner)||pool[0],proof:p.proof}; } }
-  else { const p=lotteryPick(entries.map(x=>x.user_id),`${row.seed}:giveaway:${row.id}`); if(p) result={winner:entries.find(x=>x.user_id===p.winner)||entries[p.index],proof:p.proof}; }
+  // Use ETH block hash seed if provided, otherwise fall back to stored seed
+  const activeSeed = ethSeed || row.seed;
+  if(row.type==='guess'){ const valid=entries.filter(x=>x.guess_number!=null); row.winning_number=row.winning_number??lotteryNumberFromSeed(`${activeSeed}:winning-number`,row.min_number||1,row.max_number||100); let pool=valid.filter(x=>parseInt(x.guess_number)===parseInt(row.winning_number)); if(!pool.length && row.winner_mode!=='exact' && valid.length){ const d=Math.min(...valid.map(x=>Math.abs(parseInt(x.guess_number)-parseInt(row.winning_number)))); pool=valid.filter(x=>Math.abs(parseInt(x.guess_number)-parseInt(row.winning_number))===d); } if(pool.length){ const p=lotteryPick(pool.map(x=>x.user_id),`${activeSeed}:guess:${row.id}:${row.winning_number}`); result={winner:pool.find(x=>x.user_id===p.winner)||pool[0],proof:p.proof}; } }
+  else { const p=lotteryPick(entries.map(x=>x.user_id),`${activeSeed}:giveaway:${row.id}`); if(p) result={winner:entries.find(x=>x.user_id===p.winner)||entries[p.index],proof:p.proof}; }
+  // Store the seed used (ETH hash if available)
+  if(ethSeed) await pgPool.query('UPDATE generic_lotteries SET seed=$1 WHERE id=$2',[ethSeed,row.id]).catch(()=>{});
   await pgPool.query(`UPDATE generic_lotteries SET status='completed', winner_user_id=$1,winner_display=$2,winner_guess=$3,entry_count=$4,result_json=$5,completed_at=NOW(),winning_number=$6 WHERE id=$7`,[result.winner?.user_id||null,result.winner?.username||null,result.winner?.guess_number??null,entries.length,JSON.stringify({proof:result.proof||null}),row.winning_number??null,row.id]);
   const embed=buildGenericLotteryResultEmbed(row,entries,result); if(post){ const ch=await resolveDiscordChannel(row.channel_id); if(ch) await ch.send({embeds:[embed]}); } return {embed,entries,result};
 }
@@ -5391,7 +5395,17 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       }
       if(sub==='draw'){
         await interaction.deferReply(); const id=interaction.options.getInteger('id'); const r=await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]); const row=r.rows[0]; if(!row) return interaction.editReply('Lottery not found.'); if(row.status!=='active') return interaction.editReply('Lottery is not active.');
-        const out=await drawGenericLottery(row,false); return interaction.editReply({embeds:[out.embed]});
+        await interaction.editReply('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)');
+        let ethSeed = null;
+        try{
+          const rpcUrlG = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') || `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+          const latestBlockG = parseInt(await burnRpc(rpcUrlG, 'eth_blockNumber', []), 16);
+          const targetBlockG = latestBlockG + 5;
+          const arrivedG = await waitForEthBlock(targetBlockG);
+          if(arrivedG){ const { hash: bHashG } = await fetchEthBlockHashSeed(targetBlockG); ethSeed = bHashG; }
+        }catch(_){}
+        const out=await drawGenericLottery(row, false, ethSeed);
+        return interaction.editReply({ content: null, embeds:[out.embed] });
       }
       if(sub==='cancel'){
         const id=interaction.options.getInteger('id'); const r=await pgPool.query("UPDATE generic_lotteries SET status='cancelled' WHERE id=$1 AND guild_id=$2 AND status='active' RETURNING id",[id,guildId]);
