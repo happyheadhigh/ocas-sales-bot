@@ -2709,8 +2709,10 @@ async function waitForEthBlock(targetBlock){
     `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
   const deadline = Date.now() + 3 * 60 * 1000;
   while(Date.now() < deadline){
-    const latest = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
-    if(latest >= targetBlock) return true;
+        try{
+      const latest = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
+      if(latest >= targetBlock) return true;
+    }catch(_){}
     await new Promise(r => setTimeout(r, 12000));
   }
   return false;
