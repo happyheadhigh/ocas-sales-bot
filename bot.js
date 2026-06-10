@@ -878,6 +878,7 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
   const burnerWallet = startEvent?.owner || 'unknown';
   const burnedIds    = startEvent?.tokenIds || [];
   const txHash       = finalEvent.txHash || '';
+  const burnEventId  = finalEvent.burnEventId || null;
 
   const color     = burnTypeColor(bodyType, isAngel);
 
@@ -892,7 +893,7 @@ async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
   const burnedCount = burnedIds.length || '?';
   // Type breakdown: "3 · 3x Human" or "2 · 1x Zombie, 1x Ape"
   const burnedCountStr = burnedIds.length
-    ? await burnTypeBreakdown(burnedIds).catch(()=>String(burnedCount))
+    ? await burnTypeBreakdown(burnedIds, burnEventId).catch(()=>String(burnedCount))
     : String(burnedCount);
 
   // Prefer directly-passed freshTraits over cache to avoid stale-cache races.
@@ -2049,7 +2050,7 @@ function normalizeOcasType(raw){
 // Returns a compact type breakdown string for a list of burned token IDs.
 // Looks up each token's Type trait from token_traits DB.
 // Example output: "3 · 3x Human" or "2 · 1x Zombie, 1x Ape"
-async function burnTypeBreakdown(tokenIds){
+async function burnTypeBreakdown(tokenIds, burnEventId=null){
   if(!tokenIds || !tokenIds.length) return String(tokenIds?.length || '?');
   try{
     const ids = tokenIds.filter(Boolean).map(Number);
@@ -2057,22 +2058,49 @@ async function burnTypeBreakdown(tokenIds){
 
     const typeMap = {};
 
-    // Step 1: burn-start-input snapshots — most accurate for re-burned tokens,
-    // captured at the exact moment the token was selected for burning.
-    const snapBurn = await pgPool.query(
-      `SELECT token_id, traits_json FROM token_image_snapshots
-       WHERE token_id = ANY($1) AND source = 'burn-start-input'`,
-      [ids]
-    );
-    for(const row of snapBurn.rows){
-      if(!row.traits_json) continue;
-      const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
-      const rawType = tj?.Type || tj?.type || null;
-      if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
+    // Step 1 (best): burn_state_snapshots from the PREVIOUS burn event for each token.
+    // This is the most historically accurate source — it records the post-burn state
+    // of a token after each burn, which equals the pre-burn state going into the next burn.
+    // For a given burn event, we look for the most recent burn_state_snapshot for each
+    // input token that was written BEFORE this burn event.
+    if(burnEventId){
+      const stateSnap = await pgPool.query(
+        `SELECT DISTINCT ON (bss.token_id) bss.token_id, bss.traits_json
+         FROM burn_state_snapshots bss
+         WHERE bss.token_id = ANY($1)
+           AND bss.burn_event_id < $2
+         ORDER BY bss.token_id, bss.burn_event_id DESC`,
+        [ids, burnEventId]
+      );
+      for(const row of stateSnap.rows){
+        if(!row.traits_json) continue;
+        const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
+        const rawType = tj?.Type || tj?.type || null;
+        if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
+      }
     }
 
-    // Step 2: backfill-chunks snapshots — original mint traits, correct when
-    // no burn-start-input exists (token was never snapshotted at burn time).
+    // Step 2: burn-start-input snapshots — for tokens not covered by state snapshots,
+    // use the snapshot captured at the moment the token was selected for burning.
+    // Note: for re-burned tokens this may be stale (frozen at first burn), so it's
+    // only used as fallback when no state snapshot exists.
+    const missing0 = ids.filter(id => !typeMap[id]);
+    if(missing0.length){
+      const snapBurn = await pgPool.query(
+        `SELECT token_id, traits_json FROM token_image_snapshots
+         WHERE token_id = ANY($1) AND source = 'burn-start-input'`,
+        [missing0]
+      );
+      for(const row of snapBurn.rows){
+        if(!row.traits_json) continue;
+        const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
+        const rawType = tj?.Type || tj?.type || null;
+        if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
+      }
+    }
+
+    // Step 3: backfill-chunks snapshots — original mint traits, correct for tokens
+    // that were never snapshotted at burn time (first-time burns, never re-burned).
     const missing1 = ids.filter(id => !typeMap[id]);
     if(missing1.length){
       const snapBackfill = await pgPool.query(
@@ -2088,7 +2116,7 @@ async function burnTypeBreakdown(tokenIds){
       }
     }
 
-    // Step 3: token_traits — last resort, may reflect current state after re-burns
+    // Step 4: token_traits — last resort, may reflect current state after re-burns
     const missing2 = ids.filter(id => !typeMap[id]);
     if(missing2.length){
       const r = await pgPool.query(
@@ -3463,7 +3491,7 @@ client.on('interactionCreate', async (interaction)=>{
         const burnNum = i + 1;
         const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const ids = (b.burned_ids||[]).filter(Boolean);
-        const tokensStr = await burnTypeBreakdown(ids).catch(()=>String(ids.length||'?'));
+        const tokensStr = await burnTypeBreakdown(ids, b.id).catch(()=>String(ids.length||'?'));
         // Pre-burn state: Burn 1 = original archive, Burn N = post-state of Burn N-1
         let snap = null;
         if(i === 0){
@@ -4911,7 +4939,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const burnNum = burns.indexOf(b) + 1;
         const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
         const ids      = (b.burned_ids||[]).filter(Boolean);
-        const tokensStr = await burnTypeBreakdown(ids).catch(()=>String(ids.length || '?'));
+        const tokensStr = await burnTypeBreakdown(ids, b.id).catch(()=>String(ids.length || '?'));
         // For burn 1 in the full chain, show original mint type
         let preBurnNote = '';
         if(burnNum === 1){
