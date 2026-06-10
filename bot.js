@@ -4919,7 +4919,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
       const burns            = chainRes.rows;
       const totalPts         = burns.reduce((s,r)=>s+(r.points_used||0), 0);
-      const totalTokensBurned = burns.reduce((s,r)=>s+((r.burned_ids||[]).filter(Boolean).length), 0);
+      // Subtract 1 per burn for the survivor token — it upgrades itself and is never actually consumed.
+      const totalTokensBurned = burns.reduce((s,r)=>s+Math.max(0,(r.burned_ids||[]).filter(Boolean).length - 1), 0);
 
       const embed = new EmbedBuilder()
         .setColor(BURN_COLORS.FIRE)
