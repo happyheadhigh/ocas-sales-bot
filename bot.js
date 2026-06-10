@@ -2665,6 +2665,29 @@ function randomLotterySeed(){
   return require('crypto').randomBytes(32).toString('hex');
 }
 
+// Fetch the block hash of a specific Ethereum block number via the existing RPC.
+// Used as the public, tamper-proof seed for burn lotteries.
+async function fetchEthBlockHashSeed(targetBlock){
+  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
+    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+  const block = await burnRpc(rpcUrl, 'eth_getBlockByNumber', ['0x' + targetBlock.toString(16), false]);
+  if(!block || !block.hash) throw new Error(`Block #${targetBlock} not found or has no hash`);
+  return { hash: block.hash, blockNumber: targetBlock };
+}
+
+// Wait for a target block to be mined, polling every 12 seconds, timeout 3 minutes.
+async function waitForEthBlock(targetBlock){
+  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
+    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+  const deadline = Date.now() + 3 * 60 * 1000;
+  while(Date.now() < deadline){
+    const latest = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
+    if(latest >= targetBlock) return true;
+    await new Promise(r => setTimeout(r, 12000));
+  }
+  return false;
+}
+
 function pendingDrawSeed(){
   // Stored only so scheduled lotteries can be created before the final random seed exists.
   // The real public draw seed is generated at draw time.
@@ -2866,8 +2889,6 @@ function burnLotteryWindowDurationHours(start, end){
 function burnLotteryWindowDetails(start, end, timeZone){
   const tz = normalizeLotteryTimezone(timeZone);
   return [
-    `Window local: ${formatBurnLotteryLocalTime(start, tz)} -> ${formatBurnLotteryLocalTime(end, tz)}`,
-    `Window UTC: ${new Date(start).toISOString()} -> ${new Date(end).toISOString()}`,
     `Timezone: ${tz}`,
     `Duration: ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} hours`
   ].join('\n');
@@ -2971,7 +2992,7 @@ async function getBurnLotteryEntries(start, end, mode='wallet'){
   const entries = mode === 'burn' ? burns.map(b=>String(b.burner_wallet).toLowerCase()).filter(Boolean) : wallets;
   return { entries, wallets, burns };
 }
-function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, end, seed, entries, wallets, burns, pick, lotteryId, timezone=DEFAULT_LOTTERY_TIMEZONE}){
+function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, end, seed, entries, wallets, burns, pick, lotteryId, timezone=DEFAULT_LOTTERY_TIMEZONE, seedMeta=null}){
   const timeZone = normalizeLotteryTimezone(timezone);
   const embed = new EmbedBuilder().setTitle(`🎟️ ${title}`).setColor(COLORS.OCAS_GREEN).addFields(
     { name:'Window', value:formatBurnLotteryWindow(start, end, timeZone), inline:false },
@@ -2981,11 +3002,16 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   );
   if(prize) embed.addFields({ name:'Prize', value:String(prize).slice(0,1024), inline:false });
   if(pick?.winner) embed.addFields({ name:'Winner', value:etherscanAddressLink(pick.winner), inline:false });
-  if(pick?.proof) embed.addFields({
-    name:'Draw Proof',
-    value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`\nUse the buttons below to check the seed, full SHA-256 hash, winning position, and entries.`,
-    inline:false
-  });
+  if(pick?.proof){
+    const blockLine = seedMeta?.block_number
+      ? `\nSeed source: Ethereum block [#${seedMeta.block_number}](https://etherscan.io/block/${seedMeta.block_number})`
+      : seedMeta?.seed_type === 'random_fallback' ? `\nSeed source: random fallback (ETH RPC unavailable at draw time)` : '';
+    embed.addFields({
+      name:'Draw Proof',
+      value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`${blockLine}\nUse the buttons below to check the seed, full SHA-256 hash, winning position, and entries.`,
+      inline:false
+    });
+  }
   embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
   return embed;
 }
@@ -2994,13 +3020,41 @@ async function drawAndPostBurnLottery(row){
   const timeZone = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
   const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
 
-  // For scheduled lotteries, generate the final public seed at draw time,
-  // after the entry window is closed and the final eligible list is known.
-  // If an admin explicitly supplied a seed, keep it. If the lottery was already
-  // completed and re-viewed, keep the stored seed so proof stays repeatable.
-  const drawSeed = (row.status === 'active' && isPendingDrawSeed(row.seed))
-    ? randomLotterySeed()
-    : String(row.seed || randomLotterySeed());
+  let drawSeed, seedMeta = {};
+
+  if(row.status === 'active' && isPendingDrawSeed(row.seed)){
+    // Use Ethereum block hash as the tamper-proof public seed.
+    // Target: the block mined 5 blocks after the end of the lottery window,
+    // giving finality and ensuring no one (including the bot operator) can
+    // predict or influence the seed before the entry window closes.
+    try{
+      const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
+        `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+      const latestBlock = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
+      const targetBlock = latestBlock + 5;
+      console.log(`[BurnLottery #${row.id}] Waiting for Ethereum block #${targetBlock} (current: ${latestBlock})...`);
+      const arrived = await waitForEthBlock(targetBlock);
+      if(arrived){
+        const { hash, blockNumber } = await fetchEthBlockHashSeed(targetBlock);
+        drawSeed = hash; // Full 66-char 0x-prefixed block hash is the seed
+        seedMeta = { seed_type: 'eth_block_hash', block_number: blockNumber, block_hash: hash };
+        console.log(`[BurnLottery #${row.id}] Seed: block #${blockNumber} hash ${hash}`);
+      } else {
+        // Fallback to randomBytes if RPC unavailable after timeout
+        drawSeed = randomLotterySeed();
+        seedMeta = { seed_type: 'random_fallback', reason: 'eth_block_timeout' };
+        console.warn(`[BurnLottery #${row.id}] ETH block timeout — falling back to random seed`);
+      }
+    }catch(e){
+      drawSeed = randomLotterySeed();
+      seedMeta = { seed_type: 'random_fallback', reason: e.message };
+      console.warn(`[BurnLottery #${row.id}] ETH block fetch failed: ${e.message} — falling back to random seed`);
+    }
+  } else {
+    // Admin-supplied seed or already-completed lottery being re-viewed — keep as-is
+    drawSeed = String(row.seed || randomLotterySeed());
+    seedMeta = { seed_type: 'admin_supplied' };
+  }
 
   const pick = lotteryPick(entries, drawSeed);
   await pgPool.query(
@@ -3008,12 +3062,14 @@ async function drawAndPostBurnLottery(row){
      SET status='completed', seed=$1, winner_wallet=$2, qualified_wallets=$3, total_burns=$4,
          result_json=$5, completed_at=NOW()
      WHERE id=$6`,
-    [drawSeed, pick?.winner||null, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick?.proof||null, winner_index:pick?.index ?? null, winner_position:pick?.position ?? null, seed_generated_at:'draw_time'}), row.id]
+    [drawSeed, pick?.winner||null, wallets.length, burns.length,
+     JSON.stringify({entries:entries.length, proof:pick?.proof||null, winner_index:pick?.index ?? null, winner_position:pick?.position ?? null, ...seedMeta}),
+     row.id]
   );
   const ch = await resolveDiscordChannel(row.channel_id);
   if(ch){
     await ch.send({
-      embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone})],
+      embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone, seedMeta})],
       components:buildBurnLotteryComponents(row.id)
     });
   }
@@ -3252,8 +3308,10 @@ client.on('interactionCreate', async (interaction)=>{
         (winnerPosition ? `**Winning entry:** ${Number(winnerPosition).toLocaleString()} of ${entries.length.toLocaleString()}\n` : '') +
         `\n**How to verify:**\n` +
         `The draw uses the final ordered entry list. In wallet mode, that means one entry per wallet. In burn mode, that means one entry per burn, so wallets may repeat.\n` +
-        `The bot hashes the public seed plus the exact ordered entry list using SHA-256. The full 256-bit hash is converted to a number, then divided by the entry count to select the winning entry number above. Same seed + same entries = same winner every time.\n\n` +
-        `**Seed:**\n\`${isPendingDrawSeed(row.seed) ? 'Pending — final seed is generated at draw time.' : String(row.seed || '').slice(0, 900)}\`\n` +
+        `The seed is the hash of an Ethereum block mined 5 blocks after the lottery window closes — published on-chain before the draw runs, so no one (including the bot operator) can predict or influence it. ` +
+        `The bot hashes the seed plus the exact ordered entry list using SHA-256. The full 256-bit hash is converted to a number, then divided by the entry count to select the winning entry. Same seed + same entries = same winner every time.\n` +
+        ((() => { const rj = row.result_json || {}; return rj.block_number ? `Seed source: Ethereum block [#${rj.block_number}](https://etherscan.io/block/${rj.block_number})\n` : rj.seed_type === 'random_fallback' ? `Seed source: random fallback (ETH RPC unavailable at draw time)\n` : ''; })()) +
+        `\n**Seed:**\n\`${isPendingDrawSeed(row.seed) ? 'Pending — final seed is the hash of an Ethereum block mined after the window closes.' : String(row.seed || '').slice(0, 900)}\`\n` +
         `**Full proof hash:**\n\`${String(proof).slice(0, 128)}\``;
       await interaction.editReply({
         content:content.slice(0, 1900),
