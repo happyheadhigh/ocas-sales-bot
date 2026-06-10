@@ -3056,6 +3056,10 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   return embed;
 }
 async function drawAndPostBurnLottery(row){
+  // Claim the lottery immediately to prevent double-draw during ETH block wait
+  const claim = await pgPool.query(`UPDATE burn_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`, [row.id]);
+  if(!claim.rows.length) return; // Another process already claimed it
+  const start = new Date(row.start_time), end = new Date(row.end_time);
   const start = new Date(row.start_time), end = new Date(row.end_time);
   const timeZone = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
   const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
