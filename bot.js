@@ -77,6 +77,8 @@ const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BURN_START_BLOCK, 10) : null;
 const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
 const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10)); // Alchemy free tier max 10 blocks per eth_getLogs
+const BURN_LAG_ALERT_BLOCKS = 50; // send webhook alert if burn poller falls more than N blocks behind
+let _lastLagAlertTs = 0; // debounce lag alerts — max one per 10 minutes
 const BURN_ALERT_CHANNEL_ID = process.env.BURN_ALERT_CHANNEL_ID || '';
 const BURN_METADATA_REFRESH_ENABLED = true; // always on — needed for correct post-burn traits in alert
 const BURN_COLORS = {
@@ -1745,7 +1747,20 @@ async function pollBurnEvents(){
     if(logs?.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${fromBlock}-${chunkTo}`);
     await processBurnLogs(logs || [], shouldAlert);
     await dbSave('burn_last_block', String(chunkTo));
-    if(chunkTo < latest) console.log(`[Burn] Behind by ${latest - chunkTo} block(s)`);
+    const lagBlocks = latest - chunkTo;
+    if(lagBlocks > 0){
+      console.log(`[Burn] Behind by ${lagBlocks} block(s)`);
+      // Alert if lag exceeds threshold and we haven't alerted recently
+      if(lagBlocks >= BURN_LAG_ALERT_BLOCKS && Date.now() - _lastLagAlertTs > 10 * 60 * 1000){
+        _lastLagAlertTs = Date.now();
+        sendErrorWebhook(
+          'Burn Poller Lag Alert',
+          new Error(`Poller is ${lagBlocks} blocks behind latest block ${latest}`),
+          `fromBlock=${fromBlock} chunkTo=${chunkTo} gap=${lagBlocks}`
+        );
+        console.warn(`[Burn] ⚠️ Lag alert fired — ${lagBlocks} blocks behind`);
+      }
+    }
   }catch(e){ console.error('[Burn poller]', e.message); sendErrorWebhook('Burn Poller Error', e); }
   } finally { _pollBurnRunning = false; }
 }
@@ -3214,18 +3229,77 @@ function buildGenericLotteryResultEmbed(row, entries, result){
 async function findActiveGenericLottery(guildId,type=null){ const params=[guildId]; let q=`SELECT * FROM generic_lotteries WHERE guild_id=$1 AND status='active' AND end_time > NOW()`; if(type){params.push(type); q+=` AND type=$2`;} q+=` ORDER BY id DESC LIMIT 1`; const r=await pgPool.query(q,params); return r.rows[0]||null; }
 async function getGenericLotteryEntryCount(id){ const r=await pgPool.query('SELECT COUNT(*)::int count FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]})); return parseInt(r.rows[0]?.count||0); }
 async function drawGenericLottery(row, post=true, ethSeed=null){
-  const er=await pgPool.query('SELECT user_id, username, guess_number, entered_at FROM generic_lottery_entries WHERE lottery_id=$1 ORDER BY entered_at ASC,user_id ASC',[row.id]);
-  const entries=er.rows; let result={winner:null,proof:null};
+  // Fetch entries ordered by entry time then user ID for deterministic results
+  const er = await pgPool.query(
+    'SELECT user_id, username, guess_number, entered_at FROM generic_lottery_entries WHERE lottery_id=$1 ORDER BY entered_at ASC, user_id ASC',
+    [row.id]
+  );
+  const entries = er.rows;
+  let result = { winner: null, proof: null };
+
   // Use ETH block hash seed if provided, otherwise fall back to stored seed
   const activeSeed = ethSeed || row.seed;
-  if(row.type==='guess'){ const valid=entries.filter(x=>x.guess_number!=null); row.winning_number=row.winning_number??lotteryNumberFromSeed(`${activeSeed}:winning-number`,row.min_number||1,row.max_number||100); let pool=valid.filter(x=>parseInt(x.guess_number)===parseInt(row.winning_number)); if(!pool.length && row.winner_mode!=='exact' && valid.length){ const d=Math.min(...valid.map(x=>Math.abs(parseInt(x.guess_number)-parseInt(row.winning_number)))); pool=valid.filter(x=>Math.abs(parseInt(x.guess_number)-parseInt(row.winning_number))===d); } if(pool.length){ const p=lotteryPick(pool.map(x=>x.user_id),`${activeSeed}:guess:${row.id}:${row.winning_number}`); result={winner:pool.find(x=>x.user_id===p.winner)||pool[0],proof:p.proof}; } }
-  else { const p=lotteryPick(entries.map(x=>x.user_id),`${activeSeed}:giveaway:${row.id}`); if(p) result={winner:entries.find(x=>x.user_id===p.winner)||entries[p.index],proof:p.proof}; }
-  // Store the seed used (ETH hash if available)
-  if(ethSeed) await pgPool.query('UPDATE generic_lotteries SET seed=$1 WHERE id=$2',[ethSeed,row.id]).catch(()=>{});
-  await pgPool.query(`UPDATE generic_lotteries SET status='completed', winner_user_id=$1,winner_display=$2,winner_guess=$3,entry_count=$4,result_json=$5,completed_at=NOW(),winning_number=$6 WHERE id=$7`,[result.winner?.user_id||null,result.winner?.username||null,result.winner?.guess_number??null,entries.length,JSON.stringify({proof:result.proof||null}),row.winning_number??null,row.id]);
-  const embed=buildGenericLotteryResultEmbed(row,entries,result); if(post){ const ch=await resolveDiscordChannel(row.channel_id); if(ch) await ch.send({embeds:[embed]}); } return {embed,entries,result};
+
+  if(row.type === 'guess'){
+    const valid = entries.filter(x => x.guess_number != null);
+    // Determine winning number from seed if not already set
+    row.winning_number = row.winning_number ?? lotteryNumberFromSeed(
+      `${activeSeed}:winning-number`, row.min_number || 1, row.max_number || 100
+    );
+    // Find exact matches first
+    let pool = valid.filter(x => parseInt(x.guess_number) === parseInt(row.winning_number));
+    // Fall back to closest guess if no exact match and not exact-only mode
+    if(!pool.length && row.winner_mode !== 'exact' && valid.length){
+      const minDist = Math.min(...valid.map(x => Math.abs(parseInt(x.guess_number) - parseInt(row.winning_number))));
+      pool = valid.filter(x => Math.abs(parseInt(x.guess_number) - parseInt(row.winning_number)) === minDist);
+    }
+    if(pool.length){
+      const p = lotteryPick(pool.map(x => x.user_id), `${activeSeed}:guess:${row.id}:${row.winning_number}`);
+      result = { winner: pool.find(x => x.user_id === p.winner) || pool[0], proof: p.proof };
+    }
+  } else {
+    // Giveaway mode — pick from all entries
+    const p = lotteryPick(entries.map(x => x.user_id), `${activeSeed}:giveaway:${row.id}`);
+    if(p) result = { winner: entries.find(x => x.user_id === p.winner) || entries[p.index], proof: p.proof };
+  }
+
+  // Store ETH seed back to DB if it was used
+  if(ethSeed) await pgPool.query('UPDATE generic_lotteries SET seed=$1 WHERE id=$2', [ethSeed, row.id]).catch(() => {});
+
+  // Mark completed and store result
+  await pgPool.query(
+    `UPDATE generic_lotteries
+     SET status='completed', winner_user_id=$1, winner_display=$2, winner_guess=$3,
+         entry_count=$4, result_json=$5, completed_at=NOW(), winning_number=$6
+     WHERE id=$7`,
+    [
+      result.winner?.user_id || null,
+      result.winner?.username || null,
+      result.winner?.guess_number ?? null,
+      entries.length,
+      JSON.stringify({ proof: result.proof || null }),
+      row.winning_number ?? null,
+      row.id,
+    ]
+  );
+
+  const embed = buildGenericLotteryResultEmbed(row, entries, result);
+  if(post){
+    const ch = await resolveDiscordChannel(row.channel_id);
+    if(ch) await ch.send({ embeds: [embed] });
+  }
+  return { embed, entries, result };
 }
-async function processDueGenericLotteries(){ const r=await pgPool.query(`SELECT * FROM generic_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]})); for(const row of r.rows){try{await drawGenericLottery(row,true);}catch(e){console.warn('[GenericLottery auto]',row.id,e.message);}} }
+
+async function processDueGenericLotteries(){
+  const r = await pgPool.query(
+    `SELECT * FROM generic_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`
+  ).catch(() => ({ rows: [] }));
+  for(const row of r.rows){
+    try{ await drawGenericLottery(row, true); }
+    catch(e){ console.warn('[GenericLottery auto]', row.id, e.message); }
+  }
+}
 
 client.on('interactionCreate', async (interaction)=>{
   if(interaction.isButton() && interaction.customId.startsWith('lottery_enter:')){
