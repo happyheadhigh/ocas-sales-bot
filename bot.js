@@ -49,6 +49,8 @@ const OPENSEA_KEY   = process.env.OPENSEA_KEY || '';
 const POLL_MS       = parseInt(process.env.POLL_MS || '30000', 10);
 const SERVER_FILE   = path.join(__dirname, 'server-configs.json');
 const ALERTS_FILE   = path.join(__dirname, 'user-alerts.json');
+const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || '';
+
 
 // ── Brand colors ──────────────────────────────────────────────────────────────
 const COLORS = {
@@ -1013,7 +1015,6 @@ async function fetchFreshOsMeta(tokenId){
 async function fetchTokenUriFromContract(tokenId){
   const id = parseInt(tokenId);
   if(!id) return null;
-  const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
   const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
     `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
   if(!ALCHEMY_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return null;
@@ -1247,7 +1248,6 @@ async function postBurnAlertToConfiguredChannels(finalEvent, startEvent, freshTr
 
 async function pollBurnEventsLegacy(){
   if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return;
-  const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
   const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
     `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
 
@@ -1634,7 +1634,6 @@ async function pollBurnEvents(){
   _pollBurnRunning = true;
   try{
   if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return;
-  const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
   const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
     `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
 
@@ -3168,6 +3167,18 @@ client.on('interactionCreate', async (interaction)=>{
       const username=interaction.member?.displayName||interaction.user?.globalName||interaction.user?.username||interaction.user.id;
       await pgPool.query(`INSERT INTO generic_lottery_entries (lottery_id,user_id,username) VALUES ($1,$2,$3) ON CONFLICT (lottery_id,user_id) DO UPDATE SET username=EXCLUDED.username`,[lotteryId,interaction.user.id,username]);
       const count=await getGenericLotteryEntryCount(lotteryId);
+      try{
+  const msg = interaction.message;
+  const oldEmbed = msg.embeds[0];
+  if(oldEmbed){
+    const updated = EmbedBuilder.from(oldEmbed);
+    const fields = updated.data.fields?.map(f =>
+      f.name === 'Entries' ? { ...f, value: String(count) } : f
+    );
+    if(fields) updated.setFields(fields);
+    await msg.edit({ embeds: [updated] });
+  }
+}catch(_){}
       return interaction.reply({content:`You are entered in lottery #${lotteryId}. Current entries: ${count}.`,flags:MessageFlags.Ephemeral});
     }catch(e){ return interaction.reply({content:'Could not enter lottery: '+e.message,flags:MessageFlags.Ephemeral}).catch(()=>{}); }
   }
