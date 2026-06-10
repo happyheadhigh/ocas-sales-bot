@@ -3243,16 +3243,17 @@ function lotteryNumberFromSeed(seed,min,max){ const lo=Math.min(parseInt(min),pa
 function lotteryEntryButton(row){ return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`lottery_enter:${row.id}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)); }
 function buildGenericLotteryComponents(lotteryId, type='giveaway', active=true){
   const rows = [];
-  // Entry button for active giveaways
   if(active && type === 'giveaway'){
+    // Active giveaway — entry button only
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)
     ));
+  } else {
+    // Completed — show draw proof button
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('Show Draw Proof').setStyle(ButtonStyle.Secondary)
+    ));
   }
-  // Draw proof button — shown on active embeds and result embeds
-  rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('Show Draw Proof').setStyle(ButtonStyle.Secondary)
-  ));
   return rows;
 }
 function buildGenericLotteryStartEmbed(row, count=0){
@@ -3386,11 +3387,12 @@ async function drawGenericLottery(row, post=true, ethSeed=null){
   );
 
   const embed = buildGenericLotteryResultEmbed(row, entries, result);
+  const resultComponents = buildGenericLotteryComponents(row.id, row.type, false);
   if(post){
     const ch = await resolveDiscordChannel(row.channel_id);
-    if(ch) await ch.send({ embeds: [embed] });
+    if(ch) await ch.send({ embeds: [embed], components: resultComponents });
   }
-  return { embed, entries, result };
+  return { embed, entries, result, components: resultComponents };
 }
 
 async function processDueGenericLotteries(){
@@ -3740,7 +3742,7 @@ client.on('interactionCreate', async (interaction)=>{
         ? `\`${String(row.result_json.proof).slice(0, 64)}...\``
         : isPending ? 'Generated at draw time.' : 'Not available.';
       const content = [
-        `**🎲 Show Draw Proof — Lottery #${lotteryId}**`,
+        `**🎲 Draw Proof — Lottery #${lotteryId}**`,
         `**Type:** ${row.type === 'guess' ? 'Guess the number' : 'Giveaway button entries'}`,
         `**Status:** ${row.status}`,
         `**Entries:** ${row.entry_count ?? (isPending ? 'Open' : '0')}`,
@@ -5882,7 +5884,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         }catch(_){}
 
         const out = await drawGenericLottery(row, false, ethSeed);
-        return interaction.editReply({ content:null, embeds:[out.embed] });
+        return interaction.editReply({ content:null, embeds:[out.embed], components: out.components || [] });
       }
 
       // ── /lottery cancel — cancel an active lottery ──
