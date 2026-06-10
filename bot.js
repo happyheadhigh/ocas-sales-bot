@@ -5313,6 +5313,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       );
       const lotteryId = r.rows[0]?.id;
       return interaction.editReply({
+        content: null,
         embeds:[buildBurnLotteryEmbed({mode,start,end,seed:drawSeed,entries,wallets,burns,pick,lotteryId,timezone:timeZone,seedMeta})],
         components:buildBurnLotteryComponents(lotteryId)
       });
