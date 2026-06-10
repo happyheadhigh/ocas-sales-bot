@@ -370,6 +370,7 @@ async function ensureBotStateTable(){
       )
     `).catch(()=>{});
     await pgPool.query(`ALTER TABLE burn_lotteries ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'Europe/London'`).catch(()=>{});
+    await pgPool.query(`ALTER TABLE burn_lotteries ADD COLUMN IF NOT EXISTS message_id TEXT`).catch(()=>{});
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS burn_lotteries_status_end_idx ON burn_lotteries(status, end_time)
     `).catch(()=>{});
@@ -3220,14 +3221,23 @@ async function drawAndPostBurnLottery(row){
   // Remove the ⏳ fetching message from the original embed now that result is posted
   if(originalMsg){
     try{
-      const doneEmbed = EmbedBuilder.from(originalMsg.embeds[0]).setDescription('✅ Draw complete — see result above.');
+      const doneEmbed = EmbedBuilder.from(originalMsg.embeds[0]).setDescription('✅ Draw complete.');
       await originalMsg.edit({ embeds:[doneEmbed], components:[] }).catch(() => {});
     }catch(_){}
   }
 }
 async function processDueBurnLotteries(){
   const r = await pgPool.query(`SELECT * FROM burn_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]}));
-  for(const row of r.rows){ try{ await drawAndPostBurnLottery(row); }catch(e){ console.warn('[BurnLottery auto]', row.id, e.message); } }
+  for(const row of r.rows){
+    try{
+      console.log(`[BurnLottery #${row.id}] Auto-draw triggered`);
+      await drawAndPostBurnLottery(row);
+      console.log(`[BurnLottery #${row.id}] Draw complete`);
+    }catch(e){
+      console.warn('[BurnLottery auto]', row.id, e.message);
+      sendErrorWebhook('BurnLottery Auto-Draw Error', e, `lottery=${row.id}`);
+    }
+  }
 }
 function lotteryNumberFromSeed(seed,min,max){ const lo=Math.min(parseInt(min),parseInt(max)), hi=Math.max(parseInt(min),parseInt(max)); const h=lotteryHash(seed); return lo + Number(BigInt('0x'+h.slice(0,16)) % BigInt(hi-lo+1)); }
 function lotteryEntryButton(row){ return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`lottery_enter:${row.id}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)); }
@@ -3239,9 +3249,9 @@ function buildGenericLotteryComponents(lotteryId, type='giveaway', active=true){
       new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)
     ));
   }
-  // Draw proof button always shown
+  // Draw proof button — shown on active embeds and result embeds
   rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('How This Draw Works').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('Show Draw Proof').setStyle(ButtonStyle.Secondary)
   ));
   return rows;
 }
@@ -3433,7 +3443,7 @@ async function processDueGenericLotteries(){
       // Update original message to show draw complete
       if(originalMsg){
         try{
-          const doneEmbed = EmbedBuilder.from(originalMsg.embeds[0]).setDescription('✅ Draw complete — see result above.');
+          const doneEmbed = EmbedBuilder.from(originalMsg.embeds[0]).setDescription('✅ Draw complete.');
           await originalMsg.edit({ embeds:[doneEmbed], components:[] }).catch(() => {});
         }catch(_){}
       }
@@ -3730,7 +3740,7 @@ client.on('interactionCreate', async (interaction)=>{
         ? `\`${String(row.result_json.proof).slice(0, 64)}...\``
         : isPending ? 'Generated at draw time.' : 'Not available.';
       const content = [
-        `**🎲 How This Draw Works — Lottery #${lotteryId}**`,
+        `**🎲 Show Draw Proof — Lottery #${lotteryId}**`,
         `**Type:** ${row.type === 'guess' ? 'Guess the number' : 'Giveaway button entries'}`,
         `**Status:** ${row.status}`,
         `**Entries:** ${row.entry_count ?? (isPending ? 'Open' : '0')}`,
@@ -5586,7 +5596,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         if(end <= start) return interaction.editReply('End time must be after start time.');
         const r = await pgPool.query(`INSERT INTO burn_lotteries (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status, timezone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10) RETURNING *`, [guildId, channel.id, interaction.user.id, title, prize, mode, start, end, seed, timeZone]);
         const row = r.rows[0];
-        return interaction.editReply({ embeds:[new EmbedBuilder()
+        const burnStartMsg = await interaction.editReply({ embeds:[new EmbedBuilder()
           .setTitle('🎟️ Burn lottery scheduled')
           .setColor(COLORS.OCAS_GREEN)
           .addFields(
@@ -5598,6 +5608,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             {name:'Draw Seed',value:customSeed ? `Custom seed set: \`${String(customSeed).slice(0,256)}\`` : 'Generated automatically at draw time after the entry window closes.',inline:false}
           )
           .setTimestamp()], components:buildActiveBurnLotteryComponents(row.id) });
+        await pgPool.query('UPDATE burn_lotteries SET message_id=$1 WHERE id=$2', [burnStartMsg.id, row.id]).catch(() => {});
+        console.log(`[BurnLottery #${row.id}] Scheduled window=${formatBurnLotteryWindow(start, end, timeZone)} guild=${guildId}`);
+        return;
       }
       if(sub==='status'){
         const id = interaction.options.getInteger('id');
