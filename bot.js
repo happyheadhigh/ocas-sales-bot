@@ -125,8 +125,10 @@ function normAddr(addr){
 async function sendErrorWebhook(label, error, context = ''){
   if(!ERROR_WEBHOOK_URL) return;
   try{
+    const env = process.env.BOT_ENV || 'unknown';
+    const envTag = env === 'production' ? '🔴 PRODUCTION' : env === 'staging' ? '🟡 STAGING' : `⚪ ${env}`;
     const msg = [
-      `🚨 **${label}**`,
+      `🚨 **[${envTag}] ${label}**`,
       `\`\`\`${String(error?.message || error).slice(0, 800)}\`\`\``,
       context ? `**Context:** ${String(context).slice(0, 300)}` : '',
       `**Time:** <t:${Math.floor(Date.now()/1000)}:f>`,
