@@ -1210,65 +1210,29 @@ app.get('/db/burn-stats', auth, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        (SELECT COUNT(*)::int FROM burn_events) AS total_burns,
         (
           SELECT COUNT(DISTINCT bei.burned_token_id)::int
           FROM burn_event_inputs bei
           JOIN burn_events be ON be.id = bei.burn_event_id
           WHERE bei.burned_token_id != be.survivor_token_id
-        ) AS total_burned,
-        (SELECT COUNT(*)::int FROM burn_events) AS total_created,
-        (
-          SELECT COUNT(*)::int
-          FROM burn_events be
-          WHERE NOT EXISTS (
-            SELECT 1 FROM burn_event_inputs bei WHERE bei.burn_event_id = be.id
-          )
-        ) AS missing_input_burns,
-        (
-          SELECT COUNT(DISTINCT bei.burned_token_id)::int
-          FROM burn_event_inputs bei
-          JOIN burn_events be ON be.id = bei.burn_event_id
-          WHERE bei.burned_token_id != be.survivor_token_id
-            AND be.burned_at >= NOW() - INTERVAL '24 hours'
-        ) AS burned_24h,
-        (
-          SELECT COUNT(*)::int
-          FROM burn_events be
-          WHERE be.burned_at >= NOW() - INTERVAL '24 hours'
-        ) AS burns_24h
+        ) AS tokens_burned,
+        (SELECT COUNT(*)::int FROM burn_events) AS tokens_created
     `);
-    const ocasBurned = parseInt(result.rows[0]?.total_burned || 0, 10);
-    const totalBurns = parseInt(result.rows[0]?.total_burns || 0, 10);
-    const totalCreated = parseInt(result.rows[0]?.total_created || 0, 10);
-    const burned24h = parseInt(result.rows[0]?.burned_24h || 0, 10);
-    const burns24h = parseInt(result.rows[0]?.burns_24h || 0, 10);
-    // Intentionally mirrors the Discord bot /burnstats command.
-    const tokensUsed = ocasBurned + totalCreated;
+    const tokensBurned = parseInt(result.rows[0]?.tokens_burned || 0, 10);
+    const tokensCreated = parseInt(result.rows[0]?.tokens_created || 0, 10);
+    // Mirrors /burnstats distinct burned-token logic and burn repair net-supply math.
+    const supplyReducedBy = tokensBurned - tokensCreated;
 
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
     res.json({
       ok: true,
-      ocas_burned: ocasBurned,
-      total_burns: totalBurns,
-      tokens_used: tokensUsed,
-      estimated_supply: 10000 - ocasBurned,
-      burned_24h: burned24h,
-      burns_24h: burns24h,
-      tokens_used_24h: burned24h + burns24h,
-      missing_input_burns: parseInt(result.rows[0]?.missing_input_burns || 0, 10),
-      tokens_burned: ocasBurned,
-      tokens_created: totalCreated,
-      supply_reduced_by: ocasBurned - totalCreated,
+      tokens_burned: tokensBurned,
+      tokens_created: tokensCreated,
+      supply_reduced_by: supplyReducedBy,
+      estimated_supply: 10000 - supplyReducedBy,
     });
   } catch (e) {
     burnEndpointError(res, '/db/burn-stats', e, {
-      ocas_burned: null,
-      total_burns: null,
-      tokens_used: null,
-      burned_24h: null,
-      burns_24h: null,
-      tokens_used_24h: null,
       tokens_burned: null,
       tokens_created: null,
       supply_reduced_by: null,
@@ -1434,8 +1398,7 @@ app.get('/db/burn-best', auth, async (req, res) => {
 // GET /db/burn-activity
 app.get('/db/burn-activity', auth, async (req, res) => {
   try {
-    const [result, distributionResult] = await Promise.all([
-      pool.query(`
+    const result = await pool.query(`
       SELECT to_char(be.burned_at::date, 'YYYY-MM-DD') AS date,
              COUNT(DISTINCT be.id)::int AS burn_events,
              (COUNT(DISTINCT bei.burned_token_id)
@@ -1446,38 +1409,7 @@ app.get('/db/burn-activity', auth, async (req, res) => {
       WHERE be.burned_at IS NOT NULL
       GROUP BY be.burned_at::date
       ORDER BY be.burned_at::date ASC
-    `),
-      pool.query(`
-      WITH per_burn AS (
-        SELECT be.id,
-               (COUNT(DISTINCT bei.burned_token_id)
-                 FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id))::int AS input_count
-        FROM burn_events be
-        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-        GROUP BY be.id
-      )
-      SELECT
-        CASE
-          WHEN input_count = 1 THEN '1 token'
-          WHEN input_count = 2 THEN '2 tokens'
-          WHEN input_count BETWEEN 3 AND 5 THEN '3-5 tokens'
-          WHEN input_count BETWEEN 6 AND 10 THEN '6-10 tokens'
-          ELSE '11+ tokens'
-        END AS bucket,
-        CASE
-          WHEN input_count = 1 THEN 1
-          WHEN input_count = 2 THEN 2
-          WHEN input_count BETWEEN 3 AND 5 THEN 3
-          WHEN input_count BETWEEN 6 AND 10 THEN 4
-          ELSE 5
-        END AS bucket_order,
-        COUNT(*)::int AS burn_events
-      FROM per_burn
-      WHERE input_count > 0
-      GROUP BY bucket, bucket_order
-      ORDER BY bucket_order ASC
-    `),
-    ]);
+    `);
 
     const activity = result.rows.map(r => {
       const tokensBurned = parseInt(r.tokens_burned || 0, 10);
@@ -1487,19 +1419,14 @@ app.get('/db/burn-activity', auth, async (req, res) => {
         burn_events: parseInt(r.burn_events || 0, 10),
         tokens_burned: tokensBurned,
         tokens_created: tokensCreated,
-        tokens_used: tokensBurned + tokensCreated,
         supply_reduced_by: tokensBurned - tokensCreated,
       };
     });
-    const distribution = distributionResult.rows.map(r => ({
-      bucket: r.bucket,
-      burn_events: parseInt(r.burn_events || 0, 10),
-    }));
 
     res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
-    res.json({ ok: true, activity, burn_size_distribution: distribution, count: activity.length });
+    res.json({ ok: true, activity, count: activity.length });
   } catch (e) {
-    burnEndpointError(res, '/db/burn-activity', e, { activity: [], burn_size_distribution: [], count: 0 });
+    burnEndpointError(res, '/db/burn-activity', e, { activity: [], count: 0 });
   }
 });
 
