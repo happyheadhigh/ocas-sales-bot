@@ -3298,7 +3298,6 @@ client.on('interactionCreate', async (interaction)=>{
       let content =
         `**🎟️ OCAS Burn Lottery #${lotteryId} Draw Proof**\n` +
         `**Window:** ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)}\n` +
-        `**Timezone:** ${timeZone}\n` +
         `${burnLotteryWindowDetails(start, end, timeZone)}\n` +
         `**Mode:** ${row.mode === 'burn' ? 'One entry per burn — wallets can appear multiple times' : 'One entry per wallet'}\n` +
         `**Qualified wallets:** ${wallets.length}\n` +
@@ -5239,23 +5238,51 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         timezone: timezoneInput || DEFAULT_LOTTERY_TIMEZONE
       });
       const { start, end, timeZone } = resolved;
-      const seed = interaction.options.getString('seed') || randomLotterySeed();
+      const customSeed = interaction.options.getString('seed') || null;
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
-      const pick = lotteryPick(entries, seed);
+      if(!entries.length) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
+
+      // Use ETH block hash as seed unless admin supplied a custom seed
+      let drawSeed, seedMeta = {};
+      if(customSeed){
+        drawSeed = customSeed;
+        seedMeta = { seed_type: 'admin_supplied' };
+      } else {
+        await interaction.editReply('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)');
+        try{
+          const rpcUrl2 = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
+            `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+          const latestBlock2 = parseInt(await burnRpc(rpcUrl2, 'eth_blockNumber', []), 16);
+          const targetBlock2 = latestBlock2 + 5;
+          const arrived2 = await waitForEthBlock(targetBlock2);
+          if(arrived2){
+            const { hash: bHash, blockNumber: bNum } = await fetchEthBlockHashSeed(targetBlock2);
+            drawSeed = bHash;
+            seedMeta = { seed_type: 'eth_block_hash', block_number: bNum, block_hash: bHash };
+          } else {
+            drawSeed = randomLotterySeed();
+            seedMeta = { seed_type: 'random_fallback', reason: 'eth_block_timeout' };
+          }
+        }catch(ethErr){
+          drawSeed = randomLotterySeed();
+          seedMeta = { seed_type: 'random_fallback', reason: ethErr.message };
+        }
+      }
+
+      const pick = lotteryPick(entries, drawSeed);
       if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
-      if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatZonedLotteryTime(start, timeZone)} → ${formatZonedLotteryTime(end, timeZone)} (${timeZone})`);
       const r = await pgPool.query(
         `INSERT INTO burn_lotteries
            (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status,
             winner_wallet, qualified_wallets, total_burns, result_json, timezone, completed_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed',$10,$11,$12,$13,$14,NOW())
          RETURNING id`,
-        [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, seed,
-         pick.winner, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null, seed_generated_at:'draw_time'}), timeZone]
+        [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, drawSeed,
+         pick.winner, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null, ...seedMeta}), timeZone]
       );
       const lotteryId = r.rows[0]?.id;
       return interaction.editReply({
-        embeds:[buildBurnLotteryEmbed({mode,start,end,seed,entries,wallets,burns,pick,lotteryId,timezone:timeZone})],
+        embeds:[buildBurnLotteryEmbed({mode,start,end,seed:drawSeed,entries,wallets,burns,pick,lotteryId,timezone:timeZone,seedMeta})],
         components:buildBurnLotteryComponents(lotteryId)
       });
     }catch(e){
