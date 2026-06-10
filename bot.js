@@ -3148,9 +3148,25 @@ async function drawAndPostBurnLottery(row){
   const timeZone = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
   const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
 
+  // Edit the original scheduled embed to show fetching state
+  let originalMsg = null;
+  if(row.message_id && row.channel_id){
+    try{
+      const ch = await resolveDiscordChannel(row.channel_id);
+      if(ch){
+        originalMsg = await ch.messages.fetch(row.message_id).catch(() => null);
+        if(originalMsg){
+          const fetchingEmbed = EmbedBuilder.from(originalMsg.embeds[0])
+            .setDescription('⏳ Entry window closed — fetching Ethereum block hash for tamper-proof seed...');
+          await originalMsg.edit({ embeds:[fetchingEmbed], components:[] }).catch(() => {});
+        }
+      }
+    }catch(_){}
+  }
+
   let drawSeed, seedMeta = {};
 
-  if(row.status === 'active' && isPendingDrawSeed(row.seed)){
+  if(isPendingDrawSeed(row.seed)){
     // Use Ethereum block hash as the tamper-proof public seed.
     // Target: the block mined 5 blocks after the end of the lottery window,
     // giving finality and ensuring no one (including the bot operator) can
@@ -3201,6 +3217,13 @@ async function drawAndPostBurnLottery(row){
       components:buildBurnLotteryComponents(row.id)
     });
   }
+  // Remove the ⏳ fetching message from the original embed now that result is posted
+  if(originalMsg){
+    try{
+      const doneEmbed = EmbedBuilder.from(originalMsg.embeds[0]).setDescription('✅ Draw complete — see result above.');
+      await originalMsg.edit({ embeds:[doneEmbed], components:[] }).catch(() => {});
+    }catch(_){}
+  }
 }
 async function processDueBurnLotteries(){
   const r = await pgPool.query(`SELECT * FROM burn_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]}));
@@ -3208,6 +3231,20 @@ async function processDueBurnLotteries(){
 }
 function lotteryNumberFromSeed(seed,min,max){ const lo=Math.min(parseInt(min),parseInt(max)), hi=Math.max(parseInt(min),parseInt(max)); const h=lotteryHash(seed); return lo + Number(BigInt('0x'+h.slice(0,16)) % BigInt(hi-lo+1)); }
 function lotteryEntryButton(row){ return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`lottery_enter:${row.id}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)); }
+function buildGenericLotteryComponents(lotteryId, type='giveaway', active=true){
+  const rows = [];
+  // Entry button for active giveaways
+  if(active && type === 'giveaway'){
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)
+    ));
+  }
+  // Draw proof button always shown
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('How This Draw Works').setStyle(ButtonStyle.Secondary)
+  ));
+  return rows;
+}
 function buildGenericLotteryStartEmbed(row, count=0){
   const type = String(row.type || 'giveaway');
   const title = row.title || (type === 'guess' ? 'Guess the Number' : 'Giveaway Lottery');
@@ -3350,9 +3387,62 @@ async function processDueGenericLotteries(){
   const r = await pgPool.query(
     `SELECT * FROM generic_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`
   ).catch(() => ({ rows: [] }));
+
   for(const row of r.rows){
-    try{ await drawGenericLottery(row, true); }
-    catch(e){ console.warn('[GenericLottery auto]', row.id, e.message); }
+    try{
+      console.log(`[Lottery #${row.id}] Auto-draw triggered type=${row.type}`);
+
+      // Edit original message to show fetching state
+      let originalMsg = null;
+      if(row.message_id && row.channel_id){
+        try{
+          const ch = await resolveDiscordChannel(row.channel_id);
+          if(ch){
+            originalMsg = await ch.messages.fetch(row.message_id).catch(() => null);
+            if(originalMsg){
+              const fetchingEmbed = EmbedBuilder.from(originalMsg.embeds[0])
+                .setDescription('⏳ Entry window closed — fetching Ethereum block hash for tamper-proof seed...');
+              await originalMsg.edit({ embeds:[fetchingEmbed], components:[] }).catch(() => {});
+            }
+          }
+        }catch(_){}
+      }
+
+      // Fetch ETH block hash seed
+      let ethSeed = null;
+      try{
+        const rpcUrlA = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://', 'https://') ||
+          `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+        const latestBlockA = parseInt(await burnRpc(rpcUrlA, 'eth_blockNumber', []), 16);
+        const targetBlockA = latestBlockA + 5;
+        console.log(`[Lottery #${row.id}] Waiting for Ethereum block #${targetBlockA} (current: ${latestBlockA})...`);
+        const arrivedA = await waitForEthBlock(targetBlockA);
+        if(arrivedA){
+          const { hash: bHashA } = await fetchEthBlockHashSeed(targetBlockA);
+          ethSeed = bHashA;
+          console.log(`[Lottery #${row.id}] Seed: block hash ${bHashA}`);
+        } else {
+          console.warn(`[Lottery #${row.id}] ETH block timeout — using stored seed`);
+        }
+      }catch(ethErr){
+        console.warn(`[Lottery #${row.id}] ETH seed failed: ${ethErr.message} — using stored seed`);
+      }
+
+      await drawGenericLottery(row, true, ethSeed);
+
+      // Update original message to show draw complete
+      if(originalMsg){
+        try{
+          const doneEmbed = EmbedBuilder.from(originalMsg.embeds[0]).setDescription('✅ Draw complete — see result above.');
+          await originalMsg.edit({ embeds:[doneEmbed], components:[] }).catch(() => {});
+        }catch(_){}
+      }
+
+      console.log(`[Lottery #${row.id}] Draw complete`);
+    }catch(e){
+      console.warn('[GenericLottery auto]', row.id, e.message);
+      sendErrorWebhook('GenericLottery Auto-Draw Error', e, `lottery=${row.id}`);
+    }
   }
 }
 
@@ -3621,6 +3711,43 @@ client.on('interactionCreate', async (interaction)=>{
     }catch(e){
       console.error('[BurnLottery Entries]', e.message);
       try{ await interaction.editReply({ content:'Error loading entries.' }); }catch(_){}
+    }
+    return;
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('generic_lottery_proof:')){
+    const lotteryId = parseInt(interaction.customId.split(':')[1], 10);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const r = await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1', [lotteryId]);
+      if(!r.rows.length){ await interaction.editReply({ content:'Lottery not found.' }); return; }
+      const row = r.rows[0];
+      const isPending = row.status === 'active';
+      const seedDisplay = isPending
+        ? 'Generated at draw time using an Ethereum block hash — unpredictable by anyone including the bot operator.'
+        : `\`${String(row.seed).slice(0, 256)}\``;
+      const proofDisplay = row.result_json?.proof
+        ? `\`${String(row.result_json.proof).slice(0, 64)}...\``
+        : isPending ? 'Generated at draw time.' : 'Not available.';
+      const content = [
+        `**🎲 How This Draw Works — Lottery #${lotteryId}**`,
+        `**Type:** ${row.type === 'guess' ? 'Guess the number' : 'Giveaway button entries'}`,
+        `**Status:** ${row.status}`,
+        `**Entries:** ${row.entry_count ?? (isPending ? 'Open' : '0')}`,
+        ``,
+        `**How to verify:**`,
+        `One entry per user. The seed is an Ethereum block hash fetched at draw time — published on-chain before the result is calculated, so no one can predict or influence it.`,
+        `SHA-256(seed + ordered entry list) → winning index. Same seed + same entries = same winner every time.`,
+        ``,
+        `**Seed:**`,
+        seedDisplay,
+        `**Proof Hash:**`,
+        proofDisplay,
+      ].join('\n');
+      await interaction.editReply({ content: content.slice(0, 1900) });
+    }catch(e){
+      console.error('[GenericLottery Proof]', e.message);
+      try{ await interaction.editReply({ content:'Error loading draw proof.' }); }catch(_){}
     }
     return;
   }
@@ -5642,9 +5769,10 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
            minN, maxN, winnerMode, winning, start, end, seed]
         );
         const row = r.rows[0];
-        const components = type === 'giveaway' ? [lotteryEntryButton(row)] : [];
+        const components = buildGenericLotteryComponents(row.id, type, true);
         const msg = await interaction.editReply({ embeds:[buildGenericLotteryStartEmbed(row, 0)], components });
         await pgPool.query('UPDATE generic_lotteries SET message_id=$1 WHERE id=$2', [msg.id, row.id]).catch(() => {});
+        console.log(`[Lottery #${row.id}] Started type=${type} minutes=${minutes} guild=${guildId}`);
         return;
       }
 
