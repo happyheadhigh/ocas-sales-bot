@@ -5959,7 +5959,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           )
           .setFooter({ text:`Lottery ID ${lotteryId}` })
           .setTimestamp();
-        await interaction.editReply({ embeds:[instantEmbed], components:[] });
+        await interaction.editReply({ embeds:[instantEmbed], components:buildGenericLotteryComponents(lotteryId, 'giveaway', false) });
 
         // Fetch ETH block hash seed
         let ethSeed = null, ethBlockNumber = null;
