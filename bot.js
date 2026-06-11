@@ -415,19 +415,17 @@ async function dbSave(key, value){
   }catch(e){ console.warn('[DB] save error', key, e.message); }
 }
 
-function getRailwayApiUrl(){
-  // Primary expected env var is RAILWAY_API_URL.
-  // Fallback names are accepted so staging/prod do not break if the same API URL
-  // was saved under a slightly different variable name.
-  return String(
-    process.env.RAILWAY_API_URL ||
-    process.env.TRAITVIEW_API_URL ||
-    process.env.RAILWAY_URL ||
-    process.env.API_URL ||
-    process.env.BOT_API_URL ||
-    ''
-  ).trim().replace(/\/+$/, '');
-}
+// Resolved once at startup — avoids re-reading env vars on every command invocation
+const RAILWAY_API_URL_CACHED = String(
+  process.env.RAILWAY_API_URL ||
+  process.env.TRAITVIEW_API_URL ||
+  process.env.RAILWAY_URL ||
+  process.env.API_URL ||
+  process.env.BOT_API_URL ||
+  ''
+).trim().replace(/\/+$/, '');
+
+function getRailwayApiUrl(){ return RAILWAY_API_URL_CACHED; }
 
 // ── Config helpers ────────────────────────────────────────────────────────────
 async function loadAllConfigs(){
@@ -547,7 +545,8 @@ function isRecentChannelPost(channelId, tokenId, windowMs=180000){
 const imageCache      = new Map(); // "contract:tokenId" → {result, ts}
 const IMAGE_CACHE_TTL = 60 * 60 * 1000; // 1 hour TTL
 
-const IMAGE_CACHE_MAX = 2000; // max entries — evict oldest when exceeded
+const IMAGE_CACHE_MAX   = 2000; // max entries
+const IMAGE_CACHE_EVICT = 200;  // evict this many when full
 
 function getCachedImage(key){
   const entry = imageCache.get(key);
@@ -556,10 +555,13 @@ function getCachedImage(key){
   return entry.result;
 }
 function setCachedImage(key, result){
-  // Evict oldest entries if over max size
   if(imageCache.size >= IMAGE_CACHE_MAX){
-    const oldest = [...imageCache.entries()].sort((a,b) => a[1].ts - b[1].ts).slice(0, 200);
-    for(const [k] of oldest) imageCache.delete(k);
+    // Map preserves insertion order — first keys are oldest, no sort needed
+    let evicted = 0;
+    for(const k of imageCache.keys()){
+      imageCache.delete(k);
+      if(++evicted >= IMAGE_CACHE_EVICT) break;
+    }
   }
   imageCache.set(key, { result, ts: Date.now() });
 }
@@ -5099,6 +5101,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const components = [];
       const sessionId = interaction.id;
       const cleanSweepListings = sweepListings.map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
+      // Cap total concurrent sweep sessions to prevent unbounded memory growth
+      if(sweepSessions.size >= 100){
+        const oldest = sweepSessions.keys().next().value;
+        sweepSessions.delete(oldest);
+      }
       sweepSessions.set(sessionId, { listings: cleanSweepListings, page: 0 });
       setTimeout(() => sweepSessions.delete(sessionId), 30 * 60 * 1000);
       components.push(new ActionRowBuilder().addComponents(
