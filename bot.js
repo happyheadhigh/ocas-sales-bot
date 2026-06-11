@@ -3160,7 +3160,7 @@ async function drawAndPostBurnLottery(row){
         if(originalMsg){
           const fetchingEmbed = EmbedBuilder.from(originalMsg.embeds[0])
             .setDescription('⏳ Entry window closed — fetching Ethereum block hash for tamper-proof seed...');
-          await originalMsg.edit({ embeds:[fetchingEmbed], components:[] }).catch(() => {});
+          await originalMsg.edit({ embeds:[fetchingEmbed], components:buildActiveBurnLotteryComponents(row.id) }).catch(() => {});
         }
       }
     }catch(_){}
@@ -5697,7 +5697,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           seed: null, entries: preEntries, wallets: preWallets, burns: preBurns,
           pick: null, lotteryId: lotteryRow.id, timezone: drawTz
         }).setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
-        await interaction.editReply({ embeds:[fetchingEmbed], components:[] });
+        await interaction.editReply({ embeds:[fetchingEmbed], components:buildActiveBurnLotteryComponents(lotteryRow.id) });
 
         await drawAndPostBurnLottery(lotteryRow);
 
