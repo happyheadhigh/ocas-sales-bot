@@ -172,7 +172,7 @@ const pgPool = new Pool({
   ssl: process.env.DATABASE_URL?.includes('railway.internal')
     ? false
     : { rejectUnauthorized: false },
-  max: 3,
+  max: 8,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
 });
@@ -569,6 +569,7 @@ function setCachedImage(key, result){
 // Each session: { embeds: [], index: 0, userId, expiresAt }
 const slideshowSessions = new Map();
 const ocasTraitsCache = new Map(); // tokenId → {traits, expires}
+const OCAS_TRAITS_CACHE_MAX = 1000;
 
 // ── Hoisted trait parser helpers (shared by /ocas and /sweep) ───────────────
 const sweepSessions = new Map(); // sessionId → { listings, page }
@@ -2465,7 +2466,7 @@ async function fetchBotApiJson(url, label){
 async function buildTokenSearchEmbed(token, config, footerLabel){
   const tokenId = token.token_id ?? token.id ?? token.identifier;
   const id = String(tokenId || '');
-  const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+  const contract = config.contract || '';
   const chain = config.chain || 'ethereum';
   const slug = config.slug || '';
   const dbMeta = token._dbToken || (id ? await fetchTokenMetaFromDb(id) : null);
@@ -2741,10 +2742,10 @@ async function sendPersonalAlerts(event, type, config){
       const dedupKey = `${userId}:${type}:${event.id||event.event_timestamp}`;
       if(alertedEventIds.has(dedupKey)) continue;
       alertedEventIds.add(dedupKey);
-      // Keep set from growing forever — trim if over 5000 entries
+      // Keep set from growing forever — trim oldest 500 when over 5000
       if(alertedEventIds.size > 5000){
-        const first = alertedEventIds.values().next().value;
-        alertedEventIds.delete(first);
+        const toDelete = [...alertedEventIds].slice(0, 500);
+        for(const k of toDelete) alertedEventIds.delete(k);
       }
       const user=await client.users.fetch(userId).catch(()=>null);
       if(!user) continue;
@@ -3284,12 +3285,7 @@ function buildGenericLotteryStartEmbed(row, count=0){
     );
   }
 
-  const seedDisplay = isPendingDrawSeed(row.seed)
-    ? 'Pending — assigned from Ethereum block hash mined 5 blocks after the window closes.'
-    : `\`${String(row.seed).slice(0, 256)}\``;
-
   embed
-    .addFields({ name:'Seed', value:seedDisplay, inline:false })
     .setFooter({ text:`Lottery ID ${row.id}` })
     .setTimestamp();
 
@@ -3623,7 +3619,11 @@ client.on('interactionCreate', async (interaction)=>{
         });
         if(contractTraits && realTraitCount(contractTraits)){
           traits = contractTraits;
-          ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+          if(ocasTraitsCache.size >= OCAS_TRAITS_CACHE_MAX){
+          const oldest = [...ocasTraitsCache.keys()].slice(0, 200);
+          for(const k of oldest) ocasTraitsCache.delete(k);
+        }
+        ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
         }
       }
 
@@ -3636,7 +3636,13 @@ client.on('interactionCreate', async (interaction)=>{
             const tj = await tr.json();
             if(tj.ok && tj.token?.traits) traits = tj.token.traits;
           }
-          if(traits) ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+          if(traits){
+            if(ocasTraitsCache.size >= OCAS_TRAITS_CACHE_MAX){
+              const oldest = [...ocasTraitsCache.keys()].slice(0, 200);
+              for(const k of oldest) ocasTraitsCache.delete(k);
+            }
+            ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+          }
         }catch(apiErr){
           console.warn('[ShowTraits API]', apiErr.message);
         }
@@ -4373,7 +4379,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           if(!j.ok) throw new Error(j.error || 'API error');
           const tokens = j.tokens || [];
           if(!tokens.length){ await interaction.editReply(`No listed tokens found with **${trait ? trait+': ' : ''}${value}**.`); return; }
-          const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+          const contract = config.contract || '';
           const listEmbeds = await Promise.all(tokens.map(async t => {
             const tokenId = t.token_id ?? t.id ?? t.identifier;
             const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
@@ -4624,7 +4630,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. Try: "1-100" or "1-500 rank"', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
-    const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+    const contract = config.contract || '';
     try{
 
       // ── Sales mode ─────────────────────────────────────────────────────────
@@ -4699,7 +4705,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   if(commandName==='ocas'){
     const tokenInput = interaction.options.getInteger('token');
     const rawSearch  = (interaction.options.getString('search') || '').trim();
-    const contract   = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+    const contract   = config.contract || '';
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
 
