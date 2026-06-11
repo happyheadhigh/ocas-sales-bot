@@ -49,7 +49,8 @@ const OPENSEA_KEY   = process.env.OPENSEA_KEY || '';
 const POLL_MS       = parseInt(process.env.POLL_MS || '30000', 10);
 const SERVER_FILE   = path.join(__dirname, 'server-configs.json');
 const ALERTS_FILE   = path.join(__dirname, 'user-alerts.json');
-const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || '';
+const ALCHEMY_KEY         = process.env.ALCHEMY_API_KEY || '';
+const ERROR_WEBHOOK_URL   = process.env.ERROR_WEBHOOK_URL || '';
 
 
 // ── Brand colors ──────────────────────────────────────────────────────────────
@@ -76,6 +77,8 @@ const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BURN_START_BLOCK, 10) : null;
 const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
 const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10)); // Alchemy free tier max 10 blocks per eth_getLogs
+const BURN_LAG_ALERT_BLOCKS = 50; // send webhook alert if burn poller falls more than N blocks behind
+let _lastLagAlertTs = 0; // debounce lag alerts — max one per 10 minutes
 const BURN_ALERT_CHANNEL_ID = process.env.BURN_ALERT_CHANNEL_ID || '';
 const BURN_METADATA_REFRESH_ENABLED = true; // always on — needed for correct post-burn traits in alert
 const BURN_COLORS = {
@@ -118,6 +121,50 @@ function normAddr(addr){
   return /^0x[a-f0-9]{40}$/.test(s) ? s : '';
 }
 
+// ── Error reporting webhook ──────────────────────────────────────────────────────
+// Posts critical errors to a private Discord channel via webhook.
+// Set ERROR_WEBHOOK_URL in Railway env vars to enable.
+async function sendErrorWebhook(label, error, context = ''){
+  if(!ERROR_WEBHOOK_URL) return;
+  try{
+    const env = process.env.BOT_ENV || 'unknown';
+    const envTag = env === 'production' ? '🔴 PRODUCTION' : env === 'staging' ? '🟡 STAGING' : `⚪ ${env}`;
+    const msg = [
+      `🚨 **[${envTag}] ${label}**`,
+      `\`\`\`${String(error?.message || error).slice(0, 800)}\`\`\``,
+      context ? `**Context:** ${String(context).slice(0, 300)}` : '',
+      `**Time:** <t:${Math.floor(Date.now()/1000)}:f>`,
+    ].filter(Boolean).join('\n');
+    await fetch(ERROR_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: msg.slice(0, 2000), username: 'OCAS Bot Errors' }),
+    });
+  }catch(_){} // never let webhook errors break the bot
+}
+
+// ── Startup env var checks ────────────────────────────────────────────────────
+function checkStartupEnvVars(){
+  const required = [
+    ['DISCORD_TOKEN',    'Bot will not connect to Discord'],
+    ['DATABASE_URL',     'DB pool will fail — all features broken'],
+    ['ALCHEMY_API_KEY',  'Burn poller + lottery ETH seed disabled (set ALCHEMY_WEBSOCKET_URL as fallback)'],
+    ['OPENSEA_KEY',      'OpenSea API calls will hit rate limits quickly'],
+    ['API_SECRET',       'TraitView API auth disabled'],
+    ['RAILWAY_API_URL',  'Trait search, rank search, floor commands will not work'],
+  ];
+  for(const [key, impact] of required){
+    if(!process.env[key]){
+      console.warn(`[Startup] ⚠️  Missing env var ${key}: ${impact}`);
+    }
+  }
+  if(ERROR_WEBHOOK_URL){
+    console.log('[Startup] Error webhook: enabled');
+  } else {
+    console.warn('[Startup] ERROR_WEBHOOK_URL not set — errors will only appear in Railway logs');
+  }
+}
+
 // ── Railway Postgres pool (same DB as api.js) ─────────────────────────────────
 const { Pool } = require('pg');
 const pgPool = new Pool({
@@ -125,11 +172,11 @@ const pgPool = new Pool({
   ssl: process.env.DATABASE_URL?.includes('railway.internal')
     ? false
     : { rejectUnauthorized: false },
-  max: 3,
+  max: 8,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
 });
-pgPool.on('error', e => console.error('[PG bot]', e.message));
+pgPool.on('error', e => { console.error('[PG bot]', e.message); sendErrorWebhook('DB Pool Error', e); });
 
 // ── Create bot_state table if it doesn't exist ───────────────────────────────
 async function ensureBotStateTable(){
@@ -323,6 +370,7 @@ async function ensureBotStateTable(){
       )
     `).catch(()=>{});
     await pgPool.query(`ALTER TABLE burn_lotteries ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'Europe/London'`).catch(()=>{});
+    await pgPool.query(`ALTER TABLE burn_lotteries ADD COLUMN IF NOT EXISTS message_id TEXT`).catch(()=>{});
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS burn_lotteries_status_end_idx ON burn_lotteries(status, end_time)
     `).catch(()=>{});
@@ -367,19 +415,17 @@ async function dbSave(key, value){
   }catch(e){ console.warn('[DB] save error', key, e.message); }
 }
 
-function getRailwayApiUrl(){
-  // Primary expected env var is RAILWAY_API_URL.
-  // Fallback names are accepted so staging/prod do not break if the same API URL
-  // was saved under a slightly different variable name.
-  return String(
-    process.env.RAILWAY_API_URL ||
-    process.env.TRAITVIEW_API_URL ||
-    process.env.RAILWAY_URL ||
-    process.env.API_URL ||
-    process.env.BOT_API_URL ||
-    ''
-  ).trim().replace(/\/+$/, '');
-}
+// Resolved once at startup — avoids re-reading env vars on every command invocation
+const RAILWAY_API_URL_CACHED = String(
+  process.env.RAILWAY_API_URL ||
+  process.env.TRAITVIEW_API_URL ||
+  process.env.RAILWAY_URL ||
+  process.env.API_URL ||
+  process.env.BOT_API_URL ||
+  ''
+).trim().replace(/\/+$/, '');
+
+function getRailwayApiUrl(){ return RAILWAY_API_URL_CACHED; }
 
 // ── Config helpers ────────────────────────────────────────────────────────────
 async function loadAllConfigs(){
@@ -468,6 +514,25 @@ const recentChannelPosts = new Map(); // dedup: channelId+tokenId → timestamp,
 // Rate limit for /burnrefresh: userId+tokenId → last used timestamp
 // One use per token per user per 5 minutes — prevents OS API spam
 const burnRefreshCooldowns = new Map();
+// Per-user rate limiting for heavy search commands (traitfind, rankfind, burn)
+// Prevents DB spam — 1 use per user per 8 seconds
+const commandCooldowns = new Map();
+const COMMAND_COOLDOWN_MS = 8000;
+function checkCommandCooldown(userId, command){
+  const key = `${userId}:${command}`;
+  const last = commandCooldowns.get(key);
+  if(last && Date.now() - last < COMMAND_COOLDOWN_MS){
+    const secsLeft = Math.ceil((COMMAND_COOLDOWN_MS - (Date.now() - last)) / 1000);
+    return secsLeft;
+  }
+  commandCooldowns.set(key, Date.now());
+  // Prune old entries every 2000 entries
+  if(commandCooldowns.size > 2000){
+    const cutoff = Date.now() - COMMAND_COOLDOWN_MS;
+    for(const [k,v] of commandCooldowns) if(v < cutoff) commandCooldowns.delete(k);
+  }
+  return 0;
+}
 function isRecentChannelPost(channelId, tokenId, windowMs=180000){
   const key = channelId + ':' + tokenId;
   const last = recentChannelPosts.get(key);
@@ -480,6 +545,9 @@ function isRecentChannelPost(channelId, tokenId, windowMs=180000){
 const imageCache      = new Map(); // "contract:tokenId" → {result, ts}
 const IMAGE_CACHE_TTL = 60 * 60 * 1000; // 1 hour TTL
 
+const IMAGE_CACHE_MAX   = 2000; // max entries
+const IMAGE_CACHE_EVICT = 200;  // evict this many when full
+
 function getCachedImage(key){
   const entry = imageCache.get(key);
   if(!entry) return null;
@@ -487,6 +555,14 @@ function getCachedImage(key){
   return entry.result;
 }
 function setCachedImage(key, result){
+  if(imageCache.size >= IMAGE_CACHE_MAX){
+    // Map preserves insertion order — first keys are oldest, no sort needed
+    let evicted = 0;
+    for(const k of imageCache.keys()){
+      imageCache.delete(k);
+      if(++evicted >= IMAGE_CACHE_EVICT) break;
+    }
+  }
   imageCache.set(key, { result, ts: Date.now() });
 }
 
@@ -495,6 +571,7 @@ function setCachedImage(key, result){
 // Each session: { embeds: [], index: 0, userId, expiresAt }
 const slideshowSessions = new Map();
 const ocasTraitsCache = new Map(); // tokenId → {traits, expires}
+const OCAS_TRAITS_CACHE_MAX = 1000;
 
 // ── Hoisted trait parser helpers (shared by /ocas and /sweep) ───────────────
 const sweepSessions = new Map(); // sessionId → { listings, page }
@@ -1571,7 +1648,7 @@ async function processPendingBurnAlerts(){
       }
       pendingBurnAlerts.delete(key);
     }catch(e){
-      console.error(`[BurnMeta] post failed for #${survivorId}:`, e.message);
+      console.error(`[BurnMeta] post failed for #${survivorId}:`, e.message); sendErrorWebhook(`Burn Alert Post Failed #${survivorId}`, e);
       // Keep in queue — retry next tick
     }
   }
@@ -1674,8 +1751,21 @@ async function pollBurnEvents(){
     if(logs?.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${fromBlock}-${chunkTo}`);
     await processBurnLogs(logs || [], shouldAlert);
     await dbSave('burn_last_block', String(chunkTo));
-    if(chunkTo < latest) console.log(`[Burn] Behind by ${latest - chunkTo} block(s)`);
-  }catch(e){ console.error('[Burn poller]', e.message); }
+    const lagBlocks = latest - chunkTo;
+    if(lagBlocks > 0){
+      console.log(`[Burn] Behind by ${lagBlocks} block(s)`);
+      // Alert if lag exceeds threshold and we haven't alerted recently
+      if(lagBlocks >= BURN_LAG_ALERT_BLOCKS && Date.now() - _lastLagAlertTs > 10 * 60 * 1000){
+        _lastLagAlertTs = Date.now();
+        sendErrorWebhook(
+          'Burn Poller Lag Alert',
+          new Error(`Poller is ${lagBlocks} blocks behind latest block ${latest}`),
+          `fromBlock=${fromBlock} chunkTo=${chunkTo} gap=${lagBlocks}`
+        );
+        console.warn(`[Burn] ⚠️ Lag alert fired — ${lagBlocks} blocks behind`);
+      }
+    }
+  }catch(e){ console.error('[Burn poller]', e.message); sendErrorWebhook('Burn Poller Error', e); }
   } finally { _pollBurnRunning = false; }
 }
 
@@ -2378,7 +2468,7 @@ async function fetchBotApiJson(url, label){
 async function buildTokenSearchEmbed(token, config, footerLabel){
   const tokenId = token.token_id ?? token.id ?? token.identifier;
   const id = String(tokenId || '');
-  const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+  const contract = config.contract || '';
   const chain = config.chain || 'ethereum';
   const slug = config.slug || '';
   const dbMeta = token._dbToken || (id ? await fetchTokenMetaFromDb(id) : null);
@@ -2528,7 +2618,7 @@ async function pollSales(){
       // Personal DM alerts
       for(const sale of toPost) await sendPersonalAlerts(sale, 'sale', config);
 
-    }catch(e){ console.error('[Poll sales]',guildId,e.message); }
+    }catch(e){ console.error('[Poll sales]',guildId,e.message); sendErrorWebhook('Poll Sales Error', e, `guild=${guildId}`); }
   }
 }
 
@@ -2635,7 +2725,7 @@ async function pollListings(){
 
       for(const l of toPost) await sendPersonalAlerts(l,'listing',config);
 
-    }catch(e){ console.error('[Poll listings]',guildId,e.message); }
+    }catch(e){ console.error('[Poll listings]',guildId,e.message); sendErrorWebhook('Poll Listings Error', e, `guild=${guildId}`); }
   }
 }
 
@@ -2654,10 +2744,10 @@ async function sendPersonalAlerts(event, type, config){
       const dedupKey = `${userId}:${type}:${event.id||event.event_timestamp}`;
       if(alertedEventIds.has(dedupKey)) continue;
       alertedEventIds.add(dedupKey);
-      // Keep set from growing forever — trim if over 5000 entries
+      // Keep set from growing forever — trim oldest 500 when over 5000
       if(alertedEventIds.size > 5000){
-        const first = alertedEventIds.values().next().value;
-        alertedEventIds.delete(first);
+        const toDelete = [...alertedEventIds].slice(0, 500);
+        for(const k of toDelete) alertedEventIds.delete(k);
       }
       const user=await client.users.fetch(userId).catch(()=>null);
       if(!user) continue;
@@ -3044,10 +3134,10 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   if(pick?.proof){
     const blockLine = seedMeta?.block_number
       ? `\nSeed source: Ethereum block [#${seedMeta.block_number}](https://etherscan.io/block/${seedMeta.block_number})`
-      : seedMeta?.seed_type === 'random_fallback' ? `\nSeed source: random fallback (ETH RPC unavailable at draw time)` : '';
+      : seedMeta?.seed_type === 'random_fallback' ? `\nSeed source: cryptographic random (ETH RPC unavailable — result is fair but not on-chain verifiable)` : '';
     embed.addFields({
       name:'Draw Proof',
-      value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`${blockLine}\nUse the buttons below to check the seed, full SHA-256 hash, winning position, and entries.`,
+      value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`${blockLine}`,
       inline:false
     });
   }
@@ -3062,9 +3152,25 @@ async function drawAndPostBurnLottery(row){
   const timeZone = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
   const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
 
+  // Edit the original scheduled embed to show fetching state
+  let originalMsg = null;
+  if(row.message_id && row.channel_id){
+    try{
+      const ch = await resolveDiscordChannel(row.channel_id);
+      if(ch){
+        originalMsg = await ch.messages.fetch(row.message_id).catch(() => null);
+        if(originalMsg){
+          const fetchingEmbed = EmbedBuilder.from(originalMsg.embeds[0])
+            .setDescription('⏳ Entry window closed — fetching Ethereum block hash for tamper-proof seed...');
+          await originalMsg.edit({ embeds:[fetchingEmbed], components:buildActiveBurnLotteryComponents(row.id) }).catch(() => {});
+        }
+      }
+    }catch(_){}
+  }
+
   let drawSeed, seedMeta = {};
 
-  if(row.status === 'active' && isPendingDrawSeed(row.seed)){
+  if(isPendingDrawSeed(row.seed)){
     // Use Ethereum block hash as the tamper-proof public seed.
     // Target: the block mined 5 blocks after the end of the lottery window,
     // giving finality and ensuring no one (including the bot operator) can
@@ -3108,53 +3214,277 @@ async function drawAndPostBurnLottery(row){
      JSON.stringify({entries:entries.length, proof:pick?.proof||null, winner_index:pick?.index ?? null, winner_position:pick?.position ?? null, ...seedMeta}),
      row.id]
   );
-  const ch = await resolveDiscordChannel(row.channel_id);
-  if(ch){
-    await ch.send({
-      embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone, seedMeta})],
-      components:buildBurnLotteryComponents(row.id)
-    });
+  const resultEmbed = buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone, seedMeta});
+  const resultComponents = buildBurnLotteryComponents(row.id);
+
+  if(originalMsg){
+    // Edit the original message to show the full result — no second message posted
+    try{
+      await originalMsg.edit({ embeds:[resultEmbed], components:resultComponents }).catch(() => {});
+    }catch(_){}
+  } else {
+    // No original message to edit (e.g. auto-draw with no stored message_id) — post fresh
+    const ch = await resolveDiscordChannel(row.channel_id);
+    if(ch) await ch.send({ embeds:[resultEmbed], components:resultComponents });
   }
 }
 async function processDueBurnLotteries(){
   const r = await pgPool.query(`SELECT * FROM burn_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]}));
-  for(const row of r.rows){ try{ await drawAndPostBurnLottery(row); }catch(e){ console.warn('[BurnLottery auto]', row.id, e.message); } }
+  for(const row of r.rows){
+    try{
+      console.log(`[BurnLottery #${row.id}] Auto-draw triggered`);
+      await drawAndPostBurnLottery(row);
+      console.log(`[BurnLottery #${row.id}] Draw complete`);
+    }catch(e){
+      console.warn('[BurnLottery auto]', row.id, e.message);
+      sendErrorWebhook('BurnLottery Auto-Draw Error', e, `lottery=${row.id}`);
+    }
+  }
 }
 function lotteryNumberFromSeed(seed,min,max){ const lo=Math.min(parseInt(min),parseInt(max)), hi=Math.max(parseInt(min),parseInt(max)); const h=lotteryHash(seed); return lo + Number(BigInt('0x'+h.slice(0,16)) % BigInt(hi-lo+1)); }
 function lotteryEntryButton(row){ return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`lottery_enter:${row.id}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)); }
+function buildGenericLotteryComponents(lotteryId, type='giveaway', active=true){
+  const rows = [];
+  if(active && type === 'giveaway'){
+    // Active giveaway — entry button only
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)
+    ));
+  } else {
+    // Completed — show draw proof button
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('Show Draw Proof').setStyle(ButtonStyle.Secondary)
+    ));
+  }
+  return rows;
+}
 function buildGenericLotteryStartEmbed(row, count=0){
-  const type=String(row.type||'giveaway'), title=row.title || (type==='guess'?'Guess the Number':'Giveaway Lottery');
-  const e=new EmbedBuilder().setTitle(`🎲 ${title}`).setColor(COLORS.OCAS_GREEN)
-    .addFields({name:'ID',value:String(row.id),inline:true},{name:'Type',value:type==='guess'?'Guess the number':'Giveaway button entries',inline:true},{name:'Window',value:`${lotteryTime(row.start_time)} → ${lotteryTime(row.end_time)}`,inline:false});
-  if(row.prize) e.addFields({name:'Prize',value:String(row.prize).slice(0,1024),inline:false});
-  if(type==='guess') e.addFields({name:'Range',value:`${row.min_number}–${row.max_number}`,inline:true},{name:'Winner Mode',value:row.winner_mode==='exact'?'Exact only':'Closest wins',inline:true},{name:'How to Play',value:`Use \`/lottery guess id:${row.id} number:<guess>\``,inline:false});
-  else e.addFields({name:'Entries',value:String(count),inline:true},{name:'How to Enter',value:'Click **Enter Giveaway** below, or use `/lottery enter`.',inline:false});
-  e.addFields({name:'Seed',value:`\`${String(row.seed).slice(0,256)}\``,inline:false}).setFooter({text:`Lottery ID ${row.id}`}).setTimestamp(); return e;
+  const type = String(row.type || 'giveaway');
+  const title = row.title || (type === 'guess' ? 'Guess the Number' : 'Giveaway Lottery');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🎲 ${title}`)
+    .setColor(COLORS.OCAS_GREEN)
+    .addFields(
+      { name:'ID',     value:String(row.id),                                       inline:true },
+      { name:'Type',   value:type === 'guess' ? 'Guess the number' : 'Giveaway button entries', inline:true },
+      { name:'Window', value:`${lotteryTime(row.start_time)} → ${lotteryTime(row.end_time)}`,   inline:false },
+    );
+
+  if(row.prize) embed.addFields({ name:'Prize', value:String(row.prize).slice(0, 1024), inline:false });
+
+  if(type === 'guess'){
+    embed.addFields(
+      { name:'Range',       value:`${row.min_number}–${row.max_number}`,                       inline:true },
+      { name:'Winner Mode', value:row.winner_mode === 'exact' ? 'Exact only' : 'Closest wins', inline:true },
+      { name:'How to Play', value:`Use \`/lottery guess id:${row.id} number:<guess>\``,         inline:false },
+    );
+  } else {
+    embed.addFields(
+      { name:'Entries',    value:String(count),                                                inline:true },
+      { name:'How to Enter', value:'Click **Enter Giveaway** below, or use `/lottery enter`.', inline:false },
+    );
+  }
+
+  embed
+    .setFooter({ text:`Lottery ID ${row.id}` })
+    .setTimestamp();
+
+  return embed;
 }
 function buildGenericLotteryResultEmbed(row, entries, result){
-  const type=String(row.type||'giveaway'), title=row.title || (type==='guess'?'Guess the Number Result':'Giveaway Result');
-  const e=new EmbedBuilder().setTitle(`🏆 ${title}`).setColor(COLORS.OCAS_GREEN)
-    .addFields({name:'ID',value:String(row.id),inline:true},{name:'Entries',value:String(entries.length),inline:true},{name:'Window',value:`${lotteryTime(row.start_time)} → ${lotteryTime(row.end_time)}`,inline:false});
-  if(row.prize) e.addFields({name:'Prize',value:String(row.prize).slice(0,1024),inline:false});
-  if(type==='guess'){ e.addFields({name:'Winning Number',value:String(row.winning_number),inline:true}); if(result?.winner) e.addFields({name:'Winner',value:`<@${result.winner.user_id}>`,inline:true},{name:'Winning Guess',value:String(result.winner.guess_number),inline:true}); else e.addFields({name:'Winner',value:row.winner_mode==='exact'?'No exact guess.':'No valid guesses.',inline:false}); }
-  else { if(result?.winner) e.addFields({name:'Winner',value:`<@${result.winner.user_id}>`,inline:false}); else e.addFields({name:'Winner',value:'No eligible entries.',inline:false}); }
-  e.addFields({name:'Seed',value:`\`${String(row.seed).slice(0,256)}\``,inline:false}); if(result?.proof) e.addFields({name:'Proof Hash',value:`\`${result.proof.slice(0,32)}...\``,inline:false}); return e.setFooter({text:`Lottery ID ${row.id}`}).setTimestamp();
+  const type = String(row.type || 'giveaway');
+  const title = row.title || (type === 'guess' ? 'Guess the Number Result' : 'Giveaway Result');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 ${title}`)
+    .setColor(COLORS.OCAS_GREEN)
+    .addFields(
+      { name:'ID',      value:String(row.id),       inline:true },
+      { name:'Entries', value:String(entries.length), inline:true },
+      { name:'Window',  value:`${lotteryTime(row.start_time)} → ${lotteryTime(row.end_time)}`, inline:false },
+    );
+
+  if(row.prize) embed.addFields({ name:'Prize', value:String(row.prize).slice(0, 1024), inline:false });
+
+  if(type === 'guess'){
+    embed.addFields({ name:'Winning Number', value:String(row.winning_number), inline:true });
+    if(result?.winner){
+      embed.addFields(
+        { name:'Winner',       value:`<@${result.winner.user_id}>`,       inline:true },
+        { name:'Winning Guess', value:String(result.winner.guess_number), inline:true },
+      );
+    } else {
+      embed.addFields({ name:'Winner', value:row.winner_mode === 'exact' ? 'No exact guess.' : 'No valid guesses.', inline:false });
+    }
+  } else {
+    if(result?.winner){
+      embed.addFields({ name:'Winner', value:`<@${result.winner.user_id}>`, inline:false });
+    } else {
+      embed.addFields({ name:'Winner', value:'No eligible entries.', inline:false });
+    }
+  }
+
+  const rj = row.result_json || {};
+  const blockNum = rj.block_number || null;
+  const seedLine = blockNum
+    ? `[Block #${blockNum}](https://etherscan.io/block/${blockNum}) — \`${String(row.seed).slice(0, 100)}\``
+    : `\`${String(row.seed).slice(0, 256)}\``;
+  embed.addFields({ name:'Seed', value:seedLine, inline:false });
+  if(result?.proof) embed.addFields({ name:'Proof', value:`\`${result.proof.slice(0, 32)}...\``, inline:false });
+
+  return embed.setFooter({ text:`Lottery ID ${row.id}` }).setTimestamp();
 }
 async function findActiveGenericLottery(guildId,type=null){ const params=[guildId]; let q=`SELECT * FROM generic_lotteries WHERE guild_id=$1 AND status='active' AND end_time > NOW()`; if(type){params.push(type); q+=` AND type=$2`;} q+=` ORDER BY id DESC LIMIT 1`; const r=await pgPool.query(q,params); return r.rows[0]||null; }
 async function getGenericLotteryEntryCount(id){ const r=await pgPool.query('SELECT COUNT(*)::int count FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]})); return parseInt(r.rows[0]?.count||0); }
-async function drawGenericLottery(row, post=true, ethSeed=null){
-  const er=await pgPool.query('SELECT user_id, username, guess_number, entered_at FROM generic_lottery_entries WHERE lottery_id=$1 ORDER BY entered_at ASC,user_id ASC',[row.id]);
-  const entries=er.rows; let result={winner:null,proof:null};
-  // Use ETH block hash seed if provided, otherwise fall back to stored seed
-  const activeSeed = ethSeed || row.seed;
-  if(row.type==='guess'){ const valid=entries.filter(x=>x.guess_number!=null); row.winning_number=row.winning_number??lotteryNumberFromSeed(`${activeSeed}:winning-number`,row.min_number||1,row.max_number||100); let pool=valid.filter(x=>parseInt(x.guess_number)===parseInt(row.winning_number)); if(!pool.length && row.winner_mode!=='exact' && valid.length){ const d=Math.min(...valid.map(x=>Math.abs(parseInt(x.guess_number)-parseInt(row.winning_number)))); pool=valid.filter(x=>Math.abs(parseInt(x.guess_number)-parseInt(row.winning_number))===d); } if(pool.length){ const p=lotteryPick(pool.map(x=>x.user_id),`${activeSeed}:guess:${row.id}:${row.winning_number}`); result={winner:pool.find(x=>x.user_id===p.winner)||pool[0],proof:p.proof}; } }
-  else { const p=lotteryPick(entries.map(x=>x.user_id),`${activeSeed}:giveaway:${row.id}`); if(p) result={winner:entries.find(x=>x.user_id===p.winner)||entries[p.index],proof:p.proof}; }
-  // Store the seed used (ETH hash if available)
-  if(ethSeed) await pgPool.query('UPDATE generic_lotteries SET seed=$1 WHERE id=$2',[ethSeed,row.id]).catch(()=>{});
-  await pgPool.query(`UPDATE generic_lotteries SET status='completed', winner_user_id=$1,winner_display=$2,winner_guess=$3,entry_count=$4,result_json=$5,completed_at=NOW(),winning_number=$6 WHERE id=$7`,[result.winner?.user_id||null,result.winner?.username||null,result.winner?.guess_number??null,entries.length,JSON.stringify({proof:result.proof||null}),row.winning_number??null,row.id]);
-  const embed=buildGenericLotteryResultEmbed(row,entries,result); if(post){ const ch=await resolveDiscordChannel(row.channel_id); if(ch) await ch.send({embeds:[embed]}); } return {embed,entries,result};
+async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=null, preClaimed=false){
+  // Claim to prevent double-draw. Skip if caller already claimed (processDueGenericLotteries).
+  if(!preClaimed){
+    const claim = await pgPool.query(
+      `UPDATE generic_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`,
+      [row.id]
+    );
+    if(!claim.rows.length) return { embed:null, entries:[], result:{winner:null,proof:null}, components:[] };
+  }
+
+  // Fetch entries ordered by entry time then user ID for deterministic results
+  const er = await pgPool.query(
+    'SELECT user_id, username, guess_number, entered_at FROM generic_lottery_entries WHERE lottery_id=$1 ORDER BY entered_at ASC, user_id ASC',
+    [row.id]
+  );
+  const entries = er.rows;
+  let result = { winner: null, proof: null };
+
+  // Use ETH block hash seed if provided.
+  // If ETH fetch failed and the stored seed is still a pending placeholder, generate a
+  // cryptographic random seed so the result embed never shows a raw __PENDING_DRAW_SEED__ string.
+  const activeSeed = ethSeed || (isPendingDrawSeed(row.seed) ? randomLotterySeed() : row.seed);
+
+  if(row.type === 'guess'){
+    const valid = entries.filter(x => x.guess_number != null);
+    // Determine winning number from seed if not already set
+    row.winning_number = row.winning_number ?? lotteryNumberFromSeed(
+      `${activeSeed}:winning-number`, row.min_number || 1, row.max_number || 100
+    );
+    // Find exact matches first
+    let pool = valid.filter(x => parseInt(x.guess_number) === parseInt(row.winning_number));
+    // Fall back to closest guess if no exact match and not exact-only mode
+    if(!pool.length && row.winner_mode !== 'exact' && valid.length){
+      const minDist = Math.min(...valid.map(x => Math.abs(parseInt(x.guess_number) - parseInt(row.winning_number))));
+      pool = valid.filter(x => Math.abs(parseInt(x.guess_number) - parseInt(row.winning_number)) === minDist);
+    }
+    if(pool.length){
+      const p = lotteryPick(pool.map(x => x.user_id), `${activeSeed}:guess:${row.id}:${row.winning_number}`);
+      result = { winner: pool.find(x => x.user_id === p.winner) || pool[0], proof: p.proof };
+    }
+  } else {
+    // Giveaway mode — pick from all entries
+    const p = lotteryPick(entries.map(x => x.user_id), `${activeSeed}:giveaway:${row.id}`);
+    if(p) result = { winner: entries.find(x => x.user_id === p.winner) || entries[p.index], proof: p.proof };
+  }
+
+  // Always write the final seed back to DB — covers ETH hash, random fallback, and pending→resolved
+  await pgPool.query('UPDATE generic_lotteries SET seed=$1 WHERE id=$2', [activeSeed, row.id]).catch(() => {});
+
+  // Mark completed and store result
+  await pgPool.query(
+    `UPDATE generic_lotteries
+     SET status='completed', winner_user_id=$1, winner_display=$2, winner_guess=$3,
+         entry_count=$4, result_json=$5, completed_at=NOW(), winning_number=$6
+     WHERE id=$7`,
+    [
+      result.winner?.user_id || null,
+      result.winner?.username || null,
+      result.winner?.guess_number ?? null,
+      entries.length,
+      JSON.stringify({ proof: result.proof || null, winner_index: result.index ?? null, winner_position: result.position ?? null, block_number: ethBlockNumber || null }),
+      row.winning_number ?? null,
+      row.id,
+    ]
+  );
+
+  // Ensure row.seed reflects the final resolved seed for the result embed
+  row.seed = activeSeed;
+  const embed = buildGenericLotteryResultEmbed(row, entries, result);
+  const resultComponents = buildGenericLotteryComponents(row.id, row.type, false);
+  if(post){
+    const ch = await resolveDiscordChannel(row.channel_id);
+    if(ch) await ch.send({ embeds: [embed], components: resultComponents });
+  }
+  return { embed, entries, result, components: resultComponents };
 }
-async function processDueGenericLotteries(){ const r=await pgPool.query(`SELECT * FROM generic_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]})); for(const row of r.rows){try{await drawGenericLottery(row,true);}catch(e){console.warn('[GenericLottery auto]',row.id,e.message);}} }
+
+async function processDueGenericLotteries(){
+  const r = await pgPool.query(
+    `SELECT * FROM generic_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`
+  ).catch(() => ({ rows: [] }));
+
+  for(const row of r.rows){
+    try{
+      // Claim immediately — prevents a second poller cycle from racing during the ETH block wait
+      const claim = await pgPool.query(
+        `UPDATE generic_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`,
+        [row.id]
+      );
+      if(!claim.rows.length){ console.log(`[Lottery #${row.id}] Already claimed, skipping`); continue; }
+
+      console.log(`[Lottery #${row.id}] Auto-draw triggered type=${row.type}`);
+
+      // Edit original message to show fetching state
+      let originalMsg = null;
+      if(row.message_id && row.channel_id){
+        try{
+          const ch = await resolveDiscordChannel(row.channel_id);
+          if(ch){
+            originalMsg = await ch.messages.fetch(row.message_id).catch(() => null);
+            if(originalMsg){
+              const fetchingEmbed = EmbedBuilder.from(originalMsg.embeds[0])
+                .setDescription('⏳ Entry window closed — fetching Ethereum block hash for tamper-proof seed...');
+              await originalMsg.edit({ embeds:[fetchingEmbed], components:[] }).catch(() => {});
+            }
+          }
+        }catch(_){}
+      }
+
+      // Fetch ETH block hash seed
+      let ethSeed = null;
+      let ethBlockNumber = null;
+      try{
+        const rpcUrlA = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://', 'https://') ||
+          `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+        const latestBlockA = parseInt(await burnRpc(rpcUrlA, 'eth_blockNumber', []), 16);
+        const targetBlockA = latestBlockA + 5;
+        console.log(`[Lottery #${row.id}] Waiting for Ethereum block #${targetBlockA} (current: ${latestBlockA})...`);
+        const arrivedA = await waitForEthBlock(targetBlockA);
+        if(arrivedA){
+          const { hash: bHashA } = await fetchEthBlockHashSeed(targetBlockA);
+          ethSeed = bHashA;
+          ethBlockNumber = targetBlockA;
+          console.log(`[Lottery #${row.id}] Seed: block hash ${bHashA}`);
+        } else {
+          console.warn(`[Lottery #${row.id}] ETH block timeout — using stored seed`);
+        }
+      }catch(ethErr){
+        console.warn(`[Lottery #${row.id}] ETH seed failed: ${ethErr.message} — using stored seed`);
+      }
+
+      await drawGenericLottery(row, true, ethSeed, ethBlockNumber, true);
+
+      // Update original message to show draw complete
+      if(originalMsg){
+        try{
+          const doneEmbed = EmbedBuilder.from(originalMsg.embeds[0]).setDescription('✅ Draw complete.');
+          await originalMsg.edit({ embeds:[doneEmbed], components:[] }).catch(() => {});
+        }catch(_){}
+      }
+
+      console.log(`[Lottery #${row.id}] Draw complete`);
+    }catch(e){
+      console.warn('[GenericLottery auto]', row.id, e.message);
+      sendErrorWebhook('GenericLottery Auto-Draw Error', e, `lottery=${row.id}`);
+    }
+  }
+}
 
 client.on('interactionCreate', async (interaction)=>{
   if(interaction.isButton() && interaction.customId.startsWith('lottery_enter:')){
@@ -3303,7 +3633,11 @@ client.on('interactionCreate', async (interaction)=>{
         });
         if(contractTraits && realTraitCount(contractTraits)){
           traits = contractTraits;
-          ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+          if(ocasTraitsCache.size >= OCAS_TRAITS_CACHE_MAX){
+          const oldest = [...ocasTraitsCache.keys()].slice(0, 200);
+          for(const k of oldest) ocasTraitsCache.delete(k);
+        }
+        ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
         }
       }
 
@@ -3316,7 +3650,13 @@ client.on('interactionCreate', async (interaction)=>{
             const tj = await tr.json();
             if(tj.ok && tj.token?.traits) traits = tj.token.traits;
           }
-          if(traits) ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+          if(traits){
+            if(ocasTraitsCache.size >= OCAS_TRAITS_CACHE_MAX){
+              const oldest = [...ocasTraitsCache.keys()].slice(0, 200);
+              for(const k of oldest) ocasTraitsCache.delete(k);
+            }
+            ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+          }
         }catch(apiErr){
           console.warn('[ShowTraits API]', apiErr.message);
         }
@@ -3364,10 +3704,10 @@ client.on('interactionCreate', async (interaction)=>{
         (winner ? `**Winner:** ${etherscanAddressLink(winner)}\n\`${winner}\`\n` : `**Winner:** none\n`) +
         (winnerPosition ? `**Winning entry:** ${Number(winnerPosition).toLocaleString()} of ${entries.length.toLocaleString()}\n` : '') +
         `\n**How to verify:**\n` +
-        `The draw uses the final ordered entry list. In wallet mode, that means one entry per wallet. In burn mode, that means one entry per burn, so wallets may repeat.\n` +
-        `The seed is the hash of an Ethereum block mined 5 blocks after the lottery window closes — published on-chain before the draw runs, so no one (including the bot operator) can predict or influence it. ` +
-        `The bot hashes the seed plus the exact ordered entry list using SHA-256. The full 256-bit hash is converted to a number, then divided by the entry count to select the winning entry. Same seed + same entries = same winner every time.\n` +
-        ((() => { const rj = row.result_json || {}; return rj.block_number ? `Seed source: Ethereum block [#${rj.block_number}](https://etherscan.io/block/${rj.block_number})\n` : rj.seed_type === 'random_fallback' ? `Seed source: random fallback (ETH RPC unavailable at draw time)\n` : ''; })()) +
+        `One entry per wallet (wallet mode) or one entry per burn (burn mode). ` +
+        `The seed is an Ethereum block hash mined 5 blocks after the window closes — unpredictable by anyone including the bot operator. ` +
+        `SHA-256(seed + ordered entries) → winning index. Same seed + same entries = same winner every time.\n` +
+        ((() => { const rj = row.result_json || {}; return rj.block_number ? `Seed source: Ethereum block [#${rj.block_number}](https://etherscan.io/block/${rj.block_number})\n` : rj.seed_type === 'random_fallback' ? `Seed source: cryptographic random (ETH RPC unavailable — result is fair but not on-chain verifiable)\n` : ''; })()) +
         `\n**Seed:**\n\`${isPendingDrawSeed(row.seed) ? 'Pending — final seed is the hash of an Ethereum block mined after the window closes.' : String(row.seed || '').slice(0, 900)}\`\n` +
         `**Full proof hash:**\n\`${String(proof).slice(0, 128)}\``;
       await interaction.editReply({
@@ -3421,6 +3761,54 @@ client.on('interactionCreate', async (interaction)=>{
     }catch(e){
       console.error('[BurnLottery Entries]', e.message);
       try{ await interaction.editReply({ content:'Error loading entries.' }); }catch(_){}
+    }
+    return;
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('generic_lottery_proof:')){
+    const lotteryId = parseInt(interaction.customId.split(':')[1], 10);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const r = await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1', [lotteryId]);
+      if(!r.rows.length){ await interaction.editReply({ content:'Lottery not found.' }); return; }
+      const row = r.rows[0];
+      const isPending = row.status === 'active' || row.status === 'processing';
+      const rj = row.result_json || {};
+      const blockNum = rj.block_number || null;
+      const seedType = rj.seed_type || null;
+
+      const seedDisplay = isPending
+        ? 'Generated at draw time using an Ethereum block hash — unpredictable by anyone including the bot operator.'
+        : `\`${String(row.seed).slice(0, 256)}\``;
+      const proofDisplay = rj.proof
+        ? `\`${String(rj.proof).slice(0, 64)}...\``
+        : isPending ? 'Generated at draw time.' : 'Not available.';
+      const seedSourceLine = blockNum
+        ? `Seed source: Ethereum block [#${blockNum}](https://etherscan.io/block/${blockNum})`
+        : seedType === 'random_fallback'
+          ? 'Seed source: cryptographic random (ETH RPC unavailable — result is fair but not on-chain verifiable)'
+          : '';
+
+      const content = [
+        `**🎲 Draw Proof — Lottery #${lotteryId}**`,
+        `**Type:** ${row.type === 'guess' ? 'Guess the number' : 'Giveaway button entries'}`,
+        `**Status:** ${row.status}`,
+        `**Entries:** ${row.entry_count ?? (isPending ? 'Open' : '0')}`,
+        ``,
+        `**How to verify:**`,
+        `One entry per user. The seed is an Ethereum block hash fetched at draw time — published on-chain before the result is calculated, so no one can predict or influence it.`,
+        `SHA-256(seed + ordered entry list) → winning index. Same seed + same entries = same winner every time.`,
+        seedSourceLine,
+        ``,
+        `**Seed:**`,
+        seedDisplay,
+        `**Proof Hash:**`,
+        proofDisplay,
+      ].filter(s => s !== undefined).join('\n');
+      await interaction.editReply({ content: content.slice(0, 1900) });
+    }catch(e){
+      console.error('[GenericLottery Proof]', e.message);
+      try{ await interaction.editReply({ content:'Error loading draw proof.' }); }catch(_){}
     }
     return;
   }
@@ -3909,6 +4297,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
   // /traitfind - token search by default; add "listings" or "sales" for those modes.
   if(commandName==='traitfind'){
+    const _tfCool = checkCommandCooldown(interaction.user.id, 'traitfind');
+    if(_tfCool) return interaction.reply({content:`⏳ Please wait **${_tfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const slug       = interaction.options.getString('collection') || config.slug;
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = getRailwayApiUrl();
@@ -4003,7 +4393,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           if(!j.ok) throw new Error(j.error || 'API error');
           const tokens = j.tokens || [];
           if(!tokens.length){ await interaction.editReply(`No listed tokens found with **${trait ? trait+': ' : ''}${value}**.`); return; }
-          const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+          const contract = config.contract || '';
           const listEmbeds = await Promise.all(tokens.map(async t => {
             const tokenId = t.token_id ?? t.id ?? t.identifier;
             const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
@@ -4230,6 +4620,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   // /help
   // /rankfilter — show currently listed tokens filtered by OS rank range
   if(commandName==='rankfind'){
+    const _rfCool = checkCommandCooldown(interaction.user.id, 'rankfind');
+    if(_rfCool) return interaction.reply({content:`⏳ Please wait **${_rfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
@@ -4252,7 +4644,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
     if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. Try: "1-100" or "1-500 rank"', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
-    const contract = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+    const contract = config.contract || '';
     try{
 
       // ── Sales mode ─────────────────────────────────────────────────────────
@@ -4327,7 +4719,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   if(commandName==='ocas'){
     const tokenInput = interaction.options.getInteger('token');
     const rawSearch  = (interaction.options.getString('search') || '').trim();
-    const contract   = config.contract || '0x078be86f3104a32313a47815792230a3808642cc';
+    const contract   = config.contract || '';
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
 
@@ -4709,6 +5101,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const components = [];
       const sessionId = interaction.id;
       const cleanSweepListings = sweepListings.map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
+      // Cap total concurrent sweep sessions to prevent unbounded memory growth
+      if(sweepSessions.size >= 100){
+        const oldest = sweepSessions.keys().next().value;
+        sweepSessions.delete(oldest);
+      }
       sweepSessions.set(sessionId, { listings: cleanSweepListings, page: 0 });
       setTimeout(() => sweepSessions.delete(sessionId), 30 * 60 * 1000);
       components.push(new ActionRowBuilder().addComponents(
@@ -4828,6 +5225,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
   // /burn token:ID
   if(commandName==='burn'){
+    const _burnCool = checkCommandCooldown(interaction.user.id, 'burn');
+    if(_burnCool) return interaction.reply({content:`⏳ Please wait **${_burnCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const tokenInput = interaction.options.getInteger('token');
     if(!tokenInput) return interaction.reply({ content:'Provide a token ID.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
@@ -5253,7 +5652,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         if(end <= start) return interaction.editReply('End time must be after start time.');
         const r = await pgPool.query(`INSERT INTO burn_lotteries (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status, timezone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10) RETURNING *`, [guildId, channel.id, interaction.user.id, title, prize, mode, start, end, seed, timeZone]);
         const row = r.rows[0];
-        return interaction.editReply({ embeds:[new EmbedBuilder()
+        const burnStartMsg = await interaction.editReply({ embeds:[new EmbedBuilder()
           .setTitle('🎟️ Burn lottery scheduled')
           .setColor(COLORS.OCAS_GREEN)
           .addFields(
@@ -5265,6 +5664,9 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
             {name:'Draw Seed',value:customSeed ? `Custom seed set: \`${String(customSeed).slice(0,256)}\`` : 'Generated automatically at draw time after the entry window closes.',inline:false}
           )
           .setTimestamp()], components:buildActiveBurnLotteryComponents(row.id) });
+        await pgPool.query('UPDATE burn_lotteries SET message_id=$1 WHERE id=$2', [burnStartMsg.id, row.id]).catch(() => {});
+        console.log(`[BurnLottery #${row.id}] Scheduled window=${formatBurnLotteryWindow(start, end, timeZone)} guild=${guildId}`);
+        return;
       }
       if(sub==='status'){
         const id = interaction.options.getInteger('id');
@@ -5288,9 +5690,27 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         if(!r.rows.length) return interaction.editReply('Lottery not found.');
         const lotteryRow = r.rows[0];
         if(lotteryRow.status === 'completed') return interaction.editReply(`Lottery #${id} is already completed.`);
-        await interaction.editReply('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)');
+
+        // Show full lottery details embed with ⏳ fetching state
+        const drawStart = new Date(lotteryRow.start_time), drawEnd = new Date(lotteryRow.end_time);
+        const drawTz = lotteryRow.timezone || DEFAULT_LOTTERY_TIMEZONE;
+        const { entries: preEntries, wallets: preWallets, burns: preBurns } = await getBurnLotteryEntries(drawStart, drawEnd, lotteryRow.mode);
+        const fetchingEmbed = buildBurnLotteryEmbed({
+          title: lotteryRow.title || 'OCAS Burn Lottery',
+          prize: lotteryRow.prize,
+          mode: lotteryRow.mode,
+          start: drawStart, end: drawEnd,
+          seed: null, entries: preEntries, wallets: preWallets, burns: preBurns,
+          pick: null, lotteryId: lotteryRow.id, timezone: drawTz
+        }).setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
+        await interaction.editReply({ embeds:[fetchingEmbed], components:buildActiveBurnLotteryComponents(lotteryRow.id) });
+
         await drawAndPostBurnLottery(lotteryRow);
-        return interaction.editReply({ content: null, embeds:[new EmbedBuilder().setColor(COLORS.OCAS_GREEN).setDescription(`✅ Drew burn lottery #${id} — result posted in <#${lotteryRow.channel_id}>`).setTimestamp()] });
+
+        // drawAndPostBurnLottery edits the original scheduled message to the full result.
+        // Update the interaction reply to confirm draw is done.
+        const doneEmbed = EmbedBuilder.from(fetchingEmbed).setDescription('✅ Draw complete.');
+        return interaction.editReply({ embeds:[doneEmbed], components:[] });
       }
       const mode = interaction.options.getString('mode') || 'wallet';
       const timezoneInput = interaction.options.getString('timezone');
@@ -5306,52 +5726,73 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
       if(!entries.length) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
 
+      // Insert lottery record early so we have an ID for the Show Current Entries button
+      const preInsert = await pgPool.query(
+        `INSERT INTO burn_lotteries
+           (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status, timezone)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'processing',$10) RETURNING id`,
+        [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, pendingDrawSeed(), timeZone]
+      );
+      const instantLotteryId = preInsert.rows[0]?.id;
+
+      // Show full details embed with ⏳ while fetching ETH seed
+      const instantFetchEmbed = buildBurnLotteryEmbed({
+        title: 'OCAS Burn Lottery', mode, start, end,
+        seed: null, entries, wallets, burns,
+        pick: null, lotteryId: instantLotteryId, timezone: timeZone
+      }).setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
+      await interaction.editReply({ embeds:[instantFetchEmbed], components:buildActiveBurnLotteryComponents(instantLotteryId) });
+
       // Use ETH block hash as seed unless admin supplied a custom seed
       let drawSeed, seedMeta = {};
       if(customSeed){
         drawSeed = customSeed;
         seedMeta = { seed_type: 'admin_supplied' };
       } else {
-        await interaction.editReply('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)');
         try{
           const rpcUrl2 = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
             `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
           const latestBlock2 = parseInt(await burnRpc(rpcUrl2, 'eth_blockNumber', []), 16);
           const targetBlock2 = latestBlock2 + 5;
+          console.log(`[BurnLottery instant] Waiting for Ethereum block #${targetBlock2} (current: ${latestBlock2})...`);
           const arrived2 = await waitForEthBlock(targetBlock2);
           if(arrived2){
             const { hash: bHash, blockNumber: bNum } = await fetchEthBlockHashSeed(targetBlock2);
             drawSeed = bHash;
             seedMeta = { seed_type: 'eth_block_hash', block_number: bNum, block_hash: bHash };
+            console.log(`[BurnLottery instant] Seed: block #${bNum} hash ${bHash}`);
           } else {
             drawSeed = randomLotterySeed();
             seedMeta = { seed_type: 'random_fallback', reason: 'eth_block_timeout' };
+            console.warn('[BurnLottery instant] ETH block timeout — falling back to random seed');
           }
         }catch(ethErr){
           drawSeed = randomLotterySeed();
           seedMeta = { seed_type: 'random_fallback', reason: ethErr.message };
+          console.warn(`[BurnLottery instant] ETH block fetch failed: ${ethErr.message} — falling back to random seed`);
+          sendErrorWebhook('BurnLottery Instant ETH Seed Failed', ethErr, `guild=${guildId}`);
         }
       }
 
       const pick = lotteryPick(entries, drawSeed);
       if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
-      const r = await pgPool.query(
-        `INSERT INTO burn_lotteries
-           (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status,
-            winner_wallet, qualified_wallets, total_burns, result_json, timezone, completed_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed',$10,$11,$12,$13,$14,NOW())
-         RETURNING id`,
-        [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, drawSeed,
-         pick.winner, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null, ...seedMeta}), timeZone]
+      await pgPool.query(
+        `UPDATE burn_lotteries
+           SET seed=$1, status='completed', winner_wallet=$2, qualified_wallets=$3,
+               total_burns=$4, result_json=$5, completed_at=NOW()
+         WHERE id=$6`,
+        [drawSeed, pick.winner, wallets.length, burns.length,
+         JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null, ...seedMeta}),
+         instantLotteryId]
       );
-      const lotteryId = r.rows[0]?.id;
+      const lotteryId = instantLotteryId;
       return interaction.editReply({
         content: null,
         embeds:[buildBurnLotteryEmbed({mode,start,end,seed:drawSeed,entries,wallets,burns,pick,lotteryId,timezone:timeZone,seedMeta})],
         components:buildBurnLotteryComponents(lotteryId)
       });
     }catch(e){
-      console.error('[/burnlottery]', e);
+      console.error('[/burnlottery]', e); sendErrorWebhook('/burnlottery Error', e, `guild=${guildId}`);
       const msg = String(e.message || '');
       if(/could not parse|invalid .*date|could not parse time|invalid .*time/i.test(msg)){
         return interaction.editReply(`${burnLotteryParseErrorMessage()}\n\n${msg}`);
@@ -5361,73 +5802,198 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
   }
 
   if(commandName==='lottery'){
-    const sub=interaction.options.getSubcommand(false)||'instant';
-    const adminOnly=['start','draw','cancel','instant'].includes(sub);
-    if(adminOnly && !isAdmin) return interaction.reply({content:'Need Manage Server permission.',flags:MessageFlags.Ephemeral});
+    const sub = interaction.options.getSubcommand(false) || 'instant';
+    const adminOnly = ['start','draw','cancel','instant'].includes(sub);
+    if(adminOnly && !isAdmin) return interaction.reply({ content:'Need Manage Server permission.', flags:MessageFlags.Ephemeral });
+
     try{
-      if(sub==='instant'){
-        const entriesRaw=interaction.options.getString('entries')||''; const min=interaction.options.getInteger('min'); const max=interaction.options.getInteger('max'); const seed=interaction.options.getString('seed')||`lottery:${guildId}:${Date.now()}`;
-        let entries=entriesRaw?entriesRaw.split(',').map(s=>s.trim()).filter(Boolean):[];
-        if(!entries.length && min!=null && max!=null){for(let i=Math.min(min,max);i<=Math.max(min,max);i++)entries.push(String(i));}
-        if(entries.length<2) return interaction.reply({content:'Add at least 2 entries, or min and max numbers.',flags:MessageFlags.Ephemeral});
-        const pick=lotteryPick(entries,seed);
-        return interaction.reply({embeds:[new EmbedBuilder().setTitle('🎲 Instant Lottery Winner').setColor(COLORS.OCAS_GREEN).addFields({name:'Winner',value:String(pick.winner),inline:false},{name:'Entries',value:String(entries.length),inline:true},{name:'Seed',value:`\`${seed}\``,inline:false},{name:'Proof Hash',value:`\`${pick.proof.slice(0,32)}...\``,inline:false}).setTimestamp()]});
+
+      // ── /lottery instant — quick one-off draw from a list or number range ──
+      if(sub === 'instant'){
+        const entriesRaw = interaction.options.getString('entries') || '';
+        const min = interaction.options.getInteger('min');
+        const max = interaction.options.getInteger('max');
+        const seed = interaction.options.getString('seed') || `lottery:${guildId}:${Date.now()}`;
+
+        let entries = entriesRaw ? entriesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+        if(!entries.length && min != null && max != null){
+          for(let i = Math.min(min, max); i <= Math.max(min, max); i++) entries.push(String(i));
+        }
+        if(entries.length < 2) return interaction.reply({ content:'Add at least 2 entries, or min and max numbers.', flags:MessageFlags.Ephemeral });
+
+        const pick = lotteryPick(entries, seed);
+        return interaction.reply({ embeds:[
+          new EmbedBuilder()
+            .setTitle('🎲 Instant Lottery Winner')
+            .setColor(COLORS.OCAS_GREEN)
+            .addFields(
+              { name:'Winner',     value:String(pick.winner),            inline:false },
+              { name:'Entries',    value:String(entries.length),         inline:true },
+              { name:'Seed',       value:`\`${seed}\``,                  inline:false },
+              { name:'Proof Hash', value:`\`${pick.proof.slice(0,32)}...\``, inline:false },
+            )
+            .setTimestamp()
+        ]});
       }
-      if(sub==='start'){
+
+      // ── /lottery start — create a new scheduled giveaway or guess lottery ──
+      if(sub === 'start'){
         await interaction.deferReply();
-        const type=interaction.options.getString('type'); const minutes=Math.max(1,Math.min(10080,interaction.options.getInteger('minutes')||10)); const start=new Date(); const end=new Date(start.getTime()+minutes*60000); const seed=interaction.options.getString('seed')||require('crypto').randomBytes(12).toString('hex'); const channel=interaction.options.getChannel('channel')||interaction.channel;
-        const title=interaction.options.getString('title')||(type==='guess'?'Guess the Number':'Giveaway Lottery'); const prize=interaction.options.getString('prize')||null;
-        let minN=interaction.options.getInteger('min')??1, maxN=interaction.options.getInteger('max')??100, winnerMode=interaction.options.getString('winner')||'closest', winning=null;
-        if(type==='guess'){ if(minN===maxN) return interaction.editReply('Min and max cannot match.'); const lo=Math.min(minN,maxN),hi=Math.max(minN,maxN); minN=lo; maxN=hi; winning=lotteryNumberFromSeed(`${seed}:winning-number`,minN,maxN); } else { minN=null; maxN=null; winnerMode='random'; }
-        const r=await pgPool.query(`INSERT INTO generic_lotteries (guild_id,channel_id,created_by,title,prize,type,min_number,max_number,winner_mode,winning_number,start_time,end_time,seed,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'active') RETURNING *`,[guildId,channel.id,interaction.user.id,title,prize,type,minN,maxN,winnerMode,winning,start,end,seed]);
-        const row=r.rows[0]; const components=type==='giveaway'?[lotteryEntryButton(row)]:[];
-        const msg=await interaction.editReply({embeds:[buildGenericLotteryStartEmbed(row,0)],components});
-        await pgPool.query('UPDATE generic_lotteries SET message_id=$1 WHERE id=$2',[msg.id,row.id]).catch(()=>{});
+
+        const type       = interaction.options.getString('type');
+        const minutes    = Math.max(1, Math.min(10080, interaction.options.getInteger('minutes') || 10));
+        const start      = new Date();
+        const end        = new Date(start.getTime() + minutes * 60000);
+        // Giveaway seeds are pending until draw time (ETH block hash assigned after window closes).
+        // Guess lotteries use a fixed seed so the winning number can be pre-committed.
+        const adminSeed  = interaction.options.getString('seed');
+        const seed       = adminSeed || (type === 'giveaway' ? pendingDrawSeed() : require('crypto').randomBytes(12).toString('hex'));
+        const channel    = interaction.options.getChannel('channel') || interaction.channel;
+        const title      = interaction.options.getString('title') || (type === 'guess' ? 'Guess the Number' : 'Giveaway Lottery');
+        const prize      = interaction.options.getString('prize') || null;
+
+        let minN = interaction.options.getInteger('min') ?? 1;
+        let maxN = interaction.options.getInteger('max') ?? 100;
+        let winnerMode = interaction.options.getString('winner') || 'closest';
+        let winning = null;
+
+        if(type === 'guess'){
+          if(minN === maxN) return interaction.editReply('Min and max cannot match.');
+          const lo = Math.min(minN, maxN), hi = Math.max(minN, maxN);
+          minN = lo; maxN = hi;
+          winning = lotteryNumberFromSeed(`${seed}:winning-number`, minN, maxN);
+        } else {
+          minN = null; maxN = null; winnerMode = 'random';
+        }
+
+        const r = await pgPool.query(
+          `INSERT INTO generic_lotteries
+             (guild_id, channel_id, created_by, title, prize, type, min_number, max_number,
+              winner_mode, winning_number, start_time, end_time, seed, status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'active') RETURNING *`,
+          [guildId, channel.id, interaction.user.id, title, prize, type,
+           minN, maxN, winnerMode, winning, start, end, seed]
+        );
+        const row = r.rows[0];
+        const components = buildGenericLotteryComponents(row.id, type, true);
+        const msg = await interaction.editReply({ embeds:[buildGenericLotteryStartEmbed(row, 0)], components });
+        await pgPool.query('UPDATE generic_lotteries SET message_id=$1 WHERE id=$2', [msg.id, row.id]).catch(() => {});
+        console.log(`[Lottery #${row.id}] Started type=${type} minutes=${minutes} guild=${guildId}`);
         return;
       }
-      if(sub==='enter'){
-        const id=interaction.options.getInteger('id'); const row=id?(await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId])).rows[0]:await findActiveGenericLottery(guildId,'giveaway');
-        if(!row) return interaction.reply({content:'No active giveaway found.',flags:MessageFlags.Ephemeral});
-        if(row.status!=='active'||new Date(row.end_time)<=new Date()) return interaction.reply({content:'This giveaway is closed.',flags:MessageFlags.Ephemeral});
-        const username=interaction.member?.displayName||interaction.user?.globalName||interaction.user?.username||interaction.user.id;
-        await pgPool.query(`INSERT INTO generic_lottery_entries (lottery_id,user_id,username) VALUES ($1,$2,$3) ON CONFLICT (lottery_id,user_id) DO UPDATE SET username=EXCLUDED.username`,[row.id,interaction.user.id,username]);
-        const count=await getGenericLotteryEntryCount(row.id);
-        return interaction.reply({content:`You are entered in lottery #${row.id}. Current entries: ${count}.`,flags:MessageFlags.Ephemeral});
+
+      // ── /lottery enter — enter an active giveaway ──
+      if(sub === 'enter'){
+        const id = interaction.options.getInteger('id');
+        const row = id
+          ? (await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2', [id, guildId])).rows[0]
+          : await findActiveGenericLottery(guildId, 'giveaway');
+
+        if(!row) return interaction.reply({ content:'No active giveaway found.', flags:MessageFlags.Ephemeral });
+        if(row.status !== 'active' || new Date(row.end_time) <= new Date())
+          return interaction.reply({ content:'This giveaway is closed.', flags:MessageFlags.Ephemeral });
+
+        const username = interaction.member?.displayName || interaction.user?.globalName || interaction.user?.username || interaction.user.id;
+        await pgPool.query(
+          `INSERT INTO generic_lottery_entries (lottery_id, user_id, username)
+           VALUES ($1,$2,$3) ON CONFLICT (lottery_id, user_id) DO UPDATE SET username=EXCLUDED.username`,
+          [row.id, interaction.user.id, username]
+        );
+        const count = await getGenericLotteryEntryCount(row.id);
+        return interaction.reply({ content:`You are entered in lottery #${row.id}. Current entries: ${count}.`, flags:MessageFlags.Ephemeral });
       }
-      if(sub==='guess'){
-        const number=interaction.options.getInteger('number'); const id=interaction.options.getInteger('id'); const row=id?(await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId])).rows[0]:await findActiveGenericLottery(guildId,'guess');
-        if(!row) return interaction.reply({content:'No active guess lottery found.',flags:MessageFlags.Ephemeral});
-        if(row.status!=='active'||new Date(row.end_time)<=new Date()) return interaction.reply({content:'This guess event is closed.',flags:MessageFlags.Ephemeral});
-        if(number<row.min_number||number>row.max_number) return interaction.reply({content:`Guess must be between ${row.min_number} and ${row.max_number}.`,flags:MessageFlags.Ephemeral});
-        const username=interaction.member?.displayName||interaction.user?.globalName||interaction.user?.username||interaction.user.id;
-        await pgPool.query(`INSERT INTO generic_lottery_entries (lottery_id,user_id,username,guess_number) VALUES ($1,$2,$3,$4) ON CONFLICT (lottery_id,user_id) DO UPDATE SET username=EXCLUDED.username, guess_number=EXCLUDED.guess_number, entered_at=NOW()`,[row.id,interaction.user.id,username,number]);
-        return interaction.reply({content:`Your guess for lottery #${row.id} is **${number}**.`,flags:MessageFlags.Ephemeral});
+
+      // ── /lottery guess — submit a guess for a guess-type lottery ──
+      if(sub === 'guess'){
+        const number = interaction.options.getInteger('number');
+        const id = interaction.options.getInteger('id');
+        const row = id
+          ? (await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2', [id, guildId])).rows[0]
+          : await findActiveGenericLottery(guildId, 'guess');
+
+        if(!row) return interaction.reply({ content:'No active guess lottery found.', flags:MessageFlags.Ephemeral });
+        if(row.status !== 'active' || new Date(row.end_time) <= new Date())
+          return interaction.reply({ content:'This guess event is closed.', flags:MessageFlags.Ephemeral });
+        if(number < row.min_number || number > row.max_number)
+          return interaction.reply({ content:`Guess must be between ${row.min_number} and ${row.max_number}.`, flags:MessageFlags.Ephemeral });
+
+        const username = interaction.member?.displayName || interaction.user?.globalName || interaction.user?.username || interaction.user.id;
+        await pgPool.query(
+          `INSERT INTO generic_lottery_entries (lottery_id, user_id, username, guess_number)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (lottery_id, user_id) DO UPDATE SET
+             username=EXCLUDED.username, guess_number=EXCLUDED.guess_number, entered_at=NOW()`,
+          [row.id, interaction.user.id, username, number]
+        );
+        return interaction.reply({ content:`Your guess for lottery #${row.id} is **${number}**.`, flags:MessageFlags.Ephemeral });
       }
-      if(sub==='status'){
-        const id=interaction.options.getInteger('id'); const r=id?await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]):await pgPool.query('SELECT * FROM generic_lotteries WHERE guild_id=$1 ORDER BY id DESC LIMIT 10',[guildId]);
-        if(!r.rows.length) return interaction.reply({content:'No lotteries found.',flags:MessageFlags.Ephemeral});
-        const lines=[]; for(const x of r.rows){const c=await getGenericLotteryEntryCount(x.id); lines.push(`#${x.id} · ${x.type} · ${x.status} · entries ${c} · ${lotteryTime(x.start_time)} → ${lotteryTime(x.end_time)}${x.winner_user_id?' · winner <@'+x.winner_user_id+'>':''}`)}
-        return interaction.reply(lines.join('\n').slice(0,1900));
+
+      // ── /lottery status — show active or recent lotteries ──
+      if(sub === 'status'){
+        const id = interaction.options.getInteger('id');
+        const r = id
+          ? await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2', [id, guildId])
+          : await pgPool.query('SELECT * FROM generic_lotteries WHERE guild_id=$1 ORDER BY id DESC LIMIT 10', [guildId]);
+
+        if(!r.rows.length) return interaction.reply({ content:'No lotteries found.', flags:MessageFlags.Ephemeral });
+
+        const lines = [];
+        for(const x of r.rows){
+          const c = await getGenericLotteryEntryCount(x.id);
+          lines.push(
+            `#${x.id} · ${x.type} · ${x.status} · entries ${c} · ` +
+            `${lotteryTime(x.start_time)} → ${lotteryTime(x.end_time)}` +
+            (x.winner_user_id ? ` · winner <@${x.winner_user_id}>` : '')
+          );
+        }
+        return interaction.reply(lines.join('\n').slice(0, 1900));
       }
-      if(sub==='draw'){
-        await interaction.deferReply(); const id=interaction.options.getInteger('id'); const r=await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]); const row=r.rows[0]; if(!row) return interaction.editReply('Lottery not found.'); if(row.status!=='active') return interaction.editReply('Lottery is not active.');
+
+      // ── /lottery draw — manually draw a winner with ETH block hash seed ──
+      if(sub === 'draw'){
+        await interaction.deferReply();
+
+        const id = interaction.options.getInteger('id');
+        const r = await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2', [id, guildId]);
+        const row = r.rows[0];
+        if(!row) return interaction.editReply('Lottery not found.');
+        if(row.status !== 'active') return interaction.editReply('Lottery is not active.');
+
         await interaction.editReply('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)');
+
         let ethSeed = null;
         try{
-          const rpcUrlG = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') || `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+          const rpcUrlG = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://', 'https://') ||
+            `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
           const latestBlockG = parseInt(await burnRpc(rpcUrlG, 'eth_blockNumber', []), 16);
           const targetBlockG = latestBlockG + 5;
           const arrivedG = await waitForEthBlock(targetBlockG);
-          if(arrivedG){ const { hash: bHashG } = await fetchEthBlockHashSeed(targetBlockG); ethSeed = bHashG; }
+          if(arrivedG){
+            const { hash: bHashG } = await fetchEthBlockHashSeed(targetBlockG);
+            ethSeed = bHashG;
+          }
         }catch(_){}
-        const out=await drawGenericLottery(row, false, ethSeed);
-        return interaction.editReply({ content: null, embeds:[out.embed] });
+
+        const out = await drawGenericLottery(row, false, ethSeed);
+        return interaction.editReply({ content:null, embeds:[out.embed], components: out.components || [] });
       }
-      if(sub==='cancel'){
-        const id=interaction.options.getInteger('id'); const r=await pgPool.query("UPDATE generic_lotteries SET status='cancelled' WHERE id=$1 AND guild_id=$2 AND status='active' RETURNING id",[id,guildId]);
-        return interaction.reply(r.rows.length?`Cancelled lottery #${id}.`:`No active lottery #${id} found.`);
+
+      // ── /lottery cancel — cancel an active lottery ──
+      if(sub === 'cancel'){
+        const id = interaction.options.getInteger('id');
+        const r = await pgPool.query(
+          "UPDATE generic_lotteries SET status='cancelled' WHERE id=$1 AND guild_id=$2 AND status='active' RETURNING id",
+          [id, guildId]
+        );
+        return interaction.reply(r.rows.length ? `Cancelled lottery #${id}.` : `No active lottery #${id} found.`);
       }
-    }catch(e){ console.error('[/lottery]',e); const msg='Lottery error: '+e.message; return interaction.deferred?interaction.editReply(msg):interaction.reply({content:msg,flags:MessageFlags.Ephemeral}); }
+
+    }catch(e){
+      console.error('[/lottery]', e);
+      sendErrorWebhook('/lottery Error', e, `guild=${guildId} sub=${sub}`);
+      const msg = 'Lottery error: ' + e.message;
+      return interaction.deferred ? interaction.editReply(msg) : interaction.reply({ content:msg, flags:MessageFlags.Ephemeral });
+    }
   }
 
   if(commandName==='help'){
@@ -5599,6 +6165,7 @@ client.on('guildCreate', async (guild)=>{
 // ── Boot ──────────────────────────────────────────────────────────────────────
 client.once('clientReady', async ()=>{
   console.log('Bot online as '+client.user.tag);
+  checkStartupEnvVars();
   console.log('OpenSea key: '+(OPENSEA_KEY?'set':'NOT SET'));
   // Init Railway DB table, then load all persisted state
   await ensureBotStateTable();
@@ -5628,9 +6195,9 @@ client.once('clientReady', async ()=>{
   processDueBurnLotteries();
   setInterval(processDueBurnLotteries, 60_000);
   processDueGenericLotteries();
-  setInterval(processDueGenericLotteries, 60_000);
+  setInterval(processDueGenericLotteries, 15_000);
 });
 
-client.on('error',e=>console.error('[Discord]',e.message));
-process.on('unhandledRejection',e=>console.error('[Bot]',e));
+client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
+process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
