@@ -17,7 +17,7 @@ const DATABASE_URL    = process.env.DATABASE_URL;
 void (function() {
 const SLUG            = 'on-chain-all-stars';
 const CONTRACT        = '0x078be86f3104a32313a47815792230a3808642cc';
-const SYNC_INTERVAL   = 3 * 60 * 1000; // 3 minutes
+const SYNC_INTERVAL   = 60 * 1000; // 1 minute
 
 if (!DATABASE_URL) {
   console.error('[sync] Missing DATABASE_URL — listings sync disabled');

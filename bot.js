@@ -63,6 +63,69 @@ const COLORS = {
   WETH_ROSE:     0xF43F5E,
 };
 
+// ── Background OS rank sync ──────────────────────────────────────────────────
+// Never triggered by user commands — purely background.
+// rankSyncQueue: token IDs waiting for a delayed OS rank fetch after burn finalization.
+const rankSyncQueue = new Set();
+const RANK_SYNC_DELAY_MS  = 45_000;  // wait 45s after burn for OS to update their end
+const RANK_SYNC_BATCH     = 50;      // tokens per rolling hourly batch
+const RANK_SYNC_INTERVAL  = 3600_000 / RANK_SYNC_BATCH * 1000; // spread 50 checks over 1hr (~72s each)
+
+async function fetchAndStoreOsRank(tokenId){
+  const id = parseInt(tokenId);
+  if(!id) return;
+  try{
+    const r = await fetch(
+      `https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}`,
+      { headers: osHeaders() }
+    );
+    if(r.status === 429){ console.warn(`[RankSync] 429 on #${id} — will retry next cycle`); return; }
+    if(!r.ok) return;
+    const j = await r.json();
+    const rank = j?.nft?.rarity?.rank ? parseInt(j.nft.rarity.rank) : null;
+    if(!rank) return;
+    await pgPool.query('UPDATE tokens SET os_rank=$1 WHERE id=$2', [rank, id]).catch(()=>{});
+    console.log(`[RankSync] #${id} os_rank updated → ${rank}`);
+  }catch(e){
+    console.warn(`[RankSync] #${id} failed:`, e.message);
+  }
+}
+
+// Rolling background re-sync — checks one token every ~72 seconds, covering
+// all ~8,750 active tokens roughly once per week. Shrinks automatically as burns reduce supply.
+let _rankSyncCursor = 1;
+async function rollingRankSync(){
+  // Skip if a burn-queued rank sync is pending — let that run first
+  if(rankSyncQueue.size) return;
+  try{
+    const result = await pgPool.query(
+      `SELECT id FROM tokens WHERE id >= $1 AND id NOT IN (
+         SELECT DISTINCT burned_token_id FROM burn_event_inputs bei
+         JOIN burn_events be ON be.id = bei.burn_event_id
+         WHERE bei.burned_token_id != be.survivor_token_id
+       ) ORDER BY id ASC LIMIT 1`,
+      [_rankSyncCursor]
+    );
+    if(!result.rows.length){
+      _rankSyncCursor = 1; // wrap around
+      return;
+    }
+    const tokenId = result.rows[0].id;
+    _rankSyncCursor = tokenId + 1;
+    await fetchAndStoreOsRank(tokenId);
+  }catch(e){
+    console.warn('[RankSync] rolling sync error:', e.message);
+  }
+}
+
+// Drain the burn-finalized rank queue (runs every 5s, only acts when queue has items)
+async function drainRankSyncQueue(){
+  if(!rankSyncQueue.size) return;
+  const id = rankSyncQueue.values().next().value;
+  rankSyncQueue.delete(id);
+  await fetchAndStoreOsRank(id);
+}
+
 function getRankTierColor(osRank){
   const n = Number(osRank);
   if(!n || !Number.isFinite(n)) return null;
@@ -1622,6 +1685,9 @@ async function processPendingBurnAlerts(){
       try{
         await upsertTokenTraitRows(survivorId, freshTraits, 'burn-finalized-survivor');
         console.log(`[BurnMeta] Wrote ${realTraitCount(freshTraits)} post-burn trait rows to DB for #${survivorId}`);
+        // Queue a delayed OS rank fetch — wait for OS to update their end before fetching
+        setTimeout(() => { rankSyncQueue.add(parseInt(survivorId)); }, RANK_SYNC_DELAY_MS);
+        console.log(`[BurnMeta] OS rank update queued for #${survivorId} in ${RANK_SYNC_DELAY_MS/1000}s`);
       }catch(dbErr){
         console.warn(`[BurnMeta] Failed to write post-burn traits for #${survivorId}:`, dbErr.message);
       }
@@ -6192,6 +6258,8 @@ client.once('clientReady', async ()=>{
   }
   // Process pending burn alerts every 30s — waits for metadata to refresh before posting
   setInterval(processPendingBurnAlerts, 30_000);
+  setInterval(drainRankSyncQueue, 5_000);           // drain burn-queued rank updates
+  setInterval(rollingRankSync, RANK_SYNC_INTERVAL); // rolling background rank re-sync
   processDueBurnLotteries();
   setInterval(processDueBurnLotteries, 60_000);
   processDueGenericLotteries();

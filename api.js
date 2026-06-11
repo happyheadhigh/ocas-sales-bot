@@ -657,7 +657,8 @@ app.get('/db/multi-trait-tokens', auth, async (req, res) => {
     params.push(limit);
 
     const result = await pool.query(query, params);
-    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    // Never cache listing results — prices and availability change frequently
+    res.set('Cache-Control', listedOnly ? 'no-store' : 'public, max-age=60, s-maxage=60');
     res.json({
       ok: true,
       matches,
