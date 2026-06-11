@@ -5959,7 +5959,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           )
           .setFooter({ text:`Lottery ID ${lotteryId}` })
           .setTimestamp();
-        await interaction.editReply({ embeds:[instantEmbed], components:buildGenericLotteryComponents(lotteryId, 'giveaway', false) });
+        await interaction.editReply({ embeds:[instantEmbed], components:[
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`generic_lottery_entries:${lotteryId}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary)
+          )
+        ] });
 
         // Fetch ETH block hash seed
         let ethSeed = null, ethBlockNumber = null;
@@ -6125,7 +6129,11 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const entryCount = (await pgPool.query('SELECT COUNT(*) FROM generic_lottery_entries WHERE lottery_id=$1', [id])).rows[0]?.count || 0;
         const drawFetchEmbed = buildGenericLotteryStartEmbed({ ...row, _entry_count: parseInt(entryCount) }, parseInt(entryCount))
           .setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
-        await interaction.editReply({ embeds:[drawFetchEmbed], components:buildGenericLotteryComponents(row.id, row.type, true) });
+        await interaction.editReply({ embeds:[drawFetchEmbed], components:[
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`generic_lottery_entries:${row.id}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary)
+          )
+        ] });
 
         let ethSeed = null, ethBlockNumber = null;
         try{
