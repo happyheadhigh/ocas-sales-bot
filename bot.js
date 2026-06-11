@@ -44,7 +44,7 @@ const { BURN_COLORS, E1_TYPE_NAMES, normalizeOcasType } = require('./lib/burn-co
 const {
   burnConfig, loadBurnConfig, saveBurnConfig,
   getBurnConfig, getConfiguredBurnChannelId,
-  checkCommandCooldown, fetchBotApiJson, resolveDiscordChannel,
+  checkCommandCooldown, fetchBotApiJson,
 } = require('./lib/burn-config');
 
 const {
@@ -95,6 +95,12 @@ const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
 // ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+// ── resolveDiscordChannel — needs client, defined here ───────────────────────
+async function resolveDiscordChannel(channelId){
+  if(!channelId) return null;
+  return client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(()=>null);
+}
+
 // ── Shared context builder ────────────────────────────────────────────────────
 // Passed to every command handler so they have access to all shared state.
 function buildCtx(interaction, guildId, config, isAdmin){
@@ -132,6 +138,7 @@ function buildCtx(interaction, guildId, config, isAdmin){
     // Alerts
     getAlert, setAlert, deleteAlert,
     // Format
+    resolveDiscordChannel,
     normAddr, shortAddr, formatEth, timeSince, lotteryTime,
     isSvg, isDiscordOk, matchesFilters,
     // Rank sync
