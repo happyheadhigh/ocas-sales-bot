@@ -3387,11 +3387,14 @@ function buildGenericLotteryResultEmbed(row, entries, result){
     }
   } else {
     if(result?.winner){
-      // Use Discord mention if user_id looks like a real Discord snowflake, otherwise plain username
+      // row.winner_display = raw entry value for instant draws (name/number)
+      // Otherwise use Discord mention for real user IDs, or plain username fallback
       const isSnowflake = /^\d{17,19}$/.test(String(result.winner.user_id || ''));
-      const winnerDisplay = isSnowflake
-        ? `<@${result.winner.user_id}>`
-        : String(result.winner.username || result.winner.user_id || 'Unknown');
+      const winnerDisplay = row.winner_display
+        ? String(row.winner_display)
+        : isSnowflake
+          ? `<@${result.winner.user_id}>`
+          : String(result.winner.username || result.winner.user_id || 'Unknown');
       embed.addFields({ name:'Winner', value:winnerDisplay, inline:false });
     } else {
       embed.addFields({ name:'Winner', value:'No eligible entries.', inline:false });
@@ -5956,7 +5959,10 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         ).catch(()=>{});
 
         // Build result row for embed
-        const resultRow = { id: lotteryId, title, type:'giveaway', seed: activeSeed, result_json: { proof: pick.proof||null, block_number: ethBlockNumber||null } };
+        // winner_display stores the raw entry value (name or number) for instant draws
+        const resultRow = { id: lotteryId, title, type:'giveaway', seed: activeSeed,
+          winner_display: String(pick.winner),
+          result_json: { proof: pick.proof||null, block_number: ethBlockNumber||null } };
         const resultEmbed = buildGenericLotteryResultEmbed(resultRow, entries.map(e=>({ username:e, user_id:e })), pick);
         const resultComponents = buildGenericLotteryComponents(lotteryId, 'giveaway', false);
 
