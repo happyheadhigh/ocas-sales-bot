@@ -5685,19 +5685,18 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const lotteryRow = r.rows[0];
         if(lotteryRow.status === 'completed') return interaction.editReply(`Lottery #${id} is already completed.`);
 
-        // Show the scheduled lottery embed with ⏳ fetching message
+        // Show full lottery details embed with ⏳ fetching state
         const drawStart = new Date(lotteryRow.start_time), drawEnd = new Date(lotteryRow.end_time);
         const drawTz = lotteryRow.timezone || DEFAULT_LOTTERY_TIMEZONE;
-        const fetchingEmbed = new EmbedBuilder()
-          .setTitle('🎟️ OCAS Burn Lottery')
-          .setColor(COLORS.OCAS_GREEN)
-          .setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)')
-          .addFields(
-            { name:'ID', value:String(lotteryRow.id), inline:true },
-            { name:'Window', value:formatBurnLotteryWindow(drawStart, drawEnd, drawTz), inline:false },
-            { name:'Mode', value:lotteryRow.mode === 'burn' ? 'One entry per burn' : 'One entry per wallet', inline:true },
-          )
-          .setTimestamp();
+        const { entries: preEntries, wallets: preWallets, burns: preBurns } = await getBurnLotteryEntries(drawStart, drawEnd, lotteryRow.mode);
+        const fetchingEmbed = buildBurnLotteryEmbed({
+          title: lotteryRow.title || 'OCAS Burn Lottery',
+          prize: lotteryRow.prize,
+          mode: lotteryRow.mode,
+          start: drawStart, end: drawEnd,
+          seed: null, entries: preEntries, wallets: preWallets, burns: preBurns,
+          pick: null, lotteryId: lotteryRow.id, timezone: drawTz
+        }).setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
         await interaction.editReply({ embeds:[fetchingEmbed], components:[] });
 
         await drawAndPostBurnLottery(lotteryRow);
@@ -5720,13 +5719,20 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
       if(!entries.length) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
 
+      // Show full details embed with ⏳ while fetching ETH seed
+      const instantFetchEmbed = buildBurnLotteryEmbed({
+        title: 'OCAS Burn Lottery', mode, start, end,
+        seed: null, entries, wallets, burns,
+        pick: null, lotteryId: null, timezone: timeZone
+      }).setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
+      await interaction.editReply({ embeds:[instantFetchEmbed], components:[] });
+
       // Use ETH block hash as seed unless admin supplied a custom seed
       let drawSeed, seedMeta = {};
       if(customSeed){
         drawSeed = customSeed;
         seedMeta = { seed_type: 'admin_supplied' };
       } else {
-        await interaction.editReply('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)');
         try{
           const rpcUrl2 = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
             `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
