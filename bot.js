@@ -6374,8 +6374,14 @@ client.once('clientReady', async ()=>{
   }
   // Process pending burn alerts every 30s — waits for metadata to refresh before posting
   setInterval(processPendingBurnAlerts, 30_000);
-  setInterval(drainRankSyncQueue, 5_000);           // drain burn-queued rank updates
-  setInterval(rollingRankSync, RANK_SYNC_INTERVAL); // rolling background rank re-sync
+  // Only run rank sync on production — staging shares the same codebase but shouldn't consume OS API quota
+  if(process.env.BOT_ENV === 'production'){
+    setInterval(drainRankSyncQueue, 5_000);           // drain burn-queued rank updates
+    setInterval(rollingRankSync, RANK_SYNC_INTERVAL); // rolling background rank re-sync
+    console.log('[RankSync] Background rank sync started (production only)');
+  } else {
+    console.log('[RankSync] Skipped on non-production environment');
+  }
   processDueBurnLotteries();
   setInterval(processDueBurnLotteries, 60_000);
   processDueGenericLotteries();
