@@ -3380,7 +3380,7 @@ function buildGenericLotteryResultEmbed(row, entries, result){
     embed.addFields({ name:'Winning Number', value:String(row.winning_number), inline:true });
     if(result?.winner){
       embed.addFields(
-        { name:'Winner',       value:`<@${result.winner.user_id}>`,       inline:true },
+        { name:'Winner',       value:`🏆 <@${result.winner.user_id}>`,    inline:true },
         { name:'Winning Guess', value:String(result.winner.guess_number), inline:true },
       );
     } else {
@@ -3391,11 +3391,13 @@ function buildGenericLotteryResultEmbed(row, entries, result){
       // row.winner_display = raw entry value for instant draws (name/number)
       // Otherwise use Discord mention for real user IDs, or plain username fallback
       const isSnowflake = /^\d{17,19}$/.test(String(result.winner.user_id || ''));
-      const winnerDisplay = row.winner_display
+      const baseName = row.winner_display
         ? String(row.winner_display)
         : isSnowflake
           ? `<@${result.winner.user_id}>`
           : String(result.winner.username || result.winner.user_id || 'Unknown');
+      const pos = result.position || row.result_json?.winner_position || null;
+      const winnerDisplay = pos ? `🏆 ${pos}. ${baseName}` : `🏆 ${baseName}`;
       embed.addFields({ name:'Winner', value:winnerDisplay, inline:false });
     } else {
       embed.addFields({ name:'Winner', value:'No eligible entries.', inline:false });
