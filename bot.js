@@ -3380,7 +3380,7 @@ function buildGenericLotteryResultEmbed(row, entries, result){
     embed.addFields({ name:'Winning Number', value:String(row.winning_number), inline:true });
     if(result?.winner){
       embed.addFields(
-        { name:'Winner',       value:`🏆 <@${result.winner.user_id}>`,    inline:true },
+        { name:'Winner',       value:`<@${result.winner.user_id}>`,    inline:true },
         { name:'Winning Guess', value:String(result.winner.guess_number), inline:true },
       );
     } else {
@@ -3397,7 +3397,7 @@ function buildGenericLotteryResultEmbed(row, entries, result){
           ? `<@${result.winner.user_id}>`
           : String(result.winner.username || result.winner.user_id || 'Unknown');
       const pos = result.position || row.result_json?.winner_position || null;
-      const winnerDisplay = pos ? `🏆 ${pos}. ${baseName}` : `🏆 ${baseName}`;
+      const winnerDisplay = pos ? `${pos}. ${baseName}` : baseName;
       embed.addFields({ name:'Winner', value:winnerDisplay, inline:false });
     } else {
       embed.addFields({ name:'Winner', value:'No eligible entries.', inline:false });
@@ -3905,12 +3905,14 @@ client.on('interactionCreate', async (interaction)=>{
       );
       if(!er.rows.length){ await interaction.editReply({ content:'No entries found.' }); return; }
       const isSnowflake = id => /^\d{17,19}$/.test(String(id||''));
+      const winnerDisplay = row.winner_display || null;
+      const winnerPos = row.result_json?.winner_position || null;
       const lines = er.rows.map((e,i) => {
         const name = isSnowflake(e.user_id) ? `<@${e.user_id}>` : String(e.username || e.user_id);
-        return `${i+1}. ${name}`;
+        const isWinner = winnerPos ? (i + 1 === winnerPos) : (winnerDisplay && name === winnerDisplay);
+        return `${i+1}. ${isWinner ? '🏆 ' : ''}${name}`;
       });
-      const winner = row.winner_display || null;
-      const header = `**Entries — Lottery #${lotteryId}** (${er.rows.length} total)${winner ? `\n🏆 Winner: **${winner}**` : ''}\n`;
+      const header = `**Entries — Lottery #${lotteryId}** (${er.rows.length} total)\n`;
       const body = lines.join('\n').slice(0, 1800);
       await interaction.editReply({ content: header + body });
     }catch(e){
