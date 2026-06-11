@@ -3317,9 +3317,10 @@ function buildGenericLotteryComponents(lotteryId, type='giveaway', active=true){
       new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)
     ));
   } else {
-    // Completed — show draw proof button
+    // Completed — show draw proof + show entries buttons
     rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('Show Draw Proof').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('Show Draw Proof').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`generic_lottery_entries:${lotteryId}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary)
     ));
   }
   return rows;
@@ -3885,6 +3886,34 @@ client.on('interactionCreate', async (interaction)=>{
     }catch(e){
       console.error('[GenericLottery Proof]', e.message);
       try{ await interaction.editReply({ content:'Error loading draw proof.' }); }catch(_){}
+    }
+    return;
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('generic_lottery_entries:')){
+    const lotteryId = parseInt(interaction.customId.split(':')[1], 10);
+    try{
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const r = await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1', [lotteryId]);
+      if(!r.rows.length){ await interaction.editReply({ content:'Lottery not found.' }); return; }
+      const row = r.rows[0];
+      const er = await pgPool.query(
+        'SELECT username, user_id, entered_at FROM generic_lottery_entries WHERE lottery_id=$1 ORDER BY entered_at ASC',
+        [lotteryId]
+      );
+      if(!er.rows.length){ await interaction.editReply({ content:'No entries found.' }); return; }
+      const isSnowflake = id => /^\d{17,19}$/.test(String(id||''));
+      const lines = er.rows.map((e,i) => {
+        const name = isSnowflake(e.user_id) ? `<@${e.user_id}>` : String(e.username || e.user_id);
+        return `${i+1}. ${name}`;
+      });
+      const winner = row.winner_display || null;
+      const header = `**Entries — Lottery #${lotteryId}** (${er.rows.length} total)${winner ? `\n🏆 Winner: **${winner}**` : ''}\n`;
+      const body = lines.join('\n').slice(0, 1800);
+      await interaction.editReply({ content: header + body });
+    }catch(e){
+      console.error('[GenericLottery Entries]', e.message);
+      try{ await interaction.editReply({ content:'Error loading entries.' }); }catch(_){}
     }
     return;
   }
