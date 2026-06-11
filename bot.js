@@ -45,11 +45,12 @@ const {
   burnConfig, loadBurnConfig, saveBurnConfig,
   getBurnConfig, getConfiguredBurnChannelId,
   checkCommandCooldown, fetchBotApiJson,
+  buildNavRow, postEmbeds,
 } = require('./lib/burn-config');
 
 const {
   pollBurnEvents, processPendingBurnAlerts,
-  buildBurnEmbed, upsertTokenTraitRows, triggerOsMetadataRefresh,
+  buildBurnEmbed, triggerOsMetadataRefresh,
 } = require('./lib/burn-poller');
 
 const {
@@ -60,8 +61,8 @@ const {
   getBurnLotteryEntries, drawAndPostBurnLottery, processDueBurnLotteries,
 } = require('./lib/lottery-engine');
 
-const { getTokenDbMeta, buildSaleEmbed, buildListingEmbed } = require('./lib/embeds');
-const { resolveImage, sendEmbed, buildNavRow, postEmbeds, extractPngFromSvg } = require('./lib/images');
+const { fetchTokenMetaFromDb, upsertTokenTraitRows, buildSaleEmbed, buildListingEmbed } = require('./lib/embeds');
+const { resolveImage, sendEmbed, extractPngFromSvg } = require('./lib/images');
 
 const {
   pollSales, pollListings,
