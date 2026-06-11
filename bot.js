@@ -823,7 +823,7 @@ client.once('clientReady', async ()=>{
   checkStartupEnvVars();
   console.log('OpenSea key: '+(OPENSEA_KEY?'set':'NOT SET'));
   // Init Railway DB table, then load all persisted state
-  await ensureBotStateTable();
+  await runMigrations();
   await loadAllConfigs();
   await loadAllAlerts();
   await loadSaleCursors();
