@@ -3368,7 +3368,9 @@ function buildGenericLotteryResultEmbed(row, entries, result){
     .addFields(
       { name:'ID',      value:String(row.id),       inline:true },
       { name:'Entries', value:String(entries.length), inline:true },
-      { name:'Window',  value:`${lotteryTime(row.start_time)} → ${lotteryTime(row.end_time)}`, inline:false },
+      ...(row.start_time && row.end_time && String(row.start_time) !== String(row.end_time)
+        ? [{ name:'Window', value:`${lotteryTime(row.start_time)} → ${lotteryTime(row.end_time)}`, inline:false }]
+        : []),
     );
 
   if(row.prize) embed.addFields({ name:'Prize', value:String(row.prize).slice(0, 1024), inline:false });
@@ -3385,7 +3387,12 @@ function buildGenericLotteryResultEmbed(row, entries, result){
     }
   } else {
     if(result?.winner){
-      embed.addFields({ name:'Winner', value:`<@${result.winner.user_id}>`, inline:false });
+      // Use Discord mention if user_id looks like a real Discord snowflake, otherwise plain username
+      const isSnowflake = /^\d{17,19}$/.test(String(result.winner.user_id || ''));
+      const winnerDisplay = isSnowflake
+        ? `<@${result.winner.user_id}>`
+        : String(result.winner.username || result.winner.user_id || 'Unknown');
+      embed.addFields({ name:'Winner', value:winnerDisplay, inline:false });
     } else {
       embed.addFields({ name:'Winner', value:'No eligible entries.', inline:false });
     }
@@ -5920,7 +5927,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           )
           .setFooter({ text:`Lottery ID ${lotteryId}` })
           .setTimestamp();
-        await interaction.editReply({ embeds:[instantEmbed], components:buildGenericLotteryComponents(lotteryId, 'giveaway', true) });
+        await interaction.editReply({ embeds:[instantEmbed], components:[] });
 
         // Fetch ETH block hash seed
         let ethSeed = null, ethBlockNumber = null;
@@ -5951,7 +5958,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         // Build result row for embed
         const resultRow = { id: lotteryId, title, type:'giveaway', seed: activeSeed, result_json: { proof: pick.proof||null, block_number: ethBlockNumber||null } };
         const resultEmbed = buildGenericLotteryResultEmbed(resultRow, entries.map(e=>({ username:e, user_id:e })), pick);
-        const resultComponents = buildGenericLotteryComponents(lotteryId);
+        const resultComponents = buildGenericLotteryComponents(lotteryId, 'giveaway', false);
 
         return interaction.editReply({ embeds:[resultEmbed], components:resultComponents });
       }
