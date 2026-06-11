@@ -5938,12 +5938,12 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         );
         const lotteryId = preInsert.rows[0]?.id;
 
-        // Store entries in DB
-        for(const e of entries){
+        // Store entries in DB — use positional key (name:index) so duplicates are preserved for weighted draws
+        for(let i = 0; i < entries.length; i++){
           await pgPool.query(
             `INSERT INTO generic_lottery_entries (lottery_id, user_id, username)
              VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-            [lotteryId, e, e]
+            [lotteryId, `${entries[i]}:${i}`, entries[i]]
           ).catch(()=>{});
         }
 
