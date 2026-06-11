@@ -3336,13 +3336,15 @@ function buildGenericLotteryResultEmbed(row, entries, result){
 }
 async function findActiveGenericLottery(guildId,type=null){ const params=[guildId]; let q=`SELECT * FROM generic_lotteries WHERE guild_id=$1 AND status='active' AND end_time > NOW()`; if(type){params.push(type); q+=` AND type=$2`;} q+=` ORDER BY id DESC LIMIT 1`; const r=await pgPool.query(q,params); return r.rows[0]||null; }
 async function getGenericLotteryEntryCount(id){ const r=await pgPool.query('SELECT COUNT(*)::int count FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]})); return parseInt(r.rows[0]?.count||0); }
-async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=null){
-  // Claim immediately to prevent double-draw
-  const claim = await pgPool.query(
-    `UPDATE generic_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`,
-    [row.id]
-  );
-  if(!claim.rows.length) return { embed:null, entries:[], result:{winner:null,proof:null}, components:[] }; // Already claimed
+async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=null, preClaimed=false){
+  // Claim to prevent double-draw. Skip if caller already claimed (processDueGenericLotteries).
+  if(!preClaimed){
+    const claim = await pgPool.query(
+      `UPDATE generic_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`,
+      [row.id]
+    );
+    if(!claim.rows.length) return { embed:null, entries:[], result:{winner:null,proof:null}, components:[] };
+  }
 
   // Fetch entries ordered by entry time then user ID for deterministic results
   const er = await pgPool.query(
@@ -3352,8 +3354,10 @@ async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=n
   const entries = er.rows;
   let result = { winner: null, proof: null };
 
-  // Use ETH block hash seed if provided, otherwise fall back to stored seed
-  const activeSeed = ethSeed || row.seed;
+  // Use ETH block hash seed if provided.
+  // If ETH fetch failed and the stored seed is still a pending placeholder, generate a
+  // cryptographic random seed so the result embed never shows a raw __PENDING_DRAW_SEED__ string.
+  const activeSeed = ethSeed || (isPendingDrawSeed(row.seed) ? randomLotterySeed() : row.seed);
 
   if(row.type === 'guess'){
     const valid = entries.filter(x => x.guess_number != null);
@@ -3378,8 +3382,8 @@ async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=n
     if(p) result = { winner: entries.find(x => x.user_id === p.winner) || entries[p.index], proof: p.proof };
   }
 
-  // Store ETH seed back to DB if it was used
-  if(ethSeed) await pgPool.query('UPDATE generic_lotteries SET seed=$1 WHERE id=$2', [ethSeed, row.id]).catch(() => {});
+  // Always write the final seed back to DB — covers ETH hash, random fallback, and pending→resolved
+  await pgPool.query('UPDATE generic_lotteries SET seed=$1 WHERE id=$2', [activeSeed, row.id]).catch(() => {});
 
   // Mark completed and store result
   await pgPool.query(
@@ -3398,6 +3402,8 @@ async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=n
     ]
   );
 
+  // Ensure row.seed reflects the final resolved seed for the result embed
+  row.seed = activeSeed;
   const embed = buildGenericLotteryResultEmbed(row, entries, result);
   const resultComponents = buildGenericLotteryComponents(row.id, row.type, false);
   if(post){
@@ -3414,6 +3420,13 @@ async function processDueGenericLotteries(){
 
   for(const row of r.rows){
     try{
+      // Claim immediately — prevents a second poller cycle from racing during the ETH block wait
+      const claim = await pgPool.query(
+        `UPDATE generic_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`,
+        [row.id]
+      );
+      if(!claim.rows.length){ console.log(`[Lottery #${row.id}] Already claimed, skipping`); continue; }
+
       console.log(`[Lottery #${row.id}] Auto-draw triggered type=${row.type}`);
 
       // Edit original message to show fetching state
@@ -3454,7 +3467,7 @@ async function processDueGenericLotteries(){
         console.warn(`[Lottery #${row.id}] ETH seed failed: ${ethErr.message} — using stored seed`);
       }
 
-      await drawGenericLottery(row, true, ethSeed, ethBlockNumber);
+      await drawGenericLottery(row, true, ethSeed, ethBlockNumber, true);
 
       // Update original message to show draw complete
       if(originalMsg){
