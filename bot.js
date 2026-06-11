@@ -3397,7 +3397,7 @@ function buildGenericLotteryResultEmbed(row, entries, result){
           ? `<@${result.winner.user_id}>`
           : String(result.winner.username || result.winner.user_id || 'Unknown');
       const pos = result.position || row.result_json?.winner_position || null;
-      const winnerDisplay = pos ? `${pos}. ${baseName}` : baseName;
+      const winnerDisplay = baseName;
       embed.addFields({ name:'Winner', value:winnerDisplay, inline:false });
     } else {
       embed.addFields({ name:'Winner', value:'No eligible entries.', inline:false });
