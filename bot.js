@@ -48,8 +48,7 @@ const {
 } = require('./lib/burn-config');
 
 const {
-  pollBurnEvents, processPendingBurnAlerts, processDueBurnLotteries,
-  getBurnLotteryEntries, drawAndPostBurnLottery,
+  pollBurnEvents, processPendingBurnAlerts,
   buildBurnEmbed, upsertTokenTraitRows, triggerOsMetadataRefresh,
 } = require('./lib/burn-poller');
 
@@ -58,6 +57,7 @@ const {
   buildGenericLotteryStartEmbed, buildGenericLotteryResultEmbed,
   buildGenericLotteryComponents, getGenericLotteryEntryCount,
   drawGenericLottery, processDueGenericLotteries,
+  getBurnLotteryEntries, drawAndPostBurnLottery, processDueBurnLotteries,
 } = require('./lib/lottery-engine');
 
 const { getTokenDbMeta, buildSaleEmbed, buildListingEmbed } = require('./lib/embeds');
