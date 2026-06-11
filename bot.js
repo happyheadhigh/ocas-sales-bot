@@ -3284,8 +3284,12 @@ function buildGenericLotteryStartEmbed(row, count=0){
     );
   }
 
+  const seedDisplay = isPendingDrawSeed(row.seed)
+    ? 'Pending — assigned from Ethereum block hash mined 5 blocks after the window closes.'
+    : `\`${String(row.seed).slice(0, 256)}\``;
+
   embed
-    .addFields({ name:'Seed', value:`\`${String(row.seed).slice(0, 256)}\``, inline:false })
+    .addFields({ name:'Seed', value:seedDisplay, inline:false })
     .setFooter({ text:`Lottery ID ${row.id}` })
     .setTimestamp();
 
@@ -3324,14 +3328,19 @@ function buildGenericLotteryResultEmbed(row, entries, result){
     }
   }
 
-  embed.addFields({ name:'Seed', value:`\`${String(row.seed).slice(0, 256)}\``, inline:false });
-  if(result?.proof) embed.addFields({ name:'Proof Hash', value:`\`${result.proof.slice(0, 32)}...\``, inline:false });
+  const rj = row.result_json || {};
+  const blockNum = rj.block_number || null;
+  const seedLine = blockNum
+    ? `[Block #${blockNum}](https://etherscan.io/block/${blockNum}) — \`${String(row.seed).slice(0, 100)}\``
+    : `\`${String(row.seed).slice(0, 256)}\``;
+  embed.addFields({ name:'Seed', value:seedLine, inline:false });
+  if(result?.proof) embed.addFields({ name:'Proof', value:`\`${result.proof.slice(0, 32)}...\``, inline:false });
 
   return embed.setFooter({ text:`Lottery ID ${row.id}` }).setTimestamp();
 }
 async function findActiveGenericLottery(guildId,type=null){ const params=[guildId]; let q=`SELECT * FROM generic_lotteries WHERE guild_id=$1 AND status='active' AND end_time > NOW()`; if(type){params.push(type); q+=` AND type=$2`;} q+=` ORDER BY id DESC LIMIT 1`; const r=await pgPool.query(q,params); return r.rows[0]||null; }
 async function getGenericLotteryEntryCount(id){ const r=await pgPool.query('SELECT COUNT(*)::int count FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]})); return parseInt(r.rows[0]?.count||0); }
-async function drawGenericLottery(row, post=true, ethSeed=null){
+async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=null){
   // Claim immediately to prevent double-draw
   const claim = await pgPool.query(
     `UPDATE generic_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`,
@@ -3387,7 +3396,7 @@ async function drawGenericLottery(row, post=true, ethSeed=null){
       result.winner?.username || null,
       result.winner?.guess_number ?? null,
       entries.length,
-      JSON.stringify({ proof: result.proof || null, winner_index: result.index ?? null, winner_position: result.position ?? null }),
+      JSON.stringify({ proof: result.proof || null, winner_index: result.index ?? null, winner_position: result.position ?? null, block_number: ethBlockNumber || null }),
       row.winning_number ?? null,
       row.id,
     ]
@@ -3429,6 +3438,7 @@ async function processDueGenericLotteries(){
 
       // Fetch ETH block hash seed
       let ethSeed = null;
+      let ethBlockNumber = null;
       try{
         const rpcUrlA = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://', 'https://') ||
           `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
@@ -3439,6 +3449,7 @@ async function processDueGenericLotteries(){
         if(arrivedA){
           const { hash: bHashA } = await fetchEthBlockHashSeed(targetBlockA);
           ethSeed = bHashA;
+          ethBlockNumber = targetBlockA;
           console.log(`[Lottery #${row.id}] Seed: block hash ${bHashA}`);
         } else {
           console.warn(`[Lottery #${row.id}] ETH block timeout — using stored seed`);
@@ -3447,7 +3458,7 @@ async function processDueGenericLotteries(){
         console.warn(`[Lottery #${row.id}] ETH seed failed: ${ethErr.message} — using stored seed`);
       }
 
-      await drawGenericLottery(row, true, ethSeed);
+      await drawGenericLottery(row, true, ethSeed, ethBlockNumber);
 
       // Update original message to show draw complete
       if(originalMsg){
@@ -5792,7 +5803,10 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         const minutes    = Math.max(1, Math.min(10080, interaction.options.getInteger('minutes') || 10));
         const start      = new Date();
         const end        = new Date(start.getTime() + minutes * 60000);
-        const seed       = interaction.options.getString('seed') || require('crypto').randomBytes(12).toString('hex');
+        // Giveaway seeds are pending until draw time (ETH block hash assigned after window closes).
+        // Guess lotteries use a fixed seed so the winning number can be pre-committed.
+        const adminSeed  = interaction.options.getString('seed');
+        const seed       = adminSeed || (type === 'giveaway' ? pendingDrawSeed() : require('crypto').randomBytes(12).toString('hex'));
         const channel    = interaction.options.getChannel('channel') || interaction.channel;
         const title      = interaction.options.getString('title') || (type === 'guess' ? 'Guess the Number' : 'Giveaway Lottery');
         const prize      = interaction.options.getString('prize') || null;
@@ -6140,7 +6154,7 @@ client.once('clientReady', async ()=>{
   processDueBurnLotteries();
   setInterval(processDueBurnLotteries, 60_000);
   processDueGenericLotteries();
-  setInterval(processDueGenericLotteries, 60_000);
+  setInterval(processDueGenericLotteries, 15_000);
 });
 
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
