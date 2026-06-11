@@ -5876,30 +5876,84 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
       // ── /lottery instant — quick one-off draw from a list or number range ──
       if(sub === 'instant'){
+        await interaction.deferReply();
         const entriesRaw = interaction.options.getString('entries') || '';
-        const min = interaction.options.getInteger('min');
-        const max = interaction.options.getInteger('max');
-        const seed = interaction.options.getString('seed') || `lottery:${guildId}:${Date.now()}`;
+        const min        = interaction.options.getInteger('min');
+        const max        = interaction.options.getInteger('max');
+        const customSeed = interaction.options.getString('seed') || null;
+        const title      = interaction.options.getString('title') || 'Instant Lottery';
 
         let entries = entriesRaw ? entriesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
         if(!entries.length && min != null && max != null){
           for(let i = Math.min(min, max); i <= Math.max(min, max); i++) entries.push(String(i));
         }
-        if(entries.length < 2) return interaction.reply({ content:'Add at least 2 entries, or min and max numbers.', flags:MessageFlags.Ephemeral });
+        if(entries.length < 2) return interaction.editReply('Add at least 2 entries, or set min and max numbers.');
 
-        const pick = lotteryPick(entries, seed);
-        return interaction.reply({ embeds:[
-          new EmbedBuilder()
-            .setTitle('🎲 Instant Lottery Winner')
-            .setColor(COLORS.OCAS_GREEN)
-            .addFields(
-              { name:'Winner',     value:String(pick.winner),            inline:false },
-              { name:'Entries',    value:String(entries.length),         inline:true },
-              { name:'Seed',       value:`\`${seed}\``,                  inline:false },
-              { name:'Proof Hash', value:`\`${pick.proof.slice(0,32)}...\``, inline:false },
-            )
-            .setTimestamp()
-        ]});
+        // Insert record early so we have an ID for the Show Entries button
+        const preInsert = await pgPool.query(
+          `INSERT INTO generic_lotteries
+             (guild_id, channel_id, created_by, title, type, start_time, end_time, seed, status, min_number, max_number)
+           VALUES ($1,$2,$3,$4,'giveaway',NOW(),NOW(),$5,'processing',$6,$7) RETURNING id`,
+          [guildId, interaction.channel.id, interaction.user.id, title, pendingDrawSeed(),
+           min ?? null, max ?? null]
+        );
+        const lotteryId = preInsert.rows[0]?.id;
+
+        // Store entries in DB
+        for(const e of entries){
+          await pgPool.query(
+            `INSERT INTO generic_lottery_entries (lottery_id, user_id, username)
+             VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+            [lotteryId, e, e]
+          ).catch(()=>{});
+        }
+
+        // Show details embed with ⏳ while fetching ETH seed
+        const instantEmbed = new EmbedBuilder()
+          .setTitle(`🎲 ${title}`)
+          .setColor(COLORS.OCAS_GREEN)
+          .setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...')
+          .addFields(
+            { name:'ID',      value:String(lotteryId), inline:true },
+            { name:'Type',    value:'Instant draw',    inline:true },
+            { name:'Entries', value:String(entries.length), inline:true },
+          )
+          .setFooter({ text:`Lottery ID ${lotteryId}` })
+          .setTimestamp();
+        await interaction.editReply({ embeds:[instantEmbed], components:buildGenericLotteryComponents(lotteryId, 'giveaway', true) });
+
+        // Fetch ETH block hash seed
+        let ethSeed = null, ethBlockNumber = null;
+        if(!customSeed){
+          try{
+            const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
+              `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+            const latestBlock   = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
+            const targetBlock   = latestBlock + 5;
+            const arrived       = await waitForEthBlock(targetBlock);
+            if(arrived){
+              const { hash } = await fetchEthBlockHashSeed(targetBlock);
+              ethSeed        = hash;
+              ethBlockNumber = targetBlock;
+            }
+          }catch(_){}
+        }
+
+        const activeSeed = customSeed || ethSeed || randomLotterySeed();
+        const pick       = lotteryPick(entries, activeSeed);
+
+        // Update DB record with result
+        await pgPool.query(
+          `UPDATE generic_lotteries SET seed=$1, status='completed', result_json=$2, completed_at=NOW() WHERE id=$3`,
+          [activeSeed, JSON.stringify({ proof: pick.proof||null, winner_index: pick.index??null, winner_position: pick.position??null, block_number: ethBlockNumber||null }), lotteryId]
+        ).catch(()=>{});
+
+        // Build result row for embed
+        const resultRow = { id: lotteryId, title, type:'giveaway', seed: activeSeed, result_json: { proof: pick.proof||null, block_number: ethBlockNumber||null } };
+        const resultEmbed = buildGenericLotteryResultEmbed(resultRow, entries.map(e=>({ username:e, user_id:e })), pick);
+        const resultComponents = buildGenericLotteryComponents(lotteryId);
+
+        return interaction.editReply({ embeds:[resultEmbed], components:resultComponents });
       }
 
       // ── /lottery start — create a new scheduled giveaway or guess lottery ──
@@ -6025,23 +6079,31 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         if(!row) return interaction.editReply('Lottery not found.');
         if(row.status !== 'active') return interaction.editReply('Lottery is not active.');
 
-        await interaction.editReply('⏳ Fetching Ethereum block hash for tamper-proof seed... (takes ~60–75 seconds)');
+        // Show full lottery details with ⏳ while fetching ETH seed
+        const entryCount = (await pgPool.query('SELECT COUNT(*) FROM generic_lottery_entries WHERE lottery_id=$1', [id])).rows[0]?.count || 0;
+        const drawFetchEmbed = buildGenericLotteryStartEmbed({ ...row, _entry_count: parseInt(entryCount) }, parseInt(entryCount))
+          .setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
+        await interaction.editReply({ embeds:[drawFetchEmbed], components:buildGenericLotteryComponents(row.id, row.type, true) });
 
-        let ethSeed = null;
+        let ethSeed = null, ethBlockNumber = null;
         try{
           const rpcUrlG = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://', 'https://') ||
             `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-          const latestBlockG = parseInt(await burnRpc(rpcUrlG, 'eth_blockNumber', []), 16);
-          const targetBlockG = latestBlockG + 5;
-          const arrivedG = await waitForEthBlock(targetBlockG);
+          const latestBlockG  = parseInt(await burnRpc(rpcUrlG, 'eth_blockNumber', []), 16);
+          const targetBlockG  = latestBlockG + 5;
+          const arrivedG      = await waitForEthBlock(targetBlockG);
           if(arrivedG){
             const { hash: bHashG } = await fetchEthBlockHashSeed(targetBlockG);
-            ethSeed = bHashG;
+            ethSeed        = bHashG;
+            ethBlockNumber = targetBlockG;
           }
         }catch(_){}
 
-        const out = await drawGenericLottery(row, false, ethSeed);
-        return interaction.editReply({ content:null, embeds:[out.embed], components: out.components || [] });
+        const out = await drawGenericLottery(row, false, ethSeed, ethBlockNumber, true);
+
+        // Update interaction reply to ✅ done — result posted via drawGenericLottery
+        const doneEmbed = EmbedBuilder.from(drawFetchEmbed).setDescription('✅ Draw complete.');
+        return interaction.editReply({ embeds:[doneEmbed], components:[] });
       }
 
       // ── /lottery cancel — cancel an active lottery ──
