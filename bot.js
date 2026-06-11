@@ -3212,19 +3212,18 @@ async function drawAndPostBurnLottery(row){
      JSON.stringify({entries:entries.length, proof:pick?.proof||null, winner_index:pick?.index ?? null, winner_position:pick?.position ?? null, ...seedMeta}),
      row.id]
   );
-  const ch = await resolveDiscordChannel(row.channel_id);
-  if(ch){
-    await ch.send({
-      embeds:[buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone, seedMeta})],
-      components:buildBurnLotteryComponents(row.id)
-    });
-  }
-  // Remove the ⏳ fetching message from the original embed now that result is posted
+  const resultEmbed = buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone, seedMeta});
+  const resultComponents = buildBurnLotteryComponents(row.id);
+
   if(originalMsg){
+    // Edit the original message to show the full result — no second message posted
     try{
-      const doneEmbed = EmbedBuilder.from(originalMsg.embeds[0]).setDescription('✅ Draw complete.');
-      await originalMsg.edit({ embeds:[doneEmbed], components:[] }).catch(() => {});
+      await originalMsg.edit({ embeds:[resultEmbed], components:resultComponents }).catch(() => {});
     }catch(_){}
+  } else {
+    // No original message to edit (e.g. auto-draw with no stored message_id) — post fresh
+    const ch = await resolveDiscordChannel(row.channel_id);
+    if(ch) await ch.send({ embeds:[resultEmbed], components:resultComponents });
   }
 }
 async function processDueBurnLotteries(){
@@ -5701,7 +5700,8 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
         await drawAndPostBurnLottery(lotteryRow);
 
-        // Update to draw complete
+        // drawAndPostBurnLottery edits the original scheduled message to the full result.
+        // Update the interaction reply to confirm draw is done.
         const doneEmbed = EmbedBuilder.from(fetchingEmbed).setDescription('✅ Draw complete.');
         return interaction.editReply({ embeds:[doneEmbed], components:[] });
       }
@@ -5719,13 +5719,22 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
       if(!entries.length) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
 
+      // Insert lottery record early so we have an ID for the Show Current Entries button
+      const preInsert = await pgPool.query(
+        `INSERT INTO burn_lotteries
+           (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status, timezone)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'processing',$10) RETURNING id`,
+        [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, pendingDrawSeed(), timeZone]
+      );
+      const instantLotteryId = preInsert.rows[0]?.id;
+
       // Show full details embed with ⏳ while fetching ETH seed
       const instantFetchEmbed = buildBurnLotteryEmbed({
         title: 'OCAS Burn Lottery', mode, start, end,
         seed: null, entries, wallets, burns,
-        pick: null, lotteryId: null, timezone: timeZone
+        pick: null, lotteryId: instantLotteryId, timezone: timeZone
       }).setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
-      await interaction.editReply({ embeds:[instantFetchEmbed], components:[] });
+      await interaction.editReply({ embeds:[instantFetchEmbed], components:buildActiveBurnLotteryComponents(instantLotteryId) });
 
       // Use ETH block hash as seed unless admin supplied a custom seed
       let drawSeed, seedMeta = {};
@@ -5760,16 +5769,16 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
 
       const pick = lotteryPick(entries, drawSeed);
       if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
-      const r = await pgPool.query(
-        `INSERT INTO burn_lotteries
-           (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status,
-            winner_wallet, qualified_wallets, total_burns, result_json, timezone, completed_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed',$10,$11,$12,$13,$14,NOW())
-         RETURNING id`,
-        [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, drawSeed,
-         pick.winner, wallets.length, burns.length, JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null, ...seedMeta}), timeZone]
+      await pgPool.query(
+        `UPDATE burn_lotteries
+           SET seed=$1, status='completed', winner_wallet=$2, qualified_wallets=$3,
+               total_burns=$4, result_json=$5, completed_at=NOW()
+         WHERE id=$6`,
+        [drawSeed, pick.winner, wallets.length, burns.length,
+         JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null, ...seedMeta}),
+         instantLotteryId]
       );
-      const lotteryId = r.rows[0]?.id;
+      const lotteryId = instantLotteryId;
       return interaction.editReply({
         content: null,
         embeds:[buildBurnLotteryEmbed({mode,start,end,seed:drawSeed,entries,wallets,burns,pick,lotteryId,timezone:timeZone,seedMeta})],
