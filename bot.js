@@ -829,7 +829,6 @@ client.once('clientReady', async ()=>{
   await loadSaleCursors();
   await loadListingCursors();
   await loadBurnConfig();
-  console.log('Servers configured: '+Object.keys(serverConfigs).length);
   pollSales();
   pollListings();
   setInterval(pollSales, POLL_MS);
