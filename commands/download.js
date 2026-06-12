@@ -155,9 +155,15 @@ async function rpcCall(rpcUrl, method, params){
 
 
 async function fetchTokenUri(contract, tokenId, chain=DEFAULT_CHAIN){
-  const key = process.env.ALCHEMY_API_KEY;
-  const rpc = key ? `https://eth-mainnet.g.alchemy.com/v2/${key}` : '';
-  if(!rpc) throw new Error('No Ethereum RPC configured. Set ALCHEMY_API_KEY or ALCHEMY_RPC_URL.');
+  const wsOrHttpRpc = process.env.ALCHEMY_WEBSOCKET_URL || process.env.ETH_RPC_URL || process.env.ALCHEMY_RPC_URL || '';
+  const rpc = wsOrHttpRpc
+    ? wsOrHttpRpc.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+    : (process.env.ALCHEMY_API_KEY ? `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : '');
+
+  if(!rpc){
+    throw new Error('No Ethereum RPC configured. Set ALCHEMY_WEBSOCKET_URL, ETH_RPC_URL, ALCHEMY_RPC_URL, or ALCHEMY_API_KEY.');
+  }
+
   const result = await rpcCall(rpc, 'eth_call', [{ to:contract, data:encodeTokenUriCall(tokenId) }, 'latest']);
   return decodeAbiString(result);
 }
