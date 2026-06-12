@@ -51,6 +51,7 @@ const {
 const {
   pollBurnEvents, processPendingBurnAlerts,
   buildBurnEmbed, triggerOsMetadataRefresh,
+  setClient,
 } = require('./lib/burn-poller');
 
 const {
@@ -95,8 +96,11 @@ const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
 
 // ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+setClient(client); // inject into burn-poller
 
 // ── resolveDiscordChannel — needs client, defined here ───────────────────────
+// Inject client into burn-poller so it can resolve channels
+
 async function resolveDiscordChannel(channelId){
   if(!channelId) return null;
   return client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(()=>null);
