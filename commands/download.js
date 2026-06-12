@@ -4,11 +4,15 @@ const fetch = require('node-fetch');
 const sharp = require('sharp');
 const { AttachmentBuilder, MessageFlags } = require('discord.js');
 const { extractPngFromSvg } = require('../lib/images');
-const { pgPool, dbLoad } = require('../lib/db');
+const { pgPool, dbLoad, dbSave } = require('../lib/db');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
 const DOWNLOAD_GUILD_WINDOW_MS = Math.max(10000, parseInt(process.env.DOWNLOAD_GUILD_WINDOW_MS || '60000', 10));
 const DOWNLOAD_GUILD_MAX_PER_WINDOW = Math.max(1, parseInt(process.env.DOWNLOAD_GUILD_MAX_PER_WINDOW || '8', 10));
+
+const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
+const DEFAULT_CHAIN = 'ethereum';
+const DEFAULT_SLUG  = 'on-chain-all-stars';
 
 
 async function loadMarketConfig(){
@@ -115,6 +119,36 @@ function checkDownloadCooldown(interaction){
   hits.push(now);
   downloadGuildHits.set(guildKey, hits);
   return null;
+}
+
+
+function rpcUrlForChain(chain){
+  if(chain !== 'ethereum') return process.env.RPC_URL || process.env.ETH_RPC_URL || process.env.ALCHEMY_RPC_URL || '';
+  if(process.env.ALCHEMY_RPC_URL) return process.env.ALCHEMY_RPC_URL;
+  if(process.env.ETH_RPC_URL) return process.env.ETH_RPC_URL;
+  if(process.env.RPC_URL) return process.env.RPC_URL;
+  if(process.env.ALCHEMY_API_KEY) return `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`;
+  return '';
+}
+
+function strip0x(s){ return String(s || '').replace(/^0x/i, ''); }
+function pad64(hex){ return strip0x(hex).padStart(64, '0'); }
+function encodeTokenUriCall(tokenId){ return '0xc87b56dd' + pad64(BigInt(tokenId).toString(16)); }
+
+function decodeAbiString(hex){
+  const clean = strip0x(hex);
+  if(!clean || clean === '0') throw new Error('empty tokenURI result');
+  const offset = parseInt(clean.slice(0,64), 16) * 2;
+  const len = parseInt(clean.slice(offset, offset+64), 16) * 2;
+  const data = clean.slice(offset+64, offset+64+len);
+  return Buffer.from(data, 'hex').toString('utf8');
+}
+
+async function rpcCall(rpcUrl, method, params){
+  const r = await fetch(rpcUrl, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({jsonrpc:'2.0', id:Date.now(), method, params}) });
+  const j = await r.json();
+  if(j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+  return j.result;
 }
 
 
