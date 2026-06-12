@@ -22,7 +22,8 @@ async function handleBurnCommand(commandName, ctx){
     timeSince, shortAddr, formatEth, isDiscordOk, normAddr,
     fetchTokenMetaFromDb, buildEmbedPayload, traitDisplayLines,
     fetchBurnDisplayTraits, fetchSnapshotImageForToken, burnTypeBreakdown,
-    fetchTokenUriFromContract, extractPngFromSvg,
+    fetchTokenUriFromContract, extractPngFromSvg, clearCachedImage,
+    burnTypeLabel, burnTypeColor, burnTypeEmoji,
     traitObjectToArray, osRankBadge, titleTokenId, getRankTierColor,
   } = ctx;
 
@@ -153,7 +154,7 @@ async function handleBurnCommand(commandName, ctx){
             return null;
           }
           // Bust image cache so stale pre-burn images never get served for survivor/current tokens
-          imageCache?.delete?.(`${contract}:${tid}`);
+          clearCachedImage?.(`${contract}:${tid}`);
           const contractTraits = await fetchTokenUriFromContract(tid).catch(()=>null);
           if(contractTraits?.__image){
             const imgSrc = contractTraits.__image;

@@ -30,7 +30,7 @@ const {
 const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
 
 const {
-  getCachedImage, setCachedImage,
+  getCachedImage, setCachedImage, clearCachedImage,
   getCachedTraits, setCachedTraits,
   sweepSessions, slideshowSessions,
   recentChannelPosts, alertedEventIds,
@@ -40,7 +40,7 @@ const {
 const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock } = require('./lib/rpc');
 const { rollingRankSync, drainRankSyncQueue, queueRankSync, rankSyncQueue } = require('./lib/rank-sync');
 
-const { BURN_COLORS, E1_TYPE_NAMES, normalizeOcasType } = require('./lib/burn-constants');
+const { BURN_COLORS, E1_TYPE_NAMES, normalizeOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji } = require('./lib/burn-constants');
 const {
   burnConfig, loadBurnConfig, saveBurnConfig,
   getBurnConfig, getConfiguredBurnChannelId,
@@ -122,13 +122,13 @@ function buildCtx(interaction, guildId, config, isAdmin){
     // Constants
     COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES,
     // Helpers
-    osHeaders, getRailwayApiUrl, fetchBotApiJson, resolveDiscordChannel,
-    checkCommandCooldown, normalizeOcasType,
+    osHeaders, getRailwayApiUrl, getRankTierColor, fetchBotApiJson, resolveDiscordChannel,
+    checkCommandCooldown, normalizeOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji,
     API_SECRET, sendErrorWebhook,
     // DB
     pgPool, dbLoad, dbSave, getConfig, setConfig,
     // Cache
-    getCachedImage, setCachedImage, getCachedTraits, setCachedTraits,
+    getCachedImage, setCachedImage, clearCachedImage, getCachedTraits, setCachedTraits,
     sweepSessions, slideshowSessions, recentChannelPosts,
     // RPC
     burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock,
