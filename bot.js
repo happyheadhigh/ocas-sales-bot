@@ -100,6 +100,7 @@ const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
 const { handleLotteryCommand, LOTTERY_COMMANDS } = require('./commands/lottery');
 const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
+const { handleDownloadCommand, DOWNLOAD_COMMANDS } = require('./commands/download');
 
 // ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -727,6 +728,7 @@ client.on('interactionCreate', async (interaction)=>{
   if(BURN_COMMANDS.has(commandName))    return handleBurnCommand(commandName, ctx);
   if(LOTTERY_COMMANDS.has(commandName)) return handleLotteryCommand(commandName, ctx);
   if(MISC_COMMANDS.has(commandName))    return handleMiscCommand(commandName, ctx);
+    if(DOWNLOAD_COMMANDS.has(commandName)) return handleDownloadCommand(interaction);
 });
 
 // ── Welcome message on server join ───────────────────────────────────────────
