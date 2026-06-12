@@ -132,7 +132,8 @@ function checkDownloadCooldown(interaction){
 
 
 function rpcUrlForChain(chain){
-  if(chain !== 'ethereum') return process.env.RPC_URL || process.env.ETH_RPC_URL || process.env.ALCHEMY_RPC_URL || '';
+  const wsUrl = process.env.ALCHEMY_WEBSOCKET_URL;
+  if(wsUrl) return wsUrl.replace('wss://','https://').replace('ws://','http://');
   if(process.env.ALCHEMY_RPC_URL) return process.env.ALCHEMY_RPC_URL;
   if(process.env.ETH_RPC_URL) return process.env.ETH_RPC_URL;
   if(process.env.RPC_URL) return process.env.RPC_URL;
