@@ -228,9 +228,25 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
   }
 
   if(typeof src === 'string' && isSvgSource(src)){
-    const buffer = await extractPngFromSvg(src, size);
-    return { buffer, meta };
+  let buffer;
+
+  if(src.trim().startsWith('<svg')){
+    buffer = await sharp(Buffer.from(src))
+      .resize(size, size, { kernel:'nearest', fit:'fill' })
+      .png()
+      .toBuffer();
+  } else {
+    buffer = await extractPngFromSvg(src);
+    if(size && size !== 500){
+      buffer = await sharp(buffer)
+        .resize(size, size, { kernel:'nearest', fit:'fill' })
+        .png()
+        .toBuffer();
+    }
   }
+
+  return { buffer, meta };
+}
 
   let pipeline = sharp(Buffer.isBuffer(src) ? src : Buffer.from(src));
   pipeline = pipeline.resize(size, size, { fit:'contain', withoutEnlargement:false });
