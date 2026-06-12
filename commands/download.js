@@ -4,6 +4,7 @@ const fetch = require('node-fetch');
 const sharp = require('sharp');
 const { AttachmentBuilder, MessageFlags } = require('discord.js');
 const { extractPngFromSvg } = require('../lib/images');
+const { burnRpcUrl } = require('../lib/rpc');
 const { pgPool, dbLoad, dbSave } = require('../lib/db');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
@@ -131,15 +132,7 @@ function checkDownloadCooldown(interaction){
 }
 
 
-function rpcUrlForChain(chain){
-  const wsUrl = process.env.ALCHEMY_WEBSOCKET_URL;
-  if(wsUrl) return wsUrl.replace('wss://','https://').replace('ws://','http://');
-  if(process.env.ALCHEMY_RPC_URL) return process.env.ALCHEMY_RPC_URL;
-  if(process.env.ETH_RPC_URL) return process.env.ETH_RPC_URL;
-  if(process.env.RPC_URL) return process.env.RPC_URL;
-  if(process.env.ALCHEMY_API_KEY) return `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`;
-  return '';
-}
+// rpcUrlForChain replaced by burnRpcUrl from lib/rpc
 
 function strip0x(s){ return String(s || '').replace(/^0x/i, ''); }
 function pad64(hex){ return strip0x(hex).padStart(64, '0'); }
@@ -163,7 +156,7 @@ async function rpcCall(rpcUrl, method, params){
 
 
 async function fetchTokenUri(contract, tokenId, chain=DEFAULT_CHAIN){
-  const rpc = rpcUrlForChain(chain);
+  const rpc = burnRpcUrl();
   if(!rpc) throw new Error('No Ethereum RPC configured. Set ALCHEMY_API_KEY or ALCHEMY_RPC_URL.');
   const result = await rpcCall(rpc, 'eth_call', [{ to:contract, data:encodeTokenUriCall(tokenId) }, 'latest']);
   return decodeAbiString(result);

@@ -16,7 +16,7 @@ async function handleBurnCommand(commandName, ctx){
     buildBurnLotteryEmbed, buildActiveBurnLotteryComponents,
     getBurnLotteryEntries, drawAndPostBurnLottery,
     processDueBurnLotteries, buildBurnLotteryComponents,
-    formatBurnLotteryWindow, pendingDrawSeed,
+    formatBurnLotteryWindow, pendingDrawSeed, resolveLotteryWindow,
     waitForEthBlock, fetchEthBlockHashSeed,
     lotteryPick, randomLotterySeed,
     timeSince, shortAddr, formatEth, isDiscordOk, normAddr,
