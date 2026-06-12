@@ -1,5 +1,6 @@
 'use strict';
 
+const { ALCHEMY_KEY } = require('../lib/constants');
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
 
 async function handleLotteryCommand(commandName, ctx){
