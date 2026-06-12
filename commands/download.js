@@ -231,18 +231,17 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
   let buffer;
 
   if(src.trim().startsWith('<svg')){
-    buffer = await sharp(Buffer.from(src))
+    const svgDataUri = 'data:image/svg+xml;base64,' + Buffer.from(src).toString('base64');
+    buffer = await extractPngFromSvg(svgDataUri);
+  } else {
+    buffer = await extractPngFromSvg(src);
+  }
+
+  if(size && size !== 500){
+    buffer = await sharp(buffer)
       .resize(size, size, { kernel:'nearest', fit:'fill' })
       .png()
       .toBuffer();
-  } else {
-    buffer = await extractPngFromSvg(src);
-    if(size && size !== 500){
-      buffer = await sharp(buffer)
-        .resize(size, size, { kernel:'nearest', fit:'fill' })
-        .png()
-        .toBuffer();
-    }
   }
 
   return { buffer, meta };
