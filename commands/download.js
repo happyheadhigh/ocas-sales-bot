@@ -4,7 +4,6 @@ const fetch = require('node-fetch');
 const sharp = require('sharp');
 const { AttachmentBuilder, MessageFlags } = require('discord.js');
 const { extractPngFromSvg } = require('../lib/images');
-const { burnRpcUrl } = require('../lib/rpc');
 const { pgPool, dbLoad, dbSave } = require('../lib/db');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
@@ -156,7 +155,8 @@ async function rpcCall(rpcUrl, method, params){
 
 
 async function fetchTokenUri(contract, tokenId, chain=DEFAULT_CHAIN){
-  const rpc = burnRpcUrl();
+  const key = process.env.ALCHEMY_API_KEY;
+  const rpc = key ? `https://eth-mainnet.g.alchemy.com/v2/${key}` : '';
   if(!rpc) throw new Error('No Ethereum RPC configured. Set ALCHEMY_API_KEY or ALCHEMY_RPC_URL.');
   const result = await rpcCall(rpc, 'eth_call', [{ to:contract, data:encodeTokenUriCall(tokenId) }, 'latest']);
   return decodeAbiString(result);
