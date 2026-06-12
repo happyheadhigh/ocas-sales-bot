@@ -11,12 +11,16 @@ const fetch = require('node-fetch');
 async function handleMarketCommand(commandName, ctx){
   const {
     interaction, guildId, config,
-    osHeaders, getRailwayApiUrl,
+    osHeaders, getRailwayApiUrl, API_SECRET,
     buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
     checkCommandCooldown, getAlert, setAlert, deleteAlert,
     pgPool, fetchBotApiJson, resolveImage,
     slideshowSessions, sweepSessions,
     COLORS, OCAS_CONTRACT,
+    getTraitIndex, chooseTraitGroupsFromQuery, traitGroupsLabel,
+    buildTokenSearchEmbed, traitDisplayLines, traitObjectToArray,
+    fetchTokenMetaFromDb, getRankTierColor, buildEmbedPayload,
+    shortAddr, formatEth, timeSince, isDiscordOk, normAddr,
   } = ctx;
 
   if(commandName==='lastsale'){

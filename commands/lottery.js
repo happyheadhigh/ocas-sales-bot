@@ -12,6 +12,9 @@ async function handleLotteryCommand(commandName, ctx){
     buildGenericLotteryComponents, drawGenericLottery,
     processDueGenericLotteries, resolveLotteryWindow,
     resolveDiscordChannel, COLORS,
+    timeSince, lotteryTime, formatEth,
+    sendErrorWebhook, findActiveGenericLottery,
+    lotteryNumberFromSeed, getGenericLotteryEntryCount,
   } = ctx;
 
   if(commandName==='lottery'){

@@ -18,7 +18,12 @@ async function handleBurnCommand(commandName, ctx){
     processDueBurnLotteries, buildBurnLotteryComponents,
     formatBurnLotteryWindow, pendingDrawSeed,
     waitForEthBlock, fetchEthBlockHashSeed,
-    burnRandom, lotteryPick, randomLotterySeed,
+    lotteryPick, randomLotterySeed,
+    timeSince, shortAddr, formatEth, isDiscordOk, normAddr,
+    fetchTokenMetaFromDb, buildEmbedPayload, traitDisplayLines,
+    fetchBurnDisplayTraits, fetchSnapshotImageForToken, burnTypeBreakdown,
+    fetchTokenUriFromContract, extractPngFromSvg,
+    traitObjectToArray, osRankBadge, titleTokenId, getRankTierColor,
   } = ctx;
 
   if(commandName==='burnlatest'){

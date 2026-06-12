@@ -124,6 +124,7 @@ function buildCtx(interaction, guildId, config, isAdmin){
     // Helpers
     osHeaders, getRailwayApiUrl, fetchBotApiJson, resolveDiscordChannel,
     checkCommandCooldown, normalizeOcasType,
+    API_SECRET, sendErrorWebhook,
     // DB
     pgPool, dbLoad, dbSave, getConfig, setConfig,
     // Cache
@@ -133,7 +134,7 @@ function buildCtx(interaction, guildId, config, isAdmin){
     burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock,
     // Embeds
     buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
-    resolveImage, extractPngFromSvg,
+    resolveImage, extractPngFromSvg, fetchTokenMetaFromDb,
     buildBurnEmbed, buildBurnLotteryEmbed,
     buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
     buildGenericLotteryStartEmbed, buildGenericLotteryResultEmbed,
@@ -163,7 +164,7 @@ function buildCtx(interaction, guildId, config, isAdmin){
     // Cache
     ocasTraitsCache,
     normAddr, shortAddr, formatEth, timeSince, lotteryTime,
-    isSvg, isDiscordOk, matchesFilters,
+    formatBurnLotteryWindow, isSvg, isDiscordOk, matchesFilters,
     // Rank sync
     rankSyncQueue, queueRankSync,
     // Components

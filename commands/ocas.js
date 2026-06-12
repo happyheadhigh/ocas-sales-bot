@@ -10,7 +10,11 @@ async function handleOcasCommand(commandName, ctx){
     buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
     checkCommandCooldown, pgPool, fetchBotApiJson, resolveImage,
     slideshowSessions, ocasTraitsCache, getCachedTraits, setCachedTraits,
-    COLORS, OCAS_CONTRACT, sweepSessions,
+    getCachedImage, setCachedImage,
+    COLORS, OCAS_CONTRACT, sweepSessions, API_SECRET,
+    getTraitIndex, chooseTraitGroupsFromQuery, getRankTierColor,
+    fetchTokenMetaFromDb, buildEmbedPayload, traitObjectToArray,
+    timeSince, shortAddr, formatEth, isDiscordOk,
   } = ctx;
 
   if(commandName==='ocas'){
