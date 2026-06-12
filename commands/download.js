@@ -224,8 +224,11 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
   let src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
 
   if(typeof src === 'string' && transparent){
-    src = makeSvgTransparent(src);
-  }
+  src = makeSvgTransparent(src);
+  src = src.replace(/<rect\b[^>]*>/gi, '');
+  src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*>\s*<\/path>/gi, '');
+  src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*\/?>/gi, '');
+}
 
   if(typeof src === 'string' && isSvgSource(src)){
   let buffer;
