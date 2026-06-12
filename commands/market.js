@@ -500,7 +500,246 @@ async function handleMarketCommand(commandName, ctx){
   }
 
 
-  // /ocas — smart search (random, token ID, rank, trait count, or phrase-aware trait combos)
+  if(commandName==='sweep'){
+    const RAILWAY_URL = getRailwayApiUrl();
+    const API_SECRET  = process.env.API_SECRET;
+    const rawSearch   = (interaction.options.getString('search')||'').trim();
+    console.log('[/sweep] RAILWAY_URL set:', !!RAILWAY_URL, 'search:', rawSearch);
+    await interaction.deferReply();
+    try{
+
+      // ── Parse sweep mode ──────────────────────────────────────────────────
+      let sweepMode   = 'count';
+      let sweepCount  = 10;
+      let budget      = null;
+      let targetFloor = null;
+      let workingSearch = rawSearch;
+
+      // Budget mode: "2eth", "1eth zombie", "0.5eth zombie hoodie"
+      const budgetMatch = workingSearch.match(/(?:^|\s)([\d.]+)\s*eth(?=\s|$)/i);
+      if(budgetMatch){
+        sweepMode = 'budget';
+        budget = parseFloat(budgetMatch[1]);
+        workingSearch = workingSearch.replace(budgetMatch[0], ' ').trim();
+      }
+
+      // Target-floor mode: "0.05 floor", "0.1 floor zombie"
+      if(sweepMode === 'count'){
+        const floorNumMatch = workingSearch.match(/(?:^|\s)([\d.]+)\s+floor(?=\s|$)/i);
+        if(floorNumMatch){
+          sweepMode   = 'floor';
+          targetFloor = parseFloat(floorNumMatch[1]);
+          workingSearch = workingSearch.replace(floorNumMatch[0], ' ').trim();
+        } else {
+          // Strip stray "floor" keyword if no number preceded it
+          workingSearch = workingSearch.replace(/(?:^|\s)floor(?=\s|$)/gi, ' ').trim();
+        }
+      }
+
+      // Count mode: extract standalone integer
+      if(sweepMode === 'count'){
+        const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
+        if(numMatch){
+          const n = parseInt(numMatch[1]);
+          if(n > 0 && n <= 500){ sweepCount = n; workingSearch = workingSearch.replace(numMatch[0], ' ').trim(); }
+        }
+      }
+
+      // ── Extract trait count e.g. "15 traits" ──────────────────────────────
+      let traitCount = null;
+      const tcMatch = workingSearch.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
+      if(tcMatch){
+        traitCount = parseInt(tcMatch[1] || tcMatch[2]);
+        workingSearch = workingSearch.replace(tcMatch[0], ' ').trim();
+      }
+
+      // ── Simple depluralize ────────────────────────────────────────────────
+      const PLURAL_OVERRIDES = {
+        zombies: 'zombie', hoodies: 'hoodie', skeletons: 'skeleton',
+        apes: 'ape', aliens: 'alien', robots: 'robot'
+      };
+      const SKIP_DEPLURAL = new Set(['teeth','tattoos','traits','clothes','glasses']);
+      workingSearch = workingSearch.split(' ').map(w => {
+        const lw = w.toLowerCase();
+        if(PLURAL_OVERRIDES[lw]) return PLURAL_OVERRIDES[lw];
+        if(SKIP_DEPLURAL.has(lw)) return w;
+        if(lw.endsWith('ies') && lw.length > 4) return w.slice(0,-3)+'y';
+        if(lw.endsWith('s') && lw.length > 3) return w.slice(0,-1);
+        return w;
+      }).join(' ').trim();
+
+      // ── Phrase-aware trait matching ────────────────────────────────────────
+      let matchedGroups = [];
+      workingSearch = workingSearch.replace(/[,+]/g,' ').replace(/\b(and|with|plus)\b/gi,' ').replace(/\s+/g,' ').trim();
+
+      if(workingSearch && RAILWAY_URL){
+        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
+        const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
+        matchedGroups = resolved.groups;
+        if(resolved.unmatched.length && !matchedGroups.length){
+          await interaction.editReply(`I couldn't match **"${workingSearch}"** to any known trait. Try: "zombie", "gold chain", "15 traits".`);
+          return;
+        }
+        if(resolved.unmatched.length){
+          await interaction.editReply(`I matched some traits but couldn't understand: **${resolved.unmatched.join(' ')}**. Try exact trait phrases.`);
+          return;
+        }
+      }
+
+      // ── Build label + title ────────────────────────────────────────────────
+      const labelParts = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
+      if(traitCount !== null) labelParts.push(traitCount + ' traits');
+      const traitLabel = labelParts.length ? labelParts.join(' · ') : 'OCAS';
+
+      let modeTitle;
+      if(sweepMode === 'budget') modeTitle = `Budget Sweep Ξ${budget} · ${traitLabel}`;
+      else if(sweepMode === 'floor') modeTitle = `Floor Sweep Ξ${targetFloor} · ${traitLabel}`;
+      else modeTitle = `Sweep ${sweepCount} · ${traitLabel}`;
+
+      // ── Determine fetch limit ──────────────────────────────────────────────
+      const fetchLimit = (sweepMode === 'count') ? sweepCount + 1 : 1000;
+
+      // ── Fetch listings from DB ─────────────────────────────────────────────
+      let allFetched = [];
+      if(!matchedGroups.length && traitCount === null){
+        console.log('[/sweep] plain sweep from DB, mode:', sweepMode);
+        const dbRes = await pgPool.query(
+          `SELECT l.token_id, l.price_eth, l.url, t.os_rank, t.obs_rank, t.trait_count
+           FROM listings l
+           LEFT JOIN tokens t ON t.id = l.token_id
+           ORDER BY l.price_eth ASC
+           LIMIT $1`,
+          [fetchLimit]
+        );
+        allFetched = dbRes.rows.map(r => ({
+          token_id: parseInt(r.token_id),
+          price_eth: parseFloat(r.price_eth),
+          url: r.url,
+          os_rank: r.os_rank ? parseInt(r.os_rank) : null,
+          obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
+          trait_count: r.trait_count ? parseInt(r.trait_count) : null
+        }));
+        console.log('[/sweep] plain sweep tokens returned:', allFetched.length);
+      } else {
+        if(!RAILWAY_URL) throw new Error('RAILWAY_API_URL is required for trait/count sweeps.');
+        const qs = new URLSearchParams({ listed:'1', limit: String(fetchLimit), key: API_SECRET||'' });
+        if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
+        if(traitCount !== null) qs.set('trait_count', String(traitCount));
+        console.log('[/sweep] fetching multi-trait-tokens, mode:', sweepMode, 'groups:', matchedGroups.length, 'traitCount:', traitCount);
+        const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
+        console.log('[/sweep] response status:', r.status);
+        if(!r.ok){ const txt = await r.text(); throw new Error('multi-trait-tokens HTTP ' + r.status + ': ' + txt.slice(0,200)); }
+        const j = await r.json();
+        console.log('[/sweep] tokens returned:', j.tokens?.length);
+        if(!j.ok) throw new Error(j.error||'API error');
+        allFetched = (j.tokens||[]).map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
+      }
+
+      if(!allFetched.length){
+        await interaction.editReply('No listed tokens found for **' + traitLabel + '**.');
+        return;
+      }
+
+      // ── Apply mode logic ───────────────────────────────────────────────────
+      let sweepListings = [];
+      let postSweepToken = null;
+      const fmt = n => n.toFixed(4);
+
+      if(sweepMode === 'budget'){
+        let running = 0;
+        for(const t of allFetched){
+          if(running + t.price_eth <= budget){ sweepListings.push(t); running += t.price_eth; }
+          else { postSweepToken = postSweepToken || t; break; }
+        }
+        if(!sweepListings.length){
+          await interaction.editReply(`No listings fit within that budget of **Ξ${budget}** for **${traitLabel}**.\nCheapest available: Ξ${fmt(allFetched[0].price_eth)}`);
+          return;
+        }
+      } else if(sweepMode === 'floor'){
+        for(const t of allFetched){
+          if(t.price_eth < targetFloor) sweepListings.push(t);
+          else { postSweepToken = postSweepToken || t; break; }
+        }
+        if(!sweepListings.length){
+          await interaction.editReply(`No listings below target floor of **Ξ${targetFloor}** for **${traitLabel}**.\nCheapest available: Ξ${fmt(allFetched[0].price_eth)}`);
+          return;
+        }
+      } else {
+        sweepListings  = allFetched.slice(0, sweepCount);
+        postSweepToken = allFetched[sweepCount] || null;
+      }
+
+      // ── Compute stats ──────────────────────────────────────────────────────
+      const available  = sweepListings.length;
+      const short      = sweepMode === 'count' && available < sweepCount;
+      const prices     = sweepListings.map(t => parseFloat(t.price_eth));
+      const totalEth   = prices.reduce((a,b)=>a+b,0);
+      const avgEth     = totalEth / prices.length;
+      const cheapest   = prices[0];
+      const highest    = prices[prices.length-1];
+      const floorAfter = postSweepToken ? parseFloat(postSweepToken.price_eth) : null;
+
+      // ── Build embed description ────────────────────────────────────────────
+      let desc = '';
+      if(sweepMode === 'budget'){
+        const remaining = budget - totalEth;
+        desc += `**Budget:** Ξ ${fmt(budget)}\n`;
+        desc += `**Tokens swept:** ${available}\n`;
+        desc += `**Total ETH:** Ξ ${fmt(totalEth)}\n`;
+        desc += `**ETH left:** Ξ ${fmt(remaining)}\n`;
+        desc += `**Average price:** Ξ ${fmt(avgEth)}\n`;
+        desc += `**Cheapest included:** Ξ ${fmt(cheapest)}\n`;
+        desc += `**Highest included:** Ξ ${fmt(highest)}\n`;
+        if(floorAfter) desc += `**New floor after sweep:** Ξ ${fmt(floorAfter)}\n`;
+      } else if(sweepMode === 'floor'){
+        desc += `**Target floor:** Ξ ${targetFloor.toFixed(4)}\n`;
+        desc += `**Tokens swept:** ${available}\n`;
+        desc += `**Total ETH:** Ξ ${fmt(totalEth)}\n`;
+        desc += `**Average price:** Ξ ${fmt(avgEth)}\n`;
+        desc += `**Cheapest included:** Ξ ${fmt(cheapest)}\n`;
+        desc += `**Highest included:** Ξ ${fmt(highest)}\n`;
+        if(floorAfter) desc += `**New floor after sweep:** Ξ ${fmt(floorAfter)}\n`;
+      } else {
+        if(short) desc += '⚠️ Only ' + available + ' listed\n\n';
+        desc += '**Total:** Ξ ' + fmt(totalEth) + '\n';
+        desc += '**Average:** Ξ ' + fmt(avgEth) + '\n';
+        desc += '**Cheapest:** Ξ ' + fmt(cheapest) + '\n';
+        desc += '**Highest included:** Ξ ' + fmt(highest) + '\n';
+        if(floorAfter) desc += '**New floor after sweep:** Ξ ' + fmt(floorAfter) + '\n';
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle(modeTitle)
+        .setColor(COLORS.OCAS_GREEN)
+        .setDescription(desc.slice(0, 4090));
+
+      // ── All tokens behind private Show All Tokens button ──────────────────
+      const components = [];
+      const sessionId = interaction.id;
+      const cleanSweepListings = sweepListings.map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
+      // Cap total concurrent sweep sessions to prevent unbounded memory growth
+      if(sweepSessions.size >= 100){
+        const oldest = sweepSessions.keys().next().value;
+        sweepSessions.delete(oldest);
+      }
+      sweepSessions.set(sessionId, { listings: cleanSweepListings, page: 0 });
+      setTimeout(() => sweepSessions.delete(sessionId), 30 * 60 * 1000);
+      components.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('sweep:showall:' + sessionId).setLabel('Show All Tokens').setStyle(ButtonStyle.Secondary)
+      ));
+
+      await interaction.editReply({ embeds: [embed], components });
+
+    }catch(e){
+      console.error('[/sweep] ERROR:', e.message, e.stack);
+      try{ await interaction.editReply('Error: ' + e.message); }catch(_){}
+    }
+    return;
+  }
+
+  // /burnlatest
+
+  // /ocas — placeholder
 }
 
 const MARKET_COMMANDS = new Set([
