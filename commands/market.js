@@ -8,6 +8,38 @@ const fetch = require('node-fetch');
  * @param {string} commandName
  * @param {object} ctx - shared context
  */
+
+// ── Sweep helper functions ────────────────────────────────────────────────────
+function getSweepTokenId(item){
+  return item?.token_id ?? item?.id ?? item?.identifier ?? item?.tokenId ?? item?.tokenID ?? null;
+}
+
+function normalizeSweepListing(item){
+  const tokenId = getSweepTokenId(item);
+  return {
+    token_id: tokenId ? parseInt(tokenId) : null,
+    price_eth: item?.price_eth != null ? parseFloat(item.price_eth) : null,
+    url: item?.url || null,
+    os_rank: item?.os_rank ? parseInt(item.os_rank) : null,
+    obs_rank: item?.obs_rank ? parseInt(item.obs_rank) : null,
+    trait_count: item?.trait_count ? parseInt(item.trait_count) : null
+  };
+}
+
+function sweepTokenUrl(item){
+  const tokenId = getSweepTokenId(item);
+  const contract = '0x078be86f3104a32313a47815792230a3808642cc';
+  return tokenId ? ('https://opensea.io/assets/ethereum/' + contract + '/' + tokenId) : 'https://opensea.io/collection/on-chain-all-stars';
+}
+
+function formatSweepTokenLine(item){
+  const tokenId = getSweepTokenId(item);
+  const rank = item?.os_rank ? ('⬥' + Number(item.os_rank).toLocaleString()) : (item?.obs_rank ? ('⬥' + Number(item.obs_rank).toLocaleString()) : null);
+  const tokenLink = '[#' + tokenId + '](' + sweepTokenUrl(item) + ')';
+  const price = 'Ξ ' + parseFloat(item.price_eth).toFixed(4);
+  return [tokenLink, rank, price].filter(Boolean).join(' · ');
+}
+
 async function handleMarketCommand(commandName, ctx){
   const {
     interaction, guildId, config,
