@@ -70,6 +70,7 @@ const {
   getAlert, setAlert, deleteAlert,
   loadAllAlerts, loadSaleCursors, loadListingCursors,
   saveSaleCursors, saveListingCursors,
+  setClient: setPollClient,
 } = require('./lib/poll');
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
@@ -97,6 +98,7 @@ const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
 // ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 setClient(client); // inject into burn-poller
+setPollClient(client); // inject into poll
 
 // ── resolveDiscordChannel — needs client, defined here ───────────────────────
 // Inject client into burn-poller so it can resolve channels
