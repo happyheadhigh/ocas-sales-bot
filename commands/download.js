@@ -15,6 +15,15 @@ const DEFAULT_CHAIN = 'ethereum';
 const DEFAULT_SLUG  = 'on-chain-all-stars';
 
 
+function normalizeAlias(alias){
+  return String(alias || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+function normalizeContract(contract){
+  const c = String(contract || '').trim().toLowerCase();
+  return /^0x[a-f0-9]{40}$/.test(c) ? c : '';
+}
+
 async function loadMarketConfig(){
   return await dbLoad('market_collections_v1') || {};
 }
