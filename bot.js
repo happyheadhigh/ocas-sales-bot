@@ -34,7 +34,7 @@ const {
   getCachedTraits, setCachedTraits,
   sweepSessions, slideshowSessions,
   recentChannelPosts, alertedEventIds,
-  checkCooldown, dedupeChannelPost,
+  checkCooldown, dedupeChannelPost, ocasTraitsCache,
 } = require('./lib/cache');
 
 const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock } = require('./lib/rpc');
@@ -46,12 +46,13 @@ const {
   getBurnConfig, getConfiguredBurnChannelId,
   checkCommandCooldown, fetchBotApiJson,
   buildNavRow, postEmbeds,
+  getTraitIndex, chooseTraitGroupsFromQuery, normalizePhrase,
 } = require('./lib/burn-config');
 
 const {
   pollBurnEvents, processPendingBurnAlerts,
   buildBurnEmbed, triggerOsMetadataRefresh,
-  setClient,
+  setClient, traitDisplayLines, fetchTokenUriFromContract,
 } = require('./lib/burn-poller');
 
 const {
@@ -60,10 +61,14 @@ const {
   buildGenericLotteryComponents, getGenericLotteryEntryCount,
   drawGenericLottery, processDueGenericLotteries,
   getBurnLotteryEntries, drawAndPostBurnLottery, processDueBurnLotteries,
+  findActiveGenericLottery, lotteryNumberFromSeed,
 } = require('./lib/lottery-engine');
 
-const { fetchTokenMetaFromDb, upsertTokenTraitRows, buildSaleEmbed, buildListingEmbed } = require('./lib/embeds');
-const { resolveImage, sendEmbed, extractPngFromSvg } = require('./lib/images');
+const { fetchTokenMetaFromDb, upsertTokenTraitRows, buildSaleEmbed, buildListingEmbed,
+  traitObjectToArray, burnTypeBreakdown, fetchBurnDisplayTraits, fetchSnapshotImageForToken,
+  osRankBadge, titleTokenId,
+} = require('./lib/embeds');
+const { resolveImage, sendEmbed, extractPngFromSvg, buildEmbedPayload } = require('./lib/images');
 
 const {
   pollSales, pollListings,
@@ -71,6 +76,7 @@ const {
   loadAllAlerts, loadSaleCursors, loadListingCursors,
   saveSaleCursors, saveListingCursors,
   setClient: setPollClient,
+  traitGroupsLabel, buildTokenSearchEmbed,
 } = require('./lib/poll');
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
@@ -146,6 +152,16 @@ function buildCtx(interaction, guildId, config, isAdmin){
     getAlert, setAlert, deleteAlert,
     // Format
     resolveDiscordChannel,
+    // Trait/search helpers
+    getTraitIndex, chooseTraitGroupsFromQuery, normalizePhrase,
+    traitGroupsLabel, buildTokenSearchEmbed,
+    traitDisplayLines, traitObjectToArray, fetchTokenUriFromContract,
+    burnTypeBreakdown, fetchBurnDisplayTraits, fetchSnapshotImageForToken,
+    buildEmbedPayload, osRankBadge, titleTokenId,
+    // Lottery extras
+    findActiveGenericLottery, lotteryNumberFromSeed,
+    // Cache
+    ocasTraitsCache,
     normAddr, shortAddr, formatEth, timeSince, lotteryTime,
     isSvg, isDiscordOk, matchesFilters,
     // Rank sync
