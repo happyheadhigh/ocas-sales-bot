@@ -12,7 +12,7 @@ async function handleOcasCommand(commandName, ctx){
     slideshowSessions, ocasTraitsCache, getCachedTraits, setCachedTraits,
     getCachedImage, setCachedImage,
     COLORS, OCAS_CONTRACT, sweepSessions, API_SECRET,
-    getTraitIndex, chooseTraitGroupsFromQuery, getRankTierColor,
+    getTraitIndex, chooseTraitGroupsFromQuery, getRankTierColor, traitGroupsLabel,
     fetchTokenMetaFromDb, buildEmbedPayload, traitObjectToArray,
     timeSince, shortAddr, formatEth, isDiscordOk,
   } = ctx;
@@ -86,7 +86,7 @@ async function handleOcasCommand(commandName, ctx){
           return;
         }
         if(resolved.unmatched.length){
-          await interaction.editReply(`I matched **${matchedLabel(matchedGroups)}**, but couldn't understand: **${resolved.unmatched.join(' ')}**. Try the exact trait phrase, like **gold chain diamond choker**.`);
+          await interaction.editReply(`I matched **${traitGroupsLabel(matchedGroups)}**, but couldn't understand: **${resolved.unmatched.join(' ')}**. Try the exact trait phrase, like **gold chain diamond choker**.`);
           return;
         }
       }
@@ -104,7 +104,7 @@ async function handleOcasCommand(commandName, ctx){
           const j = await r.json();
           if(!j.ok) throw new Error(j.error || 'multi-trait-floor API error');
           if(!j.floor){
-            const label = matchedGroups.length ? matchedLabel(matchedGroups) : `${traitCount} traits`;
+            const label = matchedGroups.length ? traitGroupsLabel(matchedGroups) : `${traitCount} traits`;
             await interaction.editReply(`No listed OCAS found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
             return;
           }
@@ -118,7 +118,7 @@ async function handleOcasCommand(commandName, ctx){
           if(!j.ok) throw new Error(j.error || 'multi-trait-tokens API error');
           const tokens = j.tokens || [];
           if(!tokens.length){
-            const label = matchedGroups.length ? matchedLabel(matchedGroups) : `${traitCount} traits`;
+            const label = matchedGroups.length ? traitGroupsLabel(matchedGroups) : `${traitCount} traits`;
             await interaction.editReply(`No OCAS tokens found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
             return;
           }
