@@ -254,7 +254,13 @@ async function handleBurnCommand(commandName, ctx){
       const burns            = chainRes.rows;
       const totalPts         = burns.reduce((s,r)=>s+(r.points_used||0), 0);
       // Subtract 1 per burn for the survivor token — it upgrades itself and is never actually consumed.
-      const totalTokensBurned = burns.reduce((s,r)=>s+Math.max(0,(r.burned_ids||[]).filter(Boolean).length - 1), 0);
+const totalTokensBurned = burns.reduce((s,r)=>{
+  const ids = (r.burned_ids || [])
+    .filter(Boolean)
+    .map(Number)
+    .filter(id => id !== Number(tokenInput));
+  return s + ids.length;
+}, 0);
 
       const embed = new EmbedBuilder()
         .setColor(BURN_COLORS.FIRE)
@@ -273,7 +279,10 @@ async function handleBurnCommand(commandName, ctx){
         // burnNum is the actual position in the full chain, not just the display slice
         const burnNum = burns.indexOf(b) + 1;
         const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-        const ids      = (b.burned_ids||[]).filter(Boolean);
+const ids = (b.burned_ids || [])
+  .filter(Boolean)
+  .map(Number)
+  .filter(id => id !== Number(tokenInput));
         const tokensStr = await burnTypeBreakdown(ids, b.id).catch(()=>String(ids.length || '?'));
         // For burn 1 in the full chain, show original mint type
         let preBurnNote = '';
