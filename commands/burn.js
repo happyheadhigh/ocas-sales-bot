@@ -244,23 +244,26 @@ async function handleBurnCommand(commandName, ctx){
       const chainRes = await pgPool.query(`
         SELECT be.id, be.tx_hash, be.burner_wallet, be.burned_at, be.points_used,
                COALESCE(
-                 array_agg(DISTINCT bsi.burned_token_id ORDER BY bsi.burned_token_id)
-                   FILTER (WHERE bsi.burned_token_id IS NOT NULL),
+                 started.burned_ids,
                  array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
                    FILTER (WHERE bei.burned_token_id IS NOT NULL),
                  ARRAY[]::int[]
                ) AS burned_ids
         FROM burn_events be
-        LEFT JOIN burn_started_events bse
-          ON bse.survivor_token_id = be.survivor_token_id
-         AND bse.owner_wallet = be.burner_wallet
-         AND bse.block_number <= be.block_number
-        LEFT JOIN burn_started_inputs bsi
-          ON bsi.burn_started_id = bse.id
+        LEFT JOIN LATERAL (
+          SELECT array_agg(bsi.burned_token_id ORDER BY bsi.burned_token_id) AS burned_ids
+          FROM burn_started_events bse
+          JOIN burn_started_inputs bsi ON bsi.burn_started_id = bse.id
+          WHERE bse.survivor_token_id = be.survivor_token_id
+            AND bse.owner_wallet = be.burner_wallet
+            AND bse.block_number <= be.block_number
+          ORDER BY bse.block_number DESC, bse.log_index DESC
+          LIMIT 1
+        ) started ON true
         LEFT JOIN burn_event_inputs bei
           ON bei.burn_event_id = be.id
         WHERE be.survivor_token_id = $1
-        GROUP BY be.id
+        GROUP BY be.id, started.burned_ids
         ORDER BY be.burned_at ASC NULLS LAST
       `, [tokenInput]);
 
