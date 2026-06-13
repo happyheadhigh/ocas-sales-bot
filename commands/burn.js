@@ -9,7 +9,7 @@ async function handleBurnCommand(commandName, ctx){
   osHeaders, getRailwayApiUrl, sendErrorWebhook,
     buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
     checkCommandCooldown, pgPool, fetchBotApiJson, resolveImage,
-    COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS,
+    COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, DEFAULT_LOTTERY_TIMEZONE,
     slideshowSessions, burnRpc, burnRpcUrl,
     triggerOsMetadataRefresh, buildBurnEmbed, upsertTokenTraitRows,
     normalizeOcasType, E1_TYPE_NAMES,
