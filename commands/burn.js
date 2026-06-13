@@ -297,11 +297,17 @@ const totalTokensBurned = burns.reduce((s,r)=>{
         // burnNum is the actual position in the full chain, not just the display slice
         const burnNum = burns.indexOf(b) + 1;
         const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-const ids = (b.burned_ids || [])
-  .filter(Boolean)
-  .map(Number)
-  .filter(id => id !== Number(tokenInput));
-        const tokensStr = await burnTypeBreakdown(ids, b.id).catch(()=>String(ids.length || '?'));
+        const consumedIds = (b.burned_ids || [])
+          .filter(Boolean)
+          .map(Number)
+          .filter(id => id !== Number(tokenInput));
+        
+        const selectedCount = Number(b.points_used || 0) > 0
+          ? Number(b.points_used || 0)
+          : consumedIds.length;
+        
+        const tokenTypes = await burnTypeBreakdown(consumedIds, b.id).catch(()=>String(consumedIds.length || '?'));
+        const tokensStr = tokenTypes.replace(/^\d+/, String(selectedCount));
         // For burn 1 in the full chain, show original mint type
         let preBurnNote = '';
         if(burnNum === 1){
@@ -315,7 +321,10 @@ const ids = (b.burned_ids || [])
               const raw = typeof snapRow.rows[0].type === 'string'
                 ? snapRow.rows[0].type.replace(/^"|"$/g,'')
                 : String(snapRow.rows[0].type);
-              preBurnNote = ` · was ${normalizeOcasType(raw)}`;
+          const normalizedType = normalizeOcasType(raw);
+              preBurnNote = normalizedType && normalizedType !== 'Type NaN'
+              ? ` · was ${normalizedType}`
+              : '';
             }
           }catch(_){}
         }
