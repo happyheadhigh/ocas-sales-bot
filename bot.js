@@ -175,31 +175,62 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
 }
 
 // ── interactionCreate — button handlers + command dispatch ────────────────────
+
+// ── Burn lottery display helpers (migrated from main) ─────────────────────────
+function burnLotteryModeNote(mode){
+  return mode === 'burn'
+    ? 'One entry per burn. Wallets may appear multiple times.'
+    : 'One entry per wallet.';
+}
+
+function burnLotteryDisplayEntries(entries, wallets, mode){
+  return mode === 'burn' ? entries : wallets;
+}
+
+function buildBurnLotteryEntryPageComponents(lotteryId, page, totalPages, live=false){
+  if(!lotteryId || totalPages <= 1) return [];
+  const prefix = live ? 'burnlottery_current_entries' : 'burnlottery_entries';
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${prefix}:${lotteryId}:${Math.max(0, page - 1)}`)
+      .setLabel('Prev')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(`${prefix}:${lotteryId}:${Math.min(totalPages - 1, page + 1)}`)
+      .setLabel('Next')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= totalPages - 1)
+  )];
+}
+
 client.on('interactionCreate', async (interaction)=>{
   if(interaction.isButton() && interaction.customId.startsWith('lottery_enter:')){
     const lotteryId=parseInt(interaction.customId.split(':')[1]);
+    // deferReply immediately so Discord doesn't expire the interaction during DB work
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(()=>{});
     try{
       const r=await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1',[lotteryId]); const row=r.rows[0];
-      if(!row) return interaction.reply({content:'Lottery not found.',flags:MessageFlags.Ephemeral});
-      if(row.status!=='active' || new Date(row.end_time)<=new Date()) return interaction.reply({content:'This lottery is closed.',flags:MessageFlags.Ephemeral});
-      if(row.type!=='giveaway') return interaction.reply({content:'This is a guess lottery. Use /lottery guess.',flags:MessageFlags.Ephemeral});
+      if(!row) return interaction.editReply({content:'Lottery not found.'});
+      if(row.status!=='active' || new Date(row.end_time)<=new Date()) return interaction.editReply({content:'This lottery is closed.'});
+      if(row.type!=='giveaway') return interaction.editReply({content:'This is a guess lottery. Use /lottery guess.'});
       const username=interaction.member?.displayName||interaction.user?.globalName||interaction.user?.username||interaction.user.id;
       await pgPool.query(`INSERT INTO generic_lottery_entries (lottery_id,user_id,username) VALUES ($1,$2,$3) ON CONFLICT (lottery_id,user_id) DO UPDATE SET username=EXCLUDED.username`,[lotteryId,interaction.user.id,username]);
       const count=await getGenericLotteryEntryCount(lotteryId);
       try{
-  const msg = interaction.message;
-  const oldEmbed = msg.embeds[0];
-  if(oldEmbed){
-    const updated = EmbedBuilder.from(oldEmbed);
-    const fields = updated.data.fields?.map(f =>
-      f.name === 'Entries' ? { ...f, value: String(count) } : f
-    );
-    if(fields) updated.setFields(fields);
-    await msg.edit({ embeds: [updated] });
-  }
-}catch(_){}
-      return interaction.reply({content:`You are entered in lottery #${lotteryId}. Current entries: ${count}.`,flags:MessageFlags.Ephemeral});
-    }catch(e){ return interaction.reply({content:'Could not enter lottery: '+e.message,flags:MessageFlags.Ephemeral}).catch(()=>{}); }
+        const msg = interaction.message;
+        const oldEmbed = msg.embeds[0];
+        if(oldEmbed){
+          const updated = EmbedBuilder.from(oldEmbed);
+          const fields = updated.data.fields?.map(f =>
+            f.name === 'Entries' ? { ...f, value: String(count) } : f
+          );
+          if(fields) updated.setFields(fields);
+          await msg.edit({ embeds: [updated] });
+        }
+      }catch(_){}
+      return interaction.editReply({content:`You are entered in lottery #${lotteryId}. Current entries: ${count}.`});
+    }catch(e){ return interaction.editReply({content:'Could not enter lottery: '+e.message}).catch(()=>{}); }
   }
   // ── Slideshow button handler ───────────────────────────────────────────────
   // ── Show More button — opens slideshow of remaining results ──────────────
