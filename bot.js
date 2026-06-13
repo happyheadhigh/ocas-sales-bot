@@ -19,8 +19,8 @@ const {
   COLORS, OCAS_CONTRACT, BURN_CONTRACT,
   POLL_MS, RANK_SYNC_INTERVAL, BOT_ENV,
   osHeaders, getRailwayApiUrl, getRankTierColor,
-  PENDING_DRAW_SEED_PREFIX,
-} = require('./lib/constants');
+  PENDING_DRAW_SEED_PREFIX, DEFAULT_LOTTERY_TIMEZONE,
+  } = require('./lib/constants');
 
 const {
   pgPool, runMigrations, dbLoad, dbSave,
@@ -121,7 +121,7 @@ function buildCtx(interaction, guildId, config, isAdmin){
   return {
     interaction, guildId, config, isAdmin,
     // Constants
-    COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES,
+COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTERY_TIMEZONE,
     // Helpers
     osHeaders, getRailwayApiUrl, getRankTierColor, fetchBotApiJson, resolveDiscordChannel,
     checkCommandCooldown, normalizeOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji,
