@@ -40,7 +40,7 @@ const {
 const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock } = require('./lib/rpc');
 const { rollingRankSync, drainRankSyncQueue, queueRankSync, rankSyncQueue } = require('./lib/rank-sync');
 
-const { BURN_COLORS, E1_TYPE_NAMES, normalizeOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji } = require('./lib/burn-constants');
+const { BURN_COLORS, E1_TYPE_NAMES, normalizeOcasType, resolveOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji } = require('./lib/burn-constants');
 const {
   burnConfig, loadBurnConfig, saveBurnConfig,
   getBurnConfig, getConfiguredBurnChannelId,
