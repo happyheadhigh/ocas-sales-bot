@@ -322,9 +322,9 @@ const totalTokensBurned = burns.reduce((s,r)=>{
                 ? snapRow.rows[0].type.replace(/^"|"$/g,'')
                 : String(snapRow.rows[0].type);
           const normalizedType = normalizeOcasType(raw);
-              preBurnNote = normalizedType && normalizedType !== 'Type NaN'
-              ? ` · was ${normalizedType}`
-              : '';
+            preBurnNote = normalizedType && !/nan/i.test(String(normalizedType))
+            ? ` · was ${normalizedType}`
+            : '';
             }
           }catch(_){}
         }
