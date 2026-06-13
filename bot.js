@@ -176,6 +176,43 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
 
 // ── interactionCreate — button handlers + command dispatch ────────────────────
 
+
+// ── Burn lottery proof helpers (migrated from main) ───────────────────────────
+function formatZonedLotteryTime(d, timeZone){
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone, month:'short', day:'numeric', year:'numeric',
+    hour:'numeric', minute:'2-digit', timeZoneName:'short'
+  }).format(new Date(d));
+}
+
+function formatLotteryHours(hours){
+  const n = Number(hours);
+  if(!Number.isFinite(n)) return 'unknown';
+  if(n < 1){
+    const mins = Math.round(n * 60);
+    return `${mins} minute${mins === 1 ? '' : 's'}`;
+  }
+  return (Number.isInteger(n) ? String(n) : String(Number(n.toFixed(2)))) + ' hour' + (n === 1 ? '' : 's');
+}
+
+function burnLotteryWindowDurationHours(start, end){
+  return (new Date(end).getTime() - new Date(start).getTime()) / 3600000;
+}
+
+function burnLotteryWindowDetails(start, end, timeZone){
+  const tz = normalizeLotteryTimezone(timeZone);
+  return [
+    `Timezone: ${tz}`,
+    `Duration: ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))}`
+  ].join('\n');
+}
+
+function etherscanAddressLink(addr){
+  const a = String(addr || '').toLowerCase();
+  if(!/^0x[a-f0-9]{40}$/.test(a)) return String(addr || 'unknown');
+  return `[${shortAddr(a)}](https://etherscan.io/address/${a})`;
+}
+
 // ── Burn lottery display helpers (migrated from main) ─────────────────────────
 function burnLotteryModeNote(mode){
   return mode === 'burn'
