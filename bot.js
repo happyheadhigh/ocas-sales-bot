@@ -383,7 +383,7 @@ client.on('interactionCreate', async (interaction)=>{
       }
 
       if(!traits || !realTraitCount(traits)){
-        const local = await fetchTokenMetaFromLocalDb(tokenId).catch(()=>null);
+        const local = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
         traits = local?.traits || null;
       }
 
@@ -750,7 +750,6 @@ client.on('interactionCreate', async (interaction)=>{
 
   // /setup
 
-  if(!interaction.isChatInputCommand()) return;
   const ctx = buildCtx(interaction, guildId, config, isAdmin);
 
   if(ADMIN_COMMANDS.has(commandName))   return handleAdminCommand(commandName, ctx);
