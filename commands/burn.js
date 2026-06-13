@@ -5,8 +5,9 @@ const fetch = require('node-fetch');
 
 async function handleBurnCommand(commandName, ctx){
   const {
-    interaction, guildId, config, isAdmin,
-    osHeaders, getRailwayApiUrl,
+    const {
+  interaction, guildId, config, isAdmin,
+  osHeaders, getRailwayApiUrl, sendErrorWebhook,
     buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
     checkCommandCooldown, pgPool, fetchBotApiJson, resolveImage,
     COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS,
@@ -243,9 +244,22 @@ async function handleBurnCommand(commandName, ctx){
       // Token is a survivor — fetch full burn chain
       const chainRes = await pgPool.query(`
         SELECT be.id, be.tx_hash, be.burner_wallet, be.burned_at, be.points_used,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+               COALESCE(
+                 array_agg(DISTINCT bsi.burned_token_id ORDER BY bsi.burned_token_id)
+                   FILTER (WHERE bsi.burned_token_id IS NOT NULL),
+                 array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
+                   FILTER (WHERE bei.burned_token_id IS NOT NULL),
+                 ARRAY[]::int[]
+               ) AS burned_ids
         FROM burn_events be
-        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        LEFT JOIN burn_started_events bse
+          ON bse.survivor_token_id = be.survivor_token_id
+         AND bse.owner_wallet = be.burner_wallet
+         AND bse.block_number <= be.block_number
+        LEFT JOIN burn_started_inputs bsi
+          ON bsi.burn_started_id = bse.id
+        LEFT JOIN burn_event_inputs bei
+          ON bei.burn_event_id = be.id
         WHERE be.survivor_token_id = $1
         GROUP BY be.id
         ORDER BY be.burned_at ASC NULLS LAST
