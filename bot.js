@@ -720,7 +720,7 @@ client.on('interactionCreate', async (interaction)=>{
         if(snap?.traits_json){
           const tj = typeof snap.traits_json==='string' ? JSON.parse(snap.traits_json) : snap.traits_json;
           const raw = tj?.Type || tj?.type || null;
-          if(raw) preBurnType = normalizeOcasType(typeof raw==='string' ? raw.replace(/^"|"$/g,'') : String(raw));
+          if(raw !== null && raw !== undefined) preBurnType = resolveOcasType(raw);
         }
         const osUrl = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
         const slideEmbed = new EmbedBuilder()
