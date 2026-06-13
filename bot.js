@@ -214,6 +214,17 @@ function etherscanAddressLink(addr){
 }
 
 // ── Burn lottery display helpers (migrated from main) ─────────────────────────
+function burnLotteryParseErrorMessage(){
+  return [
+    'I could not parse that burn lottery window.',
+    'Try:',
+    '• 06-07-2026-3pm for MM-DD-YYYY',
+    '• uk:06-07-2026-3pm for DD-MM-YYYY',
+    '• uk:08-06-2026 15:00 for 24-hour time',
+    '• Use window: now 10minutes or window: now 2h for a quick window'
+  ].join('\n');
+}
+
 function burnLotteryModeNote(mode){
   return mode === 'burn'
     ? 'One entry per burn. Wallets may appear multiple times.'
