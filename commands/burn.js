@@ -5,7 +5,6 @@ const fetch = require('node-fetch');
 
 async function handleBurnCommand(commandName, ctx){
   const {
-    const {
   interaction, guildId, config, isAdmin,
   osHeaders, getRailwayApiUrl, sendErrorWebhook,
     buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
