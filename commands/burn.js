@@ -251,13 +251,15 @@ async function handleBurnCommand(commandName, ctx){
                ) AS burned_ids
         FROM burn_events be
         LEFT JOIN LATERAL (
-          SELECT array_agg(bsi.burned_token_id ORDER BY bsi.burned_token_id) AS burned_ids
+          SELECT bse.id,
+                 array_agg(bsi.burned_token_id ORDER BY bsi.burned_token_id) AS burned_ids
           FROM burn_started_events bse
           JOIN burn_started_inputs bsi ON bsi.burn_started_id = bse.id
           WHERE bse.survivor_token_id = be.survivor_token_id
             AND bse.owner_wallet = be.burner_wallet
             AND bse.block_number <= be.block_number
-          ORDER BY bse.block_number DESC, bse.log_index DESC
+          GROUP BY bse.id
+          ORDER BY MAX(bse.block_number) DESC, MAX(bse.log_index) DESC
           LIMIT 1
         ) started ON true
         LEFT JOIN burn_event_inputs bei
