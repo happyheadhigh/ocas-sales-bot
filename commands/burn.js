@@ -691,8 +691,8 @@ const totalTokensBurned = burns.reduce((s,r)=>{
         seedMeta = { seed_type: 'admin_supplied' };
       } else {
         try{
-          const rpcUrl2 = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-            `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+          const rpcUrl2 = burnRpcUrl();
+            if(!rpcUrl2) throw new Error('No Ethereum RPC configured');
           const latestBlock2 = parseInt(await burnRpc(rpcUrl2, 'eth_blockNumber', []), 16);
           const targetBlock2 = latestBlock2 + 5;
           console.log(`[BurnLottery instant] Waiting for Ethereum block #${targetBlock2} (current: ${latestBlock2})...`);
