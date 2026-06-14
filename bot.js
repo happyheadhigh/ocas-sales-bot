@@ -673,7 +673,7 @@ client.on('interactionCreate', async (interaction)=>{
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       // Fetch all burn events for this token in chronological order
       const r = await pgPool.query(`
-        SELECT be.id, be.burned_at, be.result_body_type, be.result_is_angel, be.points_used,
+        SELECT be.id, be.tx_hash, be.burned_at, be.result_body_type, be.result_is_angel, be.points_used,
                COALESCE(
                  started.burned_ids,
                  array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
@@ -740,16 +740,18 @@ client.on('interactionCreate', async (interaction)=>{
           if(raw !== null && raw !== undefined) preBurnType = resolveOcasType(raw);
         }
         const osUrl = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
+        const txUrl = b.tx_hash ? `https://etherscan.io/tx/${b.tx_hash}` : null;
         const slideEmbed = new EmbedBuilder()
           .setColor(BURN_COLORS.FIRE)
           .setTitle(`Before Burn ${burnNum} — ${ago}`)
-          .setURL(osUrl)
+          .setTitle(`Before Burn ${burnNum} — ${ago}`)
           .addFields(
             { name:'Tokens Burned', value:tokensStr, inline:true },
             { name:'Points Used',   value:String(b.points_used||0)+' pts', inline:true },
             { name:'Type Before',   value:preBurnType || '—', inline:true },
           )
-          .setFooter({ text:`#${survivorId} · Burn ${burnNum} of ${r.rows.length}` });
+          .setFooter({ text:`#${survivorId} · Burn ${burnNum} of ${r.rows.length}${txUrl ? ' · View on Etherscan' : ''}` })
+          .setURL(txUrl || osUrl);
         // Attach image if available
         if(snap?.image_data){
           const imgSrc = snap.image_data;
