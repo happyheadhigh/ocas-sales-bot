@@ -722,7 +722,8 @@ client.on('interactionCreate', async (interaction)=>{
         const b = r.rows[i];
         const burnNum = i + 1;
         const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-        const ids = (b.burned_ids||[]).filter(Boolean);
+        const allIds = (b.burned_ids||[]).filter(Boolean);
+        const ids = allIds.map(Number).filter(id => id !== survivorId);
         const tokensStr = await burnTypeBreakdown(ids, b.id).catch(()=>String(ids.length||'?'));
         // Pre-burn state: Burn 1 = original archive, Burn N = post-state of Burn N-1
         let snap = null;
