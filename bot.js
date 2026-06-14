@@ -642,7 +642,7 @@ client.on('interactionCreate', async (interaction)=>{
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const r = await pgPool.query(`
         SELECT be.burned_at, be.points_used,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+               array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
         WHERE be.survivor_token_id = $1
@@ -674,7 +674,7 @@ client.on('interactionCreate', async (interaction)=>{
       // Fetch all burn events for this token in chronological order
       const r = await pgPool.query(`
         SELECT be.id, be.burned_at, be.result_body_type, be.result_is_angel, be.points_used,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+               array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
         WHERE be.survivor_token_id = $1
