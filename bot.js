@@ -643,19 +643,32 @@ client.on('interactionCreate', async (interaction)=>{
       const r = await pgPool.query(`
         SELECT be.burned_at, be.points_used,
                array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
-               FILTER (WHERE bei.burned_token_id IS NOT NULL) AS burned_ids
+               FILTER (WHERE bei.burned_token_id IS NOT NULL) AS burned_ids,
+               COALESCE(started.token_count, 0) AS started_count
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        LEFT JOIN LATERAL (
+          SELECT COUNT(bsi.burned_token_id) AS token_count
+          FROM burn_started_events bse
+          JOIN burn_started_inputs bsi ON bsi.burn_started_id = bse.id
+          WHERE bse.survivor_token_id = be.survivor_token_id
+            AND bse.owner_wallet = be.burner_wallet
+            AND bse.block_number <= be.block_number
+          GROUP BY bse.id
+          ORDER BY MAX(bse.block_number) DESC
+          LIMIT 1
+        ) started ON true
         WHERE be.survivor_token_id = $1
-        GROUP BY be.id
+        GROUP BY be.id, started.token_count
         ORDER BY be.burned_at ASC NULLS LAST
       `, [survivorId]);
       if(!r.rows.length){ await interaction.editReply({ content:'No burn history found.' }); return; }
       const lines = r.rows.map((b, i) => {
         const burnNum = i + 1;
         const ids = (b.burned_ids||[]).filter(Boolean);
-        const idsStr = ids.length ? ids.map(id=>`#${id}`).join(', ') : '?';
-        return `**Burn ${burnNum}:** ${idsStr} → #${survivorId}`;
+        const count = Number(b.started_count) || ids.length;
+        const idsStr = ids.length ? ids.filter(id => id !== survivorId).map(id=>`#${id}`).join(', ') : '?';
+        return `**Burn ${burnNum} (${count} tokens):** ${idsStr} → #${survivorId}`;
       });
       const msgContent = lines.join('\n').slice(0, 1900);
       await interaction.editReply({ content: msgContent });
@@ -676,11 +689,23 @@ client.on('interactionCreate', async (interaction)=>{
       const r = await pgPool.query(`
         SELECT be.id, be.tx_hash, be.burned_at, be.result_body_type, be.result_is_angel, be.points_used,
                array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
-               FILTER (WHERE bei.burned_token_id IS NOT NULL) AS burned_ids
+               FILTER (WHERE bei.burned_token_id IS NOT NULL) AS burned_ids,
+               COALESCE(started.token_count, 0) AS started_count
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        LEFT JOIN LATERAL (
+          SELECT COUNT(bsi.burned_token_id) AS token_count
+          FROM burn_started_events bse
+          JOIN burn_started_inputs bsi ON bsi.burn_started_id = bse.id
+          WHERE bse.survivor_token_id = be.survivor_token_id
+            AND bse.owner_wallet = be.burner_wallet
+            AND bse.block_number <= be.block_number
+          GROUP BY bse.id
+          ORDER BY MAX(bse.block_number) DESC
+          LIMIT 1
+        ) started ON true
         WHERE be.survivor_token_id = $1
-        GROUP BY be.id
+        GROUP BY be.id, started.token_count
         ORDER BY be.burned_at ASC NULLS LAST
       `, [survivorId]);
       if(!r.rows.length){ await interaction.editReply({ content:'No burn history found.' }); return; }
@@ -708,10 +733,9 @@ client.on('interactionCreate', async (interaction)=>{
         const b = r.rows[i];
         const burnNum = i + 1;
         const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-        const allIds = (b.burned_ids||[]).filter(Boolean);
-        const ids = allIds.map(Number).filter(id => id !== survivorId);
-        const tokensStr = await burnTypeBreakdown(ids, b.id).catch(()=>String(ids.length||'?'));
-        // Pre-burn state: Burn 1 = original archive, Burn N = post-state of Burn N-1
+        const allIds = (b.burned_ids||[]).filter(Boolean).map(Number);
+        const consumedIds = allIds.filter(id => id !== survivorId);
+        const displayCount = Number(b.started_count) > 0 ? Number(b.started_count) - 1 : consumedIds.length;
         let snap = null;
         if(i === 0){
           snap = mintSnap;
