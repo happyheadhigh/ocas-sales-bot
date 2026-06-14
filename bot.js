@@ -736,6 +736,8 @@ client.on('interactionCreate', async (interaction)=>{
         const allIds = (b.burned_ids||[]).filter(Boolean).map(Number);
         const consumedIds = allIds.filter(id => id !== survivorId);
         const displayCount = Number(b.started_count) > 0 ? Number(b.started_count) - 1 : consumedIds.length;
+        const tokenTypes = await burnTypeBreakdown(consumedIds, b.id).catch(()=>String(displayCount||'?'));
+        const tokensStr = tokenTypes.replace(/^\d+/, String(displayCount));
         let snap = null;
         if(i === 0){
           snap = mintSnap;
@@ -753,7 +755,6 @@ client.on('interactionCreate', async (interaction)=>{
         const txUrl = b.tx_hash ? `https://etherscan.io/tx/${b.tx_hash}` : null;
         const slideEmbed = new EmbedBuilder()
           .setColor(BURN_COLORS.FIRE)
-          .setTitle(`Before Burn ${burnNum} — ${ago}`)
           .setTitle(`Before Burn ${burnNum} — ${ago}`)
           .addFields(
             { name:'Tokens Burned', value:tokensStr, inline:true },
