@@ -302,16 +302,13 @@ const totalTokensBurned = burns.reduce((s,r)=>{
           .map(Number)
           .filter(id => id !== Number(tokenInput));
         
-        const selectedCount = Number(b.points_used || 0) > 0
-          ? Number(b.points_used || 0)
-          : consumedIds.length;
-        
+        // consumedIds = all burned tokens excluding the survivor itself
         const selectedIds = (b.burned_ids || [])
           .filter(Boolean)
           .map(Number);
 
-      const tokenTypes = await burnTypeBreakdown(selectedIds, b.id).catch(()=>String(selectedIds.length || '?'));
-      const tokensStr = tokenTypes.replace(/^\d+/, String(selectedCount));
+      const tokenTypes = await burnTypeBreakdown(selectedIds, b.id).catch(()=>String(consumedIds.length || '?'));
+      const tokensStr = tokenTypes.replace(/^\d+/, String(consumedIds.length));
         // For burn 1 in the full chain, show original mint type
         let preBurnNote = '';
         if(burnNum === 1){
