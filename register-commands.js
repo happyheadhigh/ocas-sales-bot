@@ -21,7 +21,7 @@ const chainChoices = [
 ];
 
 const commands = [
-  new SlashCommandBuilder().setName('setup').setDescription('Configure sales channel and collection')
+  new SlashCommandBuilder().setName('setsales').setDescription('Configure sales channel and collection')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o=>o.setName('channel').setDescription('Channel to post sales in').setRequired(true))
     .addStringOption(o=>o.setName('collection').setDescription('OpenSea collection slug (e.g. on-chain-all-stars)').setRequired(true))

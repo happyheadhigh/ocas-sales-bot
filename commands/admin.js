@@ -14,7 +14,7 @@ async function handleAdminCommand(commandName, ctx){
     getBurnConfig, getConfiguredBurnChannelId, BURN_COLORS,
   } = ctx;
 
-  if(commandName === 'setup'){
+  if(commandName === 'setsales'){
     if(!isAdmin) return interaction.reply({ content: 'Need Manage Server permission.', flags: MessageFlags.Ephemeral });
     const channel  = interaction.options.getChannel('channel');
     const slug     = interaction.options.getString('collection');
@@ -315,7 +315,7 @@ if(commandName === 'verifydashboard'){
 }
 
 const ADMIN_COMMANDS = new Set([
-  'setup','setuphere','setlistingshere','setupburn','setlistings','setchannel','verifydashboard',
+  'setsales','setuphere','setlistingshere','setupburn','setlistings','setchannel','verifydashboard',
   'setcollection','salesfilter','traitlistingfilter','ranklistingfilter',
   'removerankfilter','clearallfilters','removetraitfilter','pause','resume','status',
 ]);
