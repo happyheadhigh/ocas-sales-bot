@@ -3135,7 +3135,7 @@ function buildActiveBurnLotteryComponents(lotteryId){
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`burnlottery_current_entries:${lotteryId}:0`)
-      .setLabel('Show Current Entries')
+      .setLabel('Show Entries')
       .setStyle(ButtonStyle.Secondary)
   )];
 }
@@ -3217,11 +3217,9 @@ function buildBurnLotteryWinnerEmbed({title='OCAS Burn Lottery Winner', entries,
     .setColor(COLORS.OCAS_GREEN)
     .addFields(
       { name:'Winner', value:pick?.winner ? `🏆 ${etherscanAddressLink(pick.winner)}` : 'No eligible winner.', inline:false },
-      { name:'Lottery', value:`#${lotteryId}`, inline:true },
-      { name:'Entries', value:String(entries.length), inline:true },
+      { name:'Lottery #', value:`#${lotteryId}`, inline:true },
       { name:'Qualified Wallets', value:String(wallets.length), inline:true },
-      { name:'Total Burns', value:String(burns.length), inline:true },
-      { name:'Winning Entry', value:pick ? `${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}` : 'None', inline:true }
+      { name:'Total Burns', value:String(burns.length), inline:true }
     );
   if(blockNum) embed.addFields({ name:'Seed Block', value:`[#${blockNum}](https://etherscan.io/block/${blockNum})`, inline:true });
   return embed.setFooter({ text:`Lottery ID ${lotteryId}` }).setTimestamp();
@@ -3333,13 +3331,14 @@ function lotteryNumberFromSeed(seed,min,max){ const lo=Math.min(parseInt(min),pa
 function lotteryEntryButton(row){ return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`lottery_enter:${row.id}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)); }
 function buildGenericLotteryComponents(lotteryId, type='giveaway', active=true){
   const rows = [];
-  if(active && type === 'giveaway'){
-    // Active giveaway — entry button only
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)
-    ));
+  if(active){
+    const buttons = [];
+    if(type === 'giveaway'){
+      buttons.push(new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success));
+    }
+    buttons.push(new ButtonBuilder().setCustomId(`generic_lottery_entries:${lotteryId}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary));
+    rows.push(new ActionRowBuilder().addComponents(...buttons));
   } else {
-    // Completed — show draw proof + show entries buttons
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('Show Draw Proof').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`generic_lottery_entries:${lotteryId}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary)
@@ -3447,15 +3446,13 @@ function formatGenericLotteryWinner(row, result){
 function buildGenericLotteryWinnerEmbed(row, entries, result){
   const rj = row.result_json || {};
   const blockNum = rj.block_number || null;
-  const position = result?.position || rj.winner_position || null;
   const embed = new EmbedBuilder()
     .setTitle('🎉 OCAS Lottery Winner')
     .setColor(COLORS.OCAS_GREEN)
     .addFields(
       { name:'Winner', value:`🏆 ${formatGenericLotteryWinner(row, result)}`, inline:false },
-      { name:'Lottery', value:`#${row.id}`, inline:true },
-      { name:'Entries', value:String(entries.length), inline:true },
-      { name:'Winning Entry', value:position ? `${Number(position).toLocaleString()} of ${entries.length.toLocaleString()}` : 'Not available', inline:true }
+      { name:'Lottery #', value:`#${row.id}`, inline:true },
+      { name:'Total Entries', value:String(entries.length), inline:true }
     );
   if(blockNum) embed.addFields({ name:'Seed Block', value:`[#${blockNum}](https://etherscan.io/block/${blockNum})`, inline:true });
   return embed.setFooter({ text:`Lottery ID ${row.id}` }).setTimestamp();
