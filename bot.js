@@ -3232,7 +3232,6 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
     { name:'Total Burns', value:String(burns.length), inline:true },
   );
   if(prize) embed.addFields({ name:'Prize', value:String(prize).slice(0,1024), inline:false });
-  if(pick?.winner) embed.addFields({ name:'Winner', value:etherscanAddressLink(pick.winner), inline:false });
   if(pick?.proof){
     const blockLine = seedMeta?.block_number
       ? `\nSeed source: Ethereum block [#${seedMeta.block_number}](https://etherscan.io/block/${seedMeta.block_number})`
@@ -3246,13 +3245,26 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
   return embed;
 }
-function buildBurnLotteryWinnerEmbed({title='OCAS Burn Lottery Winner', entries, wallets, burns, pick, lotteryId, seedMeta=null}){
+// Look up a verified Discord user by their wallet address
+async function lookupDiscordPing(wallet){
+  if(!wallet) return null;
+  try{
+    const r = await pgPool.query(
+      `SELECT discord_id FROM user_registrations WHERE wallet=$1 AND verified=true`,
+      [wallet.toLowerCase()]
+    );
+    return r.rows.length ? `<@${r.rows[0].discord_id}>` : null;
+  }catch(_){ return null; }
+}
+
+
+function buildBurnLotteryWinnerEmbed({title='OCAS Burn Lottery Winner', entries, wallets, discordPing=null, burns, pick, lotteryId, seedMeta=null}){
   const blockNum = seedMeta?.block_number || null;
   const embed = new EmbedBuilder()
     .setTitle(`🎉 ${title}`)
     .setColor(COLORS.OCAS_GREEN)
     .addFields(
-      { name:'Winner', value:pick?.winner ? `🏆 ${etherscanAddressLink(pick.winner)}` : 'No eligible winner.', inline:false },
+{ name:'Winner', value:pick?.winner ? `🏆 ${etherscanAddressLink(pick.winner)}${discordPing ? '\n' + discordPing : ''}` : 'No eligible entries', inline:false },
       { name:'Lottery #', value:`#${lotteryId}`, inline:true },
       { name:'Qualified Wallets', value:String(wallets.length), inline:true },
       { name:'Total Burns', value:String(burns.length), inline:true }
@@ -3321,6 +3333,7 @@ async function drawAndPostBurnLottery(row){
   }
 
   const pick = lotteryPick(entries, drawSeed);
+const discordPing = await lookupDiscordPing(pick?.winner || null);
   await pgPool.query(
     `UPDATE burn_lotteries
      SET status='completed', seed=$1, winner_wallet=$2, qualified_wallets=$3, total_burns=$4,
@@ -3332,7 +3345,7 @@ async function drawAndPostBurnLottery(row){
   );
   const resultEmbed = buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone, seedMeta});
   const resultComponents = buildBurnLotteryComponents(row.id);
-  const winnerEmbed = buildBurnLotteryWinnerEmbed({title:'OCAS Burn Lottery Winner', entries, wallets, burns, pick, lotteryId:row.id, seedMeta});
+  const winnerEmbed = buildBurnLotteryWinnerEmbed({title:'OCAS Burn Lottery Winner', discordPing, entries, wallets, burns, pick, lotteryId:row.id, seedMeta});
   let announcementChannel = originalMsg?.channel || null;
 
   if(originalMsg){
@@ -3349,6 +3362,10 @@ async function drawAndPostBurnLottery(row){
     }
   }
   if(announcementChannel) await announcementChannel.send({ embeds:[winnerEmbed], components:resultComponents }).catch(() => {});
+  // Ping the winner separately so they get a Discord notification
+  if(announcementChannel && discordPing){
+    await announcementChannel.send({ content:`${discordPing} Congratulations — you won the OCAS Burn Lottery! 🎉` }).catch(()=>{});
+  }
 }
 async function processDueBurnLotteries(){
   const r = await pgPool.query(`SELECT * FROM burn_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]}));
@@ -3486,7 +3503,7 @@ function buildGenericLotteryWinnerEmbed(row, entries, result){
     .setTitle('🎉 OCAS Lottery Winner')
     .setColor(COLORS.OCAS_GREEN)
     .addFields(
-      { name:'Winner', value:`🏆 ${formatGenericLotteryWinner(row, result)}`, inline:false },
+{ name:'Winner', value:`🏆 ${formatGenericLotteryWinner(row, result)}${result?.winner?.user_id ? '\n<@' + result.winner.user_id + '>' : ''}`, inline:false },
       { name:'Lottery #', value:`#${row.id}`, inline:true },
       { name:'Total Entries', value:String(entries.length), inline:true }
     );
