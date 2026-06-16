@@ -255,6 +255,13 @@ function buildBurnLotteryEntryPageComponents(lotteryId, page, totalPages, live=f
 client.on('interactionCreate', async (interaction)=>{
 
   // ── Wallet verification button ────────────────────────────────────────────
+  // ── Setup wizard modal + button handlers ───────────────────────────────────
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('setup_modal:'))
+    return handleSetupModal(interaction, ctx);
+
+  if(interaction.isButton() && interaction.customId.startsWith('setup:'))
+    return handleSetupButton(interaction, ctx);
+
   if(interaction.isButton() && interaction.customId.startsWith('verify_wallet:')){
     await interaction.deferUpdate();
     const parts   = interaction.customId.split(':');
@@ -875,6 +882,7 @@ client.on('interactionCreate', async (interaction)=>{
   if(OCAS_COMMANDS.has(commandName))    return handleOcasCommand(commandName, ctx);
   if(BURN_COMMANDS.has(commandName))    return handleBurnCommand(commandName, ctx);
   if(LOTTERY_COMMANDS.has(commandName)) return handleLotteryCommand(commandName, ctx);
+  if(SETUP_COMMANDS.has(commandName))    return handleSetupCommand(interaction, ctx);
   if(MISC_COMMANDS.has(commandName))    return handleMiscCommand(commandName, ctx);
     if(DOWNLOAD_COMMANDS.has(commandName)) return handleDownloadCommand(interaction);
 });

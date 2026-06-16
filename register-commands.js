@@ -151,6 +151,9 @@ const commands = [
   new SlashCommandBuilder().setName('myregistration')
     .setDescription('Show your current wallet registration status'),
 
+
+  new SlashCommandBuilder().setName('setup')
+    .setDescription('Setup wizard — configure your bot step by step (Admin only)'),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){
