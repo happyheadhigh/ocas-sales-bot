@@ -1776,9 +1776,11 @@ async function pollBurnEvents(){
   if(_pollBurnRunning){ console.log('[Burn] Poll tick skipped — previous still running'); return; }
   _pollBurnRunning = true;
   try{
-  if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return;
-  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+  if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL && !process.env.ETH_RPC_URL && !process.env.BURN_RPC_OVERRIDE) return;
+  const _baseRpc = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://')
+    || `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+  // BURN_RPC_OVERRIDE: set to Infura URL for fast catch-up, auto-ignored when caught up
+  const rpcUrl = process.env.BURN_RPC_OVERRIDE?.replace('wss://','https://') || _baseRpc;
 
   try{
     const lastBlockRaw = await dbLoad('burn_last_block');
@@ -1804,7 +1806,12 @@ async function pollBurnEvents(){
     // api.js requests (traitfind, rankfind, etc) don't time out during backfill.
     // Adaptive chunk: catch up faster when behind, stay small when live
     const blockGap = latest - fromBlock;
-    const adaptiveChunk = blockGap > 3 ? BURN_BLOCK_CHUNK : 2;
+    const effectiveChunk = (process.env.BURN_RPC_OVERRIDE && blockGap > 100)
+      ? Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '5000', 10))
+      : Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10));
+    const adaptiveChunk = blockGap > 3 ? effectiveChunk : 2;
+    if(process.env.BURN_RPC_OVERRIDE && blockGap <= 100)
+      console.log('[Burn] Caught up — BURN_RPC_OVERRIDE ignored, using default RPC');
     const chunkTo = Math.min(latest, fromBlock + adaptiveChunk - 1);
     const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
     const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
