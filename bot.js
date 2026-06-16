@@ -253,6 +253,46 @@ function buildBurnLotteryEntryPageComponents(lotteryId, page, totalPages, live=f
 }
 
 client.on('interactionCreate', async (interaction)=>{
+
+  // ── Wallet verification button ────────────────────────────────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('verify_wallet:')){
+    await interaction.deferUpdate();
+    const parts   = interaction.customId.split(':');
+    const ownerId = parts[1];
+    const wallet  = parts[2];
+    if(interaction.user.id !== ownerId)
+      return interaction.followUp({content:'❌ This verification is not for your account.', ephemeral:true});
+    const { pgPool } = require('./lib/db');
+    const { osHeaders, osAgent } = require('./lib/poll');
+    try{
+      const codeRow = await pgPool.query(
+        `SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 AND wallet=$2`,
+        [ownerId, wallet]
+      );
+      if(!codeRow.rows.length)
+        return interaction.editReply({content:'❌ No pending verification. Run `/register` again.', components:[]});
+      const {code, expires_at} = codeRow.rows[0];
+      if(new Date() > new Date(expires_at))
+        return interaction.editReply({content:'❌ Code expired. Run `/register` again.', components:[]});
+      const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${wallet}`, { headers:osHeaders(), agent:osAgent });
+      if(!osRes.ok){
+        if(osRes.status===404) return interaction.editReply({content:'❌ No OpenSea account found for that wallet.', components:[]});
+        return interaction.editReply({content:`❌ OpenSea error (${osRes.status}). Try again.`, components:[]});
+      }
+      const bio = (await osRes.json()).bio || '';
+      if(!bio.includes(code))
+        return interaction.editReply({content:`❌ Code not found in bio yet.\n\nMake sure https://opensea.io/${wallet} bio contains:\n\`\`\`${code}\`\`\`\nSave then click again.`, components:[interaction.message.components[0]]});
+      await pgPool.query(
+        `INSERT INTO user_registrations (discord_id,wallet,verified,verified_at,updated_at) VALUES ($1,$2,true,NOW(),NOW()) ON CONFLICT (discord_id) DO UPDATE SET wallet=$2,verified=true,verified_at=NOW(),updated_at=NOW()`,
+        [ownerId, wallet]
+      );
+      await pgPool.query(`DELETE FROM verification_codes WHERE discord_id=$1`,[ownerId]);
+      return interaction.editReply({content:`✅ **Wallet verified!**\n\n🔗 \`${wallet.slice(0,6)}...${wallet.slice(-4)}\` linked to <@${ownerId}>\n\nYou can remove the code from your OpenSea bio now.`, components:[]});
+    }catch(e){
+      console.error('[VerifyBtn]',e.message);
+      return interaction.editReply({content:'❌ Verification failed. Try again.', components:[interaction.message.components[0]]});
+    }
+  }
   if(interaction.isButton() && interaction.customId.startsWith('lottery_enter:')){
     const lotteryId=parseInt(interaction.customId.split(':')[1]);
     // deferReply immediately so Discord doesn't expire the interaction during DB work
