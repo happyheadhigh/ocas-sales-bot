@@ -1807,7 +1807,7 @@ async function pollBurnEvents(){
     // Adaptive chunk: catch up faster when behind, stay small when live
     const blockGap = latest - fromBlock;
     const effectiveChunk = (process.env.BURN_RPC_OVERRIDE && blockGap > 100)
-      ? Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '5000', 10))
+      ? Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK_OVERRIDE || '5000', 10))  // use 5000 with Infura
       : Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10));
     const adaptiveChunk = blockGap > 3 ? effectiveChunk : 2;
     if(process.env.BURN_RPC_OVERRIDE && blockGap <= 100)
