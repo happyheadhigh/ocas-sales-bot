@@ -3698,7 +3698,11 @@ client.on('interactionCreate', async (interaction)=>{
         return interaction.editReply({content:`❌ OpenSea API error (${osRes.status}). Try again in a moment.`, components:[]});
       }
 
-      const bio = (await osRes.json()).bio || '';
+      const _profile = await osRes.json();
+      console.log('[Verify] OpenSea profile fields:', JSON.stringify(Object.keys(_profile)));
+      console.log('[Verify] bio field:', _profile.bio);
+      // Search all string fields — OpenSea may use different field names
+      const bio = Object.values(_profile).filter(v => typeof v === 'string').join(' ');
       if(!bio.includes(code))
         return interaction.editReply({content:[
           `❌ Code not found in your bio yet.`,
@@ -6482,7 +6486,11 @@ if(commandName==='verify'){
       return interaction.editReply({content:`❌ OpenSea API error (${osRes.status}). Try again shortly.`});
     }
 
-    const bio = (await osRes.json()).bio || '';
+    const _profile = await osRes.json();
+      console.log('[Verify] OpenSea profile fields:', JSON.stringify(Object.keys(_profile)));
+      console.log('[Verify] bio field:', _profile.bio);
+      // Search all string fields — OpenSea may use different field names
+      const bio = Object.values(_profile).filter(v => typeof v === 'string').join(' ');
     if(!bio.includes(code))
       return interaction.editReply({content:[
         `❌ Code not found in your OpenSea bio.`,
