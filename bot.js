@@ -1772,6 +1772,7 @@ async function postBurnFallbackAlert(finalEvent, startEvent){
 }
 
 let _pollBurnRunning = false;
+let _lastKnownBurnBlock = null; // in-memory cursor fallback
 async function pollBurnEvents(){
   if(_pollBurnRunning){ console.log('[Burn] Poll tick skipped — previous still running'); return; }
   _pollBurnRunning = true;
@@ -1783,7 +1784,20 @@ async function pollBurnEvents(){
   const rpcUrl = process.env.BURN_RPC_OVERRIDE?.replace('wss://','https://') || _baseRpc;
 
   try{
-    const lastBlockRaw = await dbLoad('burn_last_block');
+    // Retry dbLoad up to 3 times — staging DB can fail on startup
+    let lastBlockRaw = null;
+    for(let _attempt = 1; _attempt <= 3; _attempt++){
+      try{ lastBlockRaw = await dbLoad('burn_last_block'); break; }
+      catch(e){
+        console.error(`[dbLoad] burn_last_block attempt ${_attempt} failed:`, e.message);
+        if(_attempt < 3) await new Promise(r=>setTimeout(r, 2000));
+      }
+    }
+    // In-memory cursor guard — if DB fails, use last known block to avoid rewind
+    if(!lastBlockRaw && _lastKnownBurnBlock){
+      console.warn(`[Burn] burn_last_block DB read failed; using in-memory cursor ${_lastKnownBurnBlock} to avoid rewind`);
+      lastBlockRaw = String(_lastKnownBurnBlock);
+    }
     const latest = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
     let fromBlock = lastBlockRaw ? parseInt(lastBlockRaw, 10) + 1 : null;
     let historicalBackfill = false;
@@ -1825,6 +1839,7 @@ async function pollBurnEvents(){
     await processBurnLogs(logs || [], shouldAlert);
     await dbSave('burn_last_block', String(chunkTo));
     const lagBlocks = latest - chunkTo;
+      _lastKnownBurnBlock = chunkTo;
     if(lagBlocks > 0){
       console.log(`[Burn] Behind by ${lagBlocks} block(s)`);
       // Alert if lag exceeds threshold and we haven't alerted recently
