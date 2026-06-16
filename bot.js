@@ -269,6 +269,15 @@ async function ensureBotStateTable(){
     welcome_text TEXT,
     created_at   TIMESTAMPTZ DEFAULT NOW()
   )`);
+  await pgPool.query(`CREATE TABLE IF NOT EXISTS trait_roles (
+    id          SERIAL PRIMARY KEY,
+    guild_id    TEXT NOT NULL,
+    trait_type  TEXT NOT NULL,
+    trait_value TEXT NOT NULL,
+    role_id     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (guild_id, trait_type, trait_value, role_id)
+  )`);
 
   try{
     await pgPool.query(`
@@ -3268,6 +3277,99 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
   return embed;
 }
+
+// ── Trait role sync ───────────────────────────────────────────────────────────
+// Assigns Discord roles based on verified wallet's OCAS token traits.
+// Called on verification and by the 24hr sync job.
+async function syncTraitRoles(guild, discordId, wallet){
+  try{
+    // Get all trait roles configured for this guild
+    const traitRolesRes = await pgPool.query(
+      'SELECT trait_type, trait_value, role_id FROM trait_roles WHERE guild_id=$1',
+      [guild.id]
+    );
+    if(!traitRolesRes.rows.length) return; // No trait roles configured
+
+    // Get all OCAS tokens owned by this wallet from our token_traits table
+    // Join with nft_transfers or use token_traits directly keyed by owner
+    // token_traits has: token_id, trait_type, trait_value
+    // We need to know which tokens this wallet owns
+    // Use OpenSea NFT ownership endpoint for the collection
+    const osRes = await fetch(
+      `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?collection=on-chain-all-stars&limit=200`,
+      { headers: osHeaders() }
+    );
+    if(!osRes.ok){
+      console.error('[TraitSync] OpenSea NFT fetch failed:', osRes.status);
+      return;
+    }
+    const osData = await osRes.json();
+    const ownedTokenIds = (osData.nfts||[]).map(n => parseInt(n.identifier)).filter(Boolean);
+
+    if(!ownedTokenIds.length){
+      // No OCAS tokens — remove all trait roles
+      const member = await guild.members.fetch(discordId).catch(()=>null);
+      if(!member) return;
+      for(const tr of traitRolesRes.rows){
+        if(member.roles.cache.has(tr.role_id))
+          await member.roles.remove(tr.role_id).catch(()=>{});
+      }
+      return;
+    }
+
+    // Get traits for owned tokens from our DB
+    const traitsRes = await pgPool.query(
+      'SELECT trait_type, trait_value FROM token_traits WHERE token_id = ANY($1::int[])',
+      [ownedTokenIds]
+    );
+    const ownedTraits = new Set(traitsRes.rows.map(r => r.trait_type+'::'+r.trait_value));
+
+    // Fetch the member
+    const member = await guild.members.fetch(discordId).catch(()=>null);
+    if(!member) return;
+
+    // Add/remove roles based on trait ownership
+    for(const tr of traitRolesRes.rows){
+      const hasRole    = member.roles.cache.has(tr.role_id);
+      const hasTrait   = ownedTraits.has(tr.trait_type+'::'+tr.trait_value);
+      if(hasTrait && !hasRole)  await member.roles.add(tr.role_id).catch(()=>{});
+      if(!hasTrait && hasRole)  await member.roles.remove(tr.role_id).catch(()=>{});
+    }
+
+    // Also assign verification panel role if configured
+    const panel = await pgPool.query(
+      'SELECT role_id FROM verification_panels WHERE guild_id=$1',
+      [guild.id]
+    );
+    if(panel.rows.length && panel.rows[0].role_id && !member.roles.cache.has(panel.rows[0].role_id))
+      await member.roles.add(panel.rows[0].role_id).catch(()=>{});
+
+    console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', ownedTokenIds.length, '| traits:', ownedTraits.size);
+  }catch(e){
+    console.error('[TraitSync] Error:', e.message);
+  }
+}
+
+// ── 24hr trait role sync job ──────────────────────────────────────────────────
+async function runDailyTraitSync(){
+  console.log('[TraitSync] Starting daily sync...');
+  try{
+    // Get all verified registrations
+    const regs = await pgPool.query(
+      'SELECT discord_id, guild_id, wallet FROM user_registrations WHERE verified=true'
+    );
+    for(const reg of regs.rows){
+      const guild = client.guilds.cache.get(reg.guild_id);
+      if(!guild) continue;
+      await syncTraitRoles(guild, reg.discord_id, reg.wallet);
+      await new Promise(r=>setTimeout(r, 500)); // Rate limit buffer
+    }
+    console.log('[TraitSync] Daily sync complete —', regs.rows.length, 'wallets synced');
+  }catch(e){
+    console.error('[TraitSync] Daily sync error:', e.message);
+  }
+}
+
 // Look up a verified Discord user by their wallet address
 async function lookupDiscordPing(wallet){
   if(!wallet) return null;
@@ -3742,14 +3844,8 @@ client.on('interactionCreate', async (interaction)=>{
         [ownerId, wallet]
       );
       await pgPool.query(`DELETE FROM verification_codes WHERE discord_id=$1 AND guild_id=$2`,[ownerId, guildId]);
-      // Auto-assign verified role if panel is configured
-      try{
-        const panel = await pgPool.query(`SELECT role_id FROM verification_panels WHERE guild_id=$1`,[guildId]);
-        if(panel.rows.length && panel.rows[0].role_id){
-          const member = await interaction.guild.members.fetch(ownerId).catch(()=>null);
-          if(member) await member.roles.add(panel.rows[0].role_id).catch(()=>{});
-        }
-      }catch(_){}
+      // Sync all trait roles + panel role for this wallet
+      syncTraitRoles(interaction.guild, ownerId, wallet).catch(()=>{});
 
       return interaction.editReply({content:[
         `✅ **Wallet verified!**`,
@@ -6508,6 +6604,89 @@ if(commandName==='myregistration'){
 }
 
 
+
+  // ── /setuptraitrole ──────────────────────────────────────────────────────────
+  if(commandName==='setuptraitrole'){
+    await interaction.deferReply({ephemeral:true});
+    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+      return interaction.editReply({content:'❌ You need Manage Server permission.'});
+    const traitType  = interaction.options.getString('trait_type');
+    const traitValue = interaction.options.getString('trait_value');
+    const role       = interaction.options.getRole('role');
+    const guildId    = interaction.guildId;
+    try{
+      await pgPool.query(
+        'INSERT INTO trait_roles (guild_id,trait_type,trait_value,role_id) VALUES ($1,$2,$3,$4) ON CONFLICT (guild_id,trait_type,trait_value,role_id) DO NOTHING',
+        [guildId, traitType, traitValue, role.id]
+      );
+      return interaction.editReply({content:'✅ Trait role set: holders of **'+traitType+': '+traitValue+'** will receive <@&'+role.id+'>'});
+    }catch(e){
+      console.error('[SetupTraitRole]', e.message);
+      return interaction.editReply({content:'❌ Failed to set trait role.'});
+    }
+  }
+
+  // ── /removetraitrole ─────────────────────────────────────────────────────────
+  if(commandName==='removetraitrole'){
+    await interaction.deferReply({ephemeral:true});
+    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+      return interaction.editReply({content:'❌ You need Manage Server permission.'});
+    const traitType  = interaction.options.getString('trait_type');
+    const traitValue = interaction.options.getString('trait_value');
+    const role       = interaction.options.getRole('role');
+    const guildId    = interaction.guildId;
+    try{
+      await pgPool.query(
+        'DELETE FROM trait_roles WHERE guild_id=$1 AND trait_type=$2 AND trait_value=$3 AND role_id=$4',
+        [guildId, traitType, traitValue, role.id]
+      );
+      return interaction.editReply({content:'✅ Trait role removed: **'+traitType+': '+traitValue+'** → <@&'+role.id+'>'});
+    }catch(e){
+      return interaction.editReply({content:'❌ Failed to remove trait role.'});
+    }
+  }
+
+  // ── /listtraitroles ──────────────────────────────────────────────────────────
+  if(commandName==='listtraitroles'){
+    await interaction.deferReply({ephemeral:true});
+    const guildId = interaction.guildId;
+    try{
+      const res = await pgPool.query(
+        'SELECT trait_type, trait_value, role_id FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
+        [guildId]
+      );
+      if(!res.rows.length)
+        return interaction.editReply({content:'No trait roles configured. Use `/setuptraitrole` to add one.'});
+      const lines = res.rows.map(r => '• **'+r.trait_type+': '+r.trait_value+'** → <@&'+r.role_id+'>');
+      return interaction.editReply({content:'**Trait Roles**\n'+lines.join('\n')});
+    }catch(e){
+      return interaction.editReply({content:'❌ Failed to fetch trait roles.'});
+    }
+  }
+
+  // ── /synctraits (manual trigger) ─────────────────────────────────────────────
+  if(commandName==='synctraits'){
+    await interaction.deferReply({ephemeral:true});
+    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+      return interaction.editReply({content:'❌ You need Manage Server permission.'});
+    await interaction.editReply({content:'⏳ Syncing trait roles for all verified members... This may take a moment.'});
+    const guildId = interaction.guildId;
+    try{
+      const regs = await pgPool.query(
+        'SELECT discord_id, wallet FROM user_registrations WHERE guild_id=$1 AND verified=true',
+        [guildId]
+      );
+      for(const reg of regs.rows){
+        await syncTraitRoles(interaction.guild, reg.discord_id, reg.wallet);
+        await new Promise(r=>setTimeout(r,500));
+      }
+      return interaction.editReply({content:'✅ Trait roles synced for '+regs.rows.length+' verified member'+(regs.rows.length!==1?'s':'')+'.'});
+    }catch(e){
+      console.error('[SyncTraits]', e.message);
+      return interaction.editReply({content:'❌ Sync failed: '+e.message});
+    }
+  }
+
   if(commandName==='setupverification'){
     await interaction.deferReply({ephemeral:true});
     if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
@@ -6707,6 +6886,11 @@ client.once('clientReady', async ()=>{
   }
   processDueBurnLotteries();
   setInterval(processDueBurnLotteries, 60_000);
+  // Daily trait role sync
+  setTimeout(()=>{
+    runDailyTraitSync();
+    setInterval(runDailyTraitSync, 24 * 60 * 60 * 1000);
+  }, 5 * 60 * 1000); // Wait 5 min after startup before first sync
   processDueGenericLotteries();
   setInterval(processDueGenericLotteries, 15_000);
 });

@@ -155,6 +155,25 @@ const commands = [
     .addRoleOption(o=>o.setName('role').setDescription('Role to assign after verification').setRequired(false))
     .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum OCAS tokens required (0 = any wallet)').setRequired(false).setMinValue(0))
     .addStringOption(o=>o.setName('message').setDescription('Custom welcome message for the panel').setRequired(false)),
+
+  new SlashCommandBuilder().setName('setuptraitrole')
+    .setDescription('Assign a Discord role to holders of a specific OCAS trait (Admin only)')
+    .addStringOption(o=>o.setName('trait_type').setDescription('Trait category e.g. Type, Hat Hair, Clothes').setRequired(true))
+    .addStringOption(o=>o.setName('trait_value').setDescription('Trait value e.g. Zombie, Mohawk Blonde').setRequired(true))
+    .addRoleOption(o=>o.setName('role').setDescription('Role to assign to holders of this trait').setRequired(true)),
+
+  new SlashCommandBuilder().setName('removetraitrole')
+    .setDescription('Remove a trait role mapping (Admin only)')
+    .addStringOption(o=>o.setName('trait_type').setDescription('Trait category').setRequired(true))
+    .addStringOption(o=>o.setName('trait_value').setDescription('Trait value').setRequired(true))
+    .addRoleOption(o=>o.setName('role').setDescription('Role to remove').setRequired(true)),
+
+  new SlashCommandBuilder().setName('listtraitroles')
+    .setDescription('List all trait role mappings for this server'),
+
+  new SlashCommandBuilder().setName('synctraits')
+    .setDescription('Manually sync trait roles for all verified members now (Admin only)'),
+
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){
