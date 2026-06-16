@@ -3667,6 +3667,70 @@ async function processDueGenericLotteries(){
 }
 
 client.on('interactionCreate', async (interaction)=>{
+
+  // ── Wallet verification button ────────────────────────────────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('verify_wallet:')){
+    await interaction.deferUpdate();
+    const parts    = interaction.customId.split(':');
+    const ownerId  = parts[1];
+    const wallet   = parts[2];
+    if(interaction.user.id !== ownerId)
+      return interaction.followUp({content:'❌ This verification is not for your account.', ephemeral:true});
+
+    try{
+      const codeRow = await pgPool.query(
+        `SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 AND wallet=$2`,
+        [ownerId, wallet]
+      );
+      if(!codeRow.rows.length)
+        return interaction.editReply({content:'❌ No pending verification found. Run `/register` again.', components:[]});
+
+      const {code, expires_at} = codeRow.rows[0];
+      if(new Date() > new Date(expires_at))
+        return interaction.editReply({content:'❌ Code expired. Run `/register` again to get a new one.', components:[]});
+
+      const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${wallet}`, {
+        headers: osHeaders(),
+        agent:   osAgent,
+      });
+      if(!osRes.ok){
+        if(osRes.status === 404)
+          return interaction.editReply({content:'❌ No OpenSea account found for that wallet. Make sure you have an OpenSea profile.', components:[]});
+        return interaction.editReply({content:`❌ OpenSea API error (${osRes.status}). Try again in a moment.`, components:[]});
+      }
+
+      const bio = (await osRes.json()).bio || '';
+      if(!bio.includes(code))
+        return interaction.editReply({content:[
+          `❌ Code not found in your bio yet.`,
+          ``,
+          `Make sure your bio at https://opensea.io/${wallet} contains:`,
+          `\`\`\`${code}\`\`\``,
+          `Save your profile then click the button again.`,
+        ].join('\n'), components:[interaction.message.components[0]]});
+
+      await pgPool.query(
+        `INSERT INTO user_registrations (discord_id, wallet, verified, verified_at, updated_at)
+         VALUES ($1,$2,true,NOW(),NOW())
+         ON CONFLICT (discord_id) DO UPDATE SET wallet=$2, verified=true, verified_at=NOW(), updated_at=NOW()`,
+        [ownerId, wallet]
+      );
+      await pgPool.query(`DELETE FROM verification_codes WHERE discord_id=$1`, [ownerId]);
+
+      return interaction.editReply({content:[
+        `✅ **Wallet verified!**`,
+        ``,
+        `🔗 \`${wallet.slice(0,6)}...${wallet.slice(-4)}\` is now linked to <@${ownerId}>`,
+        ``,
+        `You can remove the code from your OpenSea bio now.`,
+        `You'll be tagged automatically if you win a giveaway.`,
+      ].join('\n'), components:[]});
+    }catch(e){
+      console.error('[VerifyBtn]', e.message);
+      return interaction.editReply({content:'❌ Verification failed. Please try again.', components:[interaction.message.components[0]]});
+    }
+  }
+
   if(interaction.isButton() && interaction.customId.startsWith('lottery_enter:')){
     const lotteryId=parseInt(interaction.customId.split(':')[1]);
     try{
@@ -6366,16 +6430,23 @@ if(commandName==='register'){
        ON CONFLICT (discord_id) DO UPDATE SET wallet=$2, code=$3, expires_at=$4`,
       [discordId, wallet, code, expiresAt]
     );
+    const verifyBtn = new ButtonBuilder()
+      .setCustomId(`verify_wallet:${discordId}:${wallet}`)
+      .setLabel("I've Added It — Verify Now")
+      .setStyle(ButtonStyle.Success)
+      .setEmoji('✅');
+    const row = new ActionRowBuilder().addComponents(verifyBtn);
     return interaction.editReply({content:[
-      `✅ Almost done! To verify you own **${wallet.slice(0,6)}...${wallet.slice(-4)}**:`,
+      `**Step 1:** Go to your OpenSea profile:`,
+      `https://opensea.io/${wallet}`,
       ``,
-      `**1.** Go to your OpenSea profile: https://opensea.io/${wallet}`,
-      `**2.** Edit your bio and add this code anywhere in it:`,
+      `**Step 2:** Edit your bio and add this code anywhere in it:`,
       `\`\`\`${code}\`\`\``,
-      `**3.** Save your profile then run \`/verify wallet:${wallet}\``,
       ``,
-      `⏱ Code expires in 30 minutes. You can remove it from your bio after verification.`,
-    ].join('\n')});
+      `**Step 3:** Click the button below once your bio is saved.`,
+      ``,
+      `⏱ Expires in 30 minutes.`,
+    ].join('\n'), components:[row]});
   }catch(e){
     console.error('[Register]', e.message);
     return interaction.editReply({content:'❌ Registration failed. Please try again.'});
