@@ -3699,10 +3699,9 @@ client.on('interactionCreate', async (interaction)=>{
       }
 
       const _profile = await osRes.json();
-      console.log('[Verify] OpenSea profile fields:', JSON.stringify(Object.keys(_profile)));
-      console.log('[Verify] bio field:', _profile.bio);
-      // Search all string fields — OpenSea may use different field names
-      const bio = Object.values(_profile).filter(v => typeof v === 'string').join(' ');
+      console.log('[Verify] OpenSea profile:', JSON.stringify(_profile).slice(0,2000));
+      // Recursively search all strings at any depth — bio may be nested
+      const bio = collectStringsDeep(_profile).join(' ');
       if(!bio.includes(code))
         return interaction.editReply({content:[
           `❌ Code not detected yet — OpenSea's API can take **5–15 minutes** to reflect bio changes.`,
@@ -6487,10 +6486,9 @@ if(commandName==='verify'){
     }
 
     const _profile = await osRes.json();
-      console.log('[Verify] OpenSea profile fields:', JSON.stringify(Object.keys(_profile)));
-      console.log('[Verify] bio field:', _profile.bio);
-      // Search all string fields — OpenSea may use different field names
-      const bio = Object.values(_profile).filter(v => typeof v === 'string').join(' ');
+    console.log('[Verify] OpenSea profile:', JSON.stringify(_profile).slice(0,2000));
+    // Recursively search all strings at any depth — bio may be nested
+    const bio = collectStringsDeep(_profile).join(' ');
     if(!bio.includes(code))
       return interaction.editReply({content:[
         `❌ Code not found in your OpenSea bio.`,
