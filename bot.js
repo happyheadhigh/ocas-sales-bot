@@ -3709,16 +3709,16 @@ client.on('interactionCreate', async (interaction)=>{
       }
 
       const _profile = await osRes.json();
-      console.log('[Verify] OpenSea profile:', JSON.stringify(_profile).slice(0,2000));
-      // Recursively search all strings at any depth — bio may be nested
-      const bio = collectStringsDeep(_profile).join(' ');
+      console.log('[Verify] OpenSea username:', _profile.username);
+      // Use username — updates in real-time unlike bio which is CDN-cached
+      const bio = _profile.username || '';
       if(!bio.includes(code))
         return interaction.editReply({content:[
-          `❌ Code not detected yet — OpenSea's API can take **5–15 minutes** to reflect bio changes.`,
+          `❌ Code not found in your OpenSea username yet.`,
           ``,
-          `Your bio should contain:`,
+          `Your username at https://opensea.io/${wallet} must contain:`,
           `\`\`\`${code}\`\`\``,
-          `If your bio is already saved at https://opensea.io/${wallet}, just wait a few minutes and click the button again. No need to re-register.`,
+          `Make sure you saved your profile, then click the button again.`,
         ].join('\n'), components:[interaction.message.components[0]]});
 
       await pgPool.query(
@@ -3734,7 +3734,7 @@ client.on('interactionCreate', async (interaction)=>{
         ``,
         `🔗 \`${wallet.slice(0,6)}...${wallet.slice(-4)}\` is now linked to <@${ownerId}>`,
         ``,
-        `You can remove the code from your OpenSea bio now.`,
+        `You can now change your OpenSea username back to normal.`,
         `You'll be tagged automatically if you win a giveaway.`,
       ].join('\n'), components:[]});
     }catch(e){
@@ -6496,14 +6496,14 @@ if(commandName==='verify'){
     }
 
     const _profile = await osRes.json();
-    console.log('[Verify] OpenSea profile:', JSON.stringify(_profile).slice(0,2000));
-    // Recursively search all strings at any depth — bio may be nested
-    const bio = collectStringsDeep(_profile).join(' ');
+    console.log('[Verify] OpenSea username:', _profile.username);
+    // Use username — updates in real-time unlike bio which is CDN-cached
+    const bio = _profile.username || '';
     if(!bio.includes(code))
       return interaction.editReply({content:[
-        `❌ Code not found in your OpenSea bio.`,
+        `❌ Code not found in your OpenSea username.`,
         ``,
-        `Make sure https://opensea.io/${wallet} bio contains:`,
+        `Make sure your username at https://opensea.io/${wallet} contains:`,
         `\`\`\`${code}\`\`\``,
         `Save your profile then try again.`,
       ].join('\n')});
@@ -6521,7 +6521,7 @@ if(commandName==='verify'){
       ``,
       `🔗 \`${wallet.slice(0,6)}...${wallet.slice(-4)}\` is now linked to <@${discordId}>`,
       ``,
-      `You can remove the code from your OpenSea bio now.`,
+      `You can now change your OpenSea username back to normal.`,
       `You'll be tagged automatically if you win a giveaway.`,
     ].join('\n')});
   }catch(e){
