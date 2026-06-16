@@ -154,6 +154,9 @@ const commands = [
 
   new SlashCommandBuilder().setName('setup')
     .setDescription('Setup wizard — configure your bot step by step (Admin only)'),
+
+  new SlashCommandBuilder().setName('verifydashboard')
+    .setDescription('View verification stats and role breakdown for this server (Admin only)'),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){

@@ -230,12 +230,96 @@ async function handleAdminCommand(commandName, ctx){
       )], flags: MessageFlags.Ephemeral });
     return;
   }
+if(commandName === 'verifydashboard'){
+  await interaction.deferReply({ephemeral:true});
+  if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+    return interaction.editReply({content:'❌ You need Manage Server permission.'});
+
+  const guildId = interaction.guildId;
+  const { pgPool } = ctx;
+
+  try{
+    const verifiedRes = await pgPool.query(
+      `SELECT COUNT(*) FROM user_registrations WHERE guild_id=$1 AND verified=true`,
+      [guildId]
+    );
+    const verifiedCount = parseInt(verifiedRes.rows[0].count);
+
+    const pendingRes = await pgPool.query(
+      `SELECT COUNT(*) FROM verification_codes WHERE guild_id=$1 AND expires_at > NOW()`,
+      [guildId]
+    );
+    const pendingCount = parseInt(pendingRes.rows[0].count);
+
+    const totalAttempts = parseInt((await pgPool.query(
+      `SELECT COUNT(*) FROM verification_codes WHERE guild_id=$1`, [guildId]
+    )).rows[0].count) + verifiedCount;
+    const successRate = totalAttempts > 0
+      ? ((verifiedCount / totalAttempts) * 100).toFixed(1) + '%'
+      : '—';
+
+    const lastRes = await pgPool.query(
+      `SELECT verified_at FROM user_registrations WHERE guild_id=$1 AND verified=true ORDER BY verified_at DESC NULLS LAST`,
+      [guildId]
+    );
+    const lastVerified = lastRes.rows[0]?.verified_at
+      ? '<t:'+Math.floor(new Date(lastRes.rows[0].verified_at).getTime()/1000)+':R>'
+      : '—';
+
+    const traitRolesRes = await pgPool.query(
+      `SELECT tr.role_id, tr.trait_type, tr.trait_value, tr.minimum_count,
+              COUNT(ur.discord_id) as member_count
+       FROM trait_roles tr
+       LEFT JOIN user_registrations ur ON ur.guild_id=tr.guild_id AND ur.verified=true
+       WHERE tr.guild_id=$1
+       GROUP BY tr.role_id, tr.trait_type, tr.trait_value, tr.minimum_count
+       ORDER BY member_count DESC`,
+      [guildId]
+    );
+
+    const panelRes = await pgPool.query(
+      `SELECT role_id FROM verification_panels WHERE guild_id=$1`, [guildId]
+    );
+    const holderRoleId = panelRes.rows[0]?.role_id;
+
+    let rolesDisplay = '';
+    if(holderRoleId) rolesDisplay += '<@&'+holderRoleId+'> — '+verifiedCount+'\n';
+    for(const tr of traitRolesRes.rows){
+      const label = tr.minimum_count > 1 ? tr.minimum_count+'+ '+tr.trait_value : tr.trait_value;
+      rolesDisplay += '<@&'+tr.role_id+'> ('+label+') — '+tr.member_count+'\n';
+    }
+    if(!rolesDisplay) rolesDisplay = '*No trait roles configured*';
+
+    const { EmbedBuilder } = require('discord.js');
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('📊 Verification Dashboard')
+      .setDescription('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+      .addFields(
+        { name:'👥 Verified Wallets', value:'**'+verifiedCount+'**', inline:true },
+        { name:'⏳ Pending',          value:'**'+pendingCount+'**',  inline:true },
+        { name:'✅ Success Rate',     value:'**'+successRate+'**',   inline:true },
+        { name:'🎭 Roles Assigned',   value:rolesDisplay,            inline:false },
+        { name:'🕐 Last Verification',value:lastVerified,            inline:false },
+      )
+      .setFooter({ text:'Only visible to you • Run /synctraits to update roles' })
+      .setTimestamp();
+
+    return interaction.editReply({ embeds:[embed] });
+  }catch(e){
+    console.error('[VerifyDashboard]', e.message);
+    return interaction.editReply({content:'❌ Failed to load dashboard: '+e.message});
+  }
+}
+
 }
 
 const ADMIN_COMMANDS = new Set([
-  'setup','setuphere','setlistingshere','setupburn','setlistings','setchannel',
+  'setup','setuphere','setlistingshere','setupburn','setlistings','setchannel','verifydashboard',
   'setcollection','salesfilter','traitlistingfilter','ranklistingfilter',
   'removerankfilter','clearallfilters','removetraitfilter','pause','resume','status',
 ]);
+
+// ── /verifydashboard ──────────────────────────────────────────────────────────
 
 module.exports = { handleAdminCommand, ADMIN_COMMANDS };
