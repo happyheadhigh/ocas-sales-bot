@@ -1917,6 +1917,16 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function osHeaders(){ const h={accept:'application/json'}; if(OPENSEA_KEY) h['x-api-key']=OPENSEA_KEY; return h; }
 
+// Recursively collect all strings from any depth of an object/array
+function collectStringsDeep(obj, out=[]){
+  if(obj == null) return out;
+  if(typeof obj === 'string'){ out.push(obj); return out; }
+  if(Array.isArray(obj)){ for(const item of obj) collectStringsDeep(item, out); return out; }
+  if(typeof obj === 'object'){ for(const val of Object.values(obj)) collectStringsDeep(val, out); }
+  return out;
+}
+
+
 function trimEth(eth){
   // Strip trailing zeros: 0.00700 → 0.007, 1.2300 → 1.23, 0.00570 → 0.0057
   if(eth >= 1)    return parseFloat(eth.toFixed(4)).toString();
