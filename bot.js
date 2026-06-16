@@ -1772,16 +1772,32 @@ async function postBurnFallbackAlert(finalEvent, startEvent){
 }
 
 let _pollBurnRunning = false;
+let _lastKnownBurnBlock = null; // in-memory cursor fallback
 async function pollBurnEvents(){
   if(_pollBurnRunning){ console.log('[Burn] Poll tick skipped — previous still running'); return; }
   _pollBurnRunning = true;
   try{
-  if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return;
-  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+  if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL && !process.env.ETH_RPC_URL && !process.env.BURN_RPC_OVERRIDE) return;
+  const _baseRpc = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://')
+    || `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+  // BURN_RPC_OVERRIDE: set to Infura URL for fast catch-up, auto-ignored when caught up
+  const rpcUrl = process.env.BURN_RPC_OVERRIDE?.replace('wss://','https://') || _baseRpc;
 
   try{
-    const lastBlockRaw = await dbLoad('burn_last_block');
+    // Retry dbLoad up to 3 times — staging DB can fail on startup
+    let lastBlockRaw = null;
+    for(let _attempt = 1; _attempt <= 3; _attempt++){
+      try{ lastBlockRaw = await dbLoad('burn_last_block'); break; }
+      catch(e){
+        console.error(`[dbLoad] burn_last_block attempt ${_attempt} failed:`, e.message);
+        if(_attempt < 3) await new Promise(r=>setTimeout(r, 2000));
+      }
+    }
+    // In-memory cursor guard — if DB fails, use last known block to avoid rewind
+    if(!lastBlockRaw && _lastKnownBurnBlock){
+      console.warn(`[Burn] burn_last_block DB read failed; using in-memory cursor ${_lastKnownBurnBlock} to avoid rewind`);
+      lastBlockRaw = String(_lastKnownBurnBlock);
+    }
     const latest = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
     let fromBlock = lastBlockRaw ? parseInt(lastBlockRaw, 10) + 1 : null;
     let historicalBackfill = false;
@@ -1804,7 +1820,12 @@ async function pollBurnEvents(){
     // api.js requests (traitfind, rankfind, etc) don't time out during backfill.
     // Adaptive chunk: catch up faster when behind, stay small when live
     const blockGap = latest - fromBlock;
-    const adaptiveChunk = blockGap > 3 ? BURN_BLOCK_CHUNK : 2;
+    const effectiveChunk = (process.env.BURN_RPC_OVERRIDE && blockGap > 100)
+      ? Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK_OVERRIDE || '5000', 10))  // use 5000 with Infura
+      : Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10));
+    const adaptiveChunk = blockGap > 3 ? effectiveChunk : 2;
+    if(process.env.BURN_RPC_OVERRIDE && blockGap <= 100)
+      console.log('[Burn] Caught up — BURN_RPC_OVERRIDE ignored, using default RPC');
     const chunkTo = Math.min(latest, fromBlock + adaptiveChunk - 1);
     const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
     const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
@@ -1818,6 +1839,7 @@ async function pollBurnEvents(){
     await processBurnLogs(logs || [], shouldAlert);
     await dbSave('burn_last_block', String(chunkTo));
     const lagBlocks = latest - chunkTo;
+      _lastKnownBurnBlock = chunkTo;
     if(lagBlocks > 0){
       console.log(`[Burn] Behind by ${lagBlocks} block(s)`);
       // Alert if lag exceeds threshold and we haven't alerted recently
@@ -3135,7 +3157,7 @@ function buildActiveBurnLotteryComponents(lotteryId){
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`burnlottery_current_entries:${lotteryId}:0`)
-      .setLabel('Show Current Entries')
+      .setLabel('Show Entries')
       .setStyle(ButtonStyle.Secondary)
   )];
 }
@@ -3210,6 +3232,20 @@ function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, e
   embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
   return embed;
 }
+function buildBurnLotteryWinnerEmbed({title='OCAS Burn Lottery Winner', entries, wallets, burns, pick, lotteryId, seedMeta=null}){
+  const blockNum = seedMeta?.block_number || null;
+  const embed = new EmbedBuilder()
+    .setTitle(`🎉 ${title}`)
+    .setColor(COLORS.OCAS_GREEN)
+    .addFields(
+      { name:'Winner', value:pick?.winner ? `🏆 ${etherscanAddressLink(pick.winner)}` : 'No eligible winner.', inline:false },
+      { name:'Lottery #', value:`#${lotteryId}`, inline:true },
+      { name:'Qualified Wallets', value:String(wallets.length), inline:true },
+      { name:'Total Burns', value:String(burns.length), inline:true }
+    );
+  if(blockNum) embed.addFields({ name:'Seed Block', value:`[#${blockNum}](https://etherscan.io/block/${blockNum})`, inline:true });
+  return embed.setFooter({ text:`Lottery ID ${lotteryId}` }).setTimestamp();
+}
 async function drawAndPostBurnLottery(row){
   // Claim the lottery immediately to prevent double-draw during ETH block wait
   const claim = await pgPool.query(`UPDATE burn_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`, [row.id]);
@@ -3282,6 +3318,8 @@ async function drawAndPostBurnLottery(row){
   );
   const resultEmbed = buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone, seedMeta});
   const resultComponents = buildBurnLotteryComponents(row.id);
+  const winnerEmbed = buildBurnLotteryWinnerEmbed({title:'OCAS Burn Lottery Winner', entries, wallets, burns, pick, lotteryId:row.id, seedMeta});
+  let announcementChannel = originalMsg?.channel || null;
 
   if(originalMsg){
     // Edit the original message to show the full result — no second message posted
@@ -3291,8 +3329,12 @@ async function drawAndPostBurnLottery(row){
   } else {
     // No original message to edit (e.g. auto-draw with no stored message_id) — post fresh
     const ch = await resolveDiscordChannel(row.channel_id);
-    if(ch) await ch.send({ embeds:[resultEmbed], components:resultComponents });
+    if(ch){
+      announcementChannel = ch;
+      await ch.send({ embeds:[resultEmbed], components:resultComponents });
+    }
   }
+  if(announcementChannel) await announcementChannel.send({ embeds:[winnerEmbed], components:resultComponents }).catch(() => {});
 }
 async function processDueBurnLotteries(){
   const r = await pgPool.query(`SELECT * FROM burn_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]}));
@@ -3311,13 +3353,14 @@ function lotteryNumberFromSeed(seed,min,max){ const lo=Math.min(parseInt(min),pa
 function lotteryEntryButton(row){ return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`lottery_enter:${row.id}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)); }
 function buildGenericLotteryComponents(lotteryId, type='giveaway', active=true){
   const rows = [];
-  if(active && type === 'giveaway'){
-    // Active giveaway — entry button only
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)
-    ));
+  if(active){
+    const buttons = [];
+    if(type === 'giveaway'){
+      buttons.push(new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success));
+    }
+    buttons.push(new ButtonBuilder().setCustomId(`generic_lottery_entries:${lotteryId}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary));
+    rows.push(new ActionRowBuilder().addComponents(...buttons));
   } else {
-    // Completed — show draw proof + show entries buttons
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('Show Draw Proof').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`generic_lottery_entries:${lotteryId}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary)
@@ -3414,6 +3457,28 @@ function buildGenericLotteryResultEmbed(row, entries, result){
 
   return embed.setFooter({ text:`Lottery ID ${row.id}` }).setTimestamp();
 }
+function formatGenericLotteryWinner(row, result){
+  if(!result?.winner) return 'No eligible winner.';
+  if(row.winner_display) return String(row.winner_display);
+  if(typeof result.winner === 'string') return String(result.winner);
+  const userId = result.winner.user_id;
+  if(/^\d{17,19}$/.test(String(userId || ''))) return `<@${userId}>`;
+  return String(result.winner.username || userId || 'Unknown');
+}
+function buildGenericLotteryWinnerEmbed(row, entries, result){
+  const rj = row.result_json || {};
+  const blockNum = rj.block_number || null;
+  const embed = new EmbedBuilder()
+    .setTitle('🎉 OCAS Lottery Winner')
+    .setColor(COLORS.OCAS_GREEN)
+    .addFields(
+      { name:'Winner', value:`🏆 ${formatGenericLotteryWinner(row, result)}`, inline:false },
+      { name:'Lottery #', value:`#${row.id}`, inline:true },
+      { name:'Total Entries', value:String(entries.length), inline:true }
+    );
+  if(blockNum) embed.addFields({ name:'Seed Block', value:`[#${blockNum}](https://etherscan.io/block/${blockNum})`, inline:true });
+  return embed.setFooter({ text:`Lottery ID ${row.id}` }).setTimestamp();
+}
 async function findActiveGenericLottery(guildId,type=null){ const params=[guildId]; let q=`SELECT * FROM generic_lotteries WHERE guild_id=$1 AND status='active' AND end_time > NOW()`; if(type){params.push(type); q+=` AND type=$2`;} q+=` ORDER BY id DESC LIMIT 1`; const r=await pgPool.query(q,params); return r.rows[0]||null; }
 async function getGenericLotteryEntryCount(id){ const r=await pgPool.query('SELECT COUNT(*)::int count FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]})); return parseInt(r.rows[0]?.count||0); }
 async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=null, preClaimed=false){
@@ -3454,18 +3519,19 @@ async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=n
     }
     if(pool.length){
       const p = lotteryPick(pool.map(x => x.user_id), `${activeSeed}:guess:${row.id}:${row.winning_number}`);
-      result = { winner: pool.find(x => x.user_id === p.winner) || pool[0], proof: p.proof };
+      result = { winner: pool.find(x => x.user_id === p.winner) || pool[0], proof: p.proof, index: p.index, position: p.position };
     }
   } else {
     // Giveaway mode — pick from all entries
     const p = lotteryPick(entries.map(x => x.user_id), `${activeSeed}:giveaway:${row.id}`);
-    if(p) result = { winner: entries.find(x => x.user_id === p.winner) || entries[p.index], proof: p.proof };
+    if(p) result = { winner: entries.find(x => x.user_id === p.winner) || entries[p.index], proof: p.proof, index: p.index, position: p.position };
   }
 
   // Always write the final seed back to DB — covers ETH hash, random fallback, and pending→resolved
   await pgPool.query('UPDATE generic_lotteries SET seed=$1 WHERE id=$2', [activeSeed, row.id]).catch(() => {});
 
   // Mark completed and store result
+  const resultJson = { proof: result.proof || null, winner_index: result.index ?? null, winner_position: result.position ?? null, block_number: ethBlockNumber || null };
   await pgPool.query(
     `UPDATE generic_lotteries
      SET status='completed', winner_user_id=$1, winner_display=$2, winner_guess=$3,
@@ -3476,7 +3542,7 @@ async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=n
       result.winner?.username || null,
       result.winner?.guess_number ?? null,
       entries.length,
-      JSON.stringify({ proof: result.proof || null, winner_index: result.index ?? null, winner_position: result.position ?? null, block_number: ethBlockNumber || null }),
+      JSON.stringify(resultJson),
       row.winning_number ?? null,
       row.id,
     ]
@@ -3484,11 +3550,15 @@ async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=n
 
   // Ensure row.seed reflects the final resolved seed for the result embed
   row.seed = activeSeed;
+  row.result_json = resultJson;
   const embed = buildGenericLotteryResultEmbed(row, entries, result);
   const resultComponents = buildGenericLotteryComponents(row.id, row.type, false);
   if(post){
     const ch = await resolveDiscordChannel(row.channel_id);
-    if(ch) await ch.send({ embeds: [embed], components: resultComponents });
+    if(ch){
+      await ch.send({ embeds: [embed], components: resultComponents });
+      await ch.send({ embeds: [buildGenericLotteryWinnerEmbed(row, entries, result)], components: resultComponents }).catch(() => {});
+    }
   }
   return { embed, entries, result, components: resultComponents };
 }
@@ -5767,9 +5837,7 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
           .addFields(
             {name:'ID',value:String(row.id),inline:true},
             {name:'Window',value:formatBurnLotteryWindow(start, end, timeZone),inline:false},
-            {name:'Timezone',value:timeZone,inline:true},
             {name:'Mode',value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet',inline:true},
-            {name:'Channel',value:`<#${channel.id}>`,inline:true},
             {name:'Draw Seed',value:customSeed ? `Custom seed set: \`${String(customSeed).slice(0,256)}\`` : 'Generated automatically at draw time after the entry window closes.',inline:false}
           )
           .setTimestamp()], components:buildActiveBurnLotteryComponents(row.id) });
@@ -5895,11 +5963,16 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
          instantLotteryId]
       );
       const lotteryId = instantLotteryId;
-      return interaction.editReply({
+      await interaction.editReply({
         content: null,
         embeds:[buildBurnLotteryEmbed({mode,start,end,seed:drawSeed,entries,wallets,burns,pick,lotteryId,timezone:timeZone,seedMeta})],
         components:buildBurnLotteryComponents(lotteryId)
       });
+      await interaction.channel?.send({
+        embeds:[buildBurnLotteryWinnerEmbed({title:'OCAS Burn Lottery Winner', entries, wallets, burns, pick, lotteryId, seedMeta})],
+        components:buildBurnLotteryComponents(lotteryId)
+      }).catch(() => {});
+      return;
     }catch(e){
       console.error('[/burnlottery]', e); sendErrorWebhook('/burnlottery Error', e, `guild=${guildId}`);
       const msg = String(e.message || '');
@@ -5999,11 +6072,13 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         // winner_display stores the raw entry value (name or number) for instant draws
         const resultRow = { id: lotteryId, title, type:'giveaway', seed: activeSeed,
           winner_display: String(pick.winner),
-          result_json: { proof: pick.proof||null, block_number: ethBlockNumber||null } };
+          result_json: { proof: pick.proof||null, winner_index: pick.index??null, winner_position: pick.position??null, block_number: ethBlockNumber||null } };
         const resultEmbed = buildGenericLotteryResultEmbed(resultRow, entries.map(e=>({ username:e, user_id:e })), pick);
         const resultComponents = buildGenericLotteryComponents(lotteryId, 'giveaway', false);
 
-        return interaction.editReply({ embeds:[resultEmbed], components:resultComponents });
+        await interaction.editReply({ embeds:[resultEmbed], components:resultComponents });
+        await interaction.channel?.send({ embeds:[buildGenericLotteryWinnerEmbed(resultRow, entries.map(e=>({ username:e, user_id:e })), pick)], components:resultComponents }).catch(() => {});
+        return;
       }
 
       // ── /lottery start — create a new scheduled giveaway or guess lottery ──
@@ -6154,6 +6229,12 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
         }catch(_){}
 
         const out = await drawGenericLottery(row, false, ethSeed, ethBlockNumber, true);
+        if(out?.embed){
+          await interaction.channel?.send({
+            embeds:[buildGenericLotteryWinnerEmbed(row, out.entries, out.result)],
+            components:out.components
+          }).catch(() => {});
+        }
 
         // Update interaction reply to ✅ done — result posted via drawGenericLottery
         const doneEmbed = EmbedBuilder.from(drawFetchEmbed).setDescription('✅ Draw complete.');
