@@ -3691,7 +3691,6 @@ client.on('interactionCreate', async (interaction)=>{
 
       const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${wallet}`, {
         headers: osHeaders(),
-        agent:   osAgent,
       });
       if(!osRes.ok){
         if(osRes.status === 404)
@@ -6476,7 +6475,6 @@ if(commandName==='verify'){
 
     const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${wallet}`, {
       headers: osHeaders(),
-      agent:   osAgent,
     });
     if(!osRes.ok){
       if(osRes.status === 404)
