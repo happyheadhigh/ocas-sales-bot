@@ -270,14 +270,17 @@ async function ensureBotStateTable(){
     created_at   TIMESTAMPTZ DEFAULT NOW()
   )`);
   await pgPool.query(`CREATE TABLE IF NOT EXISTS trait_roles (
-    id          SERIAL PRIMARY KEY,
-    guild_id    TEXT NOT NULL,
-    trait_type  TEXT NOT NULL,
-    trait_value TEXT NOT NULL,
-    role_id     TEXT NOT NULL,
-    created_at  TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (guild_id, trait_type, trait_value, role_id)
+    id             SERIAL PRIMARY KEY,
+    guild_id       TEXT NOT NULL,
+    trait_type     TEXT NOT NULL,
+    trait_value    TEXT NOT NULL,
+    role_id        TEXT NOT NULL,
+    minimum_count  INTEGER NOT NULL DEFAULT 1,
+    created_at     TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (guild_id, trait_type, trait_value, role_id, minimum_count)
   )`);
+  // Add minimum_count column if upgrading from older schema
+  await pgPool.query(`ALTER TABLE trait_roles ADD COLUMN IF NOT EXISTS minimum_count INTEGER NOT NULL DEFAULT 1`);
 
   try{
     await pgPool.query(`
@@ -3317,23 +3320,29 @@ async function syncTraitRoles(guild, discordId, wallet){
       return;
     }
 
-    // Get traits for owned tokens from our DB
+    // Get trait counts for owned tokens from our DB
     const traitsRes = await pgPool.query(
-      'SELECT trait_type, trait_value FROM token_traits WHERE token_id = ANY($1::int[])',
+      'SELECT trait_type, trait_value, COUNT(*) as count FROM token_traits WHERE token_id = ANY($1::int[]) GROUP BY trait_type, trait_value',
       [ownedTokenIds]
     );
-    const ownedTraits = new Set(traitsRes.rows.map(r => r.trait_type+'::'+r.trait_value));
+    // Build a count map: 'Type::Zombie' -> 3
+    const traitCounts = {};
+    for(const r of traitsRes.rows)
+      traitCounts[r.trait_type+'::'+r.trait_value] = parseInt(r.count);
+    // Also store total OCAS count for collection-wide rules
+    traitCounts['Collection::OCAS'] = ownedTokenIds.length;
 
     // Fetch the member
     const member = await guild.members.fetch(discordId).catch(()=>null);
     if(!member) return;
 
-    // Add/remove roles based on trait ownership
+    // Add/remove roles based on trait count vs minimum_count threshold
     for(const tr of traitRolesRes.rows){
       const hasRole    = member.roles.cache.has(tr.role_id);
-      const hasTrait   = ownedTraits.has(tr.trait_type+'::'+tr.trait_value);
-      if(hasTrait && !hasRole)  await member.roles.add(tr.role_id).catch(()=>{});
-      if(!hasTrait && hasRole)  await member.roles.remove(tr.role_id).catch(()=>{});
+      const count      = traitCounts[tr.trait_type+'::'+tr.trait_value] || 0;
+      const meetsMin   = count >= (tr.minimum_count || 1);
+      if(meetsMin && !hasRole)  await member.roles.add(tr.role_id).catch(()=>{});
+      if(!meetsMin && hasRole)  await member.roles.remove(tr.role_id).catch(()=>{});
     }
 
     // Also assign verification panel role if configured
@@ -6613,13 +6622,15 @@ if(commandName==='myregistration'){
     const traitType  = interaction.options.getString('trait_type');
     const traitValue = interaction.options.getString('trait_value');
     const role       = interaction.options.getRole('role');
+    const minCount   = interaction.options.getInteger('minimum') ?? 1;
     const guildId    = interaction.guildId;
     try{
       await pgPool.query(
-        'INSERT INTO trait_roles (guild_id,trait_type,trait_value,role_id) VALUES ($1,$2,$3,$4) ON CONFLICT (guild_id,trait_type,trait_value,role_id) DO NOTHING',
-        [guildId, traitType, traitValue, role.id]
+        'INSERT INTO trait_roles (guild_id,trait_type,trait_value,role_id,minimum_count) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (guild_id,trait_type,trait_value,role_id,minimum_count) DO NOTHING',
+        [guildId, traitType, traitValue, role.id, minCount]
       );
-      return interaction.editReply({content:'✅ Trait role set: holders of **'+traitType+': '+traitValue+'** will receive <@&'+role.id+'>'});
+      const minStr = minCount > 1 ? ' (minimum '+minCount+')' : '';
+      return interaction.editReply({content:'✅ Trait role set: holders of **'+minCount+'+ '+traitType+': '+traitValue+'** will receive <@&'+role.id+'>'});
     }catch(e){
       console.error('[SetupTraitRole]', e.message);
       return interaction.editReply({content:'❌ Failed to set trait role.'});
@@ -6657,7 +6668,7 @@ if(commandName==='myregistration'){
       );
       if(!res.rows.length)
         return interaction.editReply({content:'No trait roles configured. Use `/setuptraitrole` to add one.'});
-      const lines = res.rows.map(r => '• **'+r.trait_type+': '+r.trait_value+'** → <@&'+r.role_id+'>');
+      const lines = res.rows.map(r => '• **'+(r.minimum_count>1?r.minimum_count+'+ ':'')+r.trait_type+': '+r.trait_value+'** → <@&'+r.role_id+'>');
       return interaction.editReply({content:'**Trait Roles**\n'+lines.join('\n')});
     }catch(e){
       return interaction.editReply({content:'❌ Failed to fetch trait roles.'});

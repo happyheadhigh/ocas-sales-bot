@@ -160,7 +160,8 @@ const commands = [
     .setDescription('Assign a Discord role to holders of a specific OCAS trait (Admin only)')
     .addStringOption(o=>o.setName('trait_type').setDescription('Trait category e.g. Type, Hat Hair, Clothes').setRequired(true))
     .addStringOption(o=>o.setName('trait_value').setDescription('Trait value e.g. Zombie, Mohawk Blonde').setRequired(true))
-    .addRoleOption(o=>o.setName('role').setDescription('Role to assign to holders of this trait').setRequired(true)),
+    .addRoleOption(o=>o.setName('role').setDescription('Role to assign to holders of this trait').setRequired(true))
+    .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum number of tokens with this trait (default 1, use for King Ape / Collector etc)').setRequired(false).setMinValue(1)),
 
   new SlashCommandBuilder().setName('removetraitrole')
     .setDescription('Remove a trait role mapping (Admin only)')
