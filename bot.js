@@ -243,6 +243,20 @@ pgPool.on('error', e => { console.error('[PG bot]', e.message); sendErrorWebhook
 
 // ── Create bot_state table if it doesn't exist ───────────────────────────────
 async function ensureBotStateTable(){
+  await pgPool.query(`CREATE TABLE IF NOT EXISTS user_registrations (
+    discord_id  TEXT PRIMARY KEY,
+    wallet      TEXT UNIQUE,
+    verified    BOOLEAN DEFAULT false,
+    verified_at TIMESTAMPTZ,
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await pgPool.query(`CREATE TABLE IF NOT EXISTS verification_codes (
+    discord_id  TEXT PRIMARY KEY,
+    wallet      TEXT,
+    code        TEXT,
+    expires_at  TIMESTAMPTZ
+  )`);
+
   try{
     await pgPool.query(`
       CREATE TABLE IF NOT EXISTS bot_state (
@@ -6315,6 +6329,126 @@ Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
       )], flags: MessageFlags.Ephemeral});
     return;
   }
+
+// ── /register ─────────────────────────────────────────────────────────────────
+if(commandName==='register'){
+  await interaction.deferReply({ephemeral:true});
+  const wallet    = (interaction.options.getString('wallet')||'').trim().toLowerCase();
+  const discordId = interaction.user.id;
+
+  if(!/^0x[0-9a-f]{40}$/i.test(wallet))
+    return interaction.editReply({content:'❌ Invalid wallet address. Must be 0x followed by 40 hex characters.'});
+
+  const code = `OCAS-verify-${Math.random().toString(36).slice(2,8).toUpperCase()}`;
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+
+  try{
+    await pgPool.query(
+      `INSERT INTO verification_codes (discord_id, wallet, code, expires_at)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (discord_id) DO UPDATE SET wallet=$2, code=$3, expires_at=$4`,
+      [discordId, wallet, code, expiresAt]
+    );
+    return interaction.editReply({content:[
+      `✅ Almost done! To verify you own **${wallet.slice(0,6)}...${wallet.slice(-4)}**:`,
+      ``,
+      `**1.** Go to your OpenSea profile: https://opensea.io/${wallet}`,
+      `**2.** Edit your bio and add this code anywhere in it:`,
+      `\`\`\`${code}\`\`\``,
+      `**3.** Save your profile then run \`/verify wallet:${wallet}\``,
+      ``,
+      `⏱ Code expires in 30 minutes. You can remove it from your bio after verification.`,
+    ].join('\n')});
+  }catch(e){
+    console.error('[Register]', e.message);
+    return interaction.editReply({content:'❌ Registration failed. Please try again.'});
+  }
+}
+
+// ── /verify ───────────────────────────────────────────────────────────────────
+if(commandName==='verify'){
+  await interaction.deferReply({ephemeral:true});
+  const wallet    = (interaction.options.getString('wallet')||'').trim().toLowerCase();
+  const discordId = interaction.user.id;
+
+  if(!/^0x[0-9a-f]{40}$/i.test(wallet))
+    return interaction.editReply({content:'❌ Invalid wallet address.'});
+
+  try{
+    const codeRow = await pgPool.query(
+      `SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 AND wallet=$2`,
+      [discordId, wallet]
+    );
+    if(!codeRow.rows.length)
+      return interaction.editReply({content:'❌ No pending verification found. Run `/register wallet:' + wallet + '` first.'});
+
+    const {code, expires_at} = codeRow.rows[0];
+    if(new Date() > new Date(expires_at))
+      return interaction.editReply({content:'❌ Code expired. Run `/register` again to get a new one.'});
+
+    const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${wallet}`, {
+      headers: osHeaders(),
+      agent:   osAgent,
+    });
+    if(!osRes.ok){
+      if(osRes.status === 404)
+        return interaction.editReply({content:'❌ No OpenSea account found for that wallet.'});
+      return interaction.editReply({content:`❌ OpenSea API error (${osRes.status}). Try again shortly.`});
+    }
+
+    const bio = (await osRes.json()).bio || '';
+    if(!bio.includes(code))
+      return interaction.editReply({content:[
+        `❌ Code not found in your OpenSea bio.`,
+        ``,
+        `Make sure https://opensea.io/${wallet} bio contains:`,
+        `\`\`\`${code}\`\`\``,
+        `Save your profile then try again.`,
+      ].join('\n')});
+
+    await pgPool.query(
+      `INSERT INTO user_registrations (discord_id, wallet, verified, verified_at, updated_at)
+       VALUES ($1,$2,true,NOW(),NOW())
+       ON CONFLICT (discord_id) DO UPDATE SET wallet=$2, verified=true, verified_at=NOW(), updated_at=NOW()`,
+      [discordId, wallet]
+    );
+    await pgPool.query(`DELETE FROM verification_codes WHERE discord_id=$1`, [discordId]);
+
+    return interaction.editReply({content:[
+      `✅ **Wallet verified!**`,
+      ``,
+      `🔗 \`${wallet.slice(0,6)}...${wallet.slice(-4)}\` is now linked to <@${discordId}>`,
+      ``,
+      `You can remove the code from your OpenSea bio now.`,
+      `You'll be tagged automatically if you win a giveaway.`,
+    ].join('\n')});
+  }catch(e){
+    console.error('[Verify]', e.message);
+    return interaction.editReply({content:'❌ Verification failed. Please try again.'});
+  }
+}
+
+// ── /myregistration ───────────────────────────────────────────────────────────
+if(commandName==='myregistration'){
+  await interaction.deferReply({ephemeral:true});
+  try{
+    const row = await pgPool.query(
+      `SELECT wallet, verified, verified_at FROM user_registrations WHERE discord_id=$1`,
+      [interaction.user.id]
+    );
+    if(!row.rows.length)
+      return interaction.editReply({content:'No registration found. Run `/register` to get started.'});
+    const {wallet, verified, verified_at} = row.rows[0];
+    return interaction.editReply({content:[
+      `**Your Registration**`,
+      `🔗 Wallet: \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``,
+      `✅ Verified: ${verified ? `Yes (${new Date(verified_at).toLocaleDateString()})` : 'No — run `/verify` to complete'}`,
+    ].join('\n')});
+  }catch(e){
+    return interaction.editReply({content:'❌ Could not fetch registration.'});
+  }
+}
+
 });
 
 // ── Welcome message on server join ────────────────────────────────────────────
