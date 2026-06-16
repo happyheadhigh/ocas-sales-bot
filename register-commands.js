@@ -157,6 +157,33 @@ const commands = [
 
   new SlashCommandBuilder().setName('verifydashboard')
     .setDescription('View verification stats and role breakdown for this server (Admin only)'),
+
+  new SlashCommandBuilder().setName('setupverification')
+    .setDescription('Setup a wallet verification panel in a channel (Admin only)')
+    .addChannelOption(o=>o.setName('channel').setDescription('Channel to post the verification panel').setRequired(true))
+    .addRoleOption(o=>o.setName('role').setDescription('Role to assign after verification').setRequired(false))
+    .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum OCAS tokens required (0 = any wallet)').setRequired(false).setMinValue(0))
+    .addStringOption(o=>o.setName('message').setDescription('Custom welcome message for the panel').setRequired(false)),
+
+  new SlashCommandBuilder().setName('setuptraitrole')
+    .setDescription('Assign a role to holders of a specific trait or token count (Admin only)')
+    .addStringOption(o=>o.setName('trait_type').setDescription('Trait category e.g. Type, Hat Hair — or "Collection" for total count').setRequired(true))
+    .addStringOption(o=>o.setName('trait_value').setDescription('Trait value e.g. Zombie, Mohawk Blonde — or "OCAS" for total count').setRequired(true))
+    .addRoleOption(o=>o.setName('role').setDescription('Role to assign').setRequired(true))
+    .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum tokens with this trait (default 1). Use 5 for King Ape, 20 for Collector etc').setRequired(false).setMinValue(1)),
+
+  new SlashCommandBuilder().setName('removetraitrole')
+    .setDescription('Remove a trait role mapping (Admin only)')
+    .addStringOption(o=>o.setName('trait_type').setDescription('Trait category').setRequired(true))
+    .addStringOption(o=>o.setName('trait_value').setDescription('Trait value').setRequired(true))
+    .addRoleOption(o=>o.setName('role').setDescription('Role to remove').setRequired(true)),
+
+  new SlashCommandBuilder().setName('listtraitroles')
+    .setDescription('List all trait role mappings for this server'),
+
+  new SlashCommandBuilder().setName('synctraits')
+    .setDescription('Manually sync trait roles for all verified members now (Admin only)'),
+
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){

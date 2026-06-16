@@ -255,6 +255,140 @@ function buildBurnLotteryEntryPageComponents(lotteryId, page, totalPages, live=f
   )];
 }
 
+
+// ── Recursive string search ─────────────────────────────────────────────────
+function collectStringsDeep(obj, out=[]){
+  if(obj == null) return out;
+  if(typeof obj === 'string'){ out.push(obj); return out; }
+  if(Array.isArray(obj)){ for(const item of obj) collectStringsDeep(item, out); return out; }
+  if(typeof obj === 'object'){ for(const val of Object.values(obj)) collectStringsDeep(val, out); }
+  return out;
+}
+
+// ── Trait role sync ─────────────────────────────────────────────────────────
+async function syncTraitRoles(guild, discordId, wallet){
+  try{
+    // Get all trait roles configured for this guild
+    const traitRolesRes = await pgPool.query(
+      'SELECT trait_type, trait_value, role_id FROM trait_roles WHERE guild_id=$1',
+      [guild.id]
+    );
+    if(!traitRolesRes.rows.length) return; // No trait roles configured
+
+    // Get all OCAS tokens owned by this wallet from our token_traits table
+    // Join with nft_transfers or use token_traits directly keyed by owner
+    // token_traits has: token_id, trait_type, trait_value
+    // We need to know which tokens this wallet owns
+    // Use OpenSea NFT ownership endpoint for the collection
+    const osRes = await fetch(
+      `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?collection=on-chain-all-stars&limit=200`,
+      { headers: osHeaders() }
+    );
+    if(!osRes.ok){
+      console.error('[TraitSync] OpenSea NFT fetch failed:', osRes.status);
+      return;
+    }
+    const osData = await osRes.json();
+    const ownedTokenIds = (osData.nfts||[]).map(n => parseInt(n.identifier)).filter(Boolean);
+
+    if(!ownedTokenIds.length){
+      // No OCAS tokens — remove all trait roles
+      const member = await guild.members.fetch(discordId).catch(()=>null);
+      if(!member) return;
+      for(const tr of traitRolesRes.rows){
+        if(member.roles.cache.has(tr.role_id))
+          await member.roles.remove(tr.role_id).catch(()=>{});
+      }
+      return;
+    }
+
+    // Get trait counts for owned tokens from our DB
+    const traitsRes = await pgPool.query(
+      'SELECT trait_type, trait_value, COUNT(*) as count FROM token_traits WHERE token_id = ANY($1::int[]) GROUP BY trait_type, trait_value',
+      [ownedTokenIds]
+    );
+    // Build a count map: 'Type::Zombie' -> 3
+    const traitCounts = {};
+    for(const r of traitsRes.rows)
+      traitCounts[r.trait_type+'::'+r.trait_value] = parseInt(r.count);
+    // Also store total OCAS count for collection-wide rules
+    traitCounts['Collection::OCAS'] = ownedTokenIds.length;
+
+    // Fetch the member
+    const member = await guild.members.fetch(discordId).catch(()=>null);
+    if(!member) return;
+
+    // Add/remove roles based on trait count vs minimum_count threshold
+    for(const tr of traitRolesRes.rows){
+      const hasRole    = member.roles.cache.has(tr.role_id);
+      const count      = traitCounts[tr.trait_type+'::'+tr.trait_value] || 0;
+      const meetsMin   = count >= (tr.minimum_count || 1);
+      if(meetsMin && !hasRole)  await member.roles.add(tr.role_id).catch(()=>{});
+      if(!meetsMin && hasRole)  await member.roles.remove(tr.role_id).catch(()=>{});
+    }
+
+    // Also assign verification panel role if configured
+    const panel = await pgPool.query(
+      'SELECT role_id FROM verification_panels WHERE guild_id=$1',
+      [guild.id]
+    );
+    if(panel.rows.length && panel.rows[0].role_id && !member.roles.cache.has(panel.rows[0].role_id))
+      await member.roles.add(panel.rows[0].role_id).catch(()=>{});
+
+    console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', ownedTokenIds.length, '| traits:', ownedTraits.size);
+  }catch(e){
+    console.error('[TraitSync] Error:', e.message);
+  }
+}
+
+// ── 24hr trait role sync job ──────────────────────────────────────────────────
+async function runDailyTraitSync(){
+  console.log('[TraitSync] Starting daily sync...');
+  try{
+    // Get all verified registrations
+    const regs = await pgPool.query(
+      'SELECT discord_id, guild_id, wallet FROM user_registrations WHERE verified=true'
+    );
+    for(const reg of regs.rows){
+      const guild = client.guilds.cache.get(reg.guild_id);
+      if(!guild) continue;
+      await syncTraitRoles(guild, reg.discord_id, reg.wallet);
+      await new Promise(r=>setTimeout(r, 500)); // Rate limit buffer
+    }
+    console.log('[TraitSync] Daily sync complete —', regs.rows.length, 'wallets synced');
+  }catch(e){
+    console.error('[TraitSync] Daily sync error:', e.message);
+  }
+}
+
+// ── Discord winner ping lookup ──────────────────────────────────────────────
+async function lookupDiscordPing(wallet){
+  if(!wallet) return null;
+  try{
+    const r = await pgPool.query(
+      `SELECT discord_id FROM user_registrations WHERE wallet=$1 AND verified=true`,
+      [wallet.toLowerCase()]
+    );
+    return r.rows.length ? `<@${r.rows[0].discord_id}>` : null;
+  }catch(_){ return null; }
+}
+
+// ── Role conflict detection ──────────────────────────────────────────────────
+async function checkRoleConflict(guild, roleId){
+  try{
+    const role = await guild.roles.fetch(roleId);
+    if(!role) return null;
+    if(role.managed) return 'Role is managed by an external integration.';
+    const logs = await guild.fetchAuditLogs({ type:30, limit:5 }).catch(()=>null);
+    if(logs){
+      const entry = logs.entries.find(e => e.target?.id === roleId);
+      if(entry && entry.executor?.bot && entry.executor.id !== guild.members.me?.id)
+        return 'Role was last modified by another bot. This can cause role flickering.';
+    }
+    return null;
+  }catch(_){ return null; }
+}
+
 client.on('interactionCreate', async (interaction)=>{
 
   // ── Wallet verification button ────────────────────────────────────────────
@@ -289,7 +423,9 @@ client.on('interactionCreate', async (interaction)=>{
         if(osRes.status===404) return interaction.editReply({content:'❌ No OpenSea account found for that wallet.', components:[]});
         return interaction.editReply({content:`❌ OpenSea error (${osRes.status}). Try again.`, components:[]});
       }
-      const bio = (await osRes.json()).bio || '';
+      const _profile = await osRes.json();
+      console.log('[Verify] OpenSea username:', _profile.username);
+      const bio = _profile.username || '';
       if(!bio.includes(code))
         return interaction.editReply({content:`❌ Code not found in bio yet.\n\nMake sure https://opensea.io/${wallet} bio contains:\n\`\`\`${code}\`\`\`\nSave then click again.`, components:[interaction.message.components[0]]});
       await pgPool.query(
@@ -901,6 +1037,140 @@ client.on('interactionCreate', async (interaction)=>{
   if(LOTTERY_COMMANDS.has(commandName)) return handleLotteryCommand(commandName, ctx);
   if(SETUP_COMMANDS.has(commandName))    return handleSetupCommand(interaction, ctx);
   if(MISC_COMMANDS.has(commandName))    return handleMiscCommand(commandName, ctx);
+  // ── /setuptraitrole ──────────────────────────────────────────────────────────
+  if(commandName==='setuptraitrole'){
+    await interaction.deferReply({ephemeral:true});
+    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+      return interaction.editReply({content:'❌ You need Manage Server permission.'});
+    const traitType  = interaction.options.getString('trait_type');
+    const traitValue = interaction.options.getString('trait_value');
+    const role       = interaction.options.getRole('role');
+    const minCount   = interaction.options.getInteger('minimum') ?? 1;
+    const guildId    = interaction.guildId;
+    try{
+      await pgPool.query(
+        'INSERT INTO trait_roles (guild_id,trait_type,trait_value,role_id,minimum_count) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (guild_id,trait_type,trait_value,role_id,minimum_count) DO NOTHING',
+        [guildId, traitType, traitValue, role.id, minCount]
+      );
+      const minStr = minCount > 1 ? ' (minimum '+minCount+')' : '';
+      return interaction.editReply({content:'✅ Trait role set: holders of **'+minCount+'+ '+traitType+': '+traitValue+'** will receive <@&'+role.id+'>'});
+    }catch(e){
+      console.error('[SetupTraitRole]', e.message);
+      return interaction.editReply({content:'❌ Failed to set trait role.'});
+    }
+  }
+
+  // ── /removetraitrole ─────────────────────────────────────────────────────────
+  if(commandName==='removetraitrole'){
+    await interaction.deferReply({ephemeral:true});
+    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+      return interaction.editReply({content:'❌ You need Manage Server permission.'});
+    const traitType  = interaction.options.getString('trait_type');
+    const traitValue = interaction.options.getString('trait_value');
+    const role       = interaction.options.getRole('role');
+    const guildId    = interaction.guildId;
+    try{
+      await pgPool.query(
+        'DELETE FROM trait_roles WHERE guild_id=$1 AND trait_type=$2 AND trait_value=$3 AND role_id=$4',
+        [guildId, traitType, traitValue, role.id]
+      );
+      return interaction.editReply({content:'✅ Trait role removed: **'+traitType+': '+traitValue+'** → <@&'+role.id+'>'});
+    }catch(e){
+      return interaction.editReply({content:'❌ Failed to remove trait role.'});
+    }
+  }
+
+  // ── /listtraitroles ──────────────────────────────────────────────────────────
+  if(commandName==='listtraitroles'){
+    await interaction.deferReply({ephemeral:true});
+    const guildId = interaction.guildId;
+    try{
+      const res = await pgPool.query(
+        'SELECT trait_type, trait_value, role_id FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
+        [guildId]
+      );
+      if(!res.rows.length)
+        return interaction.editReply({content:'No trait roles configured. Use `/setuptraitrole` to add one.'});
+      const lines = res.rows.map(r => '• **'+(r.minimum_count>1?r.minimum_count+'+ ':'')+r.trait_type+': '+r.trait_value+'** → <@&'+r.role_id+'>');
+      return interaction.editReply({content:'**Trait Roles**\n'+lines.join('\n')});
+    }catch(e){
+      return interaction.editReply({content:'❌ Failed to fetch trait roles.'});
+    }
+  }
+
+  // ── /synctraits (manual trigger) ─────────────────────────────────────────────
+  if(commandName==='synctraits'){
+    await interaction.deferReply({ephemeral:true});
+    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+      return interaction.editReply({content:'❌ You need Manage Server permission.'});
+    await interaction.editReply({content:'⏳ Syncing trait roles for all verified members... This may take a moment.'});
+    const guildId = interaction.guildId;
+    try{
+      const regs = await pgPool.query(
+        'SELECT discord_id, wallet FROM user_registrations WHERE guild_id=$1 AND verified=true',
+        [guildId]
+      );
+      for(const reg of regs.rows){
+        await syncTraitRoles(interaction.guild, reg.discord_id, reg.wallet);
+        await new Promise(r=>setTimeout(r,500));
+      }
+      return interaction.editReply({content:'✅ Trait roles synced for '+regs.rows.length+' verified member'+(regs.rows.length!==1?'s':'')+'.'});
+    }catch(e){
+      console.error('[SyncTraits]', e.message);
+      return interaction.editReply({content:'❌ Sync failed: '+e.message});
+    }
+  }
+
+  if(commandName==='setupverification'){
+    await interaction.deferReply({ephemeral:true});
+    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+      return interaction.editReply({content:'❌ You need Manage Server permission.'});
+    const svChannel  = interaction.options.getChannel('channel');
+    const svRole     = interaction.options.getRole('role');
+    const svMin      = interaction.options.getInteger('minimum') ?? 0;
+    const svWelcome  = interaction.options.getString('message') || 'Verify your wallet to get access.';
+    const svGuildId  = interaction.guildId;
+    try{
+      const svEmbed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('Wallet Verification')
+        .setDescription(svWelcome + (svMin > 0 ? '\n\nRequires: **'+svMin+'+ OCAS token'+(svMin>1?'s':'')+'**' : ''))
+        .setFooter({text:'Click the button below to get started'});
+      const svBtn = new ButtonBuilder()
+        .setCustomId('start_verification:'+svGuildId)
+        .setLabel('Start Verification')
+        .setStyle(ButtonStyle.Primary)
+        .setEmoji('🔗');
+      const svMsg = await svChannel.send({embeds:[svEmbed], components:[new ActionRowBuilder().addComponents(svBtn)]});
+      await pgPool.query(
+        'INSERT INTO verification_panels (guild_id,channel_id,role_id,min_tokens,message_id,welcome_text) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (guild_id) DO UPDATE SET channel_id=$2,role_id=$3,min_tokens=$4,message_id=$5,welcome_text=$6',
+        [svGuildId, svChannel.id, svRole?.id||null, svMin, svMsg.id, svWelcome]
+      );
+      const roleStr = svRole ? '. Members get <@&'+svRole.id+'> after verifying.' : '.';
+      return interaction.editReply({content:'✅ Verification panel posted in <#'+svChannel.id+'>'+roleStr});
+    }catch(e){
+      console.error('[SetupVerification]', e.message);
+      return interaction.editReply({content:'❌ Failed — check I have permission to post in that channel.'});
+    }
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
+    await interaction.deferReply({ephemeral:true});
+    const svGuild  = interaction.guildId;
+    const svUser   = interaction.user.id;
+    try{
+      const svEx = await pgPool.query(
+        'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true',
+        [svUser, svGuild]
+      );
+      if(svEx.rows.length){
+        const w = svEx.rows[0].wallet;
+        return interaction.editReply({content:'✅ Already verified! Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+      }
+    }catch(_){}
+    return interaction.editReply({content:'**Wallet Verification**\n\nRun `/register wallet:0x...` to begin. The bot will walk you through the steps.'});
+  }
+
     if(DOWNLOAD_COMMANDS.has(commandName)) return handleDownloadCommand(interaction);
 });
 
@@ -1056,6 +1326,7 @@ client.once('clientReady', async ()=>{
   setInterval(processDueBurnLotteries, 60_000);
   processDueGenericLotteries();
   setInterval(processDueGenericLotteries, 15_000);
+  setTimeout(()=>{ runDailyTraitSync(); setInterval(runDailyTraitSync, 24*60*60*1000); }, 5*60*1000);
 });
 
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
