@@ -267,26 +267,26 @@ if(commandName === 'verifydashboard'){
       : '—';
 
     const traitRolesRes = await pgPool.query(
-      `SELECT tr.role_id, tr.trait_type, tr.trait_value, tr.minimum_count,
-              COUNT(ur.discord_id) as member_count
-       FROM trait_roles tr
-       LEFT JOIN user_registrations ur ON ur.guild_id=tr.guild_id AND ur.verified=true
-       WHERE tr.guild_id=$1
-       GROUP BY tr.role_id, tr.trait_type, tr.trait_value, tr.minimum_count
-       ORDER BY member_count DESC`,
+      `SELECT role_id, trait_type, trait_value, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value`,
       [guildId]
     );
-
     const panelRes = await pgPool.query(
       `SELECT role_id FROM verification_panels WHERE guild_id=$1`, [guildId]
     );
     const holderRoleId = panelRes.rows[0]?.role_id;
 
+    // Live Discord role member counts — fetch all members first to populate cache
+    await interaction.guild.members.fetch();
     let rolesDisplay = '';
-    if(holderRoleId) rolesDisplay += '<@&'+holderRoleId+'> — '+verifiedCount+'\n';
+    if(holderRoleId){
+      const holderRole = interaction.guild.roles.cache.get(holderRoleId);
+      rolesDisplay += '<@&'+holderRoleId+'> — '+(holderRole?.members.size??0)+'\n';
+    }
     for(const tr of traitRolesRes.rows){
+      const role  = interaction.guild.roles.cache.get(tr.role_id);
+      const count = role?.members.size ?? 0;
       const label = tr.minimum_count > 1 ? tr.minimum_count+'+ '+tr.trait_value : tr.trait_value;
-      rolesDisplay += '<@&'+tr.role_id+'> ('+label+') — '+tr.member_count+'\n';
+      rolesDisplay += '<@&'+tr.role_id+'> ('+label+') — '+count+'\n';
     }
     if(!rolesDisplay) rolesDisplay = '*No trait roles configured*';
 
@@ -302,7 +302,7 @@ if(commandName === 'verifydashboard'){
         { name:'🎭 Roles Assigned',   value:rolesDisplay,            inline:false },
         { name:'🕐 Last Verification',value:lastVerified,            inline:false },
       )
-      .setFooter({ text:'Only visible to you • Run /synctraits to update roles' })
+      .setFooter({ text:'Only visible to you • Role counts are live from Discord' })
       .setTimestamp();
 
     return interaction.editReply({ embeds:[embed] });

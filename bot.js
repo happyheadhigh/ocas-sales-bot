@@ -103,7 +103,10 @@ const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
 const { handleDownloadCommand, DOWNLOAD_COMMANDS } = require('./commands/download');
 
 // ── Discord client ────────────────────────────────────────────────────────────
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMembers,  // needed for guildMemberRemove and members.fetch()
+] });
 setClient(client); // inject into burn-poller
 setPollClient(client); // inject into poll
 
