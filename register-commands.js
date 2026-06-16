@@ -123,10 +123,6 @@ const commands = [
     .setDescription('Link your wallet to your Discord for giveaways')
     .addStringOption(o=>o.setName('wallet').setDescription('Your Ethereum wallet address (0x...)').setRequired(true)),
 
-  new SlashCommandBuilder().setName('verify')
-    .setDescription('Verify wallet ownership via your OpenSea bio')
-    .addStringOption(o=>o.setName('wallet').setDescription('The wallet address you are verifying').setRequired(true)),
-
   new SlashCommandBuilder().setName('myregistration')
     .setDescription('Show your current wallet registration status'),
 
@@ -159,6 +155,7 @@ const commands = [
     .setDescription('List all trait role mappings for this server'),
 
 
+  new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)'),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){
