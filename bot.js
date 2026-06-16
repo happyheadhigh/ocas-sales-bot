@@ -3735,8 +3735,7 @@ client.on('interactionCreate', async (interaction)=>{
         `🔗 \`${wallet.slice(0,6)}...${wallet.slice(-4)}\` is now linked to <@${ownerId}>`,
         ``,
         `You can now change your OpenSea username back to normal.`,
-        `You'll be tagged automatically if you win a giveaway.`,
-      ].join('\n'), components:[]});
+              ].join('\n'), components:[]});
     }catch(e){
       console.error('[VerifyBtn]', e.message);
       return interaction.editReply({content:'❌ Verification failed. Please try again.', components:[interaction.message.components[0]]});
@@ -6452,10 +6451,10 @@ if(commandName==='register'){
       `**Step 1:** Go to your OpenSea profile:`,
       `https://opensea.io/${wallet}`,
       ``,
-      `**Step 2:** Edit your bio and add this code anywhere in it:`,
+      `**Step 2:** Temporarily add this code to your username:`,
       `\`\`\`${code}\`\`\``,
       ``,
-      `**Step 3:** Click the button below once your bio is saved.`,
+      `**Step 3:** Save your profile then click the button below.`,
       ``,
       `⏱ Expires in 30 minutes.`,
     ].join('\n'), components:[row]});
@@ -6522,8 +6521,7 @@ if(commandName==='verify'){
       `🔗 \`${wallet.slice(0,6)}...${wallet.slice(-4)}\` is now linked to <@${discordId}>`,
       ``,
       `You can now change your OpenSea username back to normal.`,
-      `You'll be tagged automatically if you win a giveaway.`,
-    ].join('\n')});
+          ].join('\n')});
   }catch(e){
     console.error('[Verify]', e.message);
     return interaction.editReply({content:'❌ Verification failed. Please try again.'});
