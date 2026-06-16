@@ -296,6 +296,20 @@ client.on('interactionCreate', async (interaction)=>{
         `INSERT INTO user_registrations (discord_id,wallet,verified,verified_at,updated_at) VALUES ($1,$2,true,NOW(),NOW()) ON CONFLICT (discord_id) DO UPDATE SET wallet=$2,verified=true,verified_at=NOW(),updated_at=NOW()`,
         [ownerId, wallet]
       );
+      // Check for role conflicts with other bots before assigning
+      try{
+        const panelR = await pgPool.query(`SELECT role_id FROM verification_panels WHERE guild_id=$1`,[interaction.guildId]);
+        if(panelR.rows[0]?.role_id){
+          const conflict = await checkRoleConflict(interaction.guild, panelR.rows[0].role_id);
+          if(conflict){
+            // Warn admin via bot-errors or just log — don't block the user
+            console.warn('[RoleConflict]', conflict);
+          } else {
+            const member = await interaction.guild.members.fetch(ownerId).catch(()=>null);
+            if(member) await member.roles.add(panelR.rows[0].role_id).catch(()=>{});
+          }
+        }
+      }catch(_){}
       await pgPool.query(`DELETE FROM verification_codes WHERE discord_id=$1`,[ownerId]);
       return interaction.editReply({content:`✅ **Wallet verified!**\n\n🔗 \`${wallet.slice(0,6)}...${wallet.slice(-4)}\` linked to <@${ownerId}>\n\nYou can remove the code from your OpenSea bio now.`, components:[]});
     }catch(e){
