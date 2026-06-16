@@ -244,17 +244,30 @@ pgPool.on('error', e => { console.error('[PG bot]', e.message); sendErrorWebhook
 // ── Create bot_state table if it doesn't exist ───────────────────────────────
 async function ensureBotStateTable(){
   await pgPool.query(`CREATE TABLE IF NOT EXISTS user_registrations (
-    discord_id  TEXT PRIMARY KEY,
-    wallet      TEXT UNIQUE,
-    verified    BOOLEAN DEFAULT false,
-    verified_at TIMESTAMPTZ,
-    updated_at  TIMESTAMPTZ DEFAULT NOW()
+    discord_id   TEXT NOT NULL,
+    guild_id     TEXT NOT NULL,
+    wallet       TEXT,
+    verified     BOOLEAN DEFAULT false,
+    verified_at  TIMESTAMPTZ,
+    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (discord_id, guild_id)
   )`);
   await pgPool.query(`CREATE TABLE IF NOT EXISTS verification_codes (
-    discord_id  TEXT PRIMARY KEY,
+    discord_id  TEXT NOT NULL,
+    guild_id    TEXT NOT NULL,
     wallet      TEXT,
     code        TEXT,
-    expires_at  TIMESTAMPTZ
+    expires_at  TIMESTAMPTZ,
+    PRIMARY KEY (discord_id, guild_id)
+  )`);
+  await pgPool.query(`CREATE TABLE IF NOT EXISTS verification_panels (
+    guild_id     TEXT PRIMARY KEY,
+    channel_id   TEXT,
+    role_id      TEXT,
+    min_tokens   INTEGER DEFAULT 0,
+    message_id   TEXT,
+    welcome_text TEXT,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
   )`);
 
   try{
@@ -3684,13 +3697,14 @@ client.on('interactionCreate', async (interaction)=>{
     const parts    = interaction.customId.split(':');
     const ownerId  = parts[1];
     const wallet   = parts[2];
+    const guildId  = interaction.guildId;
     if(interaction.user.id !== ownerId)
       return interaction.followUp({content:'❌ This verification is not for your account.', ephemeral:true});
 
     try{
       const codeRow = await pgPool.query(
-        `SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 AND wallet=$2`,
-        [ownerId, wallet]
+        `SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 AND guild_id=$2 AND wallet=$3`,
+        [ownerId, guildId, wallet]
       );
       if(!codeRow.rows.length)
         return interaction.editReply({content:'❌ No pending verification found. Run `/register` again.', components:[]});
@@ -3727,7 +3741,15 @@ client.on('interactionCreate', async (interaction)=>{
          ON CONFLICT (discord_id) DO UPDATE SET wallet=$2, verified=true, verified_at=NOW(), updated_at=NOW()`,
         [ownerId, wallet]
       );
-      await pgPool.query(`DELETE FROM verification_codes WHERE discord_id=$1`, [ownerId]);
+      await pgPool.query(`DELETE FROM verification_codes WHERE discord_id=$1 AND guild_id=$2`,[ownerId, guildId]);
+      // Auto-assign verified role if panel is configured
+      try{
+        const panel = await pgPool.query(`SELECT role_id FROM verification_panels WHERE guild_id=$1`,[guildId]);
+        if(panel.rows.length && panel.rows[0].role_id){
+          const member = await interaction.guild.members.fetch(ownerId).catch(()=>null);
+          if(member) await member.roles.add(panel.rows[0].role_id).catch(()=>{});
+        }
+      }catch(_){}
 
       return interaction.editReply({content:[
         `✅ **Wallet verified!**`,
@@ -6485,9 +6507,59 @@ if(commandName==='myregistration'){
   }
 }
 
+
+  if(commandName==='setupverification'){
+    await interaction.deferReply({ephemeral:true});
+    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+      return interaction.editReply({content:'❌ You need Manage Server permission.'});
+    const svChannel  = interaction.options.getChannel('channel');
+    const svRole     = interaction.options.getRole('role');
+    const svMin      = interaction.options.getInteger('minimum') ?? 0;
+    const svWelcome  = interaction.options.getString('message') || 'Verify your wallet to get access.';
+    const svGuildId  = interaction.guildId;
+    try{
+      const svEmbed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('Wallet Verification')
+        .setDescription(svWelcome + (svMin > 0 ? '\n\nRequires: **'+svMin+'+ OCAS token'+(svMin>1?'s':'')+'**' : ''))
+        .setFooter({text:'Click the button below to get started'});
+      const svBtn = new ButtonBuilder()
+        .setCustomId('start_verification:'+svGuildId)
+        .setLabel('Start Verification')
+        .setStyle(ButtonStyle.Primary)
+        .setEmoji('🔗');
+      const svMsg = await svChannel.send({embeds:[svEmbed], components:[new ActionRowBuilder().addComponents(svBtn)]});
+      await pgPool.query(
+        'INSERT INTO verification_panels (guild_id,channel_id,role_id,min_tokens,message_id,welcome_text) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (guild_id) DO UPDATE SET channel_id=$2,role_id=$3,min_tokens=$4,message_id=$5,welcome_text=$6',
+        [svGuildId, svChannel.id, svRole?.id||null, svMin, svMsg.id, svWelcome]
+      );
+      const roleStr = svRole ? '. Members get <@&'+svRole.id+'> after verifying.' : '.';
+      return interaction.editReply({content:'✅ Verification panel posted in <#'+svChannel.id+'>'+roleStr});
+    }catch(e){
+      console.error('[SetupVerification]', e.message);
+      return interaction.editReply({content:'❌ Failed — check I have permission to post in that channel.'});
+    }
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
+    await interaction.deferReply({ephemeral:true});
+    const svGuild  = interaction.guildId;
+    const svUser   = interaction.user.id;
+    try{
+      const svEx = await pgPool.query(
+        'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true',
+        [svUser, svGuild]
+      );
+      if(svEx.rows.length){
+        const w = svEx.rows[0].wallet;
+        return interaction.editReply({content:'✅ Already verified! Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+      }
+    }catch(_){}
+    return interaction.editReply({content:'**Wallet Verification**\n\nRun `/register wallet:0x...` to begin. The bot will walk you through the steps.'});
+  }
+
 });
 
-// ── Welcome message on server join ────────────────────────────────────────────
 client.on('guildCreate', async (guild)=>{
   try{
     // Send welcome DM to server owner only — keeps it private and targeted
@@ -6641,4 +6713,5 @@ client.once('clientReady', async ()=>{
 
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
+
 client.login(DISCORD_TOKEN);

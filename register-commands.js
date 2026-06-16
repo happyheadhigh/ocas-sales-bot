@@ -148,6 +148,13 @@ const commands = [
   new SlashCommandBuilder().setName('myregistration')
     .setDescription('Show your current wallet registration status'),
 
+
+  new SlashCommandBuilder().setName('setupverification')
+    .setDescription('Setup a wallet verification panel in a channel (Admin only)')
+    .addChannelOption(o=>o.setName('channel').setDescription('Channel to post the verification panel in').setRequired(true))
+    .addRoleOption(o=>o.setName('role').setDescription('Role to assign after verification').setRequired(false))
+    .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum OCAS tokens required (0 = any wallet)').setRequired(false).setMinValue(0))
+    .addStringOption(o=>o.setName('message').setDescription('Custom welcome message for the panel').setRequired(false)),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){
