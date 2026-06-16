@@ -3705,11 +3705,11 @@ client.on('interactionCreate', async (interaction)=>{
       const bio = Object.values(_profile).filter(v => typeof v === 'string').join(' ');
       if(!bio.includes(code))
         return interaction.editReply({content:[
-          `❌ Code not found in your bio yet.`,
+          `❌ Code not detected yet — OpenSea's API can take **5–15 minutes** to reflect bio changes.`,
           ``,
-          `Make sure your bio at https://opensea.io/${wallet} contains:`,
+          `Your bio should contain:`,
           `\`\`\`${code}\`\`\``,
-          `Save your profile then click the button again.`,
+          `If your bio is already saved at https://opensea.io/${wallet}, just wait a few minutes and click the button again. No need to re-register.`,
         ].join('\n'), components:[interaction.message.components[0]]});
 
       await pgPool.query(
