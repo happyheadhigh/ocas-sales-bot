@@ -153,6 +153,7 @@ const commands = [
 
 
   new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)'),
+  new SlashCommandBuilder().setName('config').setDescription('Configure your bot — collections, channels, roles (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){
