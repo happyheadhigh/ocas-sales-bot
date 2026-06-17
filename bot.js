@@ -409,7 +409,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   // ── start_verification wallet modal submit ────────────────────────────────────
   if(interaction.isModalSubmit() && interaction.customId.startsWith('sv_modal:username:')){
-    await interaction.deferReply({ephemeral:true});
+    await interaction.deferReply({flags:64});
     const discordId  = interaction.user.id;
     const guildId    = interaction.guildId;
     const osUsername = (interaction.fields.getTextInputValue('os_username')||'').trim();
@@ -421,11 +421,14 @@ client.on('interactionCreate', async (interaction)=>{
     let codeRow;
     try{
       const r = await pgPool.query(
-        'SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 AND guild_id=$2',
-        [discordId, guildId]
+        'SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 ORDER BY expires_at DESC LIMIT 1',
+        [discordId]
       );
       codeRow = r.rows[0];
-    }catch(e){ return interaction.editReply({content:'❌ DB error. Try again.'}); }
+    }catch(e){
+      console.error('[SVModal] DB lookup error:', e.message);
+      return interaction.editReply({content:'❌ DB error. Please try again.'});
+    }
 
     if(!codeRow) return interaction.editReply({content:'❌ No pending verification. Click Verify Wallet again.'});
     if(new Date() > new Date(codeRow.expires_at))
@@ -641,7 +644,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   if(interaction.isButton() && interaction.customId.startsWith('verify_wallet:')){
     // Legacy handler — new flow uses sv_modal:username: directly
-    return interaction.reply({ephemeral:true, content:'Please click Verify Wallet again to use the updated flow.'});
+    return interaction.reply({flags:64, content:'Please click Verify Wallet again to use the updated flow.'});
   }
 
   if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
@@ -655,7 +658,7 @@ client.on('interactionCreate', async (interaction)=>{
       );
       if(svEx.rows.length){
         const w = svEx.rows[0].wallet;
-        await interaction.reply({ephemeral:true, content:'✅ Already verified!\n🔗 Primary wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+        await interaction.reply({flags:64, content:'✅ Already verified!\n🔗 Primary wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
         return;
       }
     }catch(_){}
@@ -697,7 +700,7 @@ client.on('interactionCreate', async (interaction)=>{
       .setCustomId('sv_done:'+svGuild)
       .setLabel("✅ I've Added It")
       .setStyle(ButtonStyle.Success);
-    return interaction.reply({ephemeral:true, embeds:[codeEmbed], components:[new ActionRowBuilder().addComponents(copyBtn, doneBtn)]});
+    return interaction.reply({flags:64, embeds:[codeEmbed], components:[new ActionRowBuilder().addComponents(copyBtn, doneBtn)]});
   }
 
   // ── Copy Code button — sends plain ephemeral followUp (tap-to-copy on mobile) ──
@@ -710,15 +713,15 @@ client.on('interactionCreate', async (interaction)=>{
         [discordId]
       );
       const code = r.rows[0]?.code || '(expired — click Verify Wallet again)';
-      return interaction.reply({ephemeral:true, content:'```'+code+'```'});
+      return interaction.reply({flags:64, content:'```'+code+'```'});
     }catch(_){
-      return interaction.reply({ephemeral:true, content:'❌ Could not retrieve code. Try again.'});
+      return interaction.reply({flags:64, content:'❌ Could not retrieve code. Try again.'});
     }
   }
 
   // ── I've Added It — bot searches OpenSea for the code ────────────────────────
   if(interaction.isButton() && interaction.customId.startsWith('sv_done:')){
-    await interaction.deferReply({ephemeral:true});
+    await interaction.deferReply({flags:64});
     const svGuild   = interaction.customId.split(':')[1];
     const discordId = interaction.user.id;
 
@@ -1454,7 +1457,7 @@ client.on('interactionCreate', async (interaction)=>{
   if(MISC_COMMANDS.has(commandName))    return handleMiscCommand(commandName, ctx);
   // ── /setuptraitrole ──────────────────────────────────────────────────────────
   if(commandName==='setuptraitrole'){
-    await interaction.deferReply({ephemeral:true});
+    await interaction.deferReply({flags:64});
     if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
       return interaction.editReply({content:'❌ You need Manage Server permission.'});
     const traitType  = interaction.options.getString('trait_type');
@@ -1477,7 +1480,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   // ── /removetraitrole ─────────────────────────────────────────────────────────
   if(commandName==='removetraitrole'){
-    await interaction.deferReply({ephemeral:true});
+    await interaction.deferReply({flags:64});
     if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
       return interaction.editReply({content:'❌ You need Manage Server permission.'});
     const traitType  = interaction.options.getString('trait_type');
@@ -1497,7 +1500,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   // ── /listtraitroles ──────────────────────────────────────────────────────────
   if(commandName==='listtraitroles'){
-    await interaction.deferReply({ephemeral:true});
+    await interaction.deferReply({flags:64});
     const guildId = interaction.guildId;
     try{
       const res = await pgPool.query(
@@ -1515,7 +1518,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   // ── /synctraits (manual trigger) ─────────────────────────────────────────────
   if(commandName==='synctraits'){
-    await interaction.deferReply({ephemeral:true});
+    await interaction.deferReply({flags:64});
     if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
       return interaction.editReply({content:'❌ You need Manage Server permission.'});
     await interaction.editReply({content:'⏳ Syncing trait roles for all verified members... This may take a moment.'});
@@ -1537,7 +1540,7 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   if(commandName==='setupverification'){
-    await interaction.deferReply({ephemeral:true});
+    await interaction.deferReply({flags:64});
     if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
       return interaction.editReply({content:'❌ You need Manage Server permission.'});
     const svChannel  = interaction.options.getChannel('channel');
@@ -1731,6 +1734,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
