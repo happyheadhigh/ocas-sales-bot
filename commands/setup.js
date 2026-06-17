@@ -327,7 +327,18 @@ async function handleSetupButton(interaction, ctx){
     if(step === 4){ const v = !!(state.config.verifyChannel && state.config.verifyRole); return interaction.editReply({ embeds:[buildVerificationEmbed(state)], components:verificationRow(v) }); }
     if(step === 5) return interaction.editReply({ embeds:[buildTraitRolesEmbed(state)], components:traitRolesRow(state) });
     if(step === 6){
-      try{ await setConfig(guildId, { ...state.config }); }catch(e){ console.error('[Setup] Save error:', e.message); }
+      try{
+        const sc = state.config;
+        // Normalize field names: wizard uses salesChannel/listingsChannel
+        // poll.js uses channelId/listingsChannelId — populate both
+        const merged = {
+          ...sc,
+          channelId:         sc.salesChannel    || sc.channelId,
+          listingsChannelId: sc.listingsChannel || sc.listingsChannelId,
+          slug:              sc.collectionSlug  || sc.slug,
+        };
+        await setConfig(guildId, merged);
+      }catch(e){ console.error('[Setup] Save error:', e.message); }
       await clearWizardState(guildId, pgPool);
       return interaction.editReply({ embeds:[buildSummaryEmbed(state, interaction.guild)], components:[summaryRow()] });
     }
@@ -516,7 +527,11 @@ async function handleSetupButton(interaction, ctx){
     await saveState(guildId, state, pgPool);
     const isOcas = state.config.contract?.toLowerCase() === OCAS_CONTRACT;
     if(nextStep === 6){
-      try{ await setConfig(guildId, { ...state.config }); }catch(_){}
+      try{
+        const sc = state.config;
+        const merged = { ...sc, channelId: sc.salesChannel||sc.channelId, listingsChannelId: sc.listingsChannel||sc.listingsChannelId, slug: sc.collectionSlug||sc.slug };
+        await setConfig(guildId, merged);
+      }catch(_){}
       await clearWizardState(guildId, pgPool);
       return interaction.editReply({ embeds:[buildSummaryEmbed(state, interaction.guild)], components:[summaryRow()] });
     }
@@ -589,6 +604,7 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 

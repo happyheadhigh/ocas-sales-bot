@@ -28,8 +28,8 @@ function buildDashboardEmbed(cfg, traitRoles){
     .setDescription(
       SEP + '\n\n' +
       `📦 **Collections:** ${(cfg.collections||[]).length + (cfg.contract?1:0)} configured ${ok(cfg.contract||((cfg.collections||[]).length>0))}\n` +
-      `🟢 **Sales:** ${ch(cfg.salesChannel)} ${ok(cfg.salesChannel)}\n` +
-      `📋 **Listings:** ${ch(cfg.listingsChannel)} ${ok(cfg.listingsChannel)}\n` +
+      `🟢 **Sales:** ${ch(cfg.salesChannel||cfg.channelId)} ${ok(cfg.salesChannel||cfg.channelId)}\n` +
+      `📋 **Listings:** ${ch(cfg.listingsChannel||cfg.listingsChannelId)} ${ok(cfg.listingsChannel||cfg.listingsChannelId)}\n` +
       (isOcas ? `🔥 **Burn Alerts:** ${ch(cfg.burnChannel)} ${ok(cfg.burnChannel)}\n` : '') +
       `📌 **Verification:** ${ch(cfg.verifyChannel)} ${ok(cfg.verifyChannel)}\n` +
       `✅ **Verified Role:** ${rol(cfg.verifyRole)} ${ok(cfg.verifyRole)}\n` +
@@ -57,10 +57,10 @@ function buildCollectionsEmbed(cfg){
   const extras = cfg.collections || [];
   const primary = cfg.contract ? {
     name: cfg.contractName || 'Primary Collection',
-    slug: cfg.collectionSlug || '—',
+    slug: cfg.collectionSlug || cfg.slug || '—',
     contract: cfg.contract,
-    salesChannel: cfg.channelId,
-    listingsChannel: cfg.listingsChannelId,
+    salesChannel: cfg.salesChannel || cfg.channelId,
+    listingsChannel: cfg.listingsChannel || cfg.listingsChannelId,
     isOcas: cfg.contract?.toLowerCase() === OCAS_CONTRACT,
   } : null;
 
@@ -157,8 +157,8 @@ function buildChannelsEmbed(cfg){
     .setTitle('📡 Alert Channels')
     .setDescription(
       SEP + '\n\n' +
-      `🟢 **Sales:** ${ch(cfg.salesChannel)} ${ok(cfg.salesChannel)}\n` +
-      `📋 **Listings:** ${ch(cfg.listingsChannel)} ${ok(cfg.listingsChannel)}\n` +
+      `🟢 **Sales:** ${ch(cfg.salesChannel||cfg.channelId)} ${ok(cfg.salesChannel||cfg.channelId)}\n` +
+      `📋 **Listings:** ${ch(cfg.listingsChannel||cfg.listingsChannelId)} ${ok(cfg.listingsChannel||cfg.listingsChannelId)}\n` +
       (isOcas ? `🔥 **Burn Alerts:** ${ch(cfg.burnChannel)} ${ok(cfg.burnChannel)}\n` : '') +
       '\n*Click a button to change that channel.\nLeave a channel unset to disable those alerts.*'
     )
@@ -673,6 +673,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
