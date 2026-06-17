@@ -106,23 +106,25 @@ function buildVerificationEmbed(state){
 }
 
 function buildTraitRolesEmbed(state){
-  const cfg = state.config;
-  const count = (cfg.traitRoles || []).length;
-
   return new EmbedBuilder()
     .setColor(0x5865F2)
-    .setTitle('🎭 Trait Roles')
+    .setTitle('🎭 Trait Roles — Advanced Role Assignment')
     .setDescription(
       stepBar(4, 5) + '\n' +
       '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' +
-      'Assign roles automatically based on token traits\n' +
-      'or how many tokens a member holds.\n\n' +
+      'Beyond the Holder role, you can create **trait-specific roles** that are\n' +
+      'automatically assigned based on what tokens a member holds.\n\n' +
+      '**How it works:**\n' +
+      '→ Member verifies their wallet\n' +
+      '→ Bot scans their tokens and traits\n' +
+      '→ Matching roles are assigned instantly — no manual work\n\n' +
       '**Examples:**\n' +
-      '• `Type: Zombie` → `@Zombie Holder`\n' +
-      '• `5+ Type: Ape` → `@King Ape`\n' +
-      '• `20+ Collection: Any` → `@Collector`\n\n' +
-      `**Configured:** ${count} trait role${count !== 1 ? 's' : ''}\n\n` +
-      '*Use `/setuptraitrole` after setup to add more.*'
+      '• Own a Zombie → get `@Zombie Holder`\n' +
+      '• Own 5+ Apes → get `@King Ape`\n' +
+      '• Own 20+ tokens → get `@Whale`\n\n' +
+      '**To set up trait roles after this wizard:**\n' +
+      '> Use `/setuptraitrole` to map any trait or token count to a Discord role.\n' +
+      '> Roles are re-synced automatically every 24 hours.'
     )
     .setFooter({ text: 'Only visible to you' });
 }
@@ -138,18 +140,19 @@ function buildSummaryEmbed(state, guild){
     .setDescription(
       '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' +
       `**Collection:** ${isOcas ? 'OCAS 🔥' : (cfg.contractName || 'Custom')} ${tick(cfg.contract)}\n` +
-      `**Sales:** ${cfg.salesChannel ? `<#${cfg.salesChannel}>` : 'Not set'} ${tick(cfg.salesChannel)}\n` +
-      `**Listings:** ${cfg.listingsChannel ? `<#${cfg.listingsChannel}>` : 'Not set'} ${tick(cfg.listingsChannel)}\n` +
+      `**Sales Channel:** ${cfg.salesChannel ? `<#${cfg.salesChannel}>` : 'Not set'} ${tick(cfg.salesChannel)}\n` +
+      `**Listings Channel:** ${cfg.listingsChannel ? `<#${cfg.listingsChannel}>` : 'Not set'} ${tick(cfg.listingsChannel)}\n` +
       (isOcas ? `**Burn Alerts:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : 'Not set'} ${tick(cfg.burnChannel)}\n` : '') +
-      `**Verification:** ${cfg.verifyChannel ? `<#${cfg.verifyChannel}>` : 'Not set'} ${tick(cfg.verifyChannel)}\n` +
-      `**Holder Role:** ${cfg.holderRole ? `<@&${cfg.holderRole}>` : 'Not set'} ${tick(cfg.holderRole)}\n` +
-      `**Trait Roles:** ${(cfg.traitRoles||[]).length} configured\n\n` +
-      '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
-      '**Useful commands:**\n' +
-      '• `/setup` — return here anytime\n' +
-      '• `/setuptraitrole` — add trait roles\n' +
-      '• `/listtraitroles` — view trait roles\n' +
-      '• `/synctraits` — manually sync roles now'
+      `**Verification Channel:** ${cfg.verifyChannel ? `<#${cfg.verifyChannel}>` : 'Not set'} ${tick(cfg.verifyChannel)}\n` +
+      `**Verified Role:** ${cfg.verifyRole ? `<@&${cfg.verifyRole}>` : 'Not set'} ${tick(cfg.verifyRole)}\n` +
+      `**Holder Role:** ${cfg.holderRole ? `<@&${cfg.holderRole}>` : 'Not set — optional'} ${cfg.holderRole ? '✅' : '⚪'}\n` +
+      '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
+      '**What happens next:**\n' +
+      '→ Members verify in your verification channel\n' +
+      '→ Roles are assigned automatically\n' +
+      '→ Run `/setup` anytime to update settings\n' +
+      '→ Use `/setuptraitrole` to add trait-based roles\n' +
+      '→ Use `/synctraits` to manually re-sync all roles'
     )
     .setFooter({ text: 'Run /setup anytime to update settings' });
 }
@@ -185,7 +188,7 @@ function verificationRow(configured){
     new ButtonBuilder().setCustomId('setup:verify:channel').setLabel('📌 Set Channel').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('setup:verify:role').setLabel('✅ Verified Role').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('setup:verify:holderrole').setLabel('🏆 Holder Role').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('setup:verify:deploy').setLabel('🚀 Deploy Panel').setStyle(ButtonStyle.Primary).setDisabled(!configured),
+    new ButtonBuilder().setCustomId('setup:verify:deploy').setLabel('📨 Post to Channel').setStyle(ButtonStyle.Primary).setDisabled(!configured),
     new ButtonBuilder().setCustomId('setup:step:5').setLabel('Next →').setStyle(ButtonStyle.Success),
   );
 }
@@ -427,6 +430,7 @@ async function handleSetupModal(interaction, ctx){
 const SETUP_COMMANDS = new Set(['setup']);
 
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 

@@ -530,6 +530,42 @@ client.on('interactionCreate', async (interaction)=>{
       return interaction.editReply({content:'❌ Verification failed. Try again.', components:[interaction.message.components[0]]});
     }
   }
+
+  if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
+    const svGuild = interaction.guildId;
+    const svUser  = interaction.user.id;
+    // Check if already verified first
+    try{
+      const svEx = await pgPool.query(
+        'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true',
+        [svUser, svGuild]
+      );
+      if(svEx.rows.length){
+        const w = svEx.rows[0].wallet;
+        await interaction.reply({ephemeral:true, content:'✅ Already verified! Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+        return;
+      }
+    }catch(_){}
+    // Show wallet input modal — no slash command needed from member
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+    const svModal = new ModalBuilder()
+      .setCustomId('sv_modal:wallet:'+svGuild)
+      .setTitle('Wallet Verification');
+    svModal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('wallet_input')
+          .setLabel('Your Ethereum Wallet Address')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('0x...')
+          .setMinLength(42)
+          .setMaxLength(42)
+          .setRequired(true)
+      )
+    );
+    return interaction.showModal(svModal);
+  }
+
   if(interaction.isButton() && interaction.customId.startsWith('lottery_enter:')){
     const lotteryId=parseInt(interaction.customId.split(':')[1]);
     // deferReply immediately so Discord doesn't expire the interaction during DB work
@@ -1231,40 +1267,6 @@ client.on('interactionCreate', async (interaction)=>{
     }
   }
 
-  if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
-    const svGuild = interaction.guildId;
-    const svUser  = interaction.user.id;
-    // Check if already verified first
-    try{
-      const svEx = await pgPool.query(
-        'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true',
-        [svUser, svGuild]
-      );
-      if(svEx.rows.length){
-        const w = svEx.rows[0].wallet;
-        await interaction.reply({ephemeral:true, content:'✅ Already verified! Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
-        return;
-      }
-    }catch(_){}
-    // Show wallet input modal — no slash command needed from member
-    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-    const svModal = new ModalBuilder()
-      .setCustomId('sv_modal:wallet:'+svGuild)
-      .setTitle('Wallet Verification');
-    svModal.addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('wallet_input')
-          .setLabel('Your Ethereum Wallet Address')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('0x...')
-          .setMinLength(42)
-          .setMaxLength(42)
-          .setRequired(true)
-      )
-    );
-    return interaction.showModal(svModal);
-  }
 
     if(DOWNLOAD_COMMANDS.has(commandName)) return handleDownloadCommand(interaction);
 });
@@ -1427,3 +1429,4 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
