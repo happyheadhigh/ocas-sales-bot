@@ -335,6 +335,30 @@ async function handleSetupButton(interaction, ctx){
     }
   }
 
+  // ── channel / role select menus ──────────────────────────────────────────
+  if(customId.startsWith('setup_chsel:') || customId.startsWith('setup_rolesel:')){
+    await interaction.deferUpdate();
+    const type = customId.split(':')[1];
+    const isOcas = state.config.contract?.toLowerCase() === OCAS_CONTRACT;
+    if(customId.startsWith('setup_chsel:')){
+      const chId = interaction.values[0];
+      if(type === 'sales')    state.config.salesChannel    = chId;
+      if(type === 'listings') state.config.listingsChannel = chId;
+      if(type === 'burn')     state.config.burnChannel     = chId;
+      if(type === 'verify')   state.config.verifyChannel   = chId;
+      if(type === 'verify'){
+        const verified = state.config.verifyChannel && state.config.verifyRole;
+        return interaction.editReply({ content:null, embeds:[buildVerificationEmbed(state)], components:[verificationRow(verified)] });
+      }
+      return interaction.editReply({ content:null, embeds:[buildChannelsEmbed(state)], components:[channelsRow(isOcas)] });
+    }
+    if(customId.startsWith('setup_rolesel:')){
+      state.config.verifyRole = interaction.values[0];
+      const verified = state.config.verifyChannel && state.config.verifyRole;
+      return interaction.editReply({ content:null, embeds:[buildVerificationEmbed(state)], components:[verificationRow(verified)] });
+    }
+  }
+
   // ── close / skip ─────────────────────────────────────────────────────────
   if(customId === 'setup:close' || customId === 'setup:skip'){
     await interaction.deferUpdate();
@@ -369,33 +393,7 @@ async function handleSetupModal(interaction, ctx){
     });
   }
 
-  // ── channel inputs ────────────────────────────────────────────────────────
-  if(customId.startsWith('setup_chsel:')){
-    await interaction.deferUpdate();
-    const type = customId.split(':')[1];
-    const chId = interaction.values[0];
-    const gState = getState(guildId);
-    if(type === 'sales')    gState.config.salesChannel    = chId;
-    if(type === 'listings') gState.config.listingsChannel = chId;
-    if(type === 'burn')     gState.config.burnChannel     = chId;
-    if(type === 'verify')   gState.config.verifyChannel   = chId;
-    const isOcas = gState.config.contract?.toLowerCase() === OCAS_CONTRACT;
-    if(type === 'verify'){
-      const verified = gState.config.verifyChannel && gState.config.verifyRole;
-      return interaction.editReply({ content:null, embeds:[buildVerificationEmbed(gState)], components:[verificationRow(verified)] });
-    }
-    return interaction.editReply({ content:null, embeds:[buildChannelsEmbed(gState)], components:[channelsRow(isOcas)] });
-  }
-
-  // ── verification channel ──────────────────────────────────────────────────
-  if(customId === 'setup_rolesel:verify'){
-    await interaction.deferUpdate();
-    const gState = getState(guildId);
-    gState.config.verifyRole = interaction.values[0];
-    const verified = gState.config.verifyChannel && gState.config.verifyRole;
-    return interaction.editReply({ content:null, embeds:[buildVerificationEmbed(gState)], components:[verificationRow(verified)] });
-  }
-  // verify role now handled by setup_rolesel:verify select menu
+  // channel/role selects handled in handleSetupButton (routed there by bot.js)
 }
 const SETUP_COMMANDS = new Set(['setup']);
 
