@@ -661,7 +661,7 @@ client.on('interactionCreate', async (interaction)=>{
         return;
       }
     }catch(_){}
-    // Generate code immediately — no wallet input needed
+    // Generate code, save to DB, show in ephemeral reply
     const code = 'OCAS-'+Math.random().toString(36).slice(2,8).toUpperCase();
     const expiresAt = new Date(Date.now() + 30*60*1000);
     try{
@@ -670,30 +670,46 @@ client.on('interactionCreate', async (interaction)=>{
         [svUser, svGuild, 'pending', code, expiresAt]
       );
     }catch(e){ console.error('[StartVerify]', e.message); }
-    // Show username modal
+    const { ButtonBuilder, ButtonStyle, ActionRowBuilder, EmbedBuilder } = require('discord.js');
+    const codeEmbed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('🔐 Verify Your Wallet')
+      .setDescription(
+        '**Step 1 — Add this code to your OpenSea username:**\n' +
+        '```' + code + '```' +
+        'Go to https://opensea.io → Edit Profile → add the code anywhere in your username.\n' +
+        'Example: `YourName-' + code + '`\n\n' +
+        '**Step 2 — Click the button below and enter your OpenSea username.**\n\n' +
+        '*You can remove the code after verification. Expires in 30 minutes.*'
+      );
+    const enterBtn = new ButtonBuilder()
+      .setCustomId('sv_enter_username:'+svGuild)
+      .setLabel("I've Added It — Enter Username")
+      .setStyle(ButtonStyle.Success)
+      .setEmoji('✅');
+    return interaction.reply({ephemeral:true, embeds:[codeEmbed], components:[new ActionRowBuilder().addComponents(enterBtn)]});
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('sv_enter_username:')){
+    // showModal for username — no DB work here, code already saved
     const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-    const svModal = new ModalBuilder()
+    const svGuild = interaction.customId.split(':')[1];
+    const modal = new ModalBuilder()
       .setCustomId('sv_modal:username:'+svGuild)
-      .setTitle('Verify Wallet');
-    svModal.addComponents(
+      .setTitle('Enter Your OpenSea Username');
+    modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('os_username')
           .setLabel('Your OpenSea Username')
           .setStyle(TextInputStyle.Short)
           .setPlaceholder('e.g. cryptowhale123')
-          .setRequired(true)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('code_confirm')
-          .setLabel('Add this code to your OS username, then submit')
-          .setStyle(TextInputStyle.Short)
-          .setValue(code)
+          .setMinLength(1)
+          .setMaxLength(100)
           .setRequired(true)
       )
     );
-    return interaction.showModal(svModal);
+    return interaction.showModal(modal);
   }
 
   if(interaction.isButton() && interaction.customId.startsWith('lottery_enter:')){
@@ -1561,6 +1577,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
