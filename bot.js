@@ -500,7 +500,7 @@ client.on('interactionCreate', async (interaction)=>{
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category  (use "_count" for token count)')
+          .setLabel('Trait Category (use "_count" for token count)')
           .setStyle(TextInputStyle.Short)
           .setPlaceholder('e.g. Type   or   Background   or   _count')
           .setRequired(true)
@@ -533,7 +533,7 @@ client.on('interactionCreate', async (interaction)=>{
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category  (use "_count" for token count)')
+          .setLabel('Trait Category (use "_count" for token count)')
           .setStyle(TextInputStyle.Short)
           .setPlaceholder('e.g. Type   or   Background   or   _count')
           .setRequired(true)
@@ -1531,6 +1531,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
