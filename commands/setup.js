@@ -3,7 +3,7 @@
 const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle, PermissionFlagsBits,
-  ChannelType,
+  ChannelSelectMenuBuilder, RoleSelectMenuBuilder, ChannelType,
 } = require('discord.js');
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
