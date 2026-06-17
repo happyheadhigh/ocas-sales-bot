@@ -408,46 +408,123 @@ client.on('interactionCreate', async (interaction)=>{
   // ── Wallet verification button ────────────────────────────────────────────
 
   // ── start_verification wallet modal submit ────────────────────────────────────
-  if(interaction.isModalSubmit() && interaction.customId.startsWith('sv_modal:wallet:')){
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('sv_modal:username:')){
     await interaction.deferReply({ephemeral:true});
-    const wallet    = (interaction.fields.getTextInputValue('wallet_input')||'').trim().toLowerCase();
-    const discordId = interaction.user.id;
-    const guildId   = interaction.guildId;
+    const discordId  = interaction.user.id;
+    const guildId    = interaction.guildId;
+    const osUsername = (interaction.fields.getTextInputValue('os_username')||'').trim();
 
-    if(!/^0x[0-9a-f]{40}$/i.test(wallet))
-      return interaction.editReply({content:'❌ Invalid wallet address. Must start with 0x followed by 40 characters.'});
+    if(!osUsername)
+      return interaction.editReply({content:'❌ Please enter your OpenSea username.'});
 
-    const code = 'OCAS-verify-'+Math.random().toString(36).slice(2,8).toUpperCase();
-    const expiresAt = new Date(Date.now() + 30*60*1000);
-
+    // Look up pending code for this user
+    let codeRow;
     try{
-      await pgPool.query(
-        'INSERT INTO verification_codes (discord_id,guild_id,wallet,code,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,code=$4,expires_at=$5',
-        [discordId, guildId, wallet, code, expiresAt]
+      const r = await pgPool.query(
+        'SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 AND guild_id=$2',
+        [discordId, guildId]
       );
-      const { ButtonBuilder, ButtonStyle, ActionRowBuilder } = require('discord.js');
-      const verifyBtn = new ButtonBuilder()
-        .setCustomId('verify_wallet:'+discordId+':'+wallet)
-        .setLabel("I've Added It — Verify Now")
-        .setStyle(ButtonStyle.Success)
-        .setEmoji('✅');
-      return interaction.editReply({content:[
-        '**Step 1:** Go to your OpenSea profile and click Edit:',
-        'https://opensea.io/'+wallet,
-        '',
-        '**Step 2:** Temporarily add this code to your username:',
-        '```'+code+'```',
-        'For example: `YourName-'+code+'`',
-        '',
-        '**Step 3:** Save your profile then click the button below.',
-        '**Step 4:** After verified, you can change your username back.',
-        '',
-        '⏱ Expires in 30 minutes.',
-      ].join('\n'), components:[new ActionRowBuilder().addComponents(verifyBtn)]});
+      codeRow = r.rows[0];
+    }catch(e){ return interaction.editReply({content:'❌ DB error. Try again.'}); }
+
+    if(!codeRow) return interaction.editReply({content:'❌ No pending verification. Click Verify Wallet again.'});
+    if(new Date() > new Date(codeRow.expires_at))
+      return interaction.editReply({content:'❌ Code expired. Click Verify Wallet again.'});
+
+    const code = codeRow.code;
+    const { osHeaders, osAgent } = require('./lib/poll');
+
+    // Fetch OpenSea profile by username
+    let profile;
+    try{
+      const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${osUsername}`, { headers:osHeaders(), agent:osAgent });
+      if(!osRes.ok){
+        if(osRes.status===404) return interaction.editReply({content:`❌ OpenSea username \`${osUsername}\` not found. Check the spelling and try again.`});
+        return interaction.editReply({content:`❌ OpenSea error (${osRes.status}). Try again.`});
+      }
+      profile = await osRes.json();
     }catch(e){
       console.error('[SVModal]', e.message);
-      return interaction.editReply({content:'❌ Registration failed. Please try again.'});
+      return interaction.editReply({content:'❌ Failed to reach OpenSea. Try again.'});
     }
+
+    // Check code is in their username
+    const displayName = profile.username || '';
+    if(!displayName.includes(code))
+      return interaction.editReply({content:[
+        '❌ Code not found in your OpenSea username.',
+        '',
+        `Go to https://opensea.io/${osUsername} → Edit Profile → temporarily add this to your username:`,
+        '```'+code+'```',
+        'Save, then try again. You can remove it after verification.',
+      ].join('\n')});
+
+    // Get all wallets linked to this OpenSea account
+    const addresses = profile.addresses || [];
+    const wallets = addresses
+      .map(a => (a.address||'').toLowerCase())
+      .filter(a => /^0x[0-9a-f]{40}$/.test(a));
+
+    if(!wallets.length)
+      return interaction.editReply({content:'❌ No Ethereum wallets linked to that OpenSea account. Connect a wallet on OpenSea first.'});
+
+    // Use first wallet as primary, check holdings across all
+    const primaryWallet = wallets[0];
+    const cfg = getConfig(guildId) || {};
+    const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+
+    // Fetch NFTs across all wallets combined
+    let totalTokens = [];
+    for(const w of wallets){
+      try{
+        const nftRes = await fetch(
+          `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+          { headers:osHeaders(), agent:osAgent }
+        );
+        if(nftRes.ok){
+          const nftData = await nftRes.json();
+          totalTokens = totalTokens.concat(nftData.nfts||[]);
+        }
+      }catch(_){}
+    }
+    const tokenCount = totalTokens.length;
+
+    // Save registration with primary wallet
+    await pgPool.query(
+      `INSERT INTO user_registrations (discord_id,guild_id,wallet,verified,verified_at,updated_at)
+       VALUES ($1,$2,$3,true,NOW(),NOW())
+       ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,verified=true,verified_at=NOW(),updated_at=NOW()`,
+      [discordId, guildId, primaryWallet]
+    ).catch(e => console.error('[SVModal] reg insert:', e.message));
+
+    // Assign roles
+    try{
+      const panelR = await pgPool.query(
+        'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1', [guildId]
+      );
+      if(panelR.rows[0]){
+        const { role_id, holder_role_id } = panelR.rows[0];
+        const member = await interaction.guild.members.fetch(discordId).catch(()=>null);
+        if(member && role_id) await member.roles.add(role_id).catch(()=>{});
+        if(member && holder_role_id && tokenCount >= 1)
+          await member.roles.add(holder_role_id).catch(()=>{});
+      }
+    }catch(_){}
+
+    // Clean up code
+    await pgPool.query('DELETE FROM verification_codes WHERE discord_id=$1 AND guild_id=$2', [discordId, guildId]).catch(()=>{});
+
+    const walletList = wallets.length > 1
+      ? `\n🔗 **${wallets.length} wallets** linked (${wallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
+      : `\n🔗 **Wallet:** \`${primaryWallet.slice(0,6)}...${primaryWallet.slice(-4)}\``;
+
+    return interaction.editReply({content:[
+      '✅ **Verified!**',
+      walletList,
+      `🪙 **Tokens found:** ${tokenCount} across all wallets`,
+      '',
+      'You can remove the code from your OpenSea username now.',
+    ].join('\n')});
   }
   // ── Setup wizard modal + button handlers ───────────────────────────────────
   if(interaction.isModalSubmit() && interaction.customId.startsWith('setup_modal:')){
@@ -565,76 +642,14 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   if(interaction.isButton() && interaction.customId.startsWith('verify_wallet:')){
-    await interaction.deferUpdate();
-    const parts   = interaction.customId.split(':');
-    const ownerId = parts[1];
-    const wallet  = parts[2];
-    if(interaction.user.id !== ownerId)
-      return interaction.followUp({content:'❌ This verification is not for your account.', ephemeral:true});
-    const { pgPool } = require('./lib/db');
-    const { osHeaders, osAgent } = require('./lib/poll');
-    try{
-      const codeRow = await pgPool.query(
-        `SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 AND wallet=$2`,
-        [ownerId, wallet]
-      );
-      if(!codeRow.rows.length)
-        return interaction.editReply({content:'❌ No pending verification. Run `/register` again.', components:[]});
-      const {code, expires_at} = codeRow.rows[0];
-      if(new Date() > new Date(expires_at))
-        return interaction.editReply({content:'❌ Code expired. Run `/register` again.', components:[]});
-      const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${wallet}`, { headers:osHeaders(), agent:osAgent });
-      if(!osRes.ok){
-        if(osRes.status===404) return interaction.editReply({content:'❌ No OpenSea account found for that wallet.', components:[]});
-        return interaction.editReply({content:`❌ OpenSea error (${osRes.status}). Try again.`, components:[]});
-      }
-      const _profile = await osRes.json();
-      console.log('[Verify] OpenSea username:', _profile.username);
-      const bio = _profile.username || '';
-      if(!bio.includes(code))
-        return interaction.editReply({content:`❌ Code not found in bio yet.\n\nMake sure https://opensea.io/${wallet} bio contains:\n\`\`\`${code}\`\`\`\nSave then click again.`, components:[interaction.message.components[0]]});
-      await pgPool.query(
-        `INSERT INTO user_registrations (discord_id,wallet,verified,verified_at,updated_at) VALUES ($1,$2,true,NOW(),NOW()) ON CONFLICT (discord_id) DO UPDATE SET wallet=$2,verified=true,verified_at=NOW(),updated_at=NOW()`,
-        [ownerId, wallet]
-      );
-      // Check for role conflicts with other bots before assigning
-      try{
-        const panelR = await pgPool.query(`SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1`,[interaction.guildId]);
-        if(panelR.rows[0]){
-          const { role_id, holder_role_id } = panelR.rows[0];
-          const member = await interaction.guild.members.fetch(ownerId).catch(()=>null);
-          if(member && role_id){
-            const conflict = await checkRoleConflict(interaction.guild, role_id);
-            if(conflict) console.warn('[RoleConflict]', conflict);
-            else await member.roles.add(role_id).catch(()=>{});
-          }
-          // Holder role — check token count at verify time
-          if(member && holder_role_id){
-            const tokenCheck = await pgPool.query(
-              `SELECT COUNT(*) FROM user_registrations ur
-               JOIN token_traits tt ON tt.token_id IS NOT NULL
-               WHERE ur.discord_id=$1 AND ur.wallet IS NOT NULL`,
-              [ownerId]
-            ).catch(()=>null);
-            // Simpler: re-use wallet we just verified
-            const { fetchNFTsForWallet } = require('./lib/rpc');
-            const tokens = await fetchNFTsForWallet(wallet).catch(()=>[]);
-            if(tokens.length >= 1) await member.roles.add(holder_role_id).catch(()=>{});
-          }
-        }
-      }catch(_){}
-      await pgPool.query(`DELETE FROM verification_codes WHERE discord_id=$1`,[ownerId]);
-      return interaction.editReply({content:`✅ **Wallet verified!**\n\n🔗 \`${wallet.slice(0,6)}...${wallet.slice(-4)}\` linked to <@${ownerId}>\n\nYou can remove the code from your OpenSea bio now.`, components:[]});
-    }catch(e){
-      console.error('[VerifyBtn]',e.message);
-      return interaction.editReply({content:'❌ Verification failed. Try again.', components:[interaction.message.components[0]]});
-    }
+    // Legacy handler — new flow uses sv_modal:username: directly
+    return interaction.reply({ephemeral:true, content:'Please click Verify Wallet again to use the updated flow.'});
   }
 
   if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
     const svGuild = interaction.guildId;
     const svUser  = interaction.user.id;
-    // Check if already verified first
+    // Check if already verified
     try{
       const svEx = await pgPool.query(
         'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true',
@@ -642,24 +657,39 @@ client.on('interactionCreate', async (interaction)=>{
       );
       if(svEx.rows.length){
         const w = svEx.rows[0].wallet;
-        await interaction.reply({ephemeral:true, content:'✅ Already verified! Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+        await interaction.reply({ephemeral:true, content:'✅ Already verified!\n🔗 Primary wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
         return;
       }
     }catch(_){}
-    // Show wallet input modal — no slash command needed from member
+    // Generate code immediately — no wallet input needed
+    const code = 'OCAS-'+Math.random().toString(36).slice(2,8).toUpperCase();
+    const expiresAt = new Date(Date.now() + 30*60*1000);
+    try{
+      await pgPool.query(
+        'INSERT INTO verification_codes (discord_id,guild_id,wallet,code,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,code=$4,expires_at=$5',
+        [svUser, svGuild, 'pending', code, expiresAt]
+      );
+    }catch(e){ console.error('[StartVerify]', e.message); }
+    // Show username modal
     const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
     const svModal = new ModalBuilder()
-      .setCustomId('sv_modal:wallet:'+svGuild)
-      .setTitle('Wallet Verification');
+      .setCustomId('sv_modal:username:'+svGuild)
+      .setTitle('Verify Wallet');
     svModal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
-          .setCustomId('wallet_input')
-          .setLabel('Your Ethereum Wallet Address')
+          .setCustomId('os_username')
+          .setLabel('Your OpenSea Username')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('0x...')
-          .setMinLength(42)
-          .setMaxLength(42)
+          .setPlaceholder('e.g. cryptowhale123')
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('code_confirm')
+          .setLabel('Add this code to your OS username, then submit')
+          .setStyle(TextInputStyle.Short)
+          .setValue(code)
           .setRequired(true)
       )
     );
@@ -1531,6 +1561,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
