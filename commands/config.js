@@ -273,7 +273,7 @@ async function handleConfigButton(interaction, ctx){
 
   // Modals open with showModal (their own response) — everything else defers first
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
-                  customId === 'cfg:col:add' ||
+                  customId === 'cfg:col:add' || customId === 'cfg_traitrole:rolesel' ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
   if(!isModal) await interaction.deferUpdate();
 
@@ -501,7 +501,7 @@ async function handleConfigButton(interaction, ctx){
     const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     const modal  = new ModalBuilder()
       .setCustomId('cfg_modal:traitrole:'+roleId)
-      .setTitle(`Trait Role: @${role?.name || roleId}`);
+      .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
@@ -671,6 +671,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 

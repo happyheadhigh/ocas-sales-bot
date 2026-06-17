@@ -298,7 +298,7 @@ async function handleSetupButton(interaction, ctx){
 
   // Defer immediately — must happen within 3s or Discord kills the interaction
   // Modals are exempt (showModal is its own response), handle those below
-  const isModal = customId === 'setup:contract';
+  const isModal = customId === 'setup:contract' || customId === 'setup_traitrole:rolesel';
   if(!isModal) await interaction.deferUpdate();
 
   const state = await loadState(guildId, pgPool);
@@ -467,7 +467,7 @@ async function handleSetupButton(interaction, ctx){
     const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     const modal  = new ModalBuilder()
       .setCustomId('setup_modal:traitrole:'+roleId)
-      .setTitle(`Trait Role: @${role?.name || roleId}`);
+      .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
@@ -587,6 +587,7 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 
