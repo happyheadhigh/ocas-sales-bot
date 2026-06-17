@@ -572,6 +572,20 @@ async function handleConfigButton(interaction, ctx){
     if(type === 'verify')   cfg.verifyChannel  = chId;
     await setConfig(guildId, cfg);
     if(type === 'verify'){
+
+    // Auto-sync verification_panels with latest roles
+    try{
+      await pgPool.query(
+        `INSERT INTO verification_panels (guild_id, channel_id, role_id, holder_role_id, min_tokens, welcome_text)
+         VALUES ($1, $2, $3, $4, 0, $5)
+         ON CONFLICT (guild_id) DO UPDATE SET
+           channel_id     = COALESCE($2, verification_panels.channel_id),
+           role_id        = COALESCE($3, verification_panels.role_id),
+           holder_role_id = COALESCE($4, verification_panels.holder_role_id)`,
+        [guildId, cfg.verifyChannel||null, cfg.verifyRole||null, cfg.holderRole||null,
+         'Link your wallet to prove ownership and unlock holder roles.']
+      );
+    }catch(e){ console.warn('[Config] panel sync:', e.message); }
       return interaction.editReply({ content:'', embeds:[buildVerificationEmbed(cfg)], components:verificationRow(cfg) });
     }
     const isOcas = cfg.contract?.toLowerCase() === OCAS_CONTRACT;
@@ -585,6 +599,20 @@ async function handleConfigButton(interaction, ctx){
     if(type === 'verify') cfg.verifyRole = roleId;
     if(type === 'holder') cfg.holderRole = roleId;
     await setConfig(guildId, cfg);
+
+    // Auto-sync verification_panels with latest roles/channel
+    try{
+      await pgPool.query(
+        `INSERT INTO verification_panels (guild_id, channel_id, role_id, holder_role_id, min_tokens, welcome_text)
+         VALUES ($1, $2, $3, $4, 0, $5)
+         ON CONFLICT (guild_id) DO UPDATE SET
+           channel_id     = COALESCE($2, verification_panels.channel_id),
+           role_id        = COALESCE($3, verification_panels.role_id),
+           holder_role_id = COALESCE($4, verification_panels.holder_role_id)`,
+        [guildId, cfg.verifyChannel||null, cfg.verifyRole||null, cfg.holderRole||null,
+         'Link your wallet to prove ownership and unlock holder roles.']
+      );
+    }catch(e){ console.warn('[Config] panel sync:', e.message); }
     return interaction.editReply({ content:'', embeds:[buildVerificationEmbed(cfg)], components:verificationRow(cfg) });
   }
 }
@@ -673,6 +701,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 

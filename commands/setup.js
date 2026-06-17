@@ -338,6 +338,20 @@ async function handleSetupButton(interaction, ctx){
           slug:              sc.collectionSlug  || sc.slug,
         };
         await setConfig(guildId, merged);
+
+        // Always sync verification_panels with latest roles — no manual re-deploy needed
+        try{
+          await pgPool.query(
+            `INSERT INTO verification_panels (guild_id, channel_id, role_id, holder_role_id, min_tokens, welcome_text)
+             VALUES ($1, $2, $3, $4, 0, $5)
+             ON CONFLICT (guild_id) DO UPDATE SET
+               channel_id    = COALESCE($2, verification_panels.channel_id),
+               role_id       = COALESCE($3, verification_panels.role_id),
+               holder_role_id= COALESCE($4, verification_panels.holder_role_id)`,
+            [guildId, sc.verifyChannel||null, sc.verifyRole||null, sc.holderRole||null,
+             'Link your wallet to prove ownership and unlock holder roles.']
+          );
+        }catch(e){ console.warn('[Setup] panel sync:', e.message); }
       }catch(e){ console.error('[Setup] Save error:', e.message); }
       await clearWizardState(guildId, pgPool);
       return interaction.editReply({ embeds:[buildSummaryEmbed(state, interaction.guild)], components:[summaryRow()] });
@@ -531,6 +545,20 @@ async function handleSetupButton(interaction, ctx){
         const sc = state.config;
         const merged = { ...sc, channelId: sc.salesChannel||sc.channelId, listingsChannelId: sc.listingsChannel||sc.listingsChannelId, slug: sc.collectionSlug||sc.slug };
         await setConfig(guildId, merged);
+
+        // Always sync verification_panels with latest roles — no manual re-deploy needed
+        try{
+          await pgPool.query(
+            `INSERT INTO verification_panels (guild_id, channel_id, role_id, holder_role_id, min_tokens, welcome_text)
+             VALUES ($1, $2, $3, $4, 0, $5)
+             ON CONFLICT (guild_id) DO UPDATE SET
+               channel_id    = COALESCE($2, verification_panels.channel_id),
+               role_id       = COALESCE($3, verification_panels.role_id),
+               holder_role_id= COALESCE($4, verification_panels.holder_role_id)`,
+            [guildId, sc.verifyChannel||null, sc.verifyRole||null, sc.holderRole||null,
+             'Link your wallet to prove ownership and unlock holder roles.']
+          );
+        }catch(e){ console.warn('[Setup] panel sync:', e.message); }
       }catch(_){}
       await clearWizardState(guildId, pgPool);
       return interaction.editReply({ embeds:[buildSummaryEmbed(state, interaction.guild)], components:[summaryRow()] });
@@ -604,6 +632,7 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 
