@@ -480,12 +480,20 @@ client.on('interactionCreate', async (interaction)=>{
     const setupCtx = { pgPool, setConfig };
     return handleSetupButton(interaction, setupCtx);
   }
+  if(interaction.isStringSelectMenu() && (interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col:'))){
+    const cfgCtx = { pgPool, getConfig, setConfig };
+    return handleConfigButton(interaction, cfgCtx);
+  }
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
      (interaction.customId.startsWith('cfg_chsel:') || interaction.customId.startsWith('cfg_rolesel:'))){
     const cfgCtx = { pgPool, getConfig, setConfig };
     return handleConfigButton(interaction, cfgCtx);
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_role:')){
+    const cfgCtx = { pgPool, getConfig, setConfig };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_col:')){
     const cfgCtx = { pgPool, getConfig, setConfig };
     return handleConfigButton(interaction, cfgCtx);
   }
@@ -1457,6 +1465,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 

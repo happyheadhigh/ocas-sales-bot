@@ -193,6 +193,7 @@ function welcomeRow(){
 
 function collectionRow(hasContract){
   return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('setup:back:1').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('setup:contract').setLabel('📦 Enter Contract').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('setup:step:3').setLabel(hasContract ? 'Next →' : 'Skip →').setStyle(hasContract ? ButtonStyle.Success : ButtonStyle.Secondary),
   );
@@ -200,6 +201,7 @@ function collectionRow(hasContract){
 
 function channelsRow(isOcas){
   const btns = [
+    new ButtonBuilder().setCustomId('setup:back:2').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('setup:channel:sales').setLabel('🟢 Sales').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('setup:channel:listings').setLabel('📋 Listings').setStyle(ButtonStyle.Secondary),
   ];
@@ -217,6 +219,7 @@ function verificationRow(configured){
     new ButtonBuilder().setCustomId('setup:verify:deploy').setLabel('📨 Post to Channel').setStyle(ButtonStyle.Primary).setDisabled(!configured),
   );
   const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('setup:back:3').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('setup:step:5').setLabel('Next →').setStyle(ButtonStyle.Success),
   );
   return [row1, row2];
@@ -228,6 +231,7 @@ function traitRolesRow(state){
 
   // Add / Next row
   rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('setup:back:4').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('setup:traitrole:add').setLabel('➕ Add Trait Role').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('setup:step:6').setLabel('Finish →').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('setup:skip').setLabel('Skip').setStyle(ButtonStyle.Secondary),
@@ -292,6 +296,19 @@ async function handleSetupButton(interaction, ctx){
   const guildId  = interaction.guildId;
   const state    = await loadState(guildId, pgPool);
   const customId = interaction.customId;
+
+  // ── back navigation ────────────────────────────────────────────────────────
+  if(customId.startsWith('setup:back:')){
+    await interaction.deferUpdate();
+    const backTo = parseInt(customId.split(':')[2]);
+    state.step = backTo;
+    await saveState(guildId, state, pgPool);
+    const isOcas = state.config.contract?.toLowerCase() === OCAS_CONTRACT;
+    if(backTo === 1) return interaction.editReply({ content:'', embeds:[buildWelcomeEmbed()], components:[welcomeRow()] });
+    if(backTo === 2) return interaction.editReply({ content:'', embeds:[buildCollectionEmbed(state)], components:[collectionRow(!!state.config.contract)] });
+    if(backTo === 3) return interaction.editReply({ content:'', embeds:[buildChannelsEmbed(state)], components:[channelsRow(isOcas)] });
+    if(backTo === 4){ const v=!!(state.config.verifyChannel&&state.config.verifyRole); return interaction.editReply({ content:'', embeds:[buildVerificationEmbed(state)], components:verificationRow(v) }); }
+  }
 
   // ── step navigation ────────────────────────────────────────────────────────
   if(customId === 'setup:start' || customId.startsWith('setup:step:')){
@@ -543,3 +560,4 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+

@@ -27,7 +27,7 @@ function buildDashboardEmbed(cfg, traitRoles){
     .setTitle('⚙️ Server Configuration')
     .setDescription(
       SEP + '\n\n' +
-      `📦 **Collection:** ${cfg.contractName || (cfg.contract ? `\`${cfg.contract.slice(0,10)}...\`` : '`Not set`')} ${ok(cfg.contract)}\n` +
+      `📦 **Collections:** ${(cfg.collections||[]).length + (cfg.contract?1:0)} configured ${ok(cfg.contract||((cfg.collections||[]).length>0))}\n` +
       `🟢 **Sales:** ${ch(cfg.salesChannel)} ${ok(cfg.salesChannel)}\n` +
       `📋 **Listings:** ${ch(cfg.listingsChannel)} ${ok(cfg.listingsChannel)}\n` +
       (isOcas ? `🔥 **Burn Alerts:** ${ch(cfg.burnChannel)} ${ok(cfg.burnChannel)}\n` : '') +
@@ -44,7 +44,7 @@ function buildDashboardEmbed(cfg, traitRoles){
 function dashboardRow(){
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('📦 Collection').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('📦 Collections').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:channels').setLabel('📡 Channels').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('🔐 Verification').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('🎭 Roles').setStyle(ButtonStyle.Secondary),
@@ -52,29 +52,99 @@ function dashboardRow(){
   ];
 }
 
-// ── Collection screen ─────────────────────────────────────────────────────────
-function buildCollectionEmbed(cfg){
-  const isOcas = cfg.contract?.toLowerCase() === OCAS_CONTRACT;
+// ── Collection screen (multi-collection) ─────────────────────────────────────
+function buildCollectionsEmbed(cfg){
+  const extras = cfg.collections || [];
+  const primary = cfg.contract ? {
+    name: cfg.contractName || 'Primary Collection',
+    slug: cfg.collectionSlug || '—',
+    contract: cfg.contract,
+    salesChannel: cfg.channelId,
+    listingsChannel: cfg.listingsChannelId,
+    isOcas: cfg.contract?.toLowerCase() === OCAS_CONTRACT,
+  } : null;
+
+  let desc = SEP + '\n\n';
+  if(!primary && extras.length===0){
+    desc += '*No collections configured.*\n\nClick **➕ Add Collection** to get started.\n';
+  } else {
+    if(primary){
+      desc += `**1. ${primary.isOcas?'🔥 ':'📦 '}${primary.name}** *(primary)*\n`;
+      desc += `> Slug: \`${primary.slug}\`\n`;
+      desc += `> Sales: ${primary.salesChannel ? `<#${primary.salesChannel}>` : '`not set`'} · Listings: ${primary.listingsChannel ? `<#${primary.listingsChannel}>` : '`not set`'}\n\n`;
+    }
+    extras.forEach((col, i) => {
+      const n = i + (primary ? 2 : 1);
+      desc += `**${n}. 📦 ${col.name||col.slug}**\n`;
+      desc += `> Slug: \`${col.slug}\`\n`;
+      desc += `> Sales: ${col.salesChannel ? `<#${col.salesChannel}>` : '`not set`'} · Listings: ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`not set`'}\n\n`;
+    });
+  }
+  desc += SEP + '\n*Click a collection to edit, or add a new one.*';
+
   return new EmbedBuilder()
     .setColor(0x5865F2)
-    .setTitle('📦 Collection')
+    .setTitle('📦 Collections')
+    .setDescription(desc)
+    .setFooter({ text: 'Only visible to you' });
+}
+
+function collectionsRow(cfg){
+  const extras = cfg.collections || [];
+  const allCols = [];
+  if(cfg.contract) allCols.push({ label: `1. ${cfg.contractName||'Primary'}`, id: 'primary' });
+  extras.forEach((col, i) => allCols.push({ label: `${i+2}. ${col.name||col.slug}`, id: String(i) }));
+
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:col:add').setLabel('➕ Add Collection').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+
+  if(allCols.length > 0){
+    const options = allCols.slice(0,25).map(c =>
+      new StringSelectMenuOptionBuilder().setLabel(c.label).setValue(c.id)
+    );
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('cfg_col:select')
+        .setPlaceholder('✏️ Edit a collection...')
+        .addOptions(options)
+    ));
+  }
+  return rows;
+}
+
+// Single collection edit embed
+function buildCollectionEditEmbed(col, isPrimary){
+  const isOcas = col.contract?.toLowerCase() === OCAS_CONTRACT;
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(`📦 Edit: ${col.name || col.slug || 'Collection'}${isPrimary?' *(primary)*':''}`)
     .setDescription(
       SEP + '\n\n' +
-      `**Contract:** ${cfg.contract ? `\`${cfg.contract}\`` : '`Not set`'} ${ok(cfg.contract)}\n` +
-      `**Name:** ${cfg.contractName || '`Unknown`'}\n` +
-      `**Slug:** \`${cfg.collectionSlug || 'Not set'}\`\n` +
-      (isOcas ? '\n🔥 **OCAS detected** — full feature set active.\n' : '') +
-      '\n*Change the contract address to switch collections.\nThe slug is used for OpenSea listing lookups.*'
+      `**Contract:** ${col.contract ? `\`${col.contract}\`` : '`Not set`'} ${ok(col.contract)}\n` +
+      `**Slug:** \`${col.slug || 'Not set'}\`\n` +
+      `**Sales Channel:** ${col.salesChannel ? `<#${col.salesChannel}>` : '`Not set`'} ${ok(col.salesChannel)}\n` +
+      `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\n` +
+      (isOcas ? '\n🔥 **OCAS** — full feature set active.\n' : '') +
+      '\n*Changes save immediately.*'
     )
     .setFooter({ text: 'Only visible to you' });
 }
 
-function collectionRow(hasCfg){
+function collectionEditRow(colId, isPrimary){
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('cfg:col:contract').setLabel('📝 Edit Contract').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('cfg:col:slug').setLabel('🔗 Edit Slug').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:col:contract:${colId}`).setLabel('📝 Contract').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
+      ...(!isPrimary ? [new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)] : []),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -221,7 +291,87 @@ async function handleConfigButton(interaction, ctx){
   // ── Category navigation ────────────────────────────────────────────────────
   if(customId === 'cfg:cat:collection'){
     await interaction.deferUpdate();
-    return interaction.editReply({ content:'', embeds:[buildCollectionEmbed(cfg)], components:collectionRow(!!cfg.contract) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
+  }
+
+  // Select a collection to edit
+  if(customId === 'cfg_col:select'){
+    await interaction.deferUpdate();
+    const colId = interaction.values[0];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId }
+      : (cfg.collections||[])[parseInt(colId)];
+    if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+  }
+
+  // Add collection button
+  if(customId === 'cfg:col:add'){
+    const modal = new ModalBuilder().setCustomId('cfg_modal:addcol').setTitle('Add Collection');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('col_name').setLabel('Collection Name').setStyle(TextInputStyle.Short).setPlaceholder('My NFT Project').setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('col_slug').setLabel('OpenSea Slug').setStyle(TextInputStyle.Short).setPlaceholder('my-nft-project').setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('col_contract').setLabel('Contract Address (0x...)').setStyle(TextInputStyle.Short).setPlaceholder('0x...').setRequired(false).setMinLength(0).setMaxLength(42)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
+  // Edit collection contract/slug via modal
+  if(customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:')){
+    const parts = customId.split(':');
+    const field = parts[2]; // 'contract' or 'slug'
+    const colId = parts[3];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName }
+      : (cfg.collections||[])[parseInt(colId)];
+    const modal = new ModalBuilder().setCustomId(`cfg_modal:editcol:${field}:${colId}`).setTitle(`Edit ${field==='contract'?'Contract':'Slug'}`);
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      (() => {
+        const ti = new TextInputBuilder().setCustomId('value_input')
+          .setLabel(field==='contract' ? 'Contract Address (0x...)' : 'OpenSea Slug')
+          .setStyle(TextInputStyle.Short)
+          .setValue(field==='contract' ? (col?.contract||'') : (col?.slug||''))
+          .setRequired(true);
+        if(field==='contract'){ ti.setMinLength(42); ti.setMaxLength(42); }
+        return ti;
+      })()
+    ));
+    return interaction.showModal(modal);
+  }
+
+  // Edit collection channels (show channel select)
+  if(customId.startsWith('cfg:col:saleschan:') || customId.startsWith('cfg:col:listchan:')){
+    await interaction.deferUpdate();
+    const parts = customId.split(':');
+    const field = parts[2]; // 'saleschan' or 'listchan'
+    const colId = parts[3];
+    const label = field==='saleschan' ? '🟢 Sales' : '📋 Listings';
+    const menu = new ChannelSelectMenuBuilder()
+      .setCustomId(`cfg_chsel:col:${field}:${colId}`)
+      .setPlaceholder(`Pick the ${label} channel`)
+      .addChannelTypes(ChannelType.GuildText);
+    return interaction.editReply({ content:`**Select the ${label} channel:**`, embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+  }
+
+  // Remove extra collection
+  if(customId.startsWith('cfg:col:remove:')){
+    await interaction.deferUpdate();
+    const colId = parseInt(customId.split(':')[3]);
+    if(!isNaN(colId)){
+      const cols = cfg.collections || [];
+      cols.splice(colId, 1);
+      cfg.collections = cols;
+      await setConfig(guildId, cfg);
+    }
+    return interaction.editReply({ content:'✅ Collection removed.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
   if(customId === 'cfg:cat:channels'){
     await interaction.deferUpdate();
@@ -360,12 +510,38 @@ async function handleConfigButton(interaction, ctx){
   // ── Channel select menus ───────────────────────────────────────────────────
   if(customId.startsWith('cfg_chsel:')){
     await interaction.deferUpdate();
-    const type = customId.split(':')[1];
+    const parts = customId.split(':');
     const chId = interaction.values[0];
-    if(type === 'sales')    cfg.salesChannel    = chId;
-    if(type === 'listings') cfg.listingsChannel = chId;
-    if(type === 'burn')     cfg.burnChannel     = chId;
-    if(type === 'verify')   cfg.verifyChannel   = chId;
+
+    // Collection channel edit: cfg_chsel:col:saleschan|listchan:colId
+    if(parts[1] === 'col'){
+      const field = parts[2]; // saleschan or listchan
+      const colId = parts[3];
+      const isPrimary = colId === 'primary';
+      if(isPrimary){
+        if(field==='saleschan')  cfg.channelId         = chId;
+        if(field==='listchan')   cfg.listingsChannelId = chId;
+      } else {
+        const idx = parseInt(colId);
+        if(!cfg.collections) cfg.collections = [];
+        if(cfg.collections[idx]){
+          if(field==='saleschan')  cfg.collections[idx].salesChannel    = chId;
+          if(field==='listchan')   cfg.collections[idx].listingsChannel = chId;
+        }
+      }
+      await setConfig(guildId, cfg);
+      const col = isPrimary
+        ? { contract:cfg.contract, slug:cfg.collectionSlug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
+        : cfg.collections[parseInt(colId)];
+      return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+    }
+
+    // Standard channel edit
+    const type = parts[1];
+    if(type === 'sales')    { cfg.salesChannel = chId; cfg.channelId = chId; }
+    if(type === 'listings') { cfg.listingsChannel = chId; cfg.listingsChannelId = chId; }
+    if(type === 'burn')     cfg.burnChannel    = chId;
+    if(type === 'verify')   cfg.verifyChannel  = chId;
     await setConfig(guildId, cfg);
     if(type === 'verify'){
       return interaction.editReply({ content:'', embeds:[buildVerificationEmbed(cfg)], components:verificationRow(cfg) });
@@ -392,31 +568,51 @@ async function handleConfigModal(interaction, ctx){
   const cfg      = getConfig(guildId) || {};
   const customId = interaction.customId;
 
-  // ── Contract ───────────────────────────────────────────────────────────────
-  if(customId === 'cfg_modal:contract'){
+  // ── Add collection ─────────────────────────────────────────────────────────
+  if(customId === 'cfg_modal:addcol'){
     await interaction.deferUpdate();
-    const contract = interaction.fields.getTextInputValue('contract_input').trim().toLowerCase();
-    if(!/^0x[0-9a-f]{40}$/i.test(contract))
-      return interaction.editReply({ content:'❌ Invalid contract address.' });
-    cfg.contract = contract;
-    const isOcas = contract === OCAS_CONTRACT;
-    if(isOcas){
-      cfg.contractName   = 'On-Chain All Stars';
-      cfg.collectionSlug = OCAS_SLUG;
-      cfg.isOcas         = true;
-    } else {
-      cfg.isOcas = false;
-    }
+    const name     = interaction.fields.getTextInputValue('col_name').trim();
+    const slug     = interaction.fields.getTextInputValue('col_slug').trim().toLowerCase();
+    const contract = interaction.fields.getTextInputValue('col_contract').trim().toLowerCase();
+    if(!cfg.collections) cfg.collections = [];
+    cfg.collections.push({ name, slug, contract:contract||null, salesChannel:null, listingsChannel:null });
     await setConfig(guildId, cfg);
-    return interaction.editReply({ content:'', embeds:[buildCollectionEmbed(cfg)], components:collectionRow(true) });
+    return interaction.editReply({ content:'✅ Collection added.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
 
-  // ── Slug ───────────────────────────────────────────────────────────────────
-  if(customId === 'cfg_modal:slug'){
+  // ── Edit collection field (contract or slug) ───────────────────────────────
+  if(customId.startsWith('cfg_modal:editcol:')){
     await interaction.deferUpdate();
-    cfg.collectionSlug = interaction.fields.getTextInputValue('slug_input').trim().toLowerCase();
+    const parts = customId.split(':'); // cfg_modal editcol field colId
+    const field = parts[2];
+    const colId = parts[3];
+    const val   = interaction.fields.getTextInputValue('value_input').trim();
+    const isPrimary = colId === 'primary';
+
+    if(isPrimary){
+      if(field==='contract'){
+        const c = val.toLowerCase();
+        if(!/^0x[0-9a-f]{40}$/i.test(c)) return interaction.editReply({ content:'❌ Invalid contract address.' });
+        cfg.contract = c;
+        if(c === OCAS_CONTRACT){ cfg.contractName='On-Chain All Stars'; cfg.collectionSlug=OCAS_SLUG; cfg.isOcas=true; }
+        else cfg.isOcas=false;
+      }
+      if(field==='slug') cfg.collectionSlug = val.toLowerCase();
+    } else {
+      const idx = parseInt(colId);
+      if(!cfg.collections?.[idx]) return interaction.editReply({ content:'❌ Collection not found.' });
+      if(field==='contract'){
+        const c = val.toLowerCase();
+        if(!/^0x[0-9a-f]{40}$/i.test(c)) return interaction.editReply({ content:'❌ Invalid contract address.' });
+        cfg.collections[idx].contract = c;
+      }
+      if(field==='slug') cfg.collections[idx].slug = val.toLowerCase();
+    }
     await setConfig(guildId, cfg);
-    return interaction.editReply({ content:'✅ Slug updated.', embeds:[buildCollectionEmbed(cfg)], components:collectionRow(true) });
+    const col = isPrimary
+      ? { contract:cfg.contract, slug:cfg.collectionSlug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
+      : cfg.collections[parseInt(colId)];
+    return interaction.editReply({ content:'✅ Updated.', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
   }
 
   // ── Add trait role ─────────────────────────────────────────────────────────
@@ -451,3 +647,4 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
