@@ -178,10 +178,10 @@ function buildSummaryEmbed(state, guild){
       '**What happens next:**\n' +
       '→ Members verify in your verification channel — roles assigned automatically\n' +
       '→ Roles re-sync every 24 hours\n' +
-      '→ Run `/setup` anytime to change settings\n' +
+      '→ Run `/setup` or `/config` anytime to change settings\n' +
       '→ Use `/setuptraitrole` to add more trait roles later'
     )
-    .setFooter({ text: 'Run /setup anytime to update settings' });
+    .setFooter({ text: 'Run /setup to update · /config to manage settings' });
 }
 
 // ── Button rows ───────────────────────────────────────────────────────────────
@@ -519,7 +519,7 @@ async function handleSetupButton(interaction, ctx){
   if(customId === 'setup:close' || customId === 'setup:skip'){
     if(customId === 'setup:close'){
       await clearWizardState(guildId, pgPool);
-      return interaction.editReply({ embeds:[], components:[], content:'✅ Setup complete. Run `/setup` anytime to update settings.' });
+      return interaction.editReply({ embeds:[], components:[], content:'✅ Setup complete!\n\n→ Run `/setup` anytime to update settings.\n→ Use `/config` to manage channels, roles and collections.' });
     }
     // skip just advances to next step
     const nextStep = (state.step || 5) + 1;
@@ -604,6 +604,7 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 
