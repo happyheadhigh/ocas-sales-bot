@@ -299,6 +299,18 @@ async function handleSetupButton(interaction, ctx){
     });
   }
 
+  if(customId === 'setup:verify:role'){
+    await interaction.deferUpdate();
+    const menu = new RoleSelectMenuBuilder()
+      .setCustomId('setup_rolesel:verify')
+      .setPlaceholder('Pick the Verified role');
+    return interaction.editReply({
+      content: '**Select the 🎭 Verified role:**',
+      components: [new ActionRowBuilder().addComponents(menu)],
+      embeds: [],
+    });
+  }
+
   if(customId === 'setup:verify:deploy'){
     await interaction.deferUpdate();
     try{
@@ -348,14 +360,14 @@ async function handleSetupButton(interaction, ctx){
       if(type === 'verify')   state.config.verifyChannel   = chId;
       if(type === 'verify'){
         const verified = state.config.verifyChannel && state.config.verifyRole;
-        return interaction.editReply({ content:null, embeds:[buildVerificationEmbed(state)], components:[verificationRow(verified)] });
+        return interaction.editReply({ content:'', embeds:[buildVerificationEmbed(state)], components:[verificationRow(verified)] });
       }
-      return interaction.editReply({ content:null, embeds:[buildChannelsEmbed(state)], components:[channelsRow(isOcas)] });
+      return interaction.editReply({ content:'', embeds:[buildChannelsEmbed(state)], components:[channelsRow(isOcas)] });
     }
     if(customId.startsWith('setup_rolesel:')){
       state.config.verifyRole = interaction.values[0];
       const verified = state.config.verifyChannel && state.config.verifyRole;
-      return interaction.editReply({ content:null, embeds:[buildVerificationEmbed(state)], components:[verificationRow(verified)] });
+      return interaction.editReply({ content:'', embeds:[buildVerificationEmbed(state)], components:[verificationRow(verified)] });
     }
   }
 
@@ -398,3 +410,4 @@ async function handleSetupModal(interaction, ctx){
 const SETUP_COMMANDS = new Set(['setup']);
 
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
