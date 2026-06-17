@@ -328,13 +328,24 @@ async function syncTraitRoles(guild, discordId, wallet){
       if(!meetsMin && hasRole)  await member.roles.remove(tr.role_id).catch(()=>{});
     }
 
-    // Also assign verification panel role if configured
+    // Assign verified + holder roles from verification panel config
     const panel = await pgPool.query(
-      'SELECT role_id FROM verification_panels WHERE guild_id=$1',
+      'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1',
       [guild.id]
     );
-    if(panel.rows.length && panel.rows[0].role_id && !member.roles.cache.has(panel.rows[0].role_id))
-      await member.roles.add(panel.rows[0].role_id).catch(()=>{});
+    if(panel.rows.length){
+      const { role_id, holder_role_id } = panel.rows[0];
+      // Verified role — any registered wallet
+      if(role_id && !member.roles.cache.has(role_id))
+        await member.roles.add(role_id).catch(()=>{});
+      // Holder role — must own ≥1 token
+      if(holder_role_id){
+        if(ownedTokenIds.length >= 1 && !member.roles.cache.has(holder_role_id))
+          await member.roles.add(holder_role_id).catch(()=>{});
+        if(ownedTokenIds.length === 0 && member.roles.cache.has(holder_role_id))
+          await member.roles.remove(holder_role_id).catch(()=>{});
+      }
+    }
 
     console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', ownedTokenIds.length, '| traits:', ownedTraits.size);
   }catch(e){
@@ -488,15 +499,27 @@ client.on('interactionCreate', async (interaction)=>{
       );
       // Check for role conflicts with other bots before assigning
       try{
-        const panelR = await pgPool.query(`SELECT role_id FROM verification_panels WHERE guild_id=$1`,[interaction.guildId]);
-        if(panelR.rows[0]?.role_id){
-          const conflict = await checkRoleConflict(interaction.guild, panelR.rows[0].role_id);
-          if(conflict){
-            // Warn admin via bot-errors or just log — don't block the user
-            console.warn('[RoleConflict]', conflict);
-          } else {
-            const member = await interaction.guild.members.fetch(ownerId).catch(()=>null);
-            if(member) await member.roles.add(panelR.rows[0].role_id).catch(()=>{});
+        const panelR = await pgPool.query(`SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1`,[interaction.guildId]);
+        if(panelR.rows[0]){
+          const { role_id, holder_role_id } = panelR.rows[0];
+          const member = await interaction.guild.members.fetch(ownerId).catch(()=>null);
+          if(member && role_id){
+            const conflict = await checkRoleConflict(interaction.guild, role_id);
+            if(conflict) console.warn('[RoleConflict]', conflict);
+            else await member.roles.add(role_id).catch(()=>{});
+          }
+          // Holder role — check token count at verify time
+          if(member && holder_role_id){
+            const tokenCheck = await pgPool.query(
+              `SELECT COUNT(*) FROM user_registrations ur
+               JOIN token_traits tt ON tt.token_id IS NOT NULL
+               WHERE ur.discord_id=$1 AND ur.wallet IS NOT NULL`,
+              [ownerId]
+            ).catch(()=>null);
+            // Simpler: re-use wallet we just verified
+            const { fetchNFTsForWallet } = require('./lib/rpc');
+            const tokens = await fetchNFTsForWallet(wallet).catch(()=>[]);
+            if(tokens.length >= 1) await member.roles.add(holder_role_id).catch(()=>{});
           }
         }
       }catch(_){}

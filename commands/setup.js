@@ -87,7 +87,7 @@ function buildChannelsEmbed(state){
 
 function buildVerificationEmbed(state){
   const cfg = state.config;
-  const configured = cfg.verifyChannel && cfg.verifyRole;
+  const configured = !!(cfg.verifyChannel && cfg.verifyRole);
 
   return new EmbedBuilder()
     .setColor(0x5865F2)
@@ -95,11 +95,12 @@ function buildVerificationEmbed(state){
     .setDescription(
       stepBar(3, 5) + '\n' +
       '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' +
-      'Any member can link their wallet — no token required.\n' +
-      'Use `/setuptraitrole` to gate roles by token ownership.\n\n' +
+      'Any member who links a wallet gets the **Verified** role.\n' +
+      'Members who hold ≥1 token also get the **Holder** role.\n\n' +
       `📌 **Channel:** ${cfg.verifyChannel ? `<#${cfg.verifyChannel}> ✅` : '❌ Not set'}\n` +
-      `🎭 **Verified Role:** ${cfg.verifyRole ? `<@&${cfg.verifyRole}> ✅` : '❌ Not set'}\n\n` +
-      (configured ? '✅ Ready to deploy verification panel.' : '*Set channel and role to enable.*')
+      `✅ **Verified Role:** ${cfg.verifyRole ? `<@&${cfg.verifyRole}> ✅` : '❌ Not set'}\n` +
+      `🏆 **Holder Role:** ${cfg.holderRole ? `<@&${cfg.holderRole}> ✅` : '⚪ Optional — skip if not needed'}\n\n` +
+      (configured ? '✅ Ready to deploy verification panel.' : '*Set channel and Verified role to enable.*')
     )
     .setFooter({ text: 'Only visible to you' });
 }
@@ -141,6 +142,7 @@ function buildSummaryEmbed(state, guild){
       `**Listings:** ${cfg.listingsChannel ? `<#${cfg.listingsChannel}>` : 'Not set'} ${tick(cfg.listingsChannel)}\n` +
       (isOcas ? `**Burn Alerts:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : 'Not set'} ${tick(cfg.burnChannel)}\n` : '') +
       `**Verification:** ${cfg.verifyChannel ? `<#${cfg.verifyChannel}>` : 'Not set'} ${tick(cfg.verifyChannel)}\n` +
+      `**Holder Role:** ${cfg.holderRole ? `<@&${cfg.holderRole}>` : 'Not set'} ${tick(cfg.holderRole)}\n` +
       `**Trait Roles:** ${(cfg.traitRoles||[]).length} configured\n\n` +
       '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
       '**Useful commands:**\n' +
@@ -181,7 +183,8 @@ function channelsRow(isOcas){
 function verificationRow(configured){
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('setup:verify:channel').setLabel('📌 Set Channel').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('setup:verify:role').setLabel('🎭 Set Role').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('setup:verify:role').setLabel('✅ Verified Role').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('setup:verify:holderrole').setLabel('🏆 Holder Role').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('setup:verify:deploy').setLabel('🚀 Deploy Panel').setStyle(ButtonStyle.Primary).setDisabled(!configured),
     new ButtonBuilder().setCustomId('setup:step:5').setLabel('Next →').setStyle(ButtonStyle.Success),
   );
@@ -302,9 +305,21 @@ async function handleSetupButton(interaction, ctx){
     await interaction.deferUpdate();
     const menu = new RoleSelectMenuBuilder()
       .setCustomId('setup_rolesel:verify')
-      .setPlaceholder('Pick the Verified role');
+      .setPlaceholder('Pick the ✅ Verified Wallet role');
     return interaction.editReply({
-      content: '**Select the 🎭 Verified role:**',
+      content: '**Select the ✅ Verified Wallet role** (given to anyone who links a wallet):',
+      components: [new ActionRowBuilder().addComponents(menu)],
+      embeds: [],
+    });
+  }
+
+  if(customId === 'setup:verify:holderrole'){
+    await interaction.deferUpdate();
+    const menu = new RoleSelectMenuBuilder()
+      .setCustomId('setup_rolesel:holder')
+      .setPlaceholder('Pick the 🏆 Holder role');
+    return interaction.editReply({
+      content: '**Select the 🏆 Holder role** (given to members who hold ≥1 token):',
       components: [new ActionRowBuilder().addComponents(menu)],
       embeds: [],
     });
@@ -332,10 +347,10 @@ async function handleSetupButton(interaction, ctx){
       state.config.verifyMessageId = msg.id;
 
       await pgPool.query(
-        `INSERT INTO verification_panels (guild_id,channel_id,role_id,min_tokens,message_id,welcome_text)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (guild_id) DO UPDATE SET channel_id=$2,role_id=$3,min_tokens=$4,message_id=$5,welcome_text=$6`,
-        [guildId, state.config.verifyChannel, state.config.verifyRole||null, 0, msg.id, 'Verify your wallet to get access.']
+        `INSERT INTO verification_panels (guild_id,channel_id,role_id,holder_role_id,min_tokens,message_id,welcome_text)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (guild_id) DO UPDATE SET channel_id=$2,role_id=$3,holder_role_id=$4,min_tokens=$5,message_id=$6,welcome_text=$7`,
+        [guildId, state.config.verifyChannel, state.config.verifyRole||null, state.config.holderRole||null, 0, msg.id, 'Verify your wallet to get access.']
       );
 
       const verified = state.config.verifyChannel && state.config.verifyRole;
@@ -364,8 +379,11 @@ async function handleSetupButton(interaction, ctx){
       return interaction.editReply({ content:'', embeds:[buildChannelsEmbed(state)], components:[channelsRow(isOcas)] });
     }
     if(customId.startsWith('setup_rolesel:')){
-      state.config.verifyRole = interaction.values[0];
-      const verified = state.config.verifyChannel && state.config.verifyRole;
+      const roleId = interaction.values[0];
+      const type = customId.split(':')[1];
+      if(type === 'verify') state.config.verifyRole = roleId;
+      if(type === 'holder') state.config.holderRole = roleId;
+      const verified = !!(state.config.verifyChannel && state.config.verifyRole);
       return interaction.editReply({ content:'', embeds:[buildVerificationEmbed(state)], components:[verificationRow(verified)] });
     }
   }
@@ -409,5 +427,6 @@ async function handleSetupModal(interaction, ctx){
 const SETUP_COMMANDS = new Set(['setup']);
 
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
