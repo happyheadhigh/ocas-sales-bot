@@ -95,11 +95,10 @@ function buildVerificationEmbed(state){
     .setDescription(
       stepBar(3, 5) + '\n' +
       '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' +
-      'Members verify their wallet via OpenSea username.\n' +
-      'The bot posts a panel — they click to verify.\n\n' +
+      'Any member can link their wallet — no token required.\n' +
+      'Use `/setuptraitrole` to gate roles by token ownership.\n\n' +
       `📌 **Channel:** ${cfg.verifyChannel ? `<#${cfg.verifyChannel}> ✅` : '❌ Not set'}\n` +
-      `🎭 **Verified Role:** ${cfg.verifyRole ? `<@&${cfg.verifyRole}> ✅` : '❌ Not set'}\n` +
-      `🪙 **Min Tokens:** ${cfg.verifyMin != null ? cfg.verifyMin + ' ✅' : '0 (any wallet)'}\n\n` +
+      `🎭 **Verified Role:** ${cfg.verifyRole ? `<@&${cfg.verifyRole}> ✅` : '❌ Not set'}\n\n` +
       (configured ? '✅ Ready to deploy verification panel.' : '*Set channel and role to enable.*')
     )
     .setFooter({ text: 'Only visible to you' });
@@ -336,7 +335,7 @@ async function handleSetupButton(interaction, ctx){
         `INSERT INTO verification_panels (guild_id,channel_id,role_id,min_tokens,message_id,welcome_text)
          VALUES ($1,$2,$3,$4,$5,$6)
          ON CONFLICT (guild_id) DO UPDATE SET channel_id=$2,role_id=$3,min_tokens=$4,message_id=$5,welcome_text=$6`,
-        [guildId, state.config.verifyChannel, state.config.verifyRole||null, state.config.verifyMin||0, msg.id, 'Verify your wallet to get access.']
+        [guildId, state.config.verifyChannel, state.config.verifyRole||null, 0, msg.id, 'Verify your wallet to get access.']
       );
 
       const verified = state.config.verifyChannel && state.config.verifyRole;
@@ -410,4 +409,5 @@ async function handleSetupModal(interaction, ctx){
 const SETUP_COMMANDS = new Set(['setup']);
 
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
