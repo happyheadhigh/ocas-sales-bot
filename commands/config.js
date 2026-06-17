@@ -273,7 +273,7 @@ async function handleConfigButton(interaction, ctx){
 
   // Modals open with showModal (their own response) — everything else defers first
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
-                  customId === 'cfg:col:add' || customId === 'cfg:role:add' ||
+                  customId === 'cfg:col:add' ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
   if(!isModal) await interaction.deferUpdate();
 
@@ -481,22 +481,41 @@ async function handleConfigButton(interaction, ctx){
 
   // ── Roles: add ─────────────────────────────────────────────────────────────
   if(customId === 'cfg:role:add'){
-    const modal = new ModalBuilder().setCustomId('cfg_modal:traitrole').setTitle('Add Trait Role');
+    const roleMenu = new RoleSelectMenuBuilder()
+      .setCustomId('cfg_traitrole:rolesel')
+      .setPlaceholder('Pick a role to assign...');
+    return interaction.editReply({
+      content: '**Step 1 of 2 — Pick the Discord role to assign:**',
+      embeds: [],
+      components: [
+        new ActionRowBuilder().addComponents(roleMenu),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+        ),
+      ],
+    });
+  }
+
+  if(customId === 'cfg_traitrole:rolesel'){
+    const roleId = interaction.values[0];
+    const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    const modal  = new ModalBuilder()
+      .setCustomId('cfg_modal:traitrole:'+roleId)
+      .setTitle(`Trait Role: @${role?.name || roleId}`);
     modal.addComponents(
       new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_role_id').setLabel('Role ID (right-click role → Copy ID)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('123456789012345678').setRequired(true)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_trait_type').setLabel('Trait Type  (or "_count" for token count)')
+        new TextInputBuilder().setCustomId('tr_trait_type')
+          .setLabel('Trait Type  (or "_count" for token count)')
           .setStyle(TextInputStyle.Short).setPlaceholder('Type   or   _count').setRequired(true)
       ),
       new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_trait_value').setLabel('Trait Value  (leave blank if using _count)')
+        new TextInputBuilder().setCustomId('tr_trait_value')
+          .setLabel('Trait Value  (leave blank if using _count)')
           .setStyle(TextInputStyle.Short).setPlaceholder('Zombie').setRequired(false)
       ),
       new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_min_count').setLabel('Min token/trait count  (default: 1)')
+        new TextInputBuilder().setCustomId('tr_min_count')
+          .setLabel('Min count  (default: 1)')
           .setStyle(TextInputStyle.Short).setPlaceholder('1').setRequired(false)
       ),
     );
@@ -618,17 +637,15 @@ async function handleConfigModal(interaction, ctx){
   }
 
   // ── Add trait role ─────────────────────────────────────────────────────────
-  if(customId === 'cfg_modal:traitrole'){
-    const roleId    = interaction.fields.getTextInputValue('tr_role_id').trim();
+  if(customId.startsWith('cfg_modal:traitrole:')){
+    const roleId    = customId.split(':')[3];
     const traitType = interaction.fields.getTextInputValue('tr_trait_type').trim();
     const traitVal  = interaction.fields.getTextInputValue('tr_trait_value').trim();
     const minCount  = parseInt(interaction.fields.getTextInputValue('tr_min_count').trim()) || 1;
 
-    if(!/^\d{17,20}$/.test(roleId))
-      return interaction.editReply({ content:'❌ Invalid Role ID. Right-click a role → Copy ID.' });
     const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     if(!role)
-      return interaction.editReply({ content:'❌ Role not found in this server.' });
+      return interaction.editReply({ content:'❌ Role not found. Please try again.' });
 
     await pgPool.query(
       `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count)
@@ -648,6 +665,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 

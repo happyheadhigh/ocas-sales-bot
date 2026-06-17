@@ -298,7 +298,7 @@ async function handleSetupButton(interaction, ctx){
 
   // Defer immediately — must happen within 3s or Discord kills the interaction
   // Modals are exempt (showModal is its own response), handle those below
-  const isModal = customId === 'setup:contract' || customId === 'setup:traitrole:add';
+  const isModal = customId === 'setup:contract';
   if(!isModal) await interaction.deferUpdate();
 
   const state = await loadState(guildId, pgPool);
@@ -446,26 +446,19 @@ async function handleSetupButton(interaction, ctx){
 
   // ── trait role: add ────────────────────────────────────────────────────────
   if(customId === 'setup:traitrole:add'){
-    const modal = new ModalBuilder().setCustomId('setup_modal:traitrole').setTitle('Add Trait Role');
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_role_id').setLabel('Role ID (right-click role → Copy ID)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('123456789012345678').setRequired(true)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_trait_type').setLabel('Trait Type (or "_count" for token count)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('Type   or   _count').setRequired(true)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_trait_value').setLabel('Trait Value (leave blank if using _count)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('Zombie').setRequired(false)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_min_count').setLabel('Min token/trait count (default: 1)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('1').setRequired(false)
-      ),
-    );
-    return interaction.showModal(modal);
+    const roleMenu = new RoleSelectMenuBuilder()
+      .setCustomId('setup_traitrole:rolesel')
+      .setPlaceholder('Pick a role to assign...');
+    return interaction.editReply({
+      content: '**Step 1 of 2 — Pick the Discord role to assign:**',
+      embeds: [],
+      components: [
+        new ActionRowBuilder().addComponents(roleMenu),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('setup:step:5').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+        ),
+      ],
+    });
   }
 
   // ── trait role: delete select ─────────────────────────────────────────────
@@ -523,20 +516,15 @@ async function handleSetupModal(interaction, ctx){
   }
 
   // ── add trait role ─────────────────────────────────────────────────────────
-  if(customId === 'setup_modal:traitrole'){
-    const roleId    = interaction.fields.getTextInputValue('tr_role_id').trim();
+  if(customId.startsWith('setup_modal:traitrole:')){
+    const roleId    = customId.split(':')[3];
     const traitType = interaction.fields.getTextInputValue('tr_trait_type').trim();
     const traitVal  = interaction.fields.getTextInputValue('tr_trait_value').trim();
-    const minRaw    = interaction.fields.getTextInputValue('tr_min_count').trim();
-    const minCount  = parseInt(minRaw) || 1;
+    const minCount  = parseInt(interaction.fields.getTextInputValue('tr_min_count').trim()) || 1;
 
-    if(!/^\d{17,20}$/.test(roleId))
-      return interaction.editReply({ content:'❌ Invalid Role ID. Right-click a role and choose "Copy ID".' });
-
-    // Verify role exists in guild
     const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     if(!role)
-      return interaction.editReply({ content:'❌ Role not found in this server. Check the ID.' });
+      return interaction.editReply({ content:'❌ Role not found. Please try again.' });
 
     if(!state.config.traitRoles) state.config.traitRoles = [];
     state.config.traitRoles.push({
@@ -566,6 +554,7 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 

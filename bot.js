@@ -489,6 +489,14 @@ client.on('interactionCreate', async (interaction)=>{
     const cfgCtx = { pgPool, getConfig, setConfig };
     return handleConfigButton(interaction, cfgCtx);
   }
+  if(interaction.isRoleSelectMenu() && interaction.customId === 'setup_traitrole:rolesel'){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
+  if(interaction.isRoleSelectMenu() && interaction.customId === 'cfg_traitrole:rolesel'){
+    const cfgCtx = { pgPool, getConfig, setConfig };
+    return handleConfigButton(interaction, cfgCtx);
+  }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_role:')){
     const cfgCtx = { pgPool, getConfig, setConfig };
     return handleConfigButton(interaction, cfgCtx);
@@ -1465,6 +1473,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
