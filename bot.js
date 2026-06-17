@@ -446,6 +446,12 @@ client.on('interactionCreate', async (interaction)=>{
     const setupCtx = { pgPool, setConfig };
     return handleSetupButton(interaction, setupCtx);
   }
+  // Channel + role select menus from setup wizard
+  if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
+     (interaction.customId.startsWith('setup_chsel:') || interaction.customId.startsWith('setup_rolesel:'))){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
 
   if(interaction.isButton() && interaction.customId.startsWith('verify_wallet:')){
     await interaction.deferUpdate();

@@ -271,38 +271,32 @@ async function handleSetupButton(interaction, ctx){
 
   // ── channel selectors ────────────────────────────────────────────────────
   if(customId.startsWith('setup:channel:')){
-    const type = customId.split(':')[2]; // sales | listings | burn
-    const modal = new ModalBuilder()
-      .setCustomId(`setup_modal:channel:${type}`)
-      .setTitle(`Set ${type.charAt(0).toUpperCase()+type.slice(1)} Channel`);
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('channel_input')
-          .setLabel('Channel ID or #channel-name mention')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. 123456789012345678')
-          .setRequired(true)
-      )
-    );
-    return interaction.showModal(modal);
+    await interaction.deferUpdate();
+    const type  = customId.split(':')[2];
+    const label = type === 'sales' ? '🟢 Sales' : type === 'listings' ? '📋 Listings' : '🔥 Burn Alerts';
+    const menu  = new ChannelSelectMenuBuilder()
+      .setCustomId('setup_chsel:'+type)
+      .setPlaceholder('Pick the '+label+' channel')
+      .addChannelTypes(ChannelType.GuildText);
+    return interaction.editReply({
+      content: '**Select the '+label+' channel:**',
+      components: [new ActionRowBuilder().addComponents(menu)],
+      embeds: [],
+    });
   }
 
   // ── verification setup ───────────────────────────────────────────────────
   if(customId === 'setup:verify:channel'){
-    const modal = new ModalBuilder().setCustomId('setup_modal:verify:channel').setTitle('Verification Channel');
-    modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId('channel_input').setLabel('Channel ID').setStyle(TextInputStyle.Short).setRequired(true)
-    ));
-    return interaction.showModal(modal);
-  }
-
-  if(customId === 'setup:verify:role'){
-    const modal = new ModalBuilder().setCustomId('setup_modal:verify:role').setTitle('Verified Role');
-    modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId('role_input').setLabel('Role ID').setStyle(TextInputStyle.Short).setRequired(true)
-    ));
-    return interaction.showModal(modal);
+    await interaction.deferUpdate();
+    const menu = new ChannelSelectMenuBuilder()
+      .setCustomId('setup_chsel:verify')
+      .setPlaceholder('Pick the verification channel')
+      .addChannelTypes(ChannelType.GuildText);
+    return interaction.editReply({
+      content: '**Select the verification channel:**',
+      components: [new ActionRowBuilder().addComponents(menu)],
+      embeds: [],
+    });
   }
 
   if(customId === 'setup:verify:deploy'){
@@ -376,44 +370,33 @@ async function handleSetupModal(interaction, ctx){
   }
 
   // ── channel inputs ────────────────────────────────────────────────────────
-  if(customId.startsWith('setup_modal:channel:')){
+  if(customId.startsWith('setup_chsel:')){
     await interaction.deferUpdate();
-    const type  = customId.split(':')[2];
-    const input = interaction.fields.getTextInputValue('channel_input').trim().replace(/[<#>]/g,'');
-    const ch    = await interaction.guild.channels.fetch(input).catch(()=>null);
-    if(!ch) return interaction.editReply({ content:'❌ Channel not found. Please use the channel ID.' });
-
-    if(type === 'sales')    state.config.salesChannel    = ch.id;
-    if(type === 'listings') state.config.listingsChannel = ch.id;
-    if(type === 'burn')     state.config.burnChannel     = ch.id;
-
-    const isOcas = state.config.contract?.toLowerCase() === OCAS_CONTRACT;
-    return interaction.editReply({ embeds:[buildChannelsEmbed(state)], components:[channelsRow(isOcas)] });
+    const type = customId.split(':')[1];
+    const chId = interaction.values[0];
+    const gState = getState(guildId);
+    if(type === 'sales')    gState.config.salesChannel    = chId;
+    if(type === 'listings') gState.config.listingsChannel = chId;
+    if(type === 'burn')     gState.config.burnChannel     = chId;
+    if(type === 'verify')   gState.config.verifyChannel   = chId;
+    const isOcas = gState.config.contract?.toLowerCase() === OCAS_CONTRACT;
+    if(type === 'verify'){
+      const verified = gState.config.verifyChannel && gState.config.verifyRole;
+      return interaction.editReply({ content:null, embeds:[buildVerificationEmbed(gState)], components:[verificationRow(verified)] });
+    }
+    return interaction.editReply({ content:null, embeds:[buildChannelsEmbed(gState)], components:[channelsRow(isOcas)] });
   }
 
   // ── verification channel ──────────────────────────────────────────────────
-  if(customId === 'setup_modal:verify:channel'){
+  if(customId === 'setup_rolesel:verify'){
     await interaction.deferUpdate();
-    const input = interaction.fields.getTextInputValue('channel_input').trim().replace(/[<#>]/g,'');
-    const ch    = await interaction.guild.channels.fetch(input).catch(()=>null);
-    if(!ch) return interaction.editReply({ content:'❌ Channel not found.' });
-    state.config.verifyChannel = ch.id;
-    const verified = state.config.verifyChannel && state.config.verifyRole;
-    return interaction.editReply({ embeds:[buildVerificationEmbed(state)], components:[verificationRow(verified)] });
+    const gState = getState(guildId);
+    gState.config.verifyRole = interaction.values[0];
+    const verified = gState.config.verifyChannel && gState.config.verifyRole;
+    return interaction.editReply({ content:null, embeds:[buildVerificationEmbed(gState)], components:[verificationRow(verified)] });
   }
-
-  // ── verification role ─────────────────────────────────────────────────────
-  if(customId === 'setup_modal:verify:role'){
-    await interaction.deferUpdate();
-    const input = interaction.fields.getTextInputValue('role_input').trim().replace(/[<@&>]/g,'');
-    const role  = await interaction.guild.roles.fetch(input).catch(()=>null);
-    if(!role) return interaction.editReply({ content:'❌ Role not found. Please use the role ID.' });
-    state.config.verifyRole = role.id;
-    const verified = state.config.verifyChannel && state.config.verifyRole;
-    return interaction.editReply({ embeds:[buildVerificationEmbed(state)], components:[verificationRow(verified)] });
-  }
+  // verify role now handled by setup_rolesel:verify select menu
 }
-
 const SETUP_COMMANDS = new Set(['setup']);
 
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
