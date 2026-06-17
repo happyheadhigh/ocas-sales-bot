@@ -671,21 +671,38 @@ client.on('interactionCreate', async (interaction)=>{
         [svUser]
       );
       if(globalEx.rows.length){
-        // Already verified elsewhere — skip full flow, just check holdings & assign roles
         await interaction.deferReply({flags:64});
         const knownWallet = globalEx.rows[0].wallet;
-        const cfg = getConfig(svGuild) || {};
-        const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+        const gCfg = getConfig(svGuild) || {};
+        const slug = gCfg.collectionSlug || gCfg.slug || 'on-chain-all-stars';
 
-        // Fetch token holdings
-        let totalTokens = [];
+        // Full OS profile fetch — get ALL linked wallets
+        let allWallets = [knownWallet];
         try{
-          const nftRes = await fetch(
-            `https://api.opensea.io/api/v2/chain/ethereum/account/${knownWallet}/nfts?collection=${slug}&limit=200`,
+          const osRes = await fetch(
+            `https://api.opensea.io/api/v2/accounts/${knownWallet}`,
             { headers:osHeaders() }
           );
-          if(nftRes.ok) totalTokens = (await nftRes.json()).nfts || [];
+          if(osRes.ok){
+            const profile = await osRes.json();
+            const extra = (profile.addresses||[])
+              .map(a=>(a.address||'').toLowerCase())
+              .filter(a=>/^0x[0-9a-f]{40}$/.test(a) && a!==knownWallet);
+            allWallets = [knownWallet, ...extra];
+          }
         }catch(_){}
+
+        // Fetch token holdings across all wallets
+        let totalTokens = [];
+        for(const w of allWallets){
+          try{
+            const nftRes = await fetch(
+              `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+              { headers:osHeaders() }
+            );
+            if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
+          }catch(_){}
+        }
         const tokenCount = totalTokens.length;
 
         // Save to this guild
@@ -709,9 +726,13 @@ client.on('interactionCreate', async (interaction)=>{
           }
         }catch(_){}
 
+        const walletSummary = allWallets.length > 1
+          ? `🔗 **${allWallets.length} wallets** on file (${allWallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
+          : `🔗 **Wallet:** \`${knownWallet.slice(0,6)}...${knownWallet.slice(-4)}\``;
+
         return interaction.editReply({content:[
           '✅ **Verified instantly!**',
-          `🔗 Wallet already on file: \`${knownWallet.slice(0,6)}...${knownWallet.slice(-4)}\``,
+          walletSummary,
           `🪙 **Tokens found:** ${tokenCount}`,
           '',
           'Your wallet was recognised from another server — no re-verification needed.',
@@ -1796,6 +1817,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 

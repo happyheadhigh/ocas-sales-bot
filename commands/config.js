@@ -454,7 +454,7 @@ async function handleConfigButton(interaction, ctx){
           '**How it works:**\n' +
           '→ Click the button below\n' +
           '→ Enter your wallet address\n' +
-          '→ Add a short code to your OpenSea username\n' +
+          '→ Add a short code to your OpenSea bio\n' +
           '→ Roles are assigned automatically\n\n' +
           '*This bot will never DM you or ask for your seed phrase.*'
         )
@@ -673,6 +673,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
