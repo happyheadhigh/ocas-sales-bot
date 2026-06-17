@@ -379,13 +379,23 @@ async function handleSetupButton(interaction, ctx){
       const ch = await interaction.guild.channels.fetch(state.config.verifyChannel).catch(()=>null);
       if(!ch) return interaction.editReply({ content:'❌ Could not find verification channel.' });
 
+      const guildName = interaction.guild.name;
       const panelEmbed = new EmbedBuilder()
-        .setColor(0x5865F2).setTitle('🔐 Wallet Verification')
-        .setDescription('Link your wallet to unlock holder roles and access.\n\nClick **Start Verification** below to get started.');
+        .setColor(0x5865F2)
+        .setTitle(`🔐 ${guildName} — Verify Ownership`)
+        .setDescription(
+          'Link your wallet to prove ownership and unlock holder roles.\n\n' +
+          '**How it works:**\n' +
+          '→ Click the button below\n' +
+          '→ Enter your wallet address\n' +
+          '→ Add a short code to your OpenSea username\n' +
+          '→ Roles are assigned automatically\n\n' +
+          '*This bot will never DM you or ask for your seed phrase.*'
+        )
+        .setThumbnail(interaction.guild.iconURL({ dynamic: true }) || null);
 
       const startBtn = new ButtonBuilder()
-        .setCustomId('start_verification:'+guildId).setLabel('Start Verification')
-        .setStyle(ButtonStyle.Primary).setEmoji('🔗');
+        .setCustomId('start_verification:'+guildId).setLabel('Verify Wallet').setStyle(ButtonStyle.Primary).setEmoji('🔗');
 
       const msg = await ch.send({ embeds:[panelEmbed], components:[new ActionRowBuilder().addComponents(startBtn)] });
       state.config.verifyMessageId = msg.id;
@@ -395,7 +405,7 @@ async function handleSetupButton(interaction, ctx){
         `INSERT INTO verification_panels (guild_id,channel_id,role_id,holder_role_id,min_tokens,message_id,welcome_text)
          VALUES ($1,$2,$3,$4,$5,$6,$7)
          ON CONFLICT (guild_id) DO UPDATE SET channel_id=$2,role_id=$3,holder_role_id=$4,min_tokens=$5,message_id=$6,welcome_text=$7`,
-        [guildId, state.config.verifyChannel, state.config.verifyRole||null, state.config.holderRole||null, 0, msg.id, 'Link your wallet to unlock holder roles and access.']
+        [guildId, state.config.verifyChannel, state.config.verifyRole||null, state.config.holderRole||null, 0, msg.id, `Link your wallet to prove ownership and unlock holder roles in ${guildName}.`]
       );
 
       const v = !!(state.config.verifyChannel && state.config.verifyRole);
@@ -560,4 +570,5 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
