@@ -550,7 +550,7 @@ async function handleSetupModal(interaction, ctx){
 
   // ── add trait role ─────────────────────────────────────────────────────────
   if(customId.startsWith('setup_modal:traitrole:')){
-    const roleId      = customId.split(':')[3];
+    const roleId      = customId.split(':')[2];
     const traitTypeRaw = interaction.fields.getTextInputValue('tr_trait_type').trim();
     const traitVal     = interaction.fields.getTextInputValue('tr_trait_value').trim();
     const minCount     = parseInt(interaction.fields.getTextInputValue('tr_min_count').trim()) || 1;
@@ -589,6 +589,7 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 
