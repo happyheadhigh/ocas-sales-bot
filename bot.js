@@ -500,23 +500,23 @@ client.on('interactionCreate', async (interaction)=>{
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category (use "_count" for token count)')
+          .setLabel('Trait Category (optional — e.g. Type)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Type   or   Background   or   _count')
-          .setRequired(true)
+          .setPlaceholder('Leave blank to require a token count instead')
+          .setRequired(false)
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_value')
-          .setLabel('Trait Value  (leave blank if using _count)')
+          .setLabel('Trait Value (optional — e.g. Zombie, Gold)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Zombie   or   Gold   or   Human 4')
+          .setPlaceholder('Leave blank if using token count')
           .setRequired(false)
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_min_count')
-          .setLabel('How many tokens needed?  (default: 1)')
+          .setLabel('Minimum tokens to qualify (default: 1)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('1 = own at least one · 5 = own five or more')
+          .setPlaceholder('e.g. 1, 5, 20')
           .setRequired(false)
       ),
     );
@@ -533,23 +533,23 @@ client.on('interactionCreate', async (interaction)=>{
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category (use "_count" for token count)')
+          .setLabel('Trait Category (optional — e.g. Type)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Type   or   Background   or   _count')
-          .setRequired(true)
+          .setPlaceholder('Leave blank to require a token count instead')
+          .setRequired(false)
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_value')
-          .setLabel('Trait Value  (leave blank if using _count)')
+          .setLabel('Trait Value (optional — e.g. Zombie, Gold)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Zombie   or   Gold   or   Human 4')
+          .setPlaceholder('Leave blank if using token count')
           .setRequired(false)
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_min_count')
-          .setLabel('How many tokens needed?  (default: 1)')
+          .setLabel('Minimum tokens to qualify (default: 1)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('1 = own at least one · 5 = own five or more')
+          .setPlaceholder('e.g. 1, 5, 20')
           .setRequired(false)
       ),
     );
@@ -1531,6 +1531,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
