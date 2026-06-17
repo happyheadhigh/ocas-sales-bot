@@ -718,13 +718,21 @@ client.on('interactionCreate', async (interaction)=>{
           const panelR = await pgPool.query(
             'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1', [svGuild]
           );
+          console.log('[SVInstant] panel row:', JSON.stringify(panelR.rows[0]));
           if(panelR.rows[0]){
             const { role_id, holder_role_id } = panelR.rows[0];
-            const member = await interaction.guild.members.fetch(svUser).catch(()=>null);
-            if(member && role_id){ const conflict = await checkRoleConflict(interaction.guild, role_id); if(!conflict) await member.roles.add(role_id).catch(()=>{}); }
-            if(member && holder_role_id && tokenCount >= 1) await member.roles.add(holder_role_id).catch(()=>{});
+            const member = await interaction.guild.members.fetch(svUser).catch(e=>{ console.error('[SVInstant] fetch member:', e.message); return null; });
+            console.log('[SVInstant] member found:', !!member, 'role_id:', role_id, 'tokens:', tokenCount);
+            if(member && role_id){
+              await member.roles.add(role_id).catch(e=>console.error('[SVInstant] add verified role:', e.message));
+            }
+            if(member && holder_role_id && tokenCount >= 1){
+              await member.roles.add(holder_role_id).catch(e=>console.error('[SVInstant] add holder role:', e.message));
+            }
+          } else {
+            console.warn('[SVInstant] No verification_panels row for guild:', svGuild);
           }
-        }catch(_){}
+        }catch(e){ console.error('[SVInstant] role assign error:', e.message); }
 
         const walletSummary = allWallets.length > 1
           ? `🔗 **${allWallets.length} wallets** on file (${allWallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
@@ -920,17 +928,21 @@ client.on('interactionCreate', async (interaction)=>{
       const panelR = await pgPool.query(
         'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1', [svGuild]
       );
+      console.log('[SVDone] panel row:', JSON.stringify(panelR.rows[0]));
       if(panelR.rows[0]){
         const { role_id, holder_role_id } = panelR.rows[0];
-        const member = await interaction.guild.members.fetch(discordId).catch(()=>null);
+        const member = await interaction.guild.members.fetch(discordId).catch(e=>{ console.error('[SVDone] fetch member:', e.message); return null; });
+        console.log('[SVDone] member found:', !!member, 'role_id:', role_id, 'tokens:', tokenCount);
         if(member && role_id){
-          const conflict = await checkRoleConflict(interaction.guild, role_id);
-          if(!conflict) await member.roles.add(role_id).catch(()=>{});
+          await member.roles.add(role_id).catch(e=>console.error('[SVDone] add verified role:', e.message));
         }
-        if(member && holder_role_id && tokenCount >= 1)
-          await member.roles.add(holder_role_id).catch(()=>{});
+        if(member && holder_role_id && tokenCount >= 1){
+          await member.roles.add(holder_role_id).catch(e=>console.error('[SVDone] add holder role:', e.message));
+        }
+      } else {
+        console.warn('[SVDone] No verification_panels row for guild:', svGuild);
       }
-    }catch(_){}
+    }catch(e){ console.error('[SVDone] role assign error:', e.message); }
 
     // Clean up code
     await pgPool.query(
@@ -1817,6 +1829,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
