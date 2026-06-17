@@ -437,11 +437,15 @@ client.on('interactionCreate', async (interaction)=>{
     }
   }
   // ── Setup wizard modal + button handlers ───────────────────────────────────
-  if(interaction.isModalSubmit() && interaction.customId.startsWith('setup_modal:'))
-    return handleSetupModal(interaction, ctx);
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('setup_modal:')){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupModal(interaction, setupCtx);
+  }
 
-  if(interaction.isButton() && interaction.customId.startsWith('setup:'))
-    return handleSetupButton(interaction, ctx);
+  if(interaction.isButton() && interaction.customId.startsWith('setup:')){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
 
   if(interaction.isButton() && interaction.customId.startsWith('verify_wallet:')){
     await interaction.deferUpdate();
