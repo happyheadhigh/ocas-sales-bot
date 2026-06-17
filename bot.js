@@ -463,6 +463,10 @@ client.on('interactionCreate', async (interaction)=>{
     const setupCtx = { pgPool, setConfig };
     return handleSetupButton(interaction, setupCtx);
   }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_traitrole:')){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
 
   if(interaction.isButton() && interaction.customId.startsWith('verify_wallet:')){
     await interaction.deferUpdate();
@@ -1429,4 +1433,5 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
