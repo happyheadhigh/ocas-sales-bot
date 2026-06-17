@@ -210,7 +210,7 @@ function buildRolesEmbed(traitRoles){
   const list = traitRoles.length === 0
     ? '*No trait roles configured yet.*'
     : traitRoles.map((r, i) =>
-        `**${i+1}.** <@&${r.role_id}> — ` +
+        `**${i+1}.** ${r.role_id ? `<@&${r.role_id}>` : 'Unknown Role'} — ` +
         (r.trait_type === '_count'
           ? `Own ${r.minimum_count}+ tokens`
           : `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`)
@@ -238,7 +238,7 @@ function rolesRow(traitRoles){
     const options = traitRoles.slice(0, 25).map((r, i) =>
       new StringSelectMenuOptionBuilder()
         .setLabel(`${i+1}. ${r.trait_type === '_count' ? `Own ${r.minimum_count}+ tokens` : `${r.trait_type}: ${r.trait_value || 'any'}`}`)
-        .setDescription(`Role ID: ${r.role_id}`)
+        .setDescription(`Role: ${r.role_id ? `<@&${r.role_id}>` : 'Unknown'}`)
         .setValue(`${r.id}`)
     );
     rows.push(new ActionRowBuilder().addComponents(
@@ -673,6 +673,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 

@@ -242,7 +242,7 @@ function traitRolesRow(state){
     const options = roles.map((r, i) =>
       new StringSelectMenuOptionBuilder()
         .setLabel(`${i+1}. ${r.traitType === '_count' ? `Own ${r.minCount}+ tokens` : `${r.traitType}: ${r.traitValue}`}`)
-        .setDescription(`Role: <@&${r.roleId}>`)
+        .setDescription(`Role: ${r.roleId ? `<@&${r.roleId}>` : (r.roleName||'Unknown')}`)
         .setValue(String(i))
     );
     rows.push(new ActionRowBuilder().addComponents(
@@ -589,6 +589,7 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 
