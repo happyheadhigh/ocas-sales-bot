@@ -101,6 +101,7 @@ const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
 const { handleLotteryCommand, LOTTERY_COMMANDS } = require('./commands/lottery');
 const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
 const { handleDownloadCommand, DOWNLOAD_COMMANDS } = require('./commands/download');
+const { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS } = require('./commands/setup');
 
 // ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({ intents: [
