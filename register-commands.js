@@ -118,3 +118,65 @@ const commands = [
     .addSubcommand(sc=>sc.setName('status').setDescription('Show recent/scheduled burn lotteries').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(false)))
     .addSubcommand(sc=>sc.setName('cancel').setDescription('Cancel an active scheduled burn lottery').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(true))),
 
+
+
+  new SlashCommandBuilder().setName('myregistration')
+    .setDescription('Show your current wallet registration status'),
+
+
+
+  new SlashCommandBuilder().setName('verifydashboard')
+    .setDescription('View verification stats and role breakdown for this server (Admin only)'),
+
+  new SlashCommandBuilder().setName('setupverification')
+    .setDescription('Setup a wallet verification panel in a channel (Admin only)')
+    .addChannelOption(o=>o.setName('channel').setDescription('Channel to post the verification panel').setRequired(true))
+    .addRoleOption(o=>o.setName('role').setDescription('Role to assign after verification').setRequired(false))
+    .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum OCAS tokens required (0 = any wallet)').setRequired(false).setMinValue(0))
+    .addStringOption(o=>o.setName('message').setDescription('Custom welcome message for the panel').setRequired(false)),
+
+  new SlashCommandBuilder().setName('setuptraitrole')
+    .setDescription('Assign a role to holders of a specific trait or token count (Admin only)')
+    .addStringOption(o=>o.setName('trait_type').setDescription('Trait category e.g. Type, Hat Hair — or "Collection" for total count').setRequired(true))
+    .addStringOption(o=>o.setName('trait_value').setDescription('Trait value e.g. Zombie, Mohawk Blonde — or "OCAS" for total count').setRequired(true))
+    .addRoleOption(o=>o.setName('role').setDescription('Role to assign').setRequired(true))
+    .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum tokens with this trait (default 1). Use 5 for King Ape, 20 for Collector etc').setRequired(false).setMinValue(1)),
+
+  new SlashCommandBuilder().setName('removetraitrole')
+    .setDescription('Remove a trait role mapping (Admin only)')
+    .addStringOption(o=>o.setName('trait_type').setDescription('Trait category').setRequired(true))
+    .addStringOption(o=>o.setName('trait_value').setDescription('Trait value').setRequired(true))
+    .addRoleOption(o=>o.setName('role').setDescription('Role to remove').setRequired(true)),
+
+  new SlashCommandBuilder().setName('listtraitroles')
+    .setDescription('List all trait role mappings for this server'),
+
+
+  new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)'),
+].map(c=>c.toJSON());
+
+if(!process.env.DISCORD_TOKEN){
+  console.error(`Missing DISCORD_TOKEN in ${envFile}`);
+  process.exit(1);
+}
+if(!process.env.CLIENT_ID){
+  console.error(`Missing CLIENT_ID in ${envFile}`);
+  process.exit(1);
+}
+if(!/^\d{17,22}$/.test(String(process.env.CLIENT_ID))){
+  console.error(`CLIENT_ID in ${envFile} does not look like a Discord application/client ID. Do not use a channel ID or server ID here.`);
+  process.exit(1);
+}
+
+const rest = new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
+
+(async()=>{
+  try{
+    console.log('Registering '+commands.length+' slash commands...');
+    const data = await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), {body:commands});
+    console.log('Registered '+data.length+' commands successfully!');
+    console.log('Commands appear in Discord within ~1 hour.');
+  }catch(e){
+    console.error('Registration failed:', e.message);
+  }
+})();
