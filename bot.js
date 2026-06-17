@@ -665,10 +665,19 @@ client.on('interactionCreate', async (interaction)=>{
     const code = 'OCAS-'+Math.random().toString(36).slice(2,8).toUpperCase();
     const expiresAt = new Date(Date.now() + 30*60*1000);
     try{
-      await pgPool.query(
-        'INSERT INTO verification_codes (discord_id,guild_id,wallet,code,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,code=$4,expires_at=$5',
-        [svUser, svGuild, 'pending', code, expiresAt]
-      );
+      // Upsert verification code — handle both old (discord_id PK) and new (discord_id,guild_id PK)
+      try{
+        await pgPool.query(
+          'INSERT INTO verification_codes (discord_id,guild_id,wallet,code,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,code=$4,expires_at=$5',
+          [svUser, svGuild, 'pending', code, expiresAt]
+        );
+      }catch(_){
+        // Fallback for old schema with single-column PK
+        await pgPool.query(
+          'INSERT INTO verification_codes (discord_id,guild_id,wallet,code,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (discord_id) DO UPDATE SET guild_id=$2,wallet=$3,code=$4,expires_at=$5',
+          [svUser, svGuild, 'pending', code, expiresAt]
+        );
+      }
     }catch(e){ console.error('[StartVerify]', e.message); }
     const { ButtonBuilder, ButtonStyle, ActionRowBuilder, EmbedBuilder } = require('discord.js');
     const codeEmbed = new EmbedBuilder()
@@ -1705,6 +1714,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
