@@ -392,6 +392,49 @@ async function checkRoleConflict(guild, roleId){
 client.on('interactionCreate', async (interaction)=>{
 
   // ── Wallet verification button ────────────────────────────────────────────
+
+  // ── start_verification wallet modal submit ────────────────────────────────────
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('sv_modal:wallet:')){
+    await interaction.deferReply({ephemeral:true});
+    const wallet    = (interaction.fields.getTextInputValue('wallet_input')||'').trim().toLowerCase();
+    const discordId = interaction.user.id;
+    const guildId   = interaction.guildId;
+
+    if(!/^0x[0-9a-f]{40}$/i.test(wallet))
+      return interaction.editReply({content:'❌ Invalid wallet address. Must start with 0x followed by 40 characters.'});
+
+    const code = 'OCAS-verify-'+Math.random().toString(36).slice(2,8).toUpperCase();
+    const expiresAt = new Date(Date.now() + 30*60*1000);
+
+    try{
+      await pgPool.query(
+        'INSERT INTO verification_codes (discord_id,guild_id,wallet,code,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,code=$4,expires_at=$5',
+        [discordId, guildId, wallet, code, expiresAt]
+      );
+      const { ButtonBuilder, ButtonStyle, ActionRowBuilder } = require('discord.js');
+      const verifyBtn = new ButtonBuilder()
+        .setCustomId('verify_wallet:'+discordId+':'+wallet)
+        .setLabel("I've Added It — Verify Now")
+        .setStyle(ButtonStyle.Success)
+        .setEmoji('✅');
+      return interaction.editReply({content:[
+        '**Step 1:** Go to your OpenSea profile and click Edit:',
+        'https://opensea.io/'+wallet,
+        '',
+        '**Step 2:** Temporarily add this code to your username:',
+        '```'+code+'```',
+        'For example: `YourName-'+code+'`',
+        '',
+        '**Step 3:** Save your profile then click the button below.',
+        '**Step 4:** After verified, you can change your username back.',
+        '',
+        '⏱ Expires in 30 minutes.',
+      ].join('\n'), components:[new ActionRowBuilder().addComponents(verifyBtn)]});
+    }catch(e){
+      console.error('[SVModal]', e.message);
+      return interaction.editReply({content:'❌ Registration failed. Please try again.'});
+    }
+  }
   // ── Setup wizard modal + button handlers ───────────────────────────────────
   if(interaction.isModalSubmit() && interaction.customId.startsWith('setup_modal:'))
     return handleSetupModal(interaction, ctx);
@@ -1155,9 +1198,9 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
-    await interaction.deferReply({ephemeral:true});
-    const svGuild  = interaction.guildId;
-    const svUser   = interaction.user.id;
+    const svGuild = interaction.guildId;
+    const svUser  = interaction.user.id;
+    // Check if already verified first
     try{
       const svEx = await pgPool.query(
         'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true',
@@ -1165,10 +1208,28 @@ client.on('interactionCreate', async (interaction)=>{
       );
       if(svEx.rows.length){
         const w = svEx.rows[0].wallet;
-        return interaction.editReply({content:'✅ Already verified! Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+        await interaction.reply({ephemeral:true, content:'✅ Already verified! Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+        return;
       }
     }catch(_){}
-    return interaction.editReply({content:'**Wallet Verification**\n\nRun `/register wallet:0x...` to begin. The bot will walk you through the steps.'});
+    // Show wallet input modal — no slash command needed from member
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+    const svModal = new ModalBuilder()
+      .setCustomId('sv_modal:wallet:'+svGuild)
+      .setTitle('Wallet Verification');
+    svModal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('wallet_input')
+          .setLabel('Your Ethereum Wallet Address')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('0x...')
+          .setMinLength(42)
+          .setMaxLength(42)
+          .setRequired(true)
+      )
+    );
+    return interaction.showModal(svModal);
   }
 
     if(DOWNLOAD_COMMANDS.has(commandName)) return handleDownloadCommand(interaction);
