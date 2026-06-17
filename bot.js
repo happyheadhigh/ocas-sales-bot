@@ -699,8 +699,8 @@ client.on('interactionCreate', async (interaction)=>{
     const discordId = interaction.user.id;
     try{
       const r = await pgPool.query(
-        'SELECT code FROM verification_codes WHERE discord_id=$1 AND guild_id=$2',
-        [discordId, svGuild]
+        'SELECT code FROM verification_codes WHERE discord_id=$1 ORDER BY expires_at DESC LIMIT 1',
+        [discordId]
       );
       const code = r.rows[0]?.code || '(expired — click Verify Wallet again)';
       return interaction.reply({ephemeral:true, content:'```'+code+'```'});
@@ -719,8 +719,8 @@ client.on('interactionCreate', async (interaction)=>{
     let codeRow;
     try{
       const r = await pgPool.query(
-        'SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 AND guild_id=$2',
-        [discordId, svGuild]
+        'SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 ORDER BY expires_at DESC LIMIT 1',
+        [discordId]
       );
       codeRow = r.rows[0];
     }catch(e){ return interaction.editReply({content:'❌ DB error. Please try again.'}); }
@@ -1705,6 +1705,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
