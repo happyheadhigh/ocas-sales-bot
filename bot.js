@@ -432,12 +432,10 @@ client.on('interactionCreate', async (interaction)=>{
       return interaction.editReply({content:'❌ Code expired. Click Verify Wallet again.'});
 
     const code = codeRow.code;
-    const { osHeaders, osAgent } = require('./lib/poll');
-
     // Fetch OpenSea profile by username
     let profile;
     try{
-      const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${osUsername}`, { headers:osHeaders(), agent:osAgent });
+      const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${osUsername}`, { headers:osHeaders() });
       if(!osRes.ok){
         if(osRes.status===404) return interaction.editReply({content:`❌ OpenSea username \`${osUsername}\` not found. Check the spelling and try again.`});
         return interaction.editReply({content:`❌ OpenSea error (${osRes.status}). Try again.`});
@@ -740,14 +738,12 @@ client.on('interactionCreate', async (interaction)=>{
       return interaction.editReply({content:'❌ Code expired. Click **Verify Wallet** again to get a new one.'});
 
     const code = codeRow.code;
-    const { osHeaders, osAgent } = require('./lib/poll');
-
     // Search OpenSea for a profile whose username contains the code
     let profile = null;
     try{
       const searchRes = await fetch(
         `https://api.opensea.io/api/v2/accounts?username_contains=${encodeURIComponent(code)}&limit=5`,
-        { headers:osHeaders(), agent:osAgent }
+        { headers:osHeaders() }
       );
       if(searchRes.ok){
         const data = await searchRes.json();
@@ -774,12 +770,14 @@ client.on('interactionCreate', async (interaction)=>{
         )
       );
       // Can't showModal after deferReply — edit reply with a prompt instead
-      return interaction.editReply({content:[
-        '❌ Could not automatically find your profile.',
-        'Please reply with your OpenSea username so we can verify the code.',
-        '',
-        'Click the button to enter it:',
-      ].join('\n')});
+      const fallbackBtn = new ButtonBuilder()
+        .setCustomId('sv_enter_username:'+svGuild)
+        .setLabel('Enter OpenSea Username')
+        .setStyle(ButtonStyle.Primary);
+      return interaction.editReply({
+        content: '❌ Could not find your profile automatically.\nEnter your OpenSea username manually:',
+        components: [new ActionRowBuilder().addComponents(fallbackBtn)]
+      });
     }
 
     // Found profile — get all linked wallets
@@ -801,7 +799,7 @@ client.on('interactionCreate', async (interaction)=>{
       try{
         const nftRes = await fetch(
           `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
-          { headers:osHeaders(), agent:osAgent }
+          { headers:osHeaders() }
         );
         if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
       }catch(_){}
@@ -847,6 +845,25 @@ client.on('interactionCreate', async (interaction)=>{
       '',
       'You can remove the code from your OpenSea username now.',
     ].join('\n')});
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('sv_enter_username:')){
+    const { ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+    const svGuild = interaction.customId.split(':')[1];
+    const modal = new ModalBuilder()
+      .setCustomId('sv_modal:username:'+svGuild)
+      .setTitle('Enter OpenSea Username');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('os_username')
+          .setLabel('Your OpenSea Username')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. cryptowhale123')
+          .setMinLength(1).setMaxLength(100).setRequired(true)
+      )
+    );
+    return interaction.showModal(modal);
   }
 
   if(interaction.isButton() && interaction.customId.startsWith('lottery_enter:')){
@@ -1714,6 +1731,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
