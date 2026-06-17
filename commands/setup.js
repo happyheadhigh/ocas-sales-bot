@@ -294,12 +294,17 @@ async function resumeStep(interaction, state, ctx){
 async function handleSetupButton(interaction, ctx){
   const { pgPool, setConfig } = ctx;
   const guildId  = interaction.guildId;
-  const state    = await loadState(guildId, pgPool);
   const customId = interaction.customId;
+
+  // Defer immediately — must happen within 3s or Discord kills the interaction
+  // Modals are exempt (showModal is its own response), handle those below
+  const isModal = customId === 'setup:contract' || customId === 'setup:traitrole:add';
+  if(!isModal) await interaction.deferUpdate();
+
+  const state = await loadState(guildId, pgPool);
 
   // ── back navigation ────────────────────────────────────────────────────────
   if(customId.startsWith('setup:back:')){
-    await interaction.deferUpdate();
     const backTo = parseInt(customId.split(':')[2]);
     state.step = backTo;
     await saveState(guildId, state, pgPool);
@@ -312,7 +317,6 @@ async function handleSetupButton(interaction, ctx){
 
   // ── step navigation ────────────────────────────────────────────────────────
   if(customId === 'setup:start' || customId.startsWith('setup:step:')){
-    await interaction.deferUpdate();
     const step = customId === 'setup:start' ? 2 : parseInt(customId.split(':')[2]);
     state.step = step;
     const isOcas = state.config.contract?.toLowerCase() === OCAS_CONTRACT;
@@ -343,7 +347,6 @@ async function handleSetupButton(interaction, ctx){
 
   // ── channel selectors ──────────────────────────────────────────────────────
   if(customId.startsWith('setup:channel:')){
-    await interaction.deferUpdate();
     const type  = customId.split(':')[2];
     const label = type === 'sales' ? '🟢 Sales' : type === 'listings' ? '📋 Listings' : '🔥 Burn Alerts';
     const menu  = new ChannelSelectMenuBuilder()
@@ -354,7 +357,6 @@ async function handleSetupButton(interaction, ctx){
 
   // ── verification pickers ───────────────────────────────────────────────────
   if(customId === 'setup:verify:channel'){
-    await interaction.deferUpdate();
     const menu = new ChannelSelectMenuBuilder()
       .setCustomId('setup_chsel:verify').setPlaceholder('Pick the verification channel')
       .addChannelTypes(ChannelType.GuildText);
@@ -362,19 +364,16 @@ async function handleSetupButton(interaction, ctx){
   }
 
   if(customId === 'setup:verify:role'){
-    await interaction.deferUpdate();
     const menu = new RoleSelectMenuBuilder().setCustomId('setup_rolesel:verify').setPlaceholder('Pick the ✅ Verified Wallet role');
     return interaction.editReply({ content:'**Select the ✅ Verified Wallet role** (given to anyone who links a wallet):', components:[new ActionRowBuilder().addComponents(menu)], embeds:[] });
   }
 
   if(customId === 'setup:verify:holderrole'){
-    await interaction.deferUpdate();
     const menu = new RoleSelectMenuBuilder().setCustomId('setup_rolesel:holder').setPlaceholder('Pick the 🏆 Holder role');
     return interaction.editReply({ content:'**Select the 🏆 Holder role** (given to members who hold ≥1 token):', components:[new ActionRowBuilder().addComponents(menu)], embeds:[] });
   }
 
   if(customId === 'setup:verify:deploy'){
-    await interaction.deferUpdate();
     try{
       const ch = await interaction.guild.channels.fetch(state.config.verifyChannel).catch(()=>null);
       if(!ch) return interaction.editReply({ content:'❌ Could not find verification channel.' });
@@ -418,7 +417,6 @@ async function handleSetupButton(interaction, ctx){
 
   // ── channel / role select menus ────────────────────────────────────────────
   if(customId.startsWith('setup_chsel:') || customId.startsWith('setup_rolesel:')){
-    await interaction.deferUpdate();
     const type  = customId.split(':')[1];
     const isOcas = state.config.contract?.toLowerCase() === OCAS_CONTRACT;
 
@@ -472,7 +470,6 @@ async function handleSetupButton(interaction, ctx){
 
   // ── trait role: delete select ─────────────────────────────────────────────
   if(customId === 'setup_traitrole:delete'){
-    await interaction.deferUpdate();
     const idx = parseInt(interaction.values[0]);
     const roles = state.config.traitRoles || [];
     if(!isNaN(idx) && roles[idx]) roles.splice(idx, 1);
@@ -483,7 +480,6 @@ async function handleSetupButton(interaction, ctx){
 
   // ── close / skip ───────────────────────────────────────────────────────────
   if(customId === 'setup:close' || customId === 'setup:skip'){
-    await interaction.deferUpdate();
     if(customId === 'setup:close'){
       await clearWizardState(guildId, pgPool);
       return interaction.editReply({ embeds:[], components:[], content:'✅ Setup complete. Run `/setup` anytime to update settings.' });
@@ -505,12 +501,13 @@ async function handleSetupButton(interaction, ctx){
 async function handleSetupModal(interaction, ctx){
   const { pgPool, setConfig } = ctx;
   const guildId  = interaction.guildId;
-  const state    = await loadState(guildId, pgPool);
   const customId = interaction.customId;
+
+  await interaction.deferUpdate();
+  const state = await loadState(guildId, pgPool);
 
   // ── contract address ───────────────────────────────────────────────────────
   if(customId === 'setup_modal:contract'){
-    await interaction.deferUpdate();
     const contract = interaction.fields.getTextInputValue('contract_input').trim().toLowerCase();
     if(!/^0x[0-9a-f]{40}$/i.test(contract))
       return interaction.editReply({ content:'❌ Invalid contract address. Must be 0x followed by 40 hex characters.' });
@@ -527,7 +524,6 @@ async function handleSetupModal(interaction, ctx){
 
   // ── add trait role ─────────────────────────────────────────────────────────
   if(customId === 'setup_modal:traitrole'){
-    await interaction.deferUpdate();
     const roleId    = interaction.fields.getTextInputValue('tr_role_id').trim();
     const traitType = interaction.fields.getTextInputValue('tr_trait_type').trim();
     const traitVal  = interaction.fields.getTextInputValue('tr_trait_value').trim();
@@ -570,5 +566,6 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 

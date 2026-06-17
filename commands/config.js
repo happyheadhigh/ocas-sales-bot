@@ -270,7 +270,14 @@ async function handleConfigButton(interaction, ctx){
   const { pgPool, getConfig, setConfig } = ctx;
   const guildId  = interaction.guildId;
   const customId = interaction.customId;
-  const cfg      = getConfig(guildId) || {};
+
+  // Modals open with showModal (their own response) — everything else defers first
+  const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
+                  customId === 'cfg:col:add' || customId === 'cfg:role:add' ||
+                  customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
+  if(!isModal) await interaction.deferUpdate();
+
+  const cfg = getConfig(guildId) || {};
 
   const traitRolesQ = () => pgPool.query(
     'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
@@ -279,7 +286,6 @@ async function handleConfigButton(interaction, ctx){
 
   // ── Back to dashboard ──────────────────────────────────────────────────────
   if(customId === 'cfg:back'){
-    await interaction.deferUpdate();
     const trRes = await traitRolesQ();
     return interaction.editReply({
       content: '',
@@ -290,13 +296,11 @@ async function handleConfigButton(interaction, ctx){
 
   // ── Category navigation ────────────────────────────────────────────────────
   if(customId === 'cfg:cat:collection'){
-    await interaction.deferUpdate();
     return interaction.editReply({ content:'', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
 
   // Select a collection to edit
   if(customId === 'cfg_col:select'){
-    await interaction.deferUpdate();
     const colId = interaction.values[0];
     const isPrimary = colId === 'primary';
     const col = isPrimary
@@ -349,7 +353,6 @@ async function handleConfigButton(interaction, ctx){
 
   // Edit collection channels (show channel select)
   if(customId.startsWith('cfg:col:saleschan:') || customId.startsWith('cfg:col:listchan:')){
-    await interaction.deferUpdate();
     const parts = customId.split(':');
     const field = parts[2]; // 'saleschan' or 'listchan'
     const colId = parts[3];
@@ -363,7 +366,6 @@ async function handleConfigButton(interaction, ctx){
 
   // Remove extra collection
   if(customId.startsWith('cfg:col:remove:')){
-    await interaction.deferUpdate();
     const colId = parseInt(customId.split(':')[3]);
     if(!isNaN(colId)){
       const cols = cfg.collections || [];
@@ -374,16 +376,13 @@ async function handleConfigButton(interaction, ctx){
     return interaction.editReply({ content:'✅ Collection removed.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
   if(customId === 'cfg:cat:channels'){
-    await interaction.deferUpdate();
     const isOcas = cfg.contract?.toLowerCase() === OCAS_CONTRACT;
     return interaction.editReply({ content:'', embeds:[buildChannelsEmbed(cfg)], components:channelsRow(isOcas) });
   }
   if(customId === 'cfg:cat:verification'){
-    await interaction.deferUpdate();
     return interaction.editReply({ content:'', embeds:[buildVerificationEmbed(cfg)], components:verificationRow(cfg) });
   }
   if(customId === 'cfg:cat:roles'){
-    await interaction.deferUpdate();
     const trRes = await traitRolesQ();
     return interaction.editReply({ content:'', embeds:[buildRolesEmbed(trRes.rows)], components:rolesRow(trRes.rows) });
   }
@@ -416,7 +415,6 @@ async function handleConfigButton(interaction, ctx){
 
   // ── Channel edits (show channel select menu) ───────────────────────────────
   if(customId.startsWith('cfg:ch:')){
-    await interaction.deferUpdate();
     const type  = customId.split(':')[2];
     const label = type === 'sales' ? '🟢 Sales' : type === 'listings' ? '📋 Listings' : '🔥 Burn Alerts';
     const menu  = new ChannelSelectMenuBuilder()
@@ -428,7 +426,6 @@ async function handleConfigButton(interaction, ctx){
 
   // ── Verification edits ─────────────────────────────────────────────────────
   if(customId === 'cfg:ver:channel'){
-    await interaction.deferUpdate();
     const menu = new ChannelSelectMenuBuilder()
       .setCustomId('cfg_chsel:verify')
       .setPlaceholder('Pick the verification channel')
@@ -436,17 +433,14 @@ async function handleConfigButton(interaction, ctx){
     return interaction.editReply({ content:'**Select the verification channel:**', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
   }
   if(customId === 'cfg:ver:role'){
-    await interaction.deferUpdate();
     const menu = new RoleSelectMenuBuilder().setCustomId('cfg_rolesel:verify').setPlaceholder('Pick the ✅ Verified Wallet role');
     return interaction.editReply({ content:'**Select the ✅ Verified Wallet role:**', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
   }
   if(customId === 'cfg:ver:holder'){
-    await interaction.deferUpdate();
     const menu = new RoleSelectMenuBuilder().setCustomId('cfg_rolesel:holder').setPlaceholder('Pick the 🏆 Holder role');
     return interaction.editReply({ content:'**Select the 🏆 Holder role:**', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
   }
   if(customId === 'cfg:ver:deploy'){
-    await interaction.deferUpdate();
     try{
       const verCh = await interaction.guild.channels.fetch(cfg.verifyChannel).catch(()=>null);
       if(!verCh) return interaction.editReply({ content:'❌ Verification channel not found. Set it first.' });
@@ -511,7 +505,6 @@ async function handleConfigButton(interaction, ctx){
 
   // ── Roles: delete select ───────────────────────────────────────────────────
   if(customId === 'cfg_role:delete'){
-    await interaction.deferUpdate();
     const rowId = parseInt(interaction.values[0]);
     await pgPool.query('DELETE FROM trait_roles WHERE id=$1 AND guild_id=$2', [rowId, guildId]).catch(()=>{});
     const trRes = await traitRolesQ();
@@ -520,7 +513,6 @@ async function handleConfigButton(interaction, ctx){
 
   // ── Channel select menus ───────────────────────────────────────────────────
   if(customId.startsWith('cfg_chsel:')){
-    await interaction.deferUpdate();
     const parts = customId.split(':');
     const chId = interaction.values[0];
 
@@ -563,7 +555,6 @@ async function handleConfigButton(interaction, ctx){
 
   // ── Role select menus ──────────────────────────────────────────────────────
   if(customId.startsWith('cfg_rolesel:')){
-    await interaction.deferUpdate();
     const type   = customId.split(':')[1];
     const roleId = interaction.values[0];
     if(type === 'verify') cfg.verifyRole = roleId;
@@ -576,12 +567,13 @@ async function handleConfigButton(interaction, ctx){
 async function handleConfigModal(interaction, ctx){
   const { pgPool, getConfig, setConfig } = ctx;
   const guildId  = interaction.guildId;
-  const cfg      = getConfig(guildId) || {};
   const customId = interaction.customId;
+
+  await interaction.deferUpdate();
+  const cfg = getConfig(guildId) || {};
 
   // ── Add collection ─────────────────────────────────────────────────────────
   if(customId === 'cfg_modal:addcol'){
-    await interaction.deferUpdate();
     const name     = interaction.fields.getTextInputValue('col_name').trim();
     const slug     = interaction.fields.getTextInputValue('col_slug').trim().toLowerCase();
     const contract = interaction.fields.getTextInputValue('col_contract').trim().toLowerCase();
@@ -593,7 +585,6 @@ async function handleConfigModal(interaction, ctx){
 
   // ── Edit collection field (contract or slug) ───────────────────────────────
   if(customId.startsWith('cfg_modal:editcol:')){
-    await interaction.deferUpdate();
     const parts = customId.split(':'); // cfg_modal editcol field colId
     const field = parts[2];
     const colId = parts[3];
@@ -628,7 +619,6 @@ async function handleConfigModal(interaction, ctx){
 
   // ── Add trait role ─────────────────────────────────────────────────────────
   if(customId === 'cfg_modal:traitrole'){
-    await interaction.deferUpdate();
     const roleId    = interaction.fields.getTextInputValue('tr_role_id').trim();
     const traitType = interaction.fields.getTextInputValue('tr_trait_type').trim();
     const traitVal  = interaction.fields.getTextInputValue('tr_trait_value').trim();
@@ -658,5 +648,6 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
