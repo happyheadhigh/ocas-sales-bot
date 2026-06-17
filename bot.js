@@ -103,6 +103,7 @@ const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
 const { handleDownloadCommand, DOWNLOAD_COMMANDS } = require('./commands/download');
 const { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS } = require('./commands/setup');
 const { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS } = require('./commands/config');
+const { handleLotteriesCommand, handleLotteriesButton, LOTTERIES_COMMANDS } = require('./commands/lotteries');
 
 // ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({ intents: [
@@ -465,6 +466,9 @@ client.on('interactionCreate', async (interaction)=>{
   if(interaction.isButton() && (interaction.customId.startsWith('cfg:') || interaction.customId.startsWith('cfg_role:'))){
     const cfgCtx = { pgPool, getConfig, setConfig };
     return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('ltrs:')){
+    return handleLotteriesButton(interaction, { pgPool });
   }
   // Channel + role select menus from setup wizard
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
@@ -1172,6 +1176,7 @@ client.on('interactionCreate', async (interaction)=>{
   if(LOTTERY_COMMANDS.has(commandName)) return handleLotteryCommand(commandName, ctx);
   if(SETUP_COMMANDS.has(commandName))    return handleSetupCommand(interaction, ctx);
   if(CONFIG_COMMANDS.has(commandName))   return handleConfigCommand(interaction, { pgPool, getConfig, setConfig });
+  if(LOTTERIES_COMMANDS.has(commandName)) return handleLotteriesCommand(interaction, { pgPool });
   if(MISC_COMMANDS.has(commandName))    return handleMiscCommand(commandName, ctx);
   // ── /setuptraitrole ──────────────────────────────────────────────────────────
   if(commandName==='setuptraitrole'){
@@ -1452,6 +1457,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
