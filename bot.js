@@ -1369,7 +1369,7 @@ client.once('clientReady', async ()=>{
   if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL){
     console.log('[Burn] Starting burn poller');
     pollBurnEvents();
-    setInterval(pollBurnEvents, 30_000);
+    setInterval(pollBurnEvents, 45_000); // 45s — prevents tick overlap if DB is slow
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
   }
