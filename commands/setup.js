@@ -461,6 +461,39 @@ async function handleSetupButton(interaction, ctx){
     });
   }
 
+  // ── trait role: role selected → open trait fields modal ─────────────────
+  if(customId === 'setup_traitrole:rolesel'){
+    const roleId = interaction.values[0];
+    const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    const modal  = new ModalBuilder()
+      .setCustomId('setup_modal:traitrole:'+roleId)
+      .setTitle(`Trait Role: @${role?.name || roleId}`);
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_trait_type')
+          .setLabel('Trait Category  (use "_count" for token count)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Type   or   Background   or   _count')
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_trait_value')
+          .setLabel('Trait Value  (leave blank if using _count)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Zombie   or   Gold   or   Human 4')
+          .setRequired(false)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_min_count')
+          .setLabel('How many tokens needed?  (default: 1)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('1 = own at least one · 5 = own five or more')
+          .setRequired(false)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
   // ── trait role: delete select ─────────────────────────────────────────────
   if(customId === 'setup_traitrole:delete'){
     const idx = parseInt(interaction.values[0]);
@@ -554,6 +587,7 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 

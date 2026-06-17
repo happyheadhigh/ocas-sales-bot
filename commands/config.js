@@ -505,18 +505,24 @@ async function handleConfigButton(interaction, ctx){
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Type  (or "_count" for token count)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('Type   or   _count').setRequired(true)
+          .setLabel('Trait Category  (use "_count" for token count)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Type   or   Background   or   _count')
+          .setRequired(true)
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_value')
           .setLabel('Trait Value  (leave blank if using _count)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('Zombie').setRequired(false)
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Zombie   or   Gold   or   Human 4')
+          .setRequired(false)
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_min_count')
-          .setLabel('Min count  (default: 1)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('1').setRequired(false)
+          .setLabel('How many tokens needed?  (default: 1)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('1 = own at least one · 5 = own five or more')
+          .setRequired(false)
       ),
     );
     return interaction.showModal(modal);
@@ -665,6 +671,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
