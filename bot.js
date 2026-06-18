@@ -273,7 +273,7 @@ async function syncTraitRoles(guild, discordId, wallet){
   try{
     // Get all trait roles configured for this guild
     const traitRolesRes = await pgPool.query(
-      'SELECT trait_type, trait_value, role_id FROM trait_roles WHERE guild_id=$1',
+      'SELECT trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1',
       [guild.id]
     );
     if(!traitRolesRes.rows.length) return; // No trait roles configured
@@ -331,10 +331,13 @@ async function syncTraitRoles(guild, discordId, wallet){
       } else {
         count = traitCounts[tr.trait_type+'::'+tr.trait_value] || traitCounts[tr.trait_type+'::'+String(tr.trait_value||'')] || 0;
       }
-      const meetsMin = count >= (tr.minimum_count || 1);
-      console.log('[TraitSync] rule:', tr.trait_type, tr.trait_value||'', '>=', tr.minimum_count, '| count:', count, '| meets:', meetsMin);
-      if(meetsMin && !hasRole)  await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
-      if(!meetsMin && hasRole)  await member.roles.remove(tr.role_id).catch(()=>{});
+      const meetsMin = count >= (parseInt(tr.minimum_count) || 1);
+      const minNeeded = parseInt(tr.minimum_count) || 1;
+      const meetsMinFixed = count >= minNeeded;
+      if(meetsMinFixed !== meetsMin) console.log('[TraitSync] FIXED meetsMin for', tr.trait_type, tr.trait_value, ':', meetsMin, '->', meetsMinFixed);
+      console.log('[TraitSync] rule:', tr.trait_type, tr.trait_value||'', '>=', minNeeded, '| count:', count, '| meets:', meetsMinFixed);
+      if(meetsMinFixed && !hasRole)  await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
+      if(!meetsMinFixed && hasRole)  await member.roles.remove(tr.role_id).catch(()=>{});
     }
 
     // Assign verified + holder roles from verification panel config
@@ -1899,6 +1902,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
