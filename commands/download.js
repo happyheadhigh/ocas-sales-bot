@@ -304,15 +304,16 @@ async function handleDownloadCommand(interaction, forced={}){
       if(resolved){ contract = resolved.cfg.contract || contract; slug = resolved.cfg.slug || slug; chain = resolved.cfg.chain || chain; alias = resolved.alias; }
     }
     const finalTransparent = transparent;
-    const { buffer } = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent });
+    const rendered = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent });
+    const { buffer } = rendered;
     const ext = rendered.ext || 'png';
     const sizeStr = ext === 'png' ? `-${size}` : '';
     const transparentStr = (ext === 'png' && finalTransparent) ? '-transparent' : '';
     const filename = `${alias}-${tokenId}${sizeStr}${transparentStr}.${ext}`.replace(/[^a-z0-9_.-]+/gi,'-');
     const att = new AttachmentBuilder(buffer, { name:filename });
-    const isAnimated = rendered.ext && rendered.ext !== 'png';
+    const isAnimated = ext !== 'png';
     const content = isAnimated
-      ? `${rendered.ext.toUpperCase()} download for **${alias.toUpperCase()} #${tokenId}**`
+      ? `${ext.toUpperCase()} download for **${alias.toUpperCase()} #${tokenId}**`
       : `PNG download for **${alias.toUpperCase()} #${tokenId}** · ${size}px${finalTransparent?' · transparent':''}`;
     return interaction.editReply({ content, files:[att] });
   }catch(e){
