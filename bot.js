@@ -1807,6 +1807,7 @@ client.once('clientReady', async ()=>{
   // Init Railway DB table, then load all persisted state
   await runMigrations();
   await loadAllConfigs();
+  await migrateMarketCollectionsToServerConfigs();
   await syncBurnConfigFromServerConfigs();
   console.log('[Startup] burnConfig synced from server_configs');
   await loadAllAlerts();
@@ -1858,6 +1859,44 @@ async function syncBurnConfigFromServerConfigs(){
     }
     await saveBurnConfig();
   }catch(e){ console.error('[BurnSync]', e.message); }
+}
+
+
+// ── Migrate market_collections_v1 -> server_configs ──────────────────────────
+// One-time migration: copies extra collections from the old /market add system
+// into server_configs.collections[] so they appear in /config
+async function migrateMarketCollectionsToServerConfigs(){
+  try{
+    const marketData = await dbLoad('market_collections_v1');
+    if(!marketData){ console.log('[Migration] market_collections_v1: no data'); return; }
+    let migrated = 0;
+    for(const [guildId, guildData] of Object.entries(marketData)){
+      const collections = guildData?.collections || {};
+      const extraCols = Object.entries(collections)
+        .filter(([alias]) => alias !== 'ocas')
+        .map(([alias, col]) => ({
+          name: col.name || alias,
+          slug: col.slug || alias,
+          contract: col.contract || null,
+          salesChannel: col.salesChannel || col.channelId || null,
+          listingsChannel: col.listingsChannel || col.listingsChannelId || null,
+          listingFilters: col.listingFilters || {},
+        }));
+      if(!extraCols.length) continue;
+      const cfg = getConfig(guildId) || {};
+      const existing = cfg.collections || [];
+      const existingSlugs = new Set(existing.map(c => c.slug));
+      const toAdd = extraCols.filter(c => c.slug && !existingSlugs.has(c.slug));
+      if(!toAdd.length) continue;
+      cfg.collections = [...existing, ...toAdd];
+      await setConfig(guildId, cfg);
+      migrated += toAdd.length;
+      console.log('[Migration] guild=' + guildId + ' added ' + toAdd.length + ' collections from market_collections_v1');
+    }
+    console.log('[Migration] market_collections_v1 -> server_configs: ' + migrated + ' collections migrated');
+  }catch(e){
+    console.error('[Migration] market_collections_v1 failed:', e.message);
+  }
 }
 
 client.login(DISCORD_TOKEN);
