@@ -249,11 +249,18 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
     console.log('[Download] isGif:', isGif, 'isMp4:', isMp4, 'animStr:', animStr.slice(0,60));
     if(isGif || isMp4){
       console.log('[Download] Fetching animated file:', ipfsToHttp(animUrl));
-      const r = await fetch(ipfsToHttp(animUrl));
+      // Request GIF explicitly — CDNs like seadn.io may serve WebP otherwise
+      const r = await fetch(ipfsToHttp(animUrl), { headers: { 'Accept': 'image/gif,image/*;q=0.9' } });
       console.log('[Download] Fetch status:', r.status, 'content-type:', r.headers.get('content-type'));
       if(!r.ok) throw new Error('animation fetch HTTP ' + r.status);
       const buffer = await r.buffer();
-      const ext = isMp4 ? (animStr.includes('.webm') ? 'webm' : 'mp4') : 'gif';
+      // Use actual content-type to determine extension
+      const ct = r.headers.get('content-type') || '';
+      let ext = 'gif';
+      if(isMp4 || ct.includes('video/mp4')) ext = 'mp4';
+      else if(ct.includes('video/webm')) ext = 'webm';
+      else if(ct.includes('image/webp')) ext = 'webp';
+      else if(ct.includes('image/gif') || animStr.includes('.gif')) ext = 'gif';
       console.log('[Download] Returning animated buffer, ext:', ext, 'size:', buffer.length);
       return { buffer, meta, ext };
     }
