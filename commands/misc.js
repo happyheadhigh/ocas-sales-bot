@@ -38,20 +38,18 @@ async function handleMiscCommand(commandName, ctx){
       '`/myalertclear` — Remove your DM alert',
     ].join('\n');
     const adminCmds=[
-      '`/setuphere` — Set sales channel to this channel',
-      '`/setlistingshere` — Set listings channel to this channel',
-      '`/setupburn` — Set burn alerts channel to this channel',
-      '`/salesfilter` — Filter auto-posted sales by trait',
-      '`/traitlistingfilter` — Filter auto-posted listings by trait',
-      '`/ranklistingfilter min:1 max:100` — Alert when top-rank token lists',
-      '`/clearallfilters` — Clear all server filters',
+      '`/setup` — Initial configuration wizard (collection, channels, roles)',
+      '`/config` — Manage channels, roles, verification & listing filters',
+      '`/synctraits` — Manually sync trait roles for all verified members',
+      '`/resetverify` — Clear a member\'s verification so they can re-verify',
+      '`/lotteries` — View and manage burn lotteries & giveaways',
       '`/pause` / `/resume` — Pause/resume auto-posts',
       '`/status` — Show server config',
     ].join('\n');
     await interaction.reply({embeds:[new EmbedBuilder()
-      .setTitle('OCAS Sales Bot')
+      .setTitle('Bot Commands')
       .setColor(COLORS.OCAS_GREEN)
-      .setDescription('Your OCAS market assistant — search tokens, track sales, sweep floors, monitor burns, and set personal alerts.')
+      .setDescription('Search tokens, track sales, sweep floors, monitor burns, verify holders, and manage your server.')  
       .addFields(
         {name:'🔍 Market & Search',         value:marketCmds, inline:false},
         {name:'📈 Sales & Listings',         value:salesCmds,  inline:false},
@@ -134,3 +132,4 @@ if(commandName==='myregistration'){
 const MISC_COMMANDS = new Set(['help','register','myregistration']);
 
 module.exports = { handleMiscCommand, MISC_COMMANDS };
+
