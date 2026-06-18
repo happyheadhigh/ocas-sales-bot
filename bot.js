@@ -323,10 +323,17 @@ async function syncTraitRoles(guild, discordId, wallet){
 
     // Add/remove roles based on trait count vs minimum_count threshold
     for(const tr of traitRolesRes.rows){
-      const hasRole    = member.roles.cache.has(tr.role_id);
-      const count      = traitCounts[tr.trait_type+'::'+tr.trait_value] || 0;
-      const meetsMin   = count >= (tr.minimum_count || 1);
-      if(meetsMin && !hasRole)  await member.roles.add(tr.role_id).catch(()=>{});
+      const hasRole  = member.roles.cache.has(tr.role_id);
+      let count;
+      if(tr.trait_type === '_count'){
+        // Token count rule — check total holdings
+        count = ownedTokenIds.length;
+      } else {
+        count = traitCounts[tr.trait_type+'::'+tr.trait_value] || 0;
+      }
+      const meetsMin = count >= (tr.minimum_count || 1);
+      console.log('[TraitSync] rule:', tr.trait_type, tr.trait_value||'', '>=', tr.minimum_count, '| count:', count, '| meets:', meetsMin);
+      if(meetsMin && !hasRole)  await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
       if(!meetsMin && hasRole)  await member.roles.remove(tr.role_id).catch(()=>{});
     }
 
@@ -349,7 +356,7 @@ async function syncTraitRoles(guild, discordId, wallet){
       }
     }
 
-    console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', ownedTokenIds.length, '| traits:', ownedTraits.size);
+    console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', ownedTokenIds.length);
   }catch(e){
     console.error('[TraitSync] Error:', e.message);
   }
@@ -1891,6 +1898,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
