@@ -273,7 +273,7 @@ async function syncTraitRoles(guild, discordId, wallet){
   try{
     // Get all trait roles configured for this guild
     const traitRolesRes = await pgPool.query(
-      'SELECT trait_type, trait_value, role_id FROM trait_roles WHERE guild_id=$1',
+      'SELECT trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1',
       [guild.id]
     );
     if(!traitRolesRes.rows.length) return; // No trait roles configured
@@ -1898,6 +1898,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
