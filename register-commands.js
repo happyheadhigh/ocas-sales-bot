@@ -65,15 +65,15 @@ const commands = [
   .setDescription('Download a high-res PNG for OCAS or another configured collection')
   .addStringOption(o=>o.setName('search').setDescription('Example: ocas #337 2048 no bg').setRequired(false))
   .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(false).setMinValue(1))
-  .addStringOption(o=>o.setName('collection').setDescription('Alias, e.g. ocas, flux, rocks. Defaults to OCAS').setRequired(false))
+  .addStringOption(o=>o.setName('collection').setDescription('Collection slug or alias. Defaults to OCAS').setRequired(false).setAutocomplete(true))
   .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(512).setMaxValue(4096))
   .addBooleanOption(o=>o.setName('transparent').setDescription('Export with transparent/no background').setRequired(false)),
 
-  new SlashCommandBuilder().setName('lastsale').setDescription('Show the most recent sale').addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false)),
-  new SlashCommandBuilder().setName('recentsales').setDescription('Show the last N sales').addIntegerOption(o=>o.setName('count').setDescription('Number of sales (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
-  new SlashCommandBuilder().setName('sale').setDescription('Show the last sale for a specific token').addStringOption(o=>o.setName('token').setDescription('Token ID (e.g. 7370)').setRequired(true)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
-  new SlashCommandBuilder().setName('traitfind').setDescription('Find sales or listings by trait — e.g. zombie, gold chain listings').addStringOption(o=>o.setName('search').setDescription('Trait + optional mode/count').setRequired(true)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
-  new SlashCommandBuilder().setName('listings').setDescription('Show recent new listings').addIntegerOption(o=>o.setName('count').setDescription('Number of listings (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
+  new SlashCommandBuilder().setName('lastsale').setDescription('Show the most recent sale').addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false).setAutocomplete(true)),
+  new SlashCommandBuilder().setName('recentsales').setDescription('Show the last N sales').addIntegerOption(o=>o.setName('count').setDescription('Number of sales (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false).setAutocomplete(true)),
+  new SlashCommandBuilder().setName('sale').setDescription('Show the last sale for a specific token').addStringOption(o=>o.setName('token').setDescription('Token ID (e.g. 7370)').setRequired(true)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false).setAutocomplete(true)),
+  new SlashCommandBuilder().setName('traitfind').setDescription('Find sales or listings by trait — e.g. zombie, gold chain listings').addStringOption(o=>o.setName('search').setDescription('Trait + optional mode/count').setRequired(true)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false).setAutocomplete(true)),
+  new SlashCommandBuilder().setName('listings').setDescription('Show recent new listings').addIntegerOption(o=>o.setName('count').setDescription('Number of listings (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false).setAutocomplete(true)),
   new SlashCommandBuilder().setName('myalert').setDescription('Get personal DMs when matching sales or listings happen').addStringOption(o=>o.setName('trait').setDescription('Trait name to filter by').setRequired(false)).addStringOption(o=>o.setName('value').setDescription('Trait value to filter by').setRequired(false)).addBooleanOption(o=>o.setName('sales').setDescription('DM me for sales? (default: true)').setRequired(false)).addBooleanOption(o=>o.setName('listings').setDescription('DM me for listings? (default: true)').setRequired(false)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
   new SlashCommandBuilder().setName('removetraitfilter').setDescription('Remove a specific trait value from a sales or listing filter').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption(o=>o.setName('type').setDescription('Which filter to modify').setRequired(true).addChoices({name:'Sales',value:'sales'},{name:'Listings',value:'listings'})).addStringOption(o=>o.setName('trait').setDescription('Trait name').setRequired(true)).addStringOption(o=>o.setName('value').setDescription('Value to remove').setRequired(true)),
   new SlashCommandBuilder().setName('debuglisting').setDescription('Show raw listing event data to diagnose issues (admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
@@ -164,6 +164,7 @@ const rest = new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
     console.error('Registration failed:', e.message);
   }
 })();
+
 
 
 

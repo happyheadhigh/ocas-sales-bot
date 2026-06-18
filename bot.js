@@ -442,6 +442,26 @@ async function isRoleManagedByOtherBot(guild, roleId){
 }
 
 client.on('interactionCreate', async (interaction)=>{
+  // ── Autocomplete for collection slugs ───────────────────────────────────────
+  if(interaction.isAutocomplete()){
+    const focused = interaction.options.getFocused().toLowerCase();
+    const guildId = interaction.guildId;
+    const cfg = getConfig(guildId) || {};
+    const choices = [];
+    if(cfg.slug || cfg.collectionSlug){
+      const slug = cfg.slug || cfg.collectionSlug;
+      const name = cfg.contractName || slug;
+      choices.push({ name: `${name} (${slug})`, value: slug });
+    }
+    for(const col of cfg.collections || []){
+      if(col.slug) choices.push({ name: `${col.name||col.slug} (${col.slug})`, value: col.slug });
+    }
+    const filtered = choices
+      .filter(c => c.name.toLowerCase().includes(focused) || c.value.toLowerCase().includes(focused))
+      .slice(0, 25);
+    return interaction.respond(filtered.length ? filtered : choices.slice(0,25));
+  }
+
 
   // ── Wallet verification button ────────────────────────────────────────────
 
@@ -1841,6 +1861,7 @@ async function syncBurnConfigFromServerConfigs(){
 }
 
 client.login(DISCORD_TOKEN);
+
 
 
 

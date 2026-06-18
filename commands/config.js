@@ -138,7 +138,7 @@ function buildCollectionEditEmbed(col, isPrimary){
 
 function collectionEditRow(colId, isPrimary){
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`cfg:col:contract:${colId}`).setLabel('📝 Contract').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:name:${colId}`).setLabel('✏️ Name').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
@@ -391,6 +391,7 @@ async function handleConfigButton(interaction, ctx){
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
                   customId === 'cfg:col:add' || customId === 'cfg_traitrole:rolesel' ||
                   customId === 'cfg:filter:add' ||
+                  customId.startsWith('cfg:col:name:') ||
                   customId.startsWith('cfg:col:filter:add:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
   if(!isModal) await interaction.deferUpdate();
@@ -852,6 +853,26 @@ async function handleConfigModal(interaction, ctx){
     return interaction.editReply({ content:'✅ Filter added.', embeds:[buildFiltersEmbed(cfg)], components:filtersRow(cfg) });
   }
 
+  // ── Edit collection name/alias ──────────────────────────────────────────────
+  if(customId.startsWith('cfg_modal:col_name:')){
+    const colId    = customId.split(':')[2];
+    const newName  = interaction.fields.getTextInputValue('col_name').trim();
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      cfg.contractName = newName;
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]) cols[idx].name = newName;
+      cfg.collections = cols;
+    }
+    await setConfig(guildId, cfg);
+    const col = isPrimary
+      ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    return interaction.editReply({ content:'✅ Name updated.', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+  }
+
   // ── Per-collection listing filter modal ────────────────────────────────────
   if(customId.startsWith('cfg_modal:col_filter:')){
     const colId     = customId.split(':')[2];
@@ -958,6 +979,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
