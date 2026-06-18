@@ -35,7 +35,7 @@ function buildDashboardEmbed(cfg, traitRoles){
       `✅ **Verified Role:** ${rol(cfg.verifyRole)} ${ok(cfg.verifyRole)}\n` +
       `🏆 **Holder Role:** ${cfg.holderRole ? rol(cfg.holderRole) + ' ✅' : '`Not set` ⚪'}\n` +
       `🎭 **Trait Roles:** ${tCount} configured\n` +
-      `📋 **Listing Filters:** ${Object.keys(cfg.listingFilters||{}).length} active\n\n` +
+      `\n\n` +
       SEP + '\n' +
       '*Select a category below to edit.*'
     )
@@ -49,7 +49,6 @@ function dashboardRow(){
       new ButtonBuilder().setCustomId('cfg:cat:channels').setLabel('📡 Channels').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('🔐 Verification').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('🎭 Roles').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('cfg:cat:filters').setLabel('📋 Filters').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -958,6 +957,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
