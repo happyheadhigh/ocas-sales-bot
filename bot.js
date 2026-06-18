@@ -734,6 +734,9 @@ client.on('interactionCreate', async (interaction)=>{
           }
         }catch(e){ console.error('[SVInstant] role assign error:', e.message); }
 
+        // Sync trait roles immediately
+        await syncTraitRoles(interaction.guild, svUser, knownWallet).catch(()=>{});
+
         const walletSummary = allWallets.length > 1
           ? `🔗 **${allWallets.length} wallets** on file (${allWallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
           : `🔗 **Wallet:** \`${knownWallet.slice(0,6)}...${knownWallet.slice(-4)}\``;
@@ -953,6 +956,9 @@ client.on('interactionCreate', async (interaction)=>{
     const walletSummary = wallets.length > 1
       ? `🔗 **${wallets.length} wallets** found (${wallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
       : `🔗 **Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``;
+
+    // Sync trait roles immediately
+    await syncTraitRoles(interaction.guild, discordId, wallet).catch(()=>{});
 
     return interaction.editReply({content:[
       '✅ **Verified!**',
@@ -1829,6 +1835,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
