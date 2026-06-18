@@ -442,6 +442,26 @@ async function handleConfigButton(interaction, ctx){
   if(customId === 'cfg:cat:filters'){
     return interaction.editReply({ content:'', embeds:[buildFiltersEmbed(cfg)], components:filtersRow(cfg) });
   }
+  if(customId === 'cfg:filter:add'){
+    const modal = new ModalBuilder().setCustomId('cfg_modal:filter').setTitle('Add Listing Filter');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('filter_trait_type')
+          .setLabel('Trait Category (e.g. Type, Background)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('Type')
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('filter_trait_values')
+          .setLabel('Trait Values — comma separated')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('Zombie, Ape, Alien')
+          .setRequired(true)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
 
   // ── Collection edits ───────────────────────────────────────────────────────
   if(customId === 'cfg:col:contract'){
@@ -771,6 +791,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
