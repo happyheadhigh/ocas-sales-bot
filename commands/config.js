@@ -447,6 +447,26 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // Edit collection contract/slug via modal
+  if(customId.startsWith('cfg:col:name:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { name: cfg.contractName||'' }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    const modal = new ModalBuilder().setCustomId(`cfg_modal:col_name:${colId}`).setTitle('Edit Collection Name');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('col_name')
+          .setLabel('Collection Name / Alias')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Portraits, MyNFT')
+          .setValue(col.name||'')
+          .setRequired(true)
+      )
+    );
+    return interaction.showModal(modal);
+  }
+
   if(customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:')){
     const parts = customId.split(':');
     const field = parts[2]; // 'contract' or 'slug'
