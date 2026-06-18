@@ -376,7 +376,8 @@ async function handleDownloadCommand(interaction, forced={}){
     const isAnimated = ext !== 'png';
     let content;
     if(isAnimated){
-      const rawUrl = rendered.animUrl || null;
+      let rawUrl = rendered.animUrl || null;
+      if(rawUrl) rawUrl = rawUrl.replace('i2c.seadn.io', 'raw2.seadn.io').replace('i.seadn.io', 'raw2.seadn.io');
       content = `${ext.toUpperCase()} download for **${alias.toUpperCase()} #${tokenId}**`;
       if(rawUrl) content += `\n📥 *To save the full quality GIF: [tap here](${rawUrl})*`;
     } else {
