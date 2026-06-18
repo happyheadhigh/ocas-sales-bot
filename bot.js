@@ -1623,12 +1623,13 @@ client.on('interactionCreate', async (interaction)=>{
     await interaction.deferReply({flags:64});
     const target = interaction.options.getUser('user') || interaction.user;
     try{
+      // Delete guild-specific AND global cross-server record
       await pgPool.query(
-        'DELETE FROM user_registrations WHERE discord_id=$1 AND guild_id=$2',
-        [target.id, guildId]
+        'DELETE FROM user_registrations WHERE discord_id=$1 AND (guild_id=$2 OR guild_id=$3)',
+        [target.id, guildId, 'global']
       );
       await pgPool.query('DELETE FROM verification_codes WHERE discord_id=$1', [target.id]);
-      return interaction.editReply({content:`✅ Verification cleared for ${target.tag}. They can verify again.`});
+      return interaction.editReply({content:`✅ Verification fully cleared for ${target.tag} — global record removed too. They can verify fresh.`});
     }catch(e){
       return interaction.editReply({content:'❌ DB error: '+e.message});
     }
@@ -1851,6 +1852,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
