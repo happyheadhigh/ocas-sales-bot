@@ -307,13 +307,13 @@ async function syncTraitRoles(guild, discordId, wallet){
 
     // Get trait counts for owned tokens from our DB
     const traitsRes = await pgPool.query(
-      'SELECT trait_type, trait_value, COUNT(*) as count FROM token_traits WHERE token_id = ANY($1::int[]) GROUP BY trait_type, trait_value',
+      'SELECT trait_name, trait_value, COUNT(*) as count FROM token_traits WHERE token_id = ANY($1::int[]) GROUP BY trait_name, trait_value',
       [ownedTokenIds]
     );
-    // Build a count map: 'Type::Zombie' -> 3
+    // Build a count map: 'Type::Zombie' -> 3 (trait_name maps to trait_type in rules)
     const traitCounts = {};
     for(const r of traitsRes.rows)
-      traitCounts[r.trait_type+'::'+r.trait_value] = parseInt(r.count);
+      traitCounts[r.trait_name+'::'+r.trait_value] = parseInt(r.count);
     // Also store total OCAS count for collection-wide rules
     traitCounts['Collection::OCAS'] = ownedTokenIds.length;
 
@@ -329,7 +329,7 @@ async function syncTraitRoles(guild, discordId, wallet){
         // Token count rule — check total holdings
         count = ownedTokenIds.length;
       } else {
-        count = traitCounts[tr.trait_type+'::'+tr.trait_value] || 0;
+        count = traitCounts[tr.trait_type+'::'+tr.trait_value] || traitCounts[tr.trait_type+'::'+String(tr.trait_value||'')] || 0;
       }
       const meetsMin = count >= (tr.minimum_count || 1);
       console.log('[TraitSync] rule:', tr.trait_type, tr.trait_value||'', '>=', tr.minimum_count, '| count:', count, '| meets:', meetsMin);
@@ -1899,6 +1899,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
