@@ -1629,9 +1629,34 @@ client.on('interactionCreate', async (interaction)=>{
         [target.id, guildId, 'global']
       );
       await pgPool.query('DELETE FROM verification_codes WHERE discord_id=$1', [target.id]);
-      return interaction.editReply({content:`✅ Verification fully cleared for ${target.tag} — global record removed too. They can verify fresh.`});
+
+      // Remove all verification-related Discord roles
+      const member = await interaction.guild.members.fetch(target.id).catch(()=>null);
+      if(member){
+        // Remove verified + holder roles from verification_panels
+        const panelR = await pgPool.query(
+          'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1', [guildId]
+        ).catch(()=>({rows:[]}));
+        if(panelR.rows[0]){
+          const { role_id, holder_role_id } = panelR.rows[0];
+          if(role_id && member.roles.cache.has(role_id))
+            await member.roles.remove(role_id).catch(()=>{});
+          if(holder_role_id && member.roles.cache.has(holder_role_id))
+            await member.roles.remove(holder_role_id).catch(()=>{});
+        }
+        // Remove all trait roles configured for this guild
+        const traitR = await pgPool.query(
+          'SELECT DISTINCT role_id FROM trait_roles WHERE guild_id=$1', [guildId]
+        ).catch(()=>({rows:[]}));
+        for(const row of traitR.rows){
+          if(member.roles.cache.has(row.role_id))
+            await member.roles.remove(row.role_id).catch(()=>{});
+        }
+      }
+
+      return interaction.editReply({content:`✅ Verification reset for ${target.tag} — DB records and all verification roles removed. They can verify fresh.`});
     }catch(e){
-      return interaction.editReply({content:'❌ DB error: '+e.message});
+      return interaction.editReply({content:'❌ Error: '+e.message});
     }
   }
 
@@ -1852,6 +1877,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
