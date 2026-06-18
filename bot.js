@@ -884,6 +884,9 @@ client.on('interactionCreate', async (interaction)=>{
 
     // Search entire profile object for the code (handles any field name OS uses)
     const allStrings = collectStringsDeep(profile).join(' ');
+    console.log('[SVDone] profile keys:', Object.keys(profile).join(', '));
+    console.log('[SVDone] bio fields:', JSON.stringify({bio:profile.bio, description:profile.description, about:profile.about, config:profile.config}));
+    console.log('[SVDone] code found in profile:', allStrings.includes(code), '| code:', code);
     if(!allStrings.includes(code))
       return interaction.editReply({content:[
         '❌ Code not found in your OpenSea profile yet.',
@@ -1877,6 +1880,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
