@@ -130,6 +130,7 @@ function buildCollectionEditEmbed(col, isPrimary){
       `**Slug:** \`${col.slug || 'Not set'}\`\n` +
       `**Sales Channel:** ${col.salesChannel ? `<#${col.salesChannel}>` : '`Not set`'} ${ok(col.salesChannel)}\n` +
       `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\n` +
+      `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\n` +
       (isOcas ? '\n🔥 **OCAS** — full feature set active.\n' : '') +
       '\n*Changes save immediately.*'
     )
@@ -143,6 +144,7 @@ function collectionEditRow(colId, isPrimary){
       new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:col:filters:${colId}`).setLabel('🔍 Filters').setStyle(ButtonStyle.Secondary),
       ...(!isPrimary ? [new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)] : []),
     ),
     new ActionRowBuilder().addComponents(
@@ -304,6 +306,50 @@ function filtersRow(cfg){
   return rows;
 }
 
+
+// ── Per-collection filter screen ─────────────────────────────────────────────
+function buildColFiltersEmbed(col, colId){
+  const filters = col.listingFilters || {};
+  const entries = Object.entries(filters);
+  const name = col.name || col.slug || 'Collection';
+  let list = entries.length === 0
+    ? '*No filters — all listings post.*\n'
+    : entries.map(([k,v]) => `**${k}:** ${Array.isArray(v)?v.join(', '):v}`).join('\n') + '\n';
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(`🔍 Listing Filters — ${name}`)
+    .setDescription(
+      SEP + '\n\n' +
+      'Only listings matching these traits will post for this collection.\n' +
+      'Leave empty to post all listings.\n\n' +
+      '**Active filters:**\n' + list
+    )
+    .setFooter({ text: 'Only visible to you' });
+}
+
+function colFiltersRow(col, colId){
+  const filters = col.listingFilters || {};
+  const hasFilters = Object.keys(filters).length > 0;
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`cfg:col:filter:add:${colId}`).setLabel('➕ Add Filter').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`cfg:col:select:${colId==='primary'?'primary':colId}`).setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+  if(hasFilters){
+    const options = Object.entries(filters).slice(0,25).map(([k,v]) =>
+      new StringSelectMenuOptionBuilder().setLabel(`${k}: ${Array.isArray(v)?v.join(', '):v}`).setValue(k)
+    );
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`cfg_col_filter:remove:${colId}`)
+        .setPlaceholder('🗑️ Remove a filter...')
+        .addOptions(options)
+    ));
+  }
+  return rows;
+}
+
 async function handleConfigCommand(interaction, ctx){
   await interaction.deferReply({ flags: 64 });
   const { pgPool, getConfig } = ctx;
@@ -327,6 +373,7 @@ async function handleConfigButton(interaction, ctx){
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
                   customId === 'cfg:col:add' || customId === 'cfg_traitrole:rolesel' ||
                   customId === 'cfg:filter:add' ||
+                  customId.startsWith('cfg:col:filter:add:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
   if(!isModal) await interaction.deferUpdate();
 
@@ -418,6 +465,59 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // Remove extra collection
+  if(customId.startsWith('cfg:col:filters:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { ...cfg, slug: cfg.collectionSlug||cfg.slug, listingFilters: cfg.listingFilters||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    return interaction.editReply({ content:'', embeds:[buildColFiltersEmbed(col, colId)], components:colFiltersRow(col, colId) });
+  }
+
+  if(customId.startsWith('cfg:col:filter:add:')){
+    const colId = customId.split(':')[4];
+    const modal = new ModalBuilder().setCustomId(`cfg_modal:col_filter:${colId}`).setTitle('Add Collection Filter');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('filter_trait_type')
+          .setLabel('Trait Category (e.g. Type, Background)')
+          .setStyle(TextInputStyle.Short).setPlaceholder('Type').setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('filter_trait_values')
+          .setLabel('Trait Values — comma separated')
+          .setStyle(TextInputStyle.Short).setPlaceholder('Zombie, Ape, Alien').setRequired(true)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
+  if(customId.startsWith('cfg_col_filter:remove:')){
+    const parts = customId.split(':');
+    const colId = parts[2];
+    const traitType = interaction.values[0];
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      const filters = cfg.listingFilters || {};
+      delete filters[traitType];
+      cfg.listingFilters = filters;
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]){
+        const filters = cols[idx].listingFilters || {};
+        delete filters[traitType];
+        cols[idx].listingFilters = filters;
+        cfg.collections = cols;
+      }
+    }
+    await setConfig(guildId, cfg);
+    const col = isPrimary
+      ? { ...cfg, listingFilters: cfg.listingFilters||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    return interaction.editReply({ content:'✅ Filter removed.', embeds:[buildColFiltersEmbed(col, colId)], components:colFiltersRow(col, colId) });
+  }
+
   if(customId.startsWith('cfg:col:remove:')){
     const colId = parseInt(customId.split(':')[3]);
     if(!isNaN(colId)){
@@ -715,6 +815,36 @@ async function handleConfigModal(interaction, ctx){
     return interaction.editReply({ content:'✅ Filter added.', embeds:[buildFiltersEmbed(cfg)], components:filtersRow(cfg) });
   }
 
+  // ── Per-collection listing filter modal ────────────────────────────────────
+  if(customId.startsWith('cfg_modal:col_filter:')){
+    const colId     = customId.split(':')[2];
+    const traitType = interaction.fields.getTextInputValue('filter_trait_type').trim().toLowerCase();
+    const valuesRaw = interaction.fields.getTextInputValue('filter_trait_values').trim();
+    const values    = valuesRaw.split(',').map(v=>v.trim().toLowerCase()).filter(Boolean);
+    if(!traitType || !values.length)
+      return interaction.editReply({ content:'❌ Trait category and at least one value required.' });
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      if(!cfg.listingFilters) cfg.listingFilters = {};
+      const existing = cfg.listingFilters[traitType] || [];
+      cfg.listingFilters[traitType] = [...new Set([...existing, ...values])];
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]){
+        if(!cols[idx].listingFilters) cols[idx].listingFilters = {};
+        const existing = cols[idx].listingFilters[traitType] || [];
+        cols[idx].listingFilters[traitType] = [...new Set([...existing, ...values])];
+        cfg.collections = cols;
+      }
+    }
+    await setConfig(guildId, cfg);
+    const col = isPrimary
+      ? { ...cfg, listingFilters: cfg.listingFilters||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    return interaction.editReply({ content:'✅ Filter added.', embeds:[buildColFiltersEmbed(col, colId)], components:colFiltersRow(col, colId) });
+  }
+
   // ── Add collection ─────────────────────────────────────────────────────────
   if(customId === 'cfg_modal:addcol'){
     const name     = interaction.fields.getTextInputValue('col_name').trim();
@@ -791,6 +921,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
