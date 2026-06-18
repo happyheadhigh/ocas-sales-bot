@@ -291,17 +291,25 @@ function filtersRow(cfg){
     ),
   ];
   if(hasFilters){
-    const options = Object.entries(filters).slice(0,25).map(([k, vals]) =>
-      new StringSelectMenuOptionBuilder()
-        .setLabel(`${k}: ${Array.isArray(vals) ? vals.join(', ') : vals}`)
-        .setValue(k)
-    );
-    rows.push(new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId('cfg_filter:remove')
-        .setPlaceholder('🗑️ Remove a filter...')
-        .addOptions(options)
-    ));
+    const options = [];
+    for(const [k, vals] of Object.entries(filters)){
+      const arr = Array.isArray(vals) ? vals : [vals];
+      for(const v of arr){
+        if(options.length >= 25) break;
+        options.push(new StringSelectMenuOptionBuilder()
+          .setLabel(`${k}: ${v}`)
+          .setValue(`${k}::${v}`)
+        );
+      }
+    }
+    if(options.length > 0){
+      rows.push(new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId('cfg_filter:remove')
+          .setPlaceholder('🗑️ Remove a value...')
+          .addOptions(options)
+      ));
+    }
   }
   return rows;
 }
@@ -337,15 +345,25 @@ function colFiltersRow(col, colId){
     ),
   ];
   if(hasFilters){
-    const options = Object.entries(filters).slice(0,25).map(([k,v]) =>
-      new StringSelectMenuOptionBuilder().setLabel(`${k}: ${Array.isArray(v)?v.join(', '):v}`).setValue(k)
-    );
-    rows.push(new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId(`cfg_col_filter:remove:${colId}`)
-        .setPlaceholder('🗑️ Remove a filter...')
-        .addOptions(options)
-    ));
+    const options = [];
+    for(const [k, vals] of Object.entries(filters)){
+      const arr = Array.isArray(vals) ? vals : [vals];
+      for(const v of arr){
+        if(options.length >= 25) break;
+        options.push(new StringSelectMenuOptionBuilder()
+          .setLabel(`${k}: ${v}`)
+          .setValue(`${k}::${v}`)
+        );
+      }
+    }
+    if(options.length > 0){
+      rows.push(new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`cfg_col_filter:remove:${colId}`)
+          .setPlaceholder('🗑️ Remove a value...')
+          .addOptions(options)
+      ));
+    }
   }
   return rows;
 }
@@ -495,18 +513,28 @@ async function handleConfigButton(interaction, ctx){
   if(customId.startsWith('cfg_col_filter:remove:')){
     const parts = customId.split(':');
     const colId = parts[2];
-    const traitType = interaction.values[0];
+    const [traitType, traitVal] = interaction.values[0].split('::');
     const isPrimary = colId === 'primary';
     if(isPrimary){
       const filters = cfg.listingFilters || {};
-      delete filters[traitType];
+      if(filters[traitType]){
+        const arr = Array.isArray(filters[traitType]) ? filters[traitType] : [filters[traitType]];
+        const updated = arr.filter(v => v !== traitVal);
+        if(updated.length === 0) delete filters[traitType];
+        else filters[traitType] = updated;
+      }
       cfg.listingFilters = filters;
     } else {
       const cols = cfg.collections || [];
       const idx = parseInt(colId);
       if(cols[idx]){
         const filters = cols[idx].listingFilters || {};
-        delete filters[traitType];
+        if(filters[traitType]){
+          const arr = Array.isArray(filters[traitType]) ? filters[traitType] : [filters[traitType]];
+          const updated = arr.filter(v => v !== traitVal);
+          if(updated.length === 0) delete filters[traitType];
+          else filters[traitType] = updated;
+        }
         cols[idx].listingFilters = filters;
         cfg.collections = cols;
       }
@@ -921,6 +949,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
