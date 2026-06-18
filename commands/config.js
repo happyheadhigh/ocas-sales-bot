@@ -137,19 +137,20 @@ function buildCollectionEditEmbed(col, isPrimary){
 }
 
 function collectionEditRow(colId, isPrimary){
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`cfg:col:contract:${colId}`).setLabel('📝 Contract').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`cfg:col:filters:${colId}`).setLabel('🔍 Filters').setStyle(ButtonStyle.Secondary),
-      ...(!isPrimary ? [new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)] : []),
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
-    ),
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`cfg:col:contract:${colId}`).setLabel('📝 Contract').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:filters:${colId}`).setLabel('🔍 Filters').setStyle(ButtonStyle.Secondary),
+  );
+  const row2Btns = [
+    new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
   ];
+  if(!isPrimary) row2Btns.push(
+    new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)
+  );
+  return [row1, new ActionRowBuilder().addComponents(row2Btns)];
 }
 
 // ── Channels screen ───────────────────────────────────────────────────────────
@@ -957,6 +958,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
