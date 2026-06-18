@@ -882,11 +882,11 @@ client.on('interactionCreate', async (interaction)=>{
       return interaction.editReply({content:'❌ Could not reach OpenSea. Please try again.'});
     }
 
-    // Check bio contains the code
-    const bio = profile.bio || profile.description || profile.username || '';
-    if(!bio.includes(code))
+    // Search entire profile object for the code (handles any field name OS uses)
+    const allStrings = collectStringsDeep(profile).join(' ');
+    if(!allStrings.includes(code))
       return interaction.editReply({content:[
-        '❌ Code not found in your OpenSea bio yet.',
+        '❌ Code not found in your OpenSea profile yet.',
         '',
         `Go to https://opensea.io/${wallet} → Edit Profile → paste this into your **bio/description**:`,
         '```'+code+'```',
@@ -1877,6 +1877,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
