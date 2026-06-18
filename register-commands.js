@@ -155,6 +155,10 @@ const commands = [
   new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)'),
   new SlashCommandBuilder().setName('config').setDescription('Configure your bot — collections, channels, roles (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('lotteries').setDescription('View and manage all lotteries and giveaways (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName('resetverify')
+    .setDescription('Clear a member\'s verification so they can verify again (Admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addUserOption(o => o.setName('user').setDescription('User to reset (leave blank to reset yourself)').setRequired(false)),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){
@@ -182,4 +186,5 @@ const rest = new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
     console.error('Registration failed:', e.message);
   }
 })();
+
 

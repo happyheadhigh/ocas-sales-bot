@@ -1618,6 +1618,22 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // ── /synctraits (manual trigger) ─────────────────────────────────────────────
+  if(commandName==='resetverify'){
+    if(!isAdmin) return interaction.reply({flags:64, content:'❌ Admin only.'});
+    await interaction.deferReply({flags:64});
+    const target = interaction.options.getUser('user') || interaction.user;
+    try{
+      await pgPool.query(
+        'DELETE FROM user_registrations WHERE discord_id=$1 AND guild_id=$2',
+        [target.id, guildId]
+      );
+      await pgPool.query('DELETE FROM verification_codes WHERE discord_id=$1', [target.id]);
+      return interaction.editReply({content:`✅ Verification cleared for ${target.tag}. They can verify again.`});
+    }catch(e){
+      return interaction.editReply({content:'❌ DB error: '+e.message});
+    }
+  }
+
   if(commandName==='synctraits'){
     await interaction.deferReply({flags:64});
     if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
@@ -1835,6 +1851,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
