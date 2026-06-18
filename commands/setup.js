@@ -619,8 +619,8 @@ async function handleSetupModal(interaction, ctx){
       await pgPool.query(
         `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count)
          VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (guild_id, trait_type, trait_value, role_id, minimum_count) DO NOTHING`,
-        [guildId, roleId, traitType, traitVal||null, minCount]
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO NOTHING`,
+        [guildId, roleId, traitType, traitVal||'', minCount]
       );
     }catch(e){ console.warn('[Setup] trait_roles insert:', e.message); }
 
@@ -632,6 +632,7 @@ async function handleSetupModal(interaction, ctx){
 
 const SETUP_COMMANDS = new Set(['setup']);
 module.exports = { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS };
+
 
 
 
