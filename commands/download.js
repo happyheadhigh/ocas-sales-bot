@@ -246,11 +246,15 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
     const animStr = String(animUrl).toLowerCase();
     const isGif = animStr.includes('.gif') || animStr.includes('image/gif') || animStr.includes('seadn.io');
     const isMp4 = animStr.includes('.mp4') || animStr.includes('video/mp4') || animStr.includes('.webm');
+    console.log('[Download] isGif:', isGif, 'isMp4:', isMp4, 'animStr:', animStr.slice(0,60));
     if(isGif || isMp4){
+      console.log('[Download] Fetching animated file:', ipfsToHttp(animUrl));
       const r = await fetch(ipfsToHttp(animUrl));
-      if(!r.ok) throw new Error(`animation fetch HTTP \${r.status}`);
+      console.log('[Download] Fetch status:', r.status, 'content-type:', r.headers.get('content-type'));
+      if(!r.ok) throw new Error('animation fetch HTTP ' + r.status);
       const buffer = await r.buffer();
       const ext = isMp4 ? (animStr.includes('.webm') ? 'webm' : 'mp4') : 'gif';
+      console.log('[Download] Returning animated buffer, ext:', ext, 'size:', buffer.length);
       return { buffer, meta, ext };
     }
   }
