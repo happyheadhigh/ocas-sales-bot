@@ -221,6 +221,22 @@ function isSvgSource(src){
 async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
   const uri = await fetchTokenUri(contract, tokenId, chain);
   const meta = await loadJsonFromUri(uri);
+
+  // Check for animated content first (GIF or MP4 via animation_url)
+  const animUrl = meta.animation_url || meta.animated_url || null;
+  if(animUrl){
+    const animStr = String(animUrl).toLowerCase();
+    const isGif = animStr.includes('.gif') || animStr.includes('image/gif');
+    const isMp4 = animStr.includes('.mp4') || animStr.includes('video/mp4') || animStr.includes('.webm');
+    if(isGif || isMp4){
+      const r = await fetch(ipfsToHttp(animUrl));
+      if(!r.ok) throw new Error(`animation fetch HTTP ${r.status}`);
+      const buffer = await r.buffer();
+      const ext = isMp4 ? (animStr.includes('.webm') ? 'webm' : 'mp4') : 'gif';
+      return { buffer, meta, ext };
+    }
+  }
+
   let src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
 
   if(typeof src === 'string' && transparent){
@@ -289,9 +305,15 @@ async function handleDownloadCommand(interaction, forced={}){
     }
     const finalTransparent = transparent;
     const { buffer } = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent });
-    const filename = `${alias}-${tokenId}-${size}${finalTransparent?'-transparent':''}.png`.replace(/[^a-z0-9_.-]+/gi,'-');
+    const ext = rendered.ext || 'png';
+    const sizeStr = ext === 'png' ? `-${size}` : '';
+    const transparentStr = (ext === 'png' && finalTransparent) ? '-transparent' : '';
+    const filename = `${alias}-${tokenId}${sizeStr}${transparentStr}.${ext}`.replace(/[^a-z0-9_.-]+/gi,'-');
     const att = new AttachmentBuilder(buffer, { name:filename });
-    const content = `PNG download for **${alias.toUpperCase()} #${tokenId}** · ${size}px${finalTransparent?' · transparent':''}`;
+    const isAnimated = rendered.ext && rendered.ext !== 'png';
+    const content = isAnimated
+      ? `${rendered.ext.toUpperCase()} download for **${alias.toUpperCase()} #${tokenId}**`
+      : `PNG download for **${alias.toUpperCase()} #${tokenId}** · ${size}px${finalTransparent?' · transparent':''}`;
     return interaction.editReply({ content, files:[att] });
   }catch(e){
     return interaction.editReply('Download failed: ' + e.message).catch(()=>{});
