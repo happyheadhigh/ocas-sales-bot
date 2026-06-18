@@ -140,9 +140,13 @@ function collectionEditRow(colId, isPrimary){
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`cfg:col:name:${colId}`).setLabel('✏️ Name').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:filters:${colId}`).setLabel('🔍 Filters').setStyle(ButtonStyle.Secondary),
+  );
+  const row1b = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:clearchan:sales:${colId}`).setLabel('✕ Sales').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:clearchan:listings:${colId}`).setLabel('✕ Listings').setStyle(ButtonStyle.Danger),
   );
   const row2Btns = [
     new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
@@ -150,7 +154,7 @@ function collectionEditRow(colId, isPrimary){
   if(!isPrimary) row2Btns.push(
     new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)
   );
-  return [row1, new ActionRowBuilder().addComponents(row2Btns)];
+  return [row1, row1b, new ActionRowBuilder().addComponents(row2Btns)];
 }
 
 // ── Channels screen ───────────────────────────────────────────────────────────
@@ -491,6 +495,28 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // Edit collection channels (show channel select)
+  if(customId.startsWith('cfg:col:clearchan:')){
+    const parts = customId.split(':');
+    const field  = parts[3]; // 'sales' or 'listings'
+    const colId  = parts[4];
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      if(field === 'sales')    { delete cfg.channelId; delete cfg.salesChannel; }
+      if(field === 'listings') { delete cfg.listingsChannelId; delete cfg.listingsChannel; }
+    } else {
+      const idx = parseInt(colId);
+      if(cfg.collections?.[idx]){
+        if(field === 'sales')    cfg.collections[idx].salesChannel    = null;
+        if(field === 'listings') cfg.collections[idx].listingsChannel = null;
+      }
+    }
+    await setConfig(guildId, cfg);
+    const col = isPrimary
+      ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
+      : cfg.collections?.[parseInt(colId)] || {};
+    return interaction.editReply({ content:'✅ Channel cleared.', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+  }
+
   if(customId.startsWith('cfg:col:saleschan:') || customId.startsWith('cfg:col:listchan:')){
     const parts = customId.split(':');
     const field = parts[2]; // 'saleschan' or 'listchan'
