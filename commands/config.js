@@ -341,7 +341,7 @@ function colFiltersRow(col, colId){
   const rows = [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`cfg:col:filter:add:${colId}`).setLabel('➕ Add Filter').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(`cfg:col:select:${colId==='primary'?'primary':colId}`).setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:col:filters:back:${colId}`).setLabel('← Back').setStyle(ButtonStyle.Secondary),
     ),
   ];
   if(hasFilters){
@@ -422,7 +422,7 @@ async function handleConfigButton(interaction, ctx){
     const colId = interaction.values[0];
     const isPrimary = colId === 'primary';
     const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId }
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
@@ -483,6 +483,15 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // Remove extra collection
+  if(customId.startsWith('cfg:col:filters:back:')){
+    const colId = customId.split(':')[4];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+  }
+
   if(customId.startsWith('cfg:col:filters:')){
     const colId = customId.split(':')[3];
     const isPrimary = colId === 'primary';
@@ -949,6 +958,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
