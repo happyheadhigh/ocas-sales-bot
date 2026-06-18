@@ -24,7 +24,7 @@ const {
 
 const {
   pgPool, runMigrations, dbLoad, dbSave,
-  loadAllConfigs, getConfig, setConfig,
+  loadAllConfigs, getConfig, setConfig, getAllConfigs,
 } = require('./lib/db');
 
 const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
@@ -1787,14 +1787,7 @@ client.once('clientReady', async ()=>{
   // Init Railway DB table, then load all persisted state
   await runMigrations();
   await loadAllConfigs();
-  // Sync burnConfig from server_configs
-  for(const [guildId, cfg] of getAllConfigs()){
-    if(cfg.burnChannel || cfg.burnAlertChannelId){
-      const existing = getBurnConfig(guildId) || {};
-      burnConfig[guildId] = { ...existing, burnAlertChannelId: cfg.burnChannel || cfg.burnAlertChannelId };
-    }
-  }
-  await saveBurnConfig();
+  await syncBurnConfigFromServerConfigs();
   console.log('[Startup] burnConfig synced from server_configs');
   await loadAllAlerts();
   await loadSaleCursors();
@@ -1834,7 +1827,21 @@ client.once('clientReady', async ()=>{
 
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
+
+async function syncBurnConfigFromServerConfigs(){
+  try{
+    for(const [guildId, cfg] of getAllConfigs()){
+      if(cfg.burnChannel || cfg.burnAlertChannelId){
+        const existing = getBurnConfig(guildId) || {};
+        burnConfig[guildId] = { ...existing, burnAlertChannelId: cfg.burnChannel || cfg.burnAlertChannelId };
+      }
+    }
+    await saveBurnConfig();
+  }catch(e){ console.error('[BurnSync]', e.message); }
+}
+
 client.login(DISCORD_TOKEN);
+
 
 
 
