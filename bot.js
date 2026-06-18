@@ -571,7 +571,7 @@ client.on('interactionCreate', async (interaction)=>{
     return handleSetupModal(interaction, setupCtx);
   }
   if(interaction.isModalSubmit() && (interaction.customId.startsWith('cfg_modal:') || interaction.customId.startsWith('cfg_modal:col_filter:'))){
-    const cfgCtx = { pgPool, getConfig, setConfig };
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigModal(interaction, cfgCtx);
   }
 
@@ -580,7 +580,7 @@ client.on('interactionCreate', async (interaction)=>{
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isButton() && (interaction.customId.startsWith('cfg:') || interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col_filter:'))){
-    const cfgCtx = { pgPool, getConfig, setConfig };
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
   if(interaction.isButton() && interaction.customId.startsWith('ltrs:')){
@@ -597,12 +597,12 @@ client.on('interactionCreate', async (interaction)=>{
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isStringSelectMenu() && (interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col:') || interaction.customId.startsWith('cfg_filter:') || interaction.customId.startsWith('cfg_col_filter:'))){
-    const cfgCtx = { pgPool, getConfig, setConfig };
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
      (interaction.customId.startsWith('cfg_chsel:') || interaction.customId.startsWith('cfg_rolesel:'))){
-    const cfgCtx = { pgPool, getConfig, setConfig };
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
   if(interaction.isRoleSelectMenu() && interaction.customId === 'setup_traitrole:rolesel'){
@@ -672,15 +672,15 @@ client.on('interactionCreate', async (interaction)=>{
     return interaction.showModal(modal);
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_role:')){
-    const cfgCtx = { pgPool, getConfig, setConfig };
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_col:')){
-    const cfgCtx = { pgPool, getConfig, setConfig };
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_filter:')){
-    const cfgCtx = { pgPool, getConfig, setConfig };
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
 
@@ -1787,6 +1787,15 @@ client.once('clientReady', async ()=>{
   // Init Railway DB table, then load all persisted state
   await runMigrations();
   await loadAllConfigs();
+  // Sync burnConfig from server_configs
+  for(const [guildId, cfg] of getAllConfigs()){
+    if(cfg.burnChannel || cfg.burnAlertChannelId){
+      const existing = getBurnConfig(guildId) || {};
+      burnConfig[guildId] = { ...existing, burnAlertChannelId: cfg.burnChannel || cfg.burnAlertChannelId };
+    }
+  }
+  await saveBurnConfig();
+  console.log('[Startup] burnConfig synced from server_configs');
   await loadAllAlerts();
   await loadSaleCursors();
   await loadListingCursors();
@@ -1826,6 +1835,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 

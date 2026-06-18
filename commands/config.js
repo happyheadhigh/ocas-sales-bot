@@ -382,7 +382,7 @@ async function handleConfigCommand(interaction, ctx){
 }
 
 async function handleConfigButton(interaction, ctx){
-  const { pgPool, getConfig, setConfig } = ctx;
+  const { pgPool, getConfig, setConfig, syncBurnConfig } = ctx;
   const guildId  = interaction.guildId;
   const customId = interaction.customId;
 
@@ -780,7 +780,7 @@ async function handleConfigButton(interaction, ctx){
     const type = parts[1];
     if(type === 'sales')    { cfg.salesChannel = chId; cfg.channelId = chId; }
     if(type === 'listings') { cfg.listingsChannel = chId; cfg.listingsChannelId = chId; }
-    if(type === 'burn')     cfg.burnChannel    = chId;
+    if(type === 'burn'){     cfg.burnChannel    = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
     if(type === 'verify')   cfg.verifyChannel  = chId;
     await setConfig(guildId, cfg);
     if(type === 'verify'){
@@ -830,7 +830,7 @@ async function handleConfigButton(interaction, ctx){
 }
 
 async function handleConfigModal(interaction, ctx){
-  const { pgPool, getConfig, setConfig } = ctx;
+  const { pgPool, getConfig, setConfig, syncBurnConfig } = ctx;
   const guildId  = interaction.guildId;
   const customId = interaction.customId;
 
@@ -957,6 +957,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
