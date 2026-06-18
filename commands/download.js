@@ -262,7 +262,7 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
       else if(ct.includes('image/webp')) ext = 'webp';
       else if(ct.includes('image/gif') || animStr.includes('.gif')) ext = 'gif';
       console.log('[Download] Returning animated buffer, ext:', ext, 'size:', buffer.length);
-      return { buffer, meta, ext };
+      return { buffer, meta, ext, animUrl: ipfsToHttp(animUrl) };
     }
   }
 
@@ -374,9 +374,14 @@ async function handleDownloadCommand(interaction, forced={}){
     const filename = `${alias}-${tokenId}${sizeStr}${transparentStr}.${ext}`.replace(/[^a-z0-9_.-]+/gi,'-');
     const att = new AttachmentBuilder(buffer, { name:filename });
     const isAnimated = ext !== 'png';
-    const content = isAnimated
-      ? `${ext.toUpperCase()} download for **${alias.toUpperCase()} #${tokenId}**`
-      : `PNG download for **${alias.toUpperCase()} #${tokenId}** · ${size}px${finalTransparent?' · transparent':''}`;
+    let content;
+    if(isAnimated){
+      const rawUrl = rendered.animUrl || null;
+      content = `${ext.toUpperCase()} download for **${alias.toUpperCase()} #${tokenId}**`;
+      if(rawUrl) content += `\n📥 *To save the full quality GIF: [tap here](${rawUrl})*`;
+    } else {
+      content = `PNG download for **${alias.toUpperCase()} #${tokenId}** · ${size}px${finalTransparent?' · transparent':''}`;
+    }
     return interaction.editReply({ content, files:[att] });
   }catch(e){
     return interaction.editReply('Download failed: ' + e.message).catch(()=>{});
