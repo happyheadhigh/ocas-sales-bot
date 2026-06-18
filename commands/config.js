@@ -34,7 +34,9 @@ function buildDashboardEmbed(cfg, traitRoles){
       `📌 **Verification:** ${ch(cfg.verifyChannel)} ${ok(cfg.verifyChannel)}\n` +
       `✅ **Verified Role:** ${rol(cfg.verifyRole)} ${ok(cfg.verifyRole)}\n` +
       `🏆 **Holder Role:** ${cfg.holderRole ? rol(cfg.holderRole) + ' ✅' : '`Not set` ⚪'}\n` +
-      `🎭 **Trait Roles:** ${tCount} configured\n\n` +
+      `🎭 **Trait Roles:** ${tCount} configured\n` +
+      `📋 **Listing Filters:** ${Object.keys(cfg.listingFilters||{}).length} active\n\n` +
+      `📋 **Listing Filters:** ${Object.keys(cfg.listingFilters||{}).length} active\n\n` +
       SEP + '\n' +
       '*Select a category below to edit.*'
     )
@@ -48,6 +50,7 @@ function dashboardRow(){
       new ButtonBuilder().setCustomId('cfg:cat:channels').setLabel('📡 Channels').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('🔐 Verification').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('🎭 Roles').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:filters').setLabel('📋 Filters').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -252,6 +255,56 @@ function rolesRow(traitRoles){
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
+
+// ── Filters screen ────────────────────────────────────────────────────────────
+function buildFiltersEmbed(cfg){
+  const filters = cfg.listingFilters || {};
+  const entries = Object.entries(filters);
+
+  let list = entries.length === 0
+    ? '*No listing filters set — all listings post to your listings channel.*\n'
+    : entries.map(([k, vals]) =>
+        `**${k}:** ${Array.isArray(vals) ? vals.join(', ') : vals}`
+      ).join('\n') + '\n';
+
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('📋 Listing Filters')
+    .setDescription(
+      SEP + '\n\n' +
+      'Only listings matching these trait filters will post to your listings channel.\n' +
+      'Leave empty to post all listings.\n\n' +
+      '**Active filters:**\n' + list + '\n' +
+      '*Example: Type = Zombie → only Zombie listings post.*'
+    )
+    .setFooter({ text: 'Only visible to you' });
+}
+
+function filtersRow(cfg){
+  const filters = cfg.listingFilters || {};
+  const hasFilters = Object.keys(filters).length > 0;
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:filter:add').setLabel('➕ Add Filter').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+  if(hasFilters){
+    const options = Object.entries(filters).slice(0,25).map(([k, vals]) =>
+      new StringSelectMenuOptionBuilder()
+        .setLabel(`${k}: ${Array.isArray(vals) ? vals.join(', ') : vals}`)
+        .setValue(k)
+    );
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('cfg_filter:remove')
+        .setPlaceholder('🗑️ Remove a filter...')
+        .addOptions(options)
+    ));
+  }
+  return rows;
+}
+
 async function handleConfigCommand(interaction, ctx){
   await interaction.deferReply({ flags: 64 });
   const { pgPool, getConfig } = ctx;
@@ -625,6 +678,20 @@ async function handleConfigModal(interaction, ctx){
   await interaction.deferUpdate();
   const cfg = getConfig(guildId) || {};
 
+  // ── Add listing filter ────────────────────────────────────────────────────
+  if(customId === 'cfg_modal:filter'){
+    const traitType  = interaction.fields.getTextInputValue('filter_trait_type').trim().toLowerCase();
+    const valuesRaw  = interaction.fields.getTextInputValue('filter_trait_values').trim();
+    const values     = valuesRaw.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+    if(!traitType || !values.length)
+      return interaction.editReply({ content:'❌ Trait category and at least one value required.' });
+    if(!cfg.listingFilters) cfg.listingFilters = {};
+    const existing = cfg.listingFilters[traitType] || [];
+    cfg.listingFilters[traitType] = [...new Set([...existing, ...values])];
+    await setConfig(guildId, cfg);
+    return interaction.editReply({ content:'✅ Filter added.', embeds:[buildFiltersEmbed(cfg)], components:filtersRow(cfg) });
+  }
+
   // ── Add collection ─────────────────────────────────────────────────────────
   if(customId === 'cfg_modal:addcol'){
     const name     = interaction.fields.getTextInputValue('col_name').trim();
@@ -701,6 +768,9 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
+
+
 
 
 
