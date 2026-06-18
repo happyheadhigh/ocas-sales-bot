@@ -229,13 +229,18 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
   if(!animUrl && osHeaders && contract && tokenId){
     try{
       const osNftUrl = `https://api.opensea.io/api/v2/chain/ethereum/contract/${contract}/nfts/${tokenId}`;
+      console.log('[Download] Fetching OS metadata for animation_url:', osNftUrl);
       const osRes = await fetch(osNftUrl, { headers: osHeaders() });
       if(osRes.ok){
         const osData = await osRes.json();
         animUrl = osData?.nft?.animation_url || osData?.nft?.metadata?.animation_url || null;
+        console.log('[Download] OS animation_url:', animUrl);
+      } else {
+        console.log('[Download] OS API status:', osRes.status);
       }
-    }catch(_){}
+    }catch(e){ console.log('[Download] OS API error:', e.message); }
   }
+  console.log('[Download] animUrl final:', animUrl, 'osHeaders available:', !!osHeaders);
 
   if(animUrl){
     const animStr = String(animUrl).toLowerCase();
