@@ -158,16 +158,17 @@ async function handleLotteriesCommand(interaction, ctx){
   sessions.set(interaction.user.id, session);
   const { embed, filtered, pages } = buildDashboardEmbed(all, 0, 'all');
 
-  // Add clickable ID buttons for first page
+  // Add clickable ID buttons for live lotteries only — completed ones don't need action buttons
   const rows = dashboardButtons(0, pages, 'all');
-  if(filtered.length>0){
-    const idBtns = filtered.slice(0,PAGE).map(r=>
+  const liveLotteries = all.filter(r=>r.status==='active');
+  if(liveLotteries.length>0){
+    const idBtns = liveLotteries.slice(0,5).map(r=>
       new ButtonBuilder()
         .setCustomId(`ltrs:detail:${r._table}:${r.id}`)
-        .setLabel(`${r._table[0].toUpperCase()}${r.id} ${r.status==='active'?'🟢':'✅'}`)
-        .setStyle(ButtonStyle.Secondary)
+        .setLabel(`${r._table[0].toUpperCase()}${r.id} 🟢`)
+        .setStyle(ButtonStyle.Success)
     );
-    if(idBtns.length) rows.push(new ActionRowBuilder().addComponents(idBtns.slice(0,5)));
+    if(idBtns.length) rows.push(new ActionRowBuilder().addComponents(idBtns));
   }
 
   return interaction.editReply({ embeds:[embed], components:rows });
@@ -198,14 +199,14 @@ async function handleLotteriesButton(interaction, ctx){
 
     const { embed, filtered, pages } = buildDashboardEmbed(session.all, session.page, session.filter);
     const rows = dashboardButtons(session.page, pages, session.filter);
-    const slice = filtered.slice(session.page*PAGE, session.page*PAGE+PAGE);
-    if(slice.length){
+    const liveItems = session.all.filter(r=>r.status==='active');
+    if(liveItems.length){
       rows.push(new ActionRowBuilder().addComponents(
-        slice.slice(0,5).map(r=>
+        liveItems.slice(0,5).map(r=>
           new ButtonBuilder()
             .setCustomId(`ltrs:detail:${r._table}:${r.id}`)
-            .setLabel(`${r._table[0].toUpperCase()}${r.id} ${r.status==='active'?'🟢':'✅'}`)
-            .setStyle(ButtonStyle.Secondary)
+            .setLabel(`${r._table[0].toUpperCase()}${r.id} 🟢`)
+            .setStyle(ButtonStyle.Success)
         )
       ));
     }
@@ -238,14 +239,14 @@ async function handleLotteriesButton(interaction, ctx){
     sessions.set(userId, session);
     const { embed, filtered, pages } = buildDashboardEmbed(session.all, session.page, session.filter);
     const rows = dashboardButtons(session.page, pages, session.filter);
-    const slice = filtered.slice(session.page*PAGE, session.page*PAGE+PAGE);
-    if(slice.length){
+    const liveItems = session.all.filter(r=>r.status==='active');
+    if(liveItems.length){
       rows.push(new ActionRowBuilder().addComponents(
-        slice.slice(0,5).map(r=>
+        liveItems.slice(0,5).map(r=>
           new ButtonBuilder()
             .setCustomId(`ltrs:detail:${r._table}:${r.id}`)
-            .setLabel(`${r._table[0].toUpperCase()}${r.id} ${r.status==='active'?'🟢':'✅'}`)
-            .setStyle(ButtonStyle.Secondary)
+            .setLabel(`${r._table[0].toUpperCase()}${r.id} 🟢`)
+            .setStyle(ButtonStyle.Success)
         )
       ));
     }
@@ -312,3 +313,4 @@ async function handleLotteriesButton(interaction, ctx){
 
 const LOTTERIES_COMMANDS = new Set(['lotteries']);
 module.exports = { handleLotteriesCommand, handleLotteriesButton, LOTTERIES_COMMANDS };
+
