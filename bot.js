@@ -273,7 +273,7 @@ async function syncTraitRoles(guild, discordId, wallet){
   try{
     // Get all trait roles configured for this guild
     const traitRolesRes = await pgPool.query(
-      'SELECT trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1',
+      'SELECT trait_type, trait_value, role_id FROM trait_roles WHERE guild_id=$1',
       [guild.id]
     );
     if(!traitRolesRes.rows.length) return; // No trait roles configured
@@ -943,9 +943,10 @@ client.on('interactionCreate', async (interaction)=>{
        VALUES ($1,$2,$3,true,NOW(),NOW())
        ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,verified=true,verified_at=NOW(),updated_at=NOW()`,
       [discordId, gid, wallet]
-    ).catch(()=>{});
+    ).catch(e=>console.error('[SVDone] upsertReg failed guild='+gid+':', e.message));
     await upsertReg(svGuild);
     await upsertReg('global'); // cross-server record
+    console.log('[SVDone] saved registration for', discordId, 'guild:', svGuild);
 
     // Assign roles
     try{
