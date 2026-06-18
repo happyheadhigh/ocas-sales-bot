@@ -866,18 +866,31 @@ client.on('interactionCreate', async (interaction)=>{
 
     const { code, wallet } = codeRow;
 
-    // Fetch OpenSea profile by wallet address
+    // Fetch OpenSea profile by wallet address — add cache-bust to get fresh data
     let profile;
     try{
+      const cacheBust = `&_=${Date.now()}`;
       const osRes = await fetch(
-        `https://api.opensea.io/api/v2/accounts/${wallet}`,
-        { headers:osHeaders() }
+        `https://api.opensea.io/api/v2/accounts/${wallet}?${cacheBust}`,
+        { headers:{ ...osHeaders(), 'Cache-Control':'no-cache', 'Pragma':'no-cache' } }
       );
       if(!osRes.ok){
         if(osRes.status===404) return interaction.editReply({content:`❌ No OpenSea account found for wallet \`${wallet.slice(0,6)}...${wallet.slice(-4)}\`. Make sure this wallet is connected to OpenSea.`});
         return interaction.editReply({content:`❌ OpenSea error (${osRes.status}). Please try again.`});
       }
       profile = await osRes.json();
+      // If username looks stale (no code), try fetching fresh by username
+      const allStringsFirst = collectStringsDeep(profile).join(' ');
+      if(!allStringsFirst.includes(code) && profile.username){
+        try{
+          const osRes2 = await fetch(
+            `https://api.opensea.io/api/v2/accounts/${profile.username}?_=${Date.now()}`,
+            { headers:{ ...osHeaders(), 'Cache-Control':'no-cache', 'Pragma':'no-cache' } }
+          );
+          if(osRes2.ok) profile = await osRes2.json();
+        }catch(_){}
+      }
+      console.log('[SVDone] username:', profile.username, '| code in profile:', collectStringsDeep(profile).join(' ').includes(code));
     }catch(e){
       console.error('[SVDone] OS fetch:', e.message);
       return interaction.editReply({content:'❌ Could not reach OpenSea. Please try again.'});
@@ -1878,6 +1891,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
