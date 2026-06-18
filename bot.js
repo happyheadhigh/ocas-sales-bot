@@ -1734,7 +1734,7 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
 
-    if(DOWNLOAD_COMMANDS.has(commandName)) return handleDownloadCommand(interaction, { getConfig });
+    if(DOWNLOAD_COMMANDS.has(commandName)) return handleDownloadCommand(interaction, { getConfig, osHeaders });
 });
 
 // ── Welcome message on server join ───────────────────────────────────────────

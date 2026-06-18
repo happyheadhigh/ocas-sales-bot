@@ -218,19 +218,32 @@ function isSvgSource(src){
 }
 
 
-async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
+async function renderTokenPng({ contract, tokenId, chain, size, transparent, osHeaders }){
   const uri = await fetchTokenUri(contract, tokenId, chain);
   const meta = await loadJsonFromUri(uri);
 
-  // Check for animated content first (GIF or MP4 via animation_url)
-  const animUrl = meta.animation_url || meta.animated_url || null;
+  // Check for animated content first — try on-chain metadata, then OpenSea API
+  let animUrl = meta.animation_url || meta.animated_url || null;
+
+  // If no animation_url in on-chain metadata, try OpenSea API (gets CDN GIF)
+  if(!animUrl && osHeaders && contract && tokenId){
+    try{
+      const osNftUrl = `https://api.opensea.io/api/v2/chain/ethereum/contract/${contract}/nfts/${tokenId}`;
+      const osRes = await fetch(osNftUrl, { headers: osHeaders() });
+      if(osRes.ok){
+        const osData = await osRes.json();
+        animUrl = osData?.nft?.animation_url || osData?.nft?.metadata?.animation_url || null;
+      }
+    }catch(_){}
+  }
+
   if(animUrl){
     const animStr = String(animUrl).toLowerCase();
-    const isGif = animStr.includes('.gif') || animStr.includes('image/gif');
+    const isGif = animStr.includes('.gif') || animStr.includes('image/gif') || animStr.includes('seadn.io');
     const isMp4 = animStr.includes('.mp4') || animStr.includes('video/mp4') || animStr.includes('.webm');
     if(isGif || isMp4){
       const r = await fetch(ipfsToHttp(animUrl));
-      if(!r.ok) throw new Error(`animation fetch HTTP ${r.status}`);
+      if(!r.ok) throw new Error(`animation fetch HTTP \${r.status}`);
       const buffer = await r.buffer();
       const ext = isMp4 ? (animStr.includes('.webm') ? 'webm' : 'mp4') : 'gif';
       return { buffer, meta, ext };
@@ -337,7 +350,7 @@ async function handleDownloadCommand(interaction, forced={}){
       }
     }
     const finalTransparent = transparent;
-    const rendered = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent });
+    const rendered = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent, osHeaders: ctx.osHeaders });
     const { buffer } = rendered;
     const ext = rendered.ext || 'png';
     const sizeStr = ext === 'png' ? `-${size}` : '';
