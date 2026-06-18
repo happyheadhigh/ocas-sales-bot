@@ -336,8 +336,16 @@ async function syncTraitRoles(guild, discordId, wallet){
       const meetsMinFixed = count >= minNeeded;
       if(meetsMinFixed !== meetsMin) console.log('[TraitSync] FIXED meetsMin for', tr.trait_type, tr.trait_value, ':', meetsMin, '->', meetsMinFixed);
       console.log('[TraitSync] rule:', tr.trait_type, tr.trait_value||'', '>=', minNeeded, '| count:', count, '| meets:', meetsMinFixed);
-      if(meetsMinFixed && !hasRole)  await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
-      if(!meetsMinFixed && hasRole)  await member.roles.remove(tr.role_id).catch(()=>{});
+      if(meetsMinFixed && !hasRole){
+        const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
+        if(!conflict) await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
+        else console.log('[TraitSync] SKIP add — role managed by other bot:', tr.role_id);
+      }
+      // Only remove roles WE added — don't remove if another bot manages it
+      if(!meetsMinFixed && hasRole){
+        const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
+        if(!conflict) await member.roles.remove(tr.role_id).catch(()=>{});
+      }
     }
 
     // Assign verified + holder roles from verification panel config
@@ -402,15 +410,35 @@ async function checkRoleConflict(guild, roleId){
   try{
     const role = await guild.roles.fetch(roleId);
     if(!role) return null;
-    if(role.managed) return 'Role is managed by an external integration.';
-    const logs = await guild.fetchAuditLogs({ type:30, limit:5 }).catch(()=>null);
+    // Managed roles are controlled by integrations — never touch
+    if(role.managed) return 'managed';
+    // Check audit log — if another bot last assigned this role, flag it
+    const logs = await guild.fetchAuditLogs({ type:25, limit:20 }).catch(()=>null); // type 25 = MEMBER_ROLE_UPDATE
     if(logs){
-      const entry = logs.entries.find(e => e.target?.id === roleId);
-      if(entry && entry.executor?.bot && entry.executor.id !== guild.members.me?.id)
-        return 'Role was last modified by another bot. This can cause role flickering.';
+      const entries = logs.entries.filter(e =>
+        e.changes?.some(c => c.key === '$add' && c.new?.some(r => r.id === roleId))
+      );
+      const otherBotEntry = entries.find(e =>
+        e.executor?.bot && e.executor.id !== guild.members.me?.id
+      );
+      if(otherBotEntry) return 'other_bot:'+otherBotEntry.executor.id;
     }
     return null;
   }catch(_){ return null; }
+}
+
+// Cache of role conflicts per guild to avoid repeated audit log fetches
+const _roleConflictCache = new Map(); // 'guildId:roleId' -> {result, ts}
+async function isRoleManagedByOtherBot(guild, roleId){
+  const key = guild.id+':'+roleId;
+  const cached = _roleConflictCache.get(key);
+  // Cache for 10 minutes
+  if(cached && Date.now() - cached.ts < 10*60*1000) return cached.result;
+  const result = await checkRoleConflict(guild, roleId);
+  const conflict = result !== null;
+  _roleConflictCache.set(key, { result: conflict, ts: Date.now() });
+  if(conflict) console.log('[RoleConflict]', roleId, 'in', guild.name, ':', result);
+  return conflict;
 }
 
 client.on('interactionCreate', async (interaction)=>{
@@ -962,7 +990,9 @@ client.on('interactionCreate', async (interaction)=>{
         const member = await interaction.guild.members.fetch(discordId).catch(e=>{ console.error('[SVDone] fetch member:', e.message); return null; });
         console.log('[SVDone] member found:', !!member, 'role_id:', role_id, 'tokens:', tokenCount);
         if(member && role_id){
-          await member.roles.add(role_id).catch(e=>console.error('[SVDone] add verified role:', e.message));
+          const conflict = await isRoleManagedByOtherBot(interaction.guild, role_id);
+          if(!conflict) await member.roles.add(role_id).catch(e=>console.error('[SVDone] add verified role:', e.message));
+          else console.log('[SVDone] SKIP verified role — managed by other bot:', role_id);
         }
         if(member && holder_role_id && tokenCount >= 1){
           await member.roles.add(holder_role_id).catch(e=>console.error('[SVDone] add holder role:', e.message));
@@ -1902,6 +1932,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
