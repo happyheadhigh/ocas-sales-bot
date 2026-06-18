@@ -273,6 +273,9 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent }){
 }
 
 async function handleDownloadCommand(interaction, forced={}){
+  // forced may contain ctx fields like getConfig; extract them
+  const ctx = forced.getConfig ? forced : {};
+  if(forced.getConfig) forced = {};
   const cfgForParse = await loadMarketConfig();
   const guildCfgForParse = getGuildMarket(cfgForParse, interaction.guildId || 'dm');
   const searchText = interaction.options?.getString?.('search') || '';
@@ -298,10 +301,40 @@ async function handleDownloadCommand(interaction, forced={}){
   try{
     let contract = OCAS_CONTRACT, slug = DEFAULT_SLUG, chain = DEFAULT_CHAIN, alias = 'ocas';
     if(collection && collection !== 'ocas'){
-      const cfg = await loadMarketConfig();
-      const guildCfg = getGuildMarket(cfg, interaction.guildId || 'dm');
-      const resolved = resolveCollectionFromGuild(guildCfg, collection, interaction.channelId);
-      if(resolved){ contract = resolved.cfg.contract || contract; slug = resolved.cfg.slug || slug; chain = resolved.cfg.chain || chain; alias = resolved.alias; }
+      // Check server_configs first (new wizard-configured collections)
+      const serverCfg = ctx.getConfig ? ctx.getConfig(interaction.guildId) : null;
+      let resolvedFromServer = false;
+      if(serverCfg){
+        // Check primary collection
+        const primarySlug = serverCfg.slug || serverCfg.collectionSlug;
+        if(primarySlug && (collection === primarySlug || collection === (serverCfg.contractName||'').toLowerCase())){
+          contract = serverCfg.contract || contract;
+          slug = primarySlug;
+          alias = serverCfg.contractName || primarySlug;
+          resolvedFromServer = true;
+        }
+        // Check extra collections
+        if(!resolvedFromServer){
+          for(const col of serverCfg.collections || []){
+            const colSlug = col.slug || '';
+            const colName = (col.name||'').toLowerCase();
+            if(collection === colSlug || collection === colName){
+              contract = col.contract || contract;
+              slug = colSlug;
+              alias = col.name || colSlug;
+              resolvedFromServer = true;
+              break;
+            }
+          }
+        }
+      }
+      // Fall back to market_collections_v1 if not found in server_configs
+      if(!resolvedFromServer){
+        const cfg = await loadMarketConfig();
+        const guildCfg = getGuildMarket(cfg, interaction.guildId || 'dm');
+        const resolved = resolveCollectionFromGuild(guildCfg, collection, interaction.channelId);
+        if(resolved){ contract = resolved.cfg.contract || contract; slug = resolved.cfg.slug || slug; chain = resolved.cfg.chain || chain; alias = resolved.alias; }
+      }
     }
     const finalTransparent = transparent;
     const rendered = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent });
