@@ -28,15 +28,9 @@ const commands = [
     .addStringOption(o=>o.setName('contract').setDescription('Contract address (e.g. 0x078be86...)').setRequired(false))
     .addStringOption(o=>o.setName('chain').setDescription('Blockchain (default: ethereum)').setRequired(false).addChoices(...chainChoices)),
 
-  new SlashCommandBuilder().setName('setuphere')
-    .setDescription('Mobile-friendly setup — posts sales to the channel you run this in')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addStringOption(o=>o.setName('collection').setDescription('OpenSea collection slug (e.g. on-chain-all-stars)').setRequired(true))
-    .addStringOption(o=>o.setName('contract').setDescription('Contract address (e.g. 0x078be86...)').setRequired(false))
-    .addStringOption(o=>o.setName('chain').setDescription('Blockchain (default: ethereum)').setRequired(false).addChoices(...chainChoices)),
 
-  new SlashCommandBuilder().setName('setlistingshere').setDescription('Mobile-friendly — sets listings channel to the channel you run this in').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-  new SlashCommandBuilder().setName('setlistings').setDescription('Set the channel for new listing alerts').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addChannelOption(o=>o.setName('channel').setDescription('Channel to post new listings in').setRequired(true)),
+
+
   new SlashCommandBuilder().setName('setchannel').setDescription('Change the sales channel').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addChannelOption(o=>o.setName('channel').setDescription('New sales channel').setRequired(true)),
   new SlashCommandBuilder().setName('setcollection').setDescription('Change the collection being watched').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption(o=>o.setName('slug').setDescription('OpenSea collection slug').setRequired(true)).addStringOption(o=>o.setName('contract').setDescription('Contract address').setRequired(false)),
   new SlashCommandBuilder().setName('salesfilter').setDescription('Only auto-post sales where a trait matches').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Type)').setRequired(true)).addStringOption(o=>o.setName('value').setDescription('Trait value (e.g. Zombie)').setRequired(true)),
@@ -125,8 +119,6 @@ const commands = [
 
 
 
-  new SlashCommandBuilder().setName('verifydashboard')
-    .setDescription('View verification stats and role breakdown for this server (Admin only)'),
 
   new SlashCommandBuilder().setName('setupverification')
     .setDescription('Setup a wallet verification panel in a channel (Admin only)')
@@ -135,21 +127,7 @@ const commands = [
     .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum OCAS tokens required (0 = any wallet)').setRequired(false).setMinValue(0))
     .addStringOption(o=>o.setName('message').setDescription('Custom welcome message for the panel').setRequired(false)),
 
-  new SlashCommandBuilder().setName('setuptraitrole')
-    .setDescription('Assign a role to holders of a specific trait or token count (Admin only)')
-    .addStringOption(o=>o.setName('trait_type').setDescription('Trait category e.g. Type, Hat Hair — or "Collection" for total count').setRequired(true))
-    .addStringOption(o=>o.setName('trait_value').setDescription('Trait value e.g. Zombie, Mohawk Blonde — or "OCAS" for total count').setRequired(true))
-    .addRoleOption(o=>o.setName('role').setDescription('Role to assign').setRequired(true))
-    .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum tokens with this trait (default 1). Use 5 for King Ape, 20 for Collector etc').setRequired(false).setMinValue(1)),
 
-  new SlashCommandBuilder().setName('removetraitrole')
-    .setDescription('Remove a trait role mapping (Admin only)')
-    .addStringOption(o=>o.setName('trait_type').setDescription('Trait category').setRequired(true))
-    .addStringOption(o=>o.setName('trait_value').setDescription('Trait value').setRequired(true))
-    .addRoleOption(o=>o.setName('role').setDescription('Role to remove').setRequired(true)),
-
-  new SlashCommandBuilder().setName('listtraitroles')
-    .setDescription('List all trait role mappings for this server'),
 
 
   new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)'),
@@ -186,5 +164,6 @@ const rest = new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
     console.error('Registration failed:', e.message);
   }
 })();
+
 
 

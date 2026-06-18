@@ -1615,67 +1615,6 @@ client.on('interactionCreate', async (interaction)=>{
   if(CONFIG_COMMANDS.has(commandName))   return handleConfigCommand(interaction, { pgPool, getConfig, setConfig });
   if(LOTTERIES_COMMANDS.has(commandName)) return handleLotteriesCommand(interaction, { pgPool });
   if(MISC_COMMANDS.has(commandName))    return handleMiscCommand(commandName, ctx);
-  // ── /setuptraitrole ──────────────────────────────────────────────────────────
-  if(commandName==='setuptraitrole'){
-    await interaction.deferReply({flags:64});
-    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
-      return interaction.editReply({content:'❌ You need Manage Server permission.'});
-    const traitType  = interaction.options.getString('trait_type');
-    const traitValue = interaction.options.getString('trait_value');
-    const role       = interaction.options.getRole('role');
-    const minCount   = interaction.options.getInteger('minimum') ?? 1;
-    const guildId    = interaction.guildId;
-    try{
-      await pgPool.query(
-        'INSERT INTO trait_roles (guild_id,trait_type,trait_value,role_id,minimum_count) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (guild_id,trait_type,trait_value,role_id,minimum_count) DO NOTHING',
-        [guildId, traitType, traitValue, role.id, minCount]
-      );
-      const minStr = minCount > 1 ? ' (minimum '+minCount+')' : '';
-      return interaction.editReply({content:'✅ Trait role set: holders of **'+minCount+'+ '+traitType+': '+traitValue+'** will receive <@&'+role.id+'>'});
-    }catch(e){
-      console.error('[SetupTraitRole]', e.message);
-      return interaction.editReply({content:'❌ Failed to set trait role.'});
-    }
-  }
-
-  // ── /removetraitrole ─────────────────────────────────────────────────────────
-  if(commandName==='removetraitrole'){
-    await interaction.deferReply({flags:64});
-    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
-      return interaction.editReply({content:'❌ You need Manage Server permission.'});
-    const traitType  = interaction.options.getString('trait_type');
-    const traitValue = interaction.options.getString('trait_value');
-    const role       = interaction.options.getRole('role');
-    const guildId    = interaction.guildId;
-    try{
-      await pgPool.query(
-        'DELETE FROM trait_roles WHERE guild_id=$1 AND trait_type=$2 AND trait_value=$3 AND role_id=$4',
-        [guildId, traitType, traitValue, role.id]
-      );
-      return interaction.editReply({content:'✅ Trait role removed: **'+traitType+': '+traitValue+'** → <@&'+role.id+'>'});
-    }catch(e){
-      return interaction.editReply({content:'❌ Failed to remove trait role.'});
-    }
-  }
-
-  // ── /listtraitroles ──────────────────────────────────────────────────────────
-  if(commandName==='listtraitroles'){
-    await interaction.deferReply({flags:64});
-    const guildId = interaction.guildId;
-    try{
-      const res = await pgPool.query(
-        'SELECT trait_type, trait_value, role_id FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
-        [guildId]
-      );
-      if(!res.rows.length)
-        return interaction.editReply({content:'No trait roles configured. Use `/setuptraitrole` to add one.'});
-      const lines = res.rows.map(r => '• **'+(r.minimum_count>1?r.minimum_count+'+ ':'')+r.trait_type+': '+r.trait_value+'** → <@&'+r.role_id+'>');
-      return interaction.editReply({content:'**Trait Roles**\n'+lines.join('\n')});
-    }catch(e){
-      return interaction.editReply({content:'❌ Failed to fetch trait roles.'});
-    }
-  }
-
   // ── /synctraits (manual trigger) ─────────────────────────────────────────────
   if(commandName==='resetverify'){
     if(!isAdmin) return interaction.reply({flags:64, content:'❌ Admin only.'});
@@ -1800,10 +1739,10 @@ client.on('guildCreate', async (guild)=>{
       'Copy exactly as shown - lowercase, dashes not spaces.',
       '',
       '**Step 2 - Sales channel (go to your sales channel and run):****',
-      '`/setuphere collection:your-slug contract:0x...`',
+      
       '',
       '**Step 3 - Listings channel (go to your listings channel and run):**',
-      '`/setlistingshere`',
+      
       '',
       '**Step 4 - Test it:**',
       '`/lastsale` and `/listings`',
@@ -1936,6 +1875,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
