@@ -36,7 +36,6 @@ function buildDashboardEmbed(cfg, traitRoles){
       `🏆 **Holder Role:** ${cfg.holderRole ? rol(cfg.holderRole) + ' ✅' : '`Not set` ⚪'}\n` +
       `🎭 **Trait Roles:** ${tCount} configured\n` +
       `📋 **Listing Filters:** ${Object.keys(cfg.listingFilters||{}).length} active\n\n` +
-      `📋 **Listing Filters:** ${Object.keys(cfg.listingFilters||{}).length} active\n\n` +
       SEP + '\n' +
       '*Select a category below to edit.*'
     )
@@ -439,6 +438,10 @@ async function handleConfigButton(interaction, ctx){
     const trRes = await traitRolesQ();
     return interaction.editReply({ content:'', embeds:[buildRolesEmbed(trRes.rows)], components:rolesRow(trRes.rows) });
   }
+  if(customId === 'cfg:cat:filters'){
+    await interaction.deferUpdate();
+    return interaction.editReply({ content:'', embeds:[buildFiltersEmbed(cfg)], components:filtersRow(cfg) });
+  }
 
   // ── Collection edits ───────────────────────────────────────────────────────
   if(customId === 'cfg:col:contract'){
@@ -768,6 +771,7 @@ async function handleConfigModal(interaction, ctx){
 
 const CONFIG_COMMANDS = new Set(['config']);
 module.exports = { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS };
+
 
 
 
