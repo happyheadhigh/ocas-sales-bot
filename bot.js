@@ -807,9 +807,10 @@ client.on('interactionCreate', async (interaction)=>{
       .setTitle('🔐 Verify Your Wallet')
       .setDescription(
         `**Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\`\n\n` +
-        '**Step 1 — Add this code to your OpenSea bio:**\n' +
+        '**Step 1 — Add this code to your OpenSea username:**\n' +
         '```' + code + '```' +
-        `Go to https://opensea.io/${wallet} → Edit Profile → paste the code into your **bio/description** field.\n\n` +
+        `Go to https://opensea.io/${wallet} → Edit Profile → add the code anywhere in your **username**.\n` +
+        `Example: \`YourName-${code}\`\n\n` +
         '**Step 2 — Once saved, click ✅ I\'ve Added It below.**\n\n' +
         '*You can remove the code from your bio after verification. Expires in 30 minutes.*'
       );
@@ -884,14 +885,11 @@ client.on('interactionCreate', async (interaction)=>{
 
     // Search entire profile object for the code (handles any field name OS uses)
     const allStrings = collectStringsDeep(profile).join(' ');
-    console.log('[SVDone] profile keys:', Object.keys(profile).join(', '));
-    console.log('[SVDone] bio fields:', JSON.stringify({bio:profile.bio, description:profile.description, about:profile.about, config:profile.config}));
-    console.log('[SVDone] code found in profile:', allStrings.includes(code), '| code:', code);
     if(!allStrings.includes(code))
       return interaction.editReply({content:[
         '❌ Code not found in your OpenSea profile yet.',
         '',
-        `Go to https://opensea.io/${wallet} → Edit Profile → paste this into your **bio/description**:`,
+        `Go to https://opensea.io/${wallet} → Edit Profile → add the code to your **username**:`,
         '```'+code+'```',
         'Save your profile, then click **✅ I\'ve Added It** again.',
       ].join('\n')});
@@ -968,7 +966,7 @@ client.on('interactionCreate', async (interaction)=>{
       walletSummary,
       `🪙 **Tokens found:** ${tokenCount}`,
       '',
-      'You can remove the code from your OpenSea bio now.',
+      'You can remove the code from your OpenSea username now.',
       'Your wallet is saved — future servers will verify you instantly.',
     ].join('\n')});
   }
@@ -1880,6 +1878,7 @@ client.once('clientReady', async ()=>{
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
 client.login(DISCORD_TOKEN);
+
 
 
 
