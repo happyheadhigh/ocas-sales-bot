@@ -1026,24 +1026,22 @@ client.on('interactionCreate', async (interaction)=>{
       [discordId, gid, wallet]
     ).catch(e=>console.error('[SVDone] upsertReg failed guild='+gid+':', e.message));
     await upsertReg(svGuild);
-    // Global cross-server record — use wallet-safe upsert to avoid unique constraint on wallet col
-    await pgPool.query(
-      `INSERT INTO user_registrations (discord_id,guild_id,wallet,verified,verified_at,updated_at)
-       VALUES ($1,'global',$2,true,NOW(),NOW())
-       ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$2,verified=true,verified_at=NOW(),updated_at=NOW()`,
-      [discordId, wallet]
-    ).catch(async e => {
-      // If wallet unique constraint fires, the wallet is linked to another discord_id — update that row instead
-      if(e.message && e.message.includes('unique constraint')){
-        await pgPool.query(
-          `UPDATE user_registrations SET discord_id=$1,verified=true,verified_at=NOW(),updated_at=NOW()
-           WHERE guild_id='global' AND wallet=$2`,
-          [discordId, wallet]
-        ).catch(e2=>console.error('[SVDone] global row update failed:', e2.message));
-      } else {
-        console.error('[SVDone] upsertReg failed guild=global:', e.message);
-      }
-    });
+    // Global cross-server record — DELETE existing global row for this wallet/discord_id then re-insert
+    console.log('[SVDone] saving global row for discord_id:', discordId, 'wallet:', wallet.slice(0,8));
+    try {
+      await pgPool.query(
+        `DELETE FROM user_registrations WHERE guild_id='global' AND (discord_id=$1 OR wallet=$2)`,
+        [discordId, wallet]
+      );
+      await pgPool.query(
+        `INSERT INTO user_registrations (discord_id,guild_id,wallet,verified,verified_at,updated_at)
+         VALUES ($1,'global',$2,true,NOW(),NOW())`,
+        [discordId, wallet]
+      );
+      console.log('[SVDone] global row saved OK');
+    } catch(e) {
+      console.error('[SVDone] global row save failed:', e.message);
+    }
     console.log('[SVDone] saved registration for', discordId, 'guild:', svGuild);
 
     // Assign roles
