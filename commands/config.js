@@ -128,16 +128,16 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
       `**Contract:** ${col.contract ? `\`${col.contract}\`` : '`Not set`'} ${ok(col.contract)}\n` +
       `**Slug:** \`${col.slug || 'Not set'}\`\n` +
       `**Sales Channel:** ${col.salesChannel ? `<#${col.salesChannel}>` : '`Not set`'} ${ok(col.salesChannel)}\n` +
-      `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\\n` +
+      `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\n` +
       (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\n` : '') +
-      `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\\n` +
+      `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\n` +
       (isOcas ? '\n🔥 **OCAS** — full feature set active.\n' : '') +
       '\n*Changes save immediately.*'
     )
     .setFooter({ text: 'Only visible to you' });
 }
 
-function collectionEditRow(colId, isPrimary){
+function collectionEditRow(colId, isPrimary, isOcas=false){
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`cfg:col:name:${colId}`).setLabel('✏️ Name').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
@@ -149,13 +149,21 @@ function collectionEditRow(colId, isPrimary){
     new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:clearchan:listings:${colId}`).setLabel('✕ Listings').setStyle(ButtonStyle.Danger),
   );
+  const rows = [row1, row1b];
+  if(isOcas){
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`cfg:col:burnchan:${colId}`).setLabel('🔥 Burn Alerts Ch.').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:col:clearchan:burn:${colId}`).setLabel('✕ Burn').setStyle(ButtonStyle.Danger),
+    ));
+  }
   const row2Btns = [
     new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
   ];
   if(!isPrimary) row2Btns.push(
     new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)
   );
-  return [row1, row1b, new ActionRowBuilder().addComponents(row2Btns)];
+  rows.push(new ActionRowBuilder().addComponents(row2Btns));
+  return rows;
 }
 
 // ── Channels screen ───────────────────────────────────────────────────────────
@@ -431,7 +439,7 @@ async function handleConfigButton(interaction, ctx){
       ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
 
   // Add collection button
@@ -504,19 +512,22 @@ async function handleConfigButton(interaction, ctx){
     if(isPrimary){
       if(field === 'sales')    { delete cfg.channelId; delete cfg.salesChannel; }
       if(field === 'listings') { delete cfg.listingsChannelId; delete cfg.listingsChannel; }
+      if(field === 'burn')     { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
     } else {
       const idx = parseInt(colId);
       if(cfg.collections?.[idx]){
         if(field === 'sales')    cfg.collections[idx].salesChannel    = null;
         if(field === 'listings') cfg.collections[idx].listingsChannel = null;
       }
+      // burn channel is always top-level in cfg
+      if(field === 'burn') { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : cfg.collections?.[parseInt(colId)] || {};
     return interaction.editReply({ content:'✅ Channel cleared.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)
-], components:collectionEditRow(colId, isPrimary) });
+], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
 
   if(customId.startsWith('cfg:col:saleschan:') || customId.startsWith('cfg:col:listchan:')){
@@ -531,6 +542,15 @@ async function handleConfigButton(interaction, ctx){
     return interaction.editReply({ content:`**Select the ${label} channel:**`, embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
   }
 
+  if(customId.startsWith('cfg:col:burnchan:')){
+    const colId = customId.split(':')[3];
+    const menu = new ChannelSelectMenuBuilder()
+      .setCustomId(`cfg_chsel:col:burnchan:${colId}`)
+      .setPlaceholder('Pick the Burn Alerts channel')
+      .addChannelTypes(ChannelType.GuildText);
+    return interaction.editReply({ content:'**Select the 🔥 Burn Alerts channel:**', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+  }
+
   // Remove extra collection
   if(customId.startsWith('cfg:col:filters:back:')){
     const colId = customId.split(':')[4];
@@ -538,7 +558,7 @@ async function handleConfigButton(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
 
   if(customId.startsWith('cfg:col:filters:')){
@@ -811,6 +831,7 @@ async function handleConfigButton(interaction, ctx){
       if(isPrimary){
         if(field==='saleschan')  cfg.channelId         = chId;
         if(field==='listchan')   cfg.listingsChannelId = chId;
+        if(field==='burnchan')   { cfg.burnChannel = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
       } else {
         const idx = parseInt(colId);
         if(!cfg.collections) cfg.collections = [];
@@ -818,12 +839,14 @@ async function handleConfigButton(interaction, ctx){
           if(field==='saleschan')  cfg.collections[idx].salesChannel    = chId;
           if(field==='listchan')   cfg.collections[idx].listingsChannel = chId;
         }
+        // burn channel is always top-level in cfg
+        if(field==='burnchan') { cfg.burnChannel = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
       }
       await setConfig(guildId, cfg);
       const col = isPrimary
         ? { contract:cfg.contract, slug:cfg.collectionSlug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
         : cfg.collections[parseInt(colId)];
-      return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
+      return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
     }
 
     // Standard channel edit
@@ -918,7 +941,7 @@ async function handleConfigModal(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
-    return interaction.editReply({ content:'✅ Name updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
+    return interaction.editReply({ content:'✅ Name updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
 
   // ── Per-collection listing filter modal ────────────────────────────────────
@@ -993,7 +1016,7 @@ async function handleConfigModal(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
       : cfg.collections[parseInt(colId)];
-    return interaction.editReply({ content:'✅ Updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
+    return interaction.editReply({ content:'✅ Updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
 
   // ── Add trait role ─────────────────────────────────────────────────────────
