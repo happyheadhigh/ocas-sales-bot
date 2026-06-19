@@ -97,6 +97,7 @@ const {
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
 const { handleMarketCommand, MARKET_COMMANDS }   = require('./commands/market');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
+const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
 const { handleLotteryCommand, LOTTERY_COMMANDS } = require('./commands/lottery');
 const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
@@ -276,6 +277,8 @@ async function syncTraitRoles(guild, discordId, wallet){
       'SELECT trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1',
       [guild.id]
     );
+
+
     if(!traitRolesRes.rows.length) return; // No trait roles configured
 
     // Get all OCAS tokens owned by this wallet from our token_traits table
@@ -1629,6 +1632,7 @@ client.on('interactionCreate', async (interaction)=>{
   if(ADMIN_COMMANDS.has(commandName))   return handleAdminCommand(commandName, ctx);
   if(MARKET_COMMANDS.has(commandName))  return handleMarketCommand(commandName, ctx);
   if(OCAS_COMMANDS.has(commandName))    return handleOcasCommand(commandName, ctx);
+  if(TOKEN_COMMANDS.has(commandName))   return handleTokenCommand(commandName, ctx);
   if(BURN_COMMANDS.has(commandName))    return handleBurnCommand(commandName, ctx);
   if(LOTTERY_COMMANDS.has(commandName)) return handleLotteryCommand(commandName, ctx);
   if(SETUP_COMMANDS.has(commandName))    return handleSetupCommand(interaction, ctx);
