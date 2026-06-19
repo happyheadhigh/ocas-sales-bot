@@ -72,7 +72,7 @@ function buildCollectionsEmbed(cfg){
     if(primary){
       desc += `**1. ${primary.isOcas?'🔥 ':'📦 '}${primary.name}** *(primary)*\n`;
       desc += `> Slug: \`${primary.slug}\`\n`;
-      desc += `> Sales: ${primary.salesChannel ? `<#${primary.salesChannel}>` : '`not set`'} · Listings: ${primary.listingsChannel ? `<#${primary.listingsChannel}>` : '`not set`'}\n\n`;
+      desc += `> Sales: ${primary.salesChannel ? `<#${primary.salesChannel}>` : '`not set`'} · Listings: ${primary.listingsChannel ? `<#${primary.listingsChannel}>` : '`not set`'}${primary.isOcas && cfg.burnChannel ? ` · Burn: <#${cfg.burnChannel}>` : ''}\\n\\n`;
     }
     extras.forEach((col, i) => {
       const n = i + (primary ? 2 : 1);
@@ -118,7 +118,7 @@ function collectionsRow(cfg){
 }
 
 // Single collection edit embed
-function buildCollectionEditEmbed(col, isPrimary){
+function buildCollectionEditEmbed(col, isPrimary, cfg={}){
   const isOcas = col.contract?.toLowerCase() === OCAS_CONTRACT;
   return new EmbedBuilder()
     .setColor(0x5865F2)
@@ -128,8 +128,9 @@ function buildCollectionEditEmbed(col, isPrimary){
       `**Contract:** ${col.contract ? `\`${col.contract}\`` : '`Not set`'} ${ok(col.contract)}\n` +
       `**Slug:** \`${col.slug || 'Not set'}\`\n` +
       `**Sales Channel:** ${col.salesChannel ? `<#${col.salesChannel}>` : '`Not set`'} ${ok(col.salesChannel)}\n` +
-      `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\n` +
-      `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\n` +
+      `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\\n` +
+      (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\\n` : '') +
+      `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\\n` +
       (isOcas ? '\n🔥 **OCAS** — full feature set active.\n' : '') +
       '\n*Changes save immediately.*'
     )
@@ -430,7 +431,7 @@ async function handleConfigButton(interaction, ctx){
       ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
   }
 
   // Add collection button
@@ -514,7 +515,8 @@ async function handleConfigButton(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : cfg.collections?.[parseInt(colId)] || {};
-    return interaction.editReply({ content:'✅ Channel cleared.', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+    return interaction.editReply({ content:'✅ Channel cleared.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)
+], components:collectionEditRow(colId, isPrimary) });
   }
 
   if(customId.startsWith('cfg:col:saleschan:') || customId.startsWith('cfg:col:listchan:')){
@@ -536,7 +538,7 @@ async function handleConfigButton(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
   }
 
   if(customId.startsWith('cfg:col:filters:')){
@@ -821,7 +823,7 @@ async function handleConfigButton(interaction, ctx){
       const col = isPrimary
         ? { contract:cfg.contract, slug:cfg.collectionSlug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
         : cfg.collections[parseInt(colId)];
-      return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+      return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
     }
 
     // Standard channel edit
@@ -916,7 +918,7 @@ async function handleConfigModal(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
-    return interaction.editReply({ content:'✅ Name updated.', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+    return interaction.editReply({ content:'✅ Name updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
   }
 
   // ── Per-collection listing filter modal ────────────────────────────────────
@@ -991,7 +993,7 @@ async function handleConfigModal(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
       : cfg.collections[parseInt(colId)];
-    return interaction.editReply({ content:'✅ Updated.', embeds:[buildCollectionEditEmbed(col, isPrimary)], components:collectionEditRow(colId, isPrimary) });
+    return interaction.editReply({ content:'✅ Updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary) });
   }
 
   // ── Add trait role ─────────────────────────────────────────────────────────
