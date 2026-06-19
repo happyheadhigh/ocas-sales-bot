@@ -72,7 +72,7 @@ function buildCollectionsEmbed(cfg){
     if(primary){
       desc += `**1. ${primary.isOcas?'🔥 ':'📦 '}${primary.name}** *(primary)*\n`;
       desc += `> Slug: \`${primary.slug}\`\n`;
-      desc += `> Sales: ${primary.salesChannel ? `<#${primary.salesChannel}>` : '`not set`'} · Listings: ${primary.listingsChannel ? `<#${primary.listingsChannel}>` : '`not set`'}${primary.isOcas && cfg.burnChannel ? ` · Burn: <#${cfg.burnChannel}>` : ''}\\n\\n`;
+      desc += `> Sales: ${primary.salesChannel ? `<#${primary.salesChannel}>` : '`not set`'} · Listings: ${primary.listingsChannel ? `<#${primary.listingsChannel}>` : '`not set`'}${primary.isOcas && cfg.burnChannel ? ` · Burn: <#${cfg.burnChannel}>` : ''}\n\n`;
     }
     extras.forEach((col, i) => {
       const n = i + (primary ? 2 : 1);
@@ -129,7 +129,7 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
       `**Slug:** \`${col.slug || 'Not set'}\`\n` +
       `**Sales Channel:** ${col.salesChannel ? `<#${col.salesChannel}>` : '`Not set`'} ${ok(col.salesChannel)}\n` +
       `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\\n` +
-      (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\\n` : '') +
+      (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\n` : '') +
       `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\\n` +
       (isOcas ? '\n🔥 **OCAS** — full feature set active.\n' : '') +
       '\n*Changes save immediately.*'
