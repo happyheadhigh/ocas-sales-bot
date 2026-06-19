@@ -673,37 +673,8 @@ client.on('interactionCreate', async (interaction)=>{
     return interaction.showModal(modal);
   }
   if(interaction.isRoleSelectMenu() && interaction.customId === 'cfg_traitrole:rolesel'){
-    // Must call showModal — cannot deferUpdate first
-    const roleId = interaction.values[0];
-    const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
-    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-    const modal = new ModalBuilder()
-      .setCustomId('cfg_modal:traitrole:'+roleId)
-      .setTitle(`Role: ${(role?.name||'Selected').slice(0,40)}`);
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category (optional — e.g. Type)')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('Leave blank to require a token count instead')
-          .setRequired(false)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_trait_value')
-          .setLabel('Trait Value (optional — e.g. Zombie, Gold)')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('Leave blank if using token count')
-          .setRequired(false)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_min_count')
-          .setLabel('Minimum tokens to qualify (default: 1)')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. 1, 5, 20')
-          .setRequired(false)
-      ),
-    );
-    return interaction.showModal(modal);
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_role:')){
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
