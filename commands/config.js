@@ -947,7 +947,39 @@ Step 2 of 3 — Pick the trait category:`,
       return interaction.editReply({ content: `❌ No trait values found for category **${category}**. Try again.`, embeds:[], components:[] });
     }
 
-    const valOptions = values.slice(0, 25).map(v =>
+    // If more than 25 values, fall back to modal — Discord select menus cap at 25
+    if(values.length > 25){
+      const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+      const modal = new ModalBuilder()
+        .setCustomId('cfg_modal:traitrole:'+roleId)
+        .setTitle(`${category} — too many to list`);
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_trait_type')
+            .setLabel('Trait Category')
+            .setStyle(TextInputStyle.Short)
+            .setValue(category)
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_trait_value')
+            .setLabel(`Trait Value (${values.length} options — type one)`)
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder(`e.g. ${values.slice(0,3).join(', ')}...`)
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_min_count')
+            .setLabel('Minimum tokens needed (default: 1)')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('1')
+            .setRequired(false)
+        ),
+      );
+      return interaction.showModal(modal);
+    }
+
+    const valOptions = values.map(v =>
       new StringSelectMenuOptionBuilder().setLabel(v).setValue(v)
     );
 
@@ -955,7 +987,7 @@ Step 2 of 3 — Pick the trait category:`,
       .setCustomId(`cfg_traitrole:valsel:${roleId}:${encodeURIComponent(category)}`)
       .setPlaceholder('Step 3 of 3 — Pick one or more values...')
       .setMinValues(1)
-      .setMaxValues(Math.min(valOptions.length, 25))
+      .setMaxValues(valOptions.length)
       .addOptions(valOptions);
 
     return interaction.editReply({
