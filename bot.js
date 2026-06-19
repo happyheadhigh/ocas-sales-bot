@@ -830,7 +830,14 @@ client.on('interactionCreate', async (interaction)=>{
           'Your wallet was recognised from another server — no re-verification needed.',
         ].join('\n')});
       }
-    }catch(_){}
+    }catch(e){
+      console.error('[SVInstant] Error in instant re-verify:', e.message);
+      // Don't fall through to modal silently — tell the user something went wrong
+      if(!interaction.deferred && !interaction.replied){
+        return interaction.reply({ flags:64, content:'❌ Something went wrong during instant verification. Please try again.' });
+      }
+      return interaction.editReply({ content:'❌ Something went wrong during instant verification. Please try again.' });
+    }
 
     // New user — show wallet input modal
     const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
