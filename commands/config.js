@@ -14,7 +14,7 @@ const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 async function fetchAndStoreCollectionTraits(slug, pgPool){
   if(!slug) return;
   try{
-    const { OPENSEA_KEY, osHeaders } = require('./lib/constants');
+    const { OPENSEA_KEY, osHeaders } = require('../lib/constants');
     const fetch = require('node-fetch');
     const res = await fetch(
       `https://api.opensea.io/api/v2/collections/${slug}/traits`,
