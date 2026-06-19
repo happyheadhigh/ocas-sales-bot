@@ -9,6 +9,41 @@ const {
 } = require('discord.js');
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
+
+// ── Fetch & cache traits from OpenSea for a collection slug ──────────────────
+async function fetchAndStoreCollectionTraits(slug, pgPool){
+  if(!slug) return;
+  try{
+    const { OPENSEA_KEY, osHeaders } = require('./lib/constants');
+    const fetch = require('node-fetch');
+    const res = await fetch(
+      `https://api.opensea.io/api/v2/collections/${slug}/traits`,
+      { headers: osHeaders() }
+    );
+    if(!res.ok){ console.warn('[TraitCache] OS traits fetch failed:', res.status, slug); return; }
+    const data = await res.json();
+    const categories = data.categories || data.traits || {};
+    let count = 0;
+    for(const [traitName, values] of Object.entries(categories)){
+      if(!Array.isArray(values)) continue;
+      for(const v of values){
+        const val = typeof v === 'object' ? (v.value||v.trait_value||String(v)) : String(v);
+        const cnt = typeof v === 'object' ? (v.count||0) : 0;
+        await pgPool.query(
+          `INSERT INTO collection_traits (slug, trait_name, trait_value, token_count)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (slug, trait_name, trait_value) DO UPDATE SET token_count=$4`,
+          [slug, traitName, val, cnt]
+        ).catch(()=>{});
+        count++;
+      }
+    }
+    console.log(`[TraitCache] Stored ${count} trait values for ${slug}`);
+  }catch(e){
+    console.warn('[TraitCache] Error fetching traits for', slug, ':', e.message);
+  }
+}
+
 const OCAS_SLUG     = 'on-chain-all-stars';
 const SEP           = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
 
@@ -782,10 +817,17 @@ async function handleConfigButton(interaction, ctx){
     const roleId = interaction.values[0];
     const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
 
-    // Load distinct trait categories from DB
+    // Load distinct trait categories — try collection_traits first, fall back to token_traits
+    const slug = cfg.collectionSlug || cfg.slug || '';
     const catRes = await pgPool.query(
-      'SELECT DISTINCT trait_name FROM token_traits ORDER BY trait_name'
+      `SELECT DISTINCT trait_name FROM collection_traits WHERE slug=$1 ORDER BY trait_name`,
+      [slug]
     ).catch(()=>({ rows:[] }));
+    if(!catRes.rows.length){
+      // fallback to token_traits if collection_traits not yet populated
+      const fallback = await pgPool.query('SELECT DISTINCT trait_name FROM token_traits ORDER BY trait_name').catch(()=>({ rows:[] }));
+      catRes.rows = fallback.rows;
+    }
 
     const categories = catRes.rows.map(r => r.trait_name).filter(Boolean);
     if(!categories.length){
@@ -887,10 +929,18 @@ Step 2 of 3 — Pick the trait category:`,
     }
 
     // Load distinct values for this category
-    const valRes = await pgPool.query(
-      'SELECT DISTINCT trait_value FROM token_traits WHERE trait_name=$1 ORDER BY trait_value',
-      [category]
+    const cfgForSlug = getConfig(guildId) || {};
+    const slugForVal = cfgForSlug.collectionSlug || cfgForSlug.slug || '';
+    let valRes = await pgPool.query(
+      `SELECT DISTINCT trait_value FROM collection_traits WHERE slug=$1 AND trait_name=$2 ORDER BY trait_value`,
+      [slugForVal, category]
     ).catch(()=>({ rows:[] }));
+    if(!valRes.rows.length){
+      valRes = await pgPool.query(
+        'SELECT DISTINCT trait_value FROM token_traits WHERE trait_name=$1 ORDER BY trait_value',
+        [category]
+      ).catch(()=>({ rows:[] }));
+    }
 
     const values = valRes.rows.map(r => r.trait_value).filter(Boolean);
     if(!values.length){
@@ -1140,7 +1190,10 @@ async function handleConfigModal(interaction, ctx){
         if(c === OCAS_CONTRACT){ cfg.contractName='On-Chain All Stars'; cfg.collectionSlug=OCAS_SLUG; cfg.isOcas=true; }
         else cfg.isOcas=false;
       }
-      if(field==='slug') cfg.collectionSlug = val.toLowerCase();
+      if(field==='slug'){
+        cfg.collectionSlug = val.toLowerCase();
+        fetchAndStoreCollectionTraits(cfg.collectionSlug, pgPool).catch(()=>{});
+      }
     } else {
       const idx = parseInt(colId);
       if(!cfg.collections?.[idx]) return interaction.editReply({ content:'❌ Collection not found.' });
@@ -1149,7 +1202,10 @@ async function handleConfigModal(interaction, ctx){
         if(!/^0x[0-9a-f]{40}$/i.test(c)) return interaction.editReply({ content:'❌ Invalid contract address.' });
         cfg.collections[idx].contract = c;
       }
-      if(field==='slug') cfg.collections[idx].slug = val.toLowerCase();
+      if(field==='slug'){
+        cfg.collections[idx].slug = val.toLowerCase();
+        fetchAndStoreCollectionTraits(cfg.collections[idx].slug, pgPool).catch(()=>{});
+      }
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
