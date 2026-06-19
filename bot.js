@@ -37,7 +37,7 @@ const {
   checkCooldown, dedupeChannelPost, ocasTraitsCache,
 } = require('./lib/cache');
 
-const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock } = require('./lib/rpc');
+const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock, realTraitCount } = require('./lib/rpc');
 const { rollingRankSync, drainRankSyncQueue, queueRankSync, rankSyncQueue } = require('./lib/rank-sync');
 
 const { BURN_COLORS, E1_TYPE_NAMES, normalizeOcasType, resolveOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji } = require('./lib/burn-constants');
@@ -1812,12 +1812,12 @@ client.once('clientReady', async ()=>{
   await runMigrations();
   await loadAllConfigs();
   await migrateMarketCollectionsToServerConfigs();
+  await loadBurnConfig();
   await syncBurnConfigFromServerConfigs();
   console.log('[Startup] burnConfig synced from server_configs');
   await loadAllAlerts();
   await loadSaleCursors();
   await loadListingCursors();
-  await loadBurnConfig();
   pollSales();
   pollListings();
   setInterval(pollSales, POLL_MS);
@@ -1904,6 +1904,7 @@ async function migrateMarketCollectionsToServerConfigs(){
 }
 
 client.login(DISCORD_TOKEN);
+
 
 
 
