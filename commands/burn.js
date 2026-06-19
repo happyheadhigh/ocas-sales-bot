@@ -54,7 +54,7 @@ async function handleBurnCommand(commandName, ctx){
         // Burn commands should always prefer the contract tokenURI for survivor/created tokens.
         // DB is only a final fallback because it may contain pre-burn traits.
         const freshTraits = await fetchBurnDisplayTraits(row.survivor_token_id).catch(()=>null);
-        return buildBurnEmbed(finalEvent, startEvent, freshTraits || undefined);
+        return buildBurnEmbed(finalEvent, startEvent, freshTraits || undefined, true);
       }));
 
       if(count === 1){
