@@ -40,6 +40,48 @@ function formatSweepTokenLine(item){
   return [tokenLink, rank, price].filter(Boolean).join(' · ');
 }
 
+
+// ── Paid tier check ────────────────────────────────────────────────────────────
+// OCAS is always free. Other collections need isPaidTier=true for premium features.
+function isPaidFeature(cfg, featureName){
+  const isOcas = (cfg?.contract||cfg?.collectionSlug||cfg?.slug||'').toLowerCase().includes('on-chain-all-stars') ||
+                 (cfg?.contract||'').toLowerCase() === '0x078be86f3104a32313a47815792230a3808642cc';
+  if(isOcas) return false; // OCAS always free
+  return !(cfg?.isPaidTier === true);
+}
+
+// ── Smart collection resolver ──────────────────────────────────────────────────
+// Returns the best matching collection config from server_configs.
+// If collectionInput is given, matches by slug or name.
+// If only 1 collection configured, returns it automatically.
+// If 2+ collections and no input, returns primary.
+function resolveCollectionFromServerCfg(serverCfg, collectionInput){
+  if(!serverCfg) return null;
+  const primary = {
+    slug: serverCfg.collectionSlug || serverCfg.slug,
+    contract: serverCfg.contract,
+    name: serverCfg.contractName,
+    channelId: serverCfg.channelId,
+    listingsChannelId: serverCfg.listingsChannelId,
+    listingFilters: serverCfg.listingFilters || {},
+    isPaidTier: serverCfg.isPaidTier || false,
+    _isPrimary: true,
+  };
+  const extras = (serverCfg.collections || []).map(c => ({...c, isPaidTier: serverCfg.isPaidTier || false}));
+  const all = [primary, ...extras].filter(c => c.slug);
+
+  if(!collectionInput) {
+    // No input — return primary always
+    return primary.slug ? primary : null;
+  }
+
+  const input = collectionInput.toLowerCase();
+  return all.find(c =>
+    (c.slug||'').toLowerCase() === input ||
+    (c.name||'').toLowerCase() === input
+  ) || primary;
+}
+
 async function handleMarketCommand(commandName, ctx){
   const {
     interaction, guildId, config,
@@ -56,7 +98,10 @@ async function handleMarketCommand(commandName, ctx){
   } = ctx;
 
   if(commandName==='lastsale'){
-    const slug=interaction.options.getString('collection')||config.slug;
+    const colInput = interaction.options.getString('collection') || null;
+    const resolved = resolveCollectionFromServerCfg(config, colInput);
+    const slug = resolved?.slug || config.slug;
+    const activeConfig = resolved ? {...config, ...resolved} : config;
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
@@ -64,7 +109,7 @@ async function handleMarketCommand(commandName, ctx){
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const sales=(await r.json()).asset_events||[];
       if(!sales.length){await interaction.editReply('No sales found.');return;}
-      const embed=await buildSaleEmbed(sales[0],{...config,slug});
+      const embed=await buildSaleEmbed(sales[0],activeConfig);
       const ir=embed._imageResult;delete embed._imageResult;
       if(ir?.type==='buffer'){const att=new AttachmentBuilder(ir.buffer,{name:ir.filename});embed.setThumbnail(`attachment://${ir.filename}`);await interaction.editReply({embeds:[embed],files:[att]});}
       else{if(ir?.type==='url')embed.setThumbnail(ir.url);await interaction.editReply({embeds:[embed]});}
@@ -114,6 +159,8 @@ async function handleMarketCommand(commandName, ctx){
 
   // /traitfind - token search by default; add "listings" or "sales" for those modes.
   if(commandName==='traitfind'){
+    if(isPaidFeature(config, 'traitfind'))
+      return interaction.reply({content:'🔍 Trait search requires a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
     const _tfCool = checkCommandCooldown(interaction.user.id, 'traitfind');
     if(_tfCool) return interaction.reply({content:`⏳ Please wait **${_tfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const slug       = interaction.options.getString('collection') || config.slug;
@@ -306,9 +353,14 @@ async function handleMarketCommand(commandName, ctx){
 
   // /listings
   if(commandName==='listings'){
-    const slug=interaction.options.getString('collection')||config.slug;
+    const colInput2 = interaction.options.getString('collection') || null;
+    const resolved2 = resolveCollectionFromServerCfg(config, colInput2);
+    const activeConfig2 = resolved2 ? {...config, ...resolved2} : config;
+    if(isPaidFeature(activeConfig2, 'listings'))
+      return interaction.reply({content:'📋 Listing commands require a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
+    const colSlug = resolved2?.slug || config.slug;
     const count=Math.min(interaction.options.getInteger('count')||5,20);
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
+    if(!colSlug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=listing&limit=${count}`,{headers:osHeaders()});
@@ -354,6 +406,11 @@ async function handleMarketCommand(commandName, ctx){
 
     // /myalert — personal DM alert setup
   if(commandName==='myalert'){
+    const alertColInput = interaction.options.getString('collection') || null;
+    const alertResolved = resolveCollectionFromServerCfg(config, alertColInput);
+    const alertConfig = alertResolved ? {...config, ...alertResolved} : config;
+    if(isPaidFeature(alertConfig, 'myalert'))
+      return interaction.reply({content:'🔔 Personal alerts require a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
     const trait=interaction.options.getString('trait')?.toLowerCase().trim();
     const value=interaction.options.getString('value')?.toLowerCase().trim();
     const alertSales=interaction.options.getBoolean('sales')??true;
@@ -437,6 +494,8 @@ async function handleMarketCommand(commandName, ctx){
   // /help
   // /rankfilter — show currently listed tokens filtered by OS rank range
   if(commandName==='rankfind'){
+    if(isPaidFeature(config, 'rankfind'))
+      return interaction.reply({content:'📊 Rank search requires a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
     const _rfCool = checkCommandCooldown(interaction.user.id, 'rankfind');
     if(_rfCool) return interaction.reply({content:`⏳ Please wait **${_rfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const rawSearch  = (interaction.options.getString('search') || '').trim();
@@ -533,6 +592,11 @@ async function handleMarketCommand(commandName, ctx){
 
 
   if(commandName==='sweep'){
+    const sweepColInput = interaction.options.getString('collection') || null;
+    const sweepResolved = resolveCollectionFromServerCfg(config, sweepColInput);
+    const sweepConfig = sweepResolved ? {...config, ...sweepResolved} : config;
+    if(isPaidFeature(sweepConfig, 'sweep'))
+      return interaction.reply({content:'🧹 Sweep commands require a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
     const rawSearch   = (interaction.options.getString('search')||'').trim();
@@ -779,4 +843,4 @@ const MARKET_COMMANDS = new Set([
   'myalert','myalertclear','myalertstatus','rankfind','sweep',
 ]);
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS };
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature };
