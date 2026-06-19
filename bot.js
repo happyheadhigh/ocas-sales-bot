@@ -324,6 +324,8 @@ async function syncTraitRoles(guild, discordId, wallet){
     const member = await guild.members.fetch(discordId).catch(()=>null);
     if(!member) return;
 
+    const rolesSummary = { assigned: [], skipped: [], alreadyHad: [] };
+
     // Add/remove roles based on trait count vs minimum_count threshold
     for(const tr of traitRolesRes.rows){
       const hasRole  = member.roles.cache.has(tr.role_id);
@@ -341,8 +343,15 @@ async function syncTraitRoles(guild, discordId, wallet){
       console.log('[TraitSync] rule:', tr.trait_type, tr.trait_value||'', '>=', minNeeded, '| count:', count, '| meets:', meetsMinFixed);
       if(meetsMinFixed && !hasRole){
         const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
-        if(!conflict) await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
-        else console.log('[TraitSync] SKIP add — role managed by other bot:', tr.role_id);
+        if(!conflict){
+          await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
+          rolesSummary.assigned.push(tr.role_id);
+        } else {
+          console.log('[TraitSync] SKIP add — role managed by other bot:', tr.role_id);
+          rolesSummary.skipped.push(tr.role_id);
+        }
+      } else if(meetsMinFixed && hasRole){
+        rolesSummary.alreadyHad.push(tr.role_id);
       }
       // Only remove roles WE added — don't remove if another bot manages it
       if(!meetsMinFixed && hasRole){
@@ -370,9 +379,11 @@ async function syncTraitRoles(guild, discordId, wallet){
       }
     }
 
-    console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', ownedTokenIds.length);
+    console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', ownedTokenIds.length, '| assigned:', rolesSummary.assigned.length, '| skipped:', rolesSummary.skipped.length);
+    return rolesSummary;
   }catch(e){
     console.error('[TraitSync] Error:', e.message);
+    return { assigned: [], skipped: [], alreadyHad: [] };
   }
 }
 
@@ -799,8 +810,13 @@ client.on('interactionCreate', async (interaction)=>{
           }
         }catch(e){ console.error('[SVInstant] role assign error:', e.message); }
 
-        // Sync trait roles immediately
-        await syncTraitRoles(interaction.guild, svUser, knownWallet).catch(()=>{});
+        // Sync trait roles immediately and collect summary
+        const roleSummaryInst = await syncTraitRoles(interaction.guild, svUser, knownWallet).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
+
+        const rolePartsInst = [];
+        if(roleSummaryInst.assigned.length)   rolePartsInst.push(`✅ Roles assigned: ${roleSummaryInst.assigned.map(id=>`<@&${id}>`).join(', ')}`);
+        if(roleSummaryInst.alreadyHad.length) rolePartsInst.push(`☑️ Already had: ${roleSummaryInst.alreadyHad.map(id=>`<@&${id}>`).join(', ')}`);
+        if(roleSummaryInst.skipped.length)    rolePartsInst.push(`⏭️ Skipped (managed by another bot): ${roleSummaryInst.skipped.map(id=>`<@&${id}>`).join(', ')}`);
 
         const walletSummary = allWallets.length > 1
           ? `🔗 **${allWallets.length} wallets** on file (${allWallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
@@ -810,6 +826,7 @@ client.on('interactionCreate', async (interaction)=>{
           '✅ **Verified instantly!**',
           walletSummary,
           `🪙 **Tokens found:** ${tokenCount}`,
+          ...(rolePartsInst.length ? ['', ...rolePartsInst] : []),
           '',
           'Your wallet was recognised from another server — no re-verification needed.',
         ].join('\n')});
@@ -1039,13 +1056,19 @@ client.on('interactionCreate', async (interaction)=>{
       ? `🔗 **${wallets.length} wallets** found (${wallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
       : `🔗 **Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``;
 
-    // Sync trait roles immediately
-    await syncTraitRoles(interaction.guild, discordId, wallet).catch(()=>{});
+    // Sync trait roles immediately and collect summary
+    const roleSummary = await syncTraitRoles(interaction.guild, discordId, wallet).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
+
+    const roleParts = [];
+    if(roleSummary.assigned.length)   roleParts.push(`✅ Roles assigned: ${roleSummary.assigned.map(id=>`<@&${id}>`).join(', ')}`);
+    if(roleSummary.alreadyHad.length) roleParts.push(`☑️ Already had: ${roleSummary.alreadyHad.map(id=>`<@&${id}>`).join(', ')}`);
+    if(roleSummary.skipped.length)    roleParts.push(`⏭️ Skipped (managed by another bot): ${roleSummary.skipped.map(id=>`<@&${id}>`).join(', ')}`);
 
     return interaction.editReply({content:[
       '✅ **Verified!**',
       walletSummary,
       `🪙 **Tokens found:** ${tokenCount}`,
+      ...(roleParts.length ? ['', ...roleParts] : []),
       '',
       'You can remove the code from your OpenSea username now.',
       'Your wallet is saved — future servers will verify you instantly.',
