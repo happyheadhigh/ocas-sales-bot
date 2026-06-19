@@ -17,18 +17,18 @@ async function fetchAndStoreCollectionTraits(slug, pgPool){
     const { OPENSEA_KEY, osHeaders } = require('../lib/constants');
     const fetch = require('node-fetch');
     const res = await fetch(
-      `https://api.opensea.io/api/v2/collections/${slug}/traits`,
+      `https://api.opensea.io/api/v2/traits/${slug}`,
       { headers: osHeaders() }
     );
     if(!res.ok){ console.warn('[TraitCache] OS traits fetch failed:', res.status, slug); return; }
     const data = await res.json();
-    const categories = data.categories || data.traits || {};
+    const categories = data.categories || {};
     let count = 0;
     for(const [traitName, values] of Object.entries(categories)){
       if(!Array.isArray(values)) continue;
       for(const v of values){
         const val = typeof v === 'object' ? (v.value||v.trait_value||String(v)) : String(v);
-        const cnt = typeof v === 'object' ? (v.count||0) : 0;
+        const cnt = typeof v === 'object' ? (parseInt(v.count)||0) : 0;
         await pgPool.query(
           `INSERT INTO collection_traits (slug, trait_name, trait_value, token_count)
            VALUES ($1,$2,$3,$4)
