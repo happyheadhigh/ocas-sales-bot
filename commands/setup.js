@@ -22,14 +22,12 @@ async function fetchAndStoreCollectionTraits(slug, pgPool){
     );
     if(!res.ok){ console.warn('[TraitCache] OS traits fetch failed:', res.status, slug); return; }
     const data = await res.json();
-    console.log('[TraitCache] raw keys:', JSON.stringify(Object.keys(data)), 'sample:', JSON.stringify(data).slice(0,400));
-    const categories = data.categories || {};
+    // OS v2 traits response: { categories: { "Type": "string" }, counts: { "Type": { "Zombie": 123 } } }
+    const counts = data.counts || {};
     let count = 0;
-    for(const [traitName, values] of Object.entries(categories)){
-      if(!Array.isArray(values)) continue;
-      for(const v of values){
-        const val = typeof v === 'object' ? (v.value||v.trait_value||String(v)) : String(v);
-        const cnt = typeof v === 'object' ? (parseInt(v.count)||0) : 0;
+    for(const [traitName, valueCounts] of Object.entries(counts)){
+      if(typeof valueCounts !== 'object' || Array.isArray(valueCounts)) continue;
+      for(const [val, cnt] of Object.entries(valueCounts)){
         await pgPool.query(
           `INSERT INTO collection_traits (slug, trait_name, trait_value, token_count)
            VALUES ($1,$2,$3,$4)
