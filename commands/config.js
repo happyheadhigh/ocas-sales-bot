@@ -818,6 +818,7 @@ async function handleConfigButton(interaction, ctx){
 
     // Load distinct trait categories — try collection_traits first, fall back to token_traits
     const slug = cfg.collectionSlug || cfg.slug || '';
+    console.log('[TraitRole] looking up traits for slug:', slug, '| cfg keys:', Object.keys(cfg).filter(k=>k.includes('slug')||k.includes('Slug')));
     const catRes = await pgPool.query(
       `SELECT DISTINCT trait_name FROM collection_traits WHERE slug=$1 ORDER BY trait_name`,
       [slug]
