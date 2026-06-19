@@ -14,7 +14,7 @@ const OCAS_SLUG     = 'on-chain-all-stars';
 async function fetchAndStoreCollectionTraits(slug, pgPool){
   if(!slug) return;
   try{
-    const { osHeaders } = require('./lib/constants');
+    const { osHeaders } = require('../lib/constants');
     const fetch = require('node-fetch');
     const res = await fetch(
       `https://api.opensea.io/api/v2/collections/${slug}/traits`,
