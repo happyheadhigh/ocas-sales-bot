@@ -10,6 +10,40 @@ const {
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const OCAS_SLUG     = 'on-chain-all-stars';
 
+// Re-use trait cache helper from config (inline here to avoid circular require)
+async function fetchAndStoreCollectionTraits(slug, pgPool){
+  if(!slug) return;
+  try{
+    const { osHeaders } = require('./lib/constants');
+    const fetch = require('node-fetch');
+    const res = await fetch(
+      `https://api.opensea.io/api/v2/collections/${slug}/traits`,
+      { headers: osHeaders() }
+    );
+    if(!res.ok){ console.warn('[TraitCache] OS traits fetch failed:', res.status, slug); return; }
+    const data = await res.json();
+    const categories = data.categories || data.traits || {};
+    let count = 0;
+    for(const [traitName, values] of Object.entries(categories)){
+      if(!Array.isArray(values)) continue;
+      for(const v of values){
+        const val = typeof v === 'object' ? (v.value||v.trait_value||String(v)) : String(v);
+        const cnt = typeof v === 'object' ? (v.count||0) : 0;
+        await pgPool.query(
+          `INSERT INTO collection_traits (slug, trait_name, trait_value, token_count)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (slug, trait_name, trait_value) DO UPDATE SET token_count=$4`,
+          [slug, traitName, val, cnt]
+        ).catch(()=>{});
+        count++;
+      }
+    }
+    console.log(`[TraitCache] Stored ${count} trait values for ${slug}`);
+  }catch(e){
+    console.warn('[TraitCache] Error fetching traits for', slug, ':', e.message);
+  }
+}
+
 // ── Wizard state ──────────────────────────────────────────────────────────────
 // In-memory cache; backed by server_configs JSONB (wizard_state key) for persistence
 const wizardCache = new Map(); // guildId → { step, config }
@@ -586,6 +620,7 @@ async function handleSetupModal(interaction, ctx){
       state.config.contractName   = 'On-Chain All Stars';
       state.config.collectionSlug = OCAS_SLUG;
       state.config.isOcas         = true;
+      fetchAndStoreCollectionTraits(OCAS_SLUG, pgPool).catch(()=>{});
     }
     await saveState(guildId, state, pgPool);
     return interaction.editReply({ content:'', embeds:[buildCollectionEmbed(state)], components:[collectionRow(true)] });
