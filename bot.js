@@ -816,7 +816,6 @@ client.on('interactionCreate', async (interaction)=>{
         const rolePartsInst = [];
         if(roleSummaryInst.assigned.length)   rolePartsInst.push(`✅ Roles assigned: ${roleSummaryInst.assigned.map(id=>`<@&${id}>`).join(', ')}`);
         if(roleSummaryInst.alreadyHad.length) rolePartsInst.push(`☑️ Already had: ${roleSummaryInst.alreadyHad.map(id=>`<@&${id}>`).join(', ')}`);
-        if(roleSummaryInst.skipped.length)    rolePartsInst.push(`⏭️ Skipped (managed by another bot): ${roleSummaryInst.skipped.map(id=>`<@&${id}>`).join(', ')}`);
 
         const walletSummary = allWallets.length > 1
           ? `🔗 **${allWallets.length} wallets** on file (${allWallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
@@ -1062,7 +1061,6 @@ client.on('interactionCreate', async (interaction)=>{
     const roleParts = [];
     if(roleSummary.assigned.length)   roleParts.push(`✅ Roles assigned: ${roleSummary.assigned.map(id=>`<@&${id}>`).join(', ')}`);
     if(roleSummary.alreadyHad.length) roleParts.push(`☑️ Already had: ${roleSummary.alreadyHad.map(id=>`<@&${id}>`).join(', ')}`);
-    if(roleSummary.skipped.length)    roleParts.push(`⏭️ Skipped (managed by another bot): ${roleSummary.skipped.map(id=>`<@&${id}>`).join(', ')}`);
 
     return interaction.editReply({content:[
       '✅ **Verified!**',
@@ -1660,10 +1658,10 @@ client.on('interactionCreate', async (interaction)=>{
     await interaction.deferReply({flags:64});
     const target = interaction.options.getUser('user') || interaction.user;
     try{
-      // Delete guild-specific AND global cross-server record
+      // Delete guild-specific record only — keep global so instant re-verify works on other servers
       await pgPool.query(
-        'DELETE FROM user_registrations WHERE discord_id=$1 AND (guild_id=$2 OR guild_id=$3)',
-        [target.id, guildId, 'global']
+        'DELETE FROM user_registrations WHERE discord_id=$1 AND guild_id=$2',
+        [target.id, guildId]
       );
       await pgPool.query('DELETE FROM verification_codes WHERE discord_id=$1', [target.id]);
 
