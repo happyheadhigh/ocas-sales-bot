@@ -436,8 +436,9 @@ async function handleConfigButton(interaction, ctx){
 
   // Modals open with showModal (their own response) — everything else defers first
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
-                  customId === 'cfg:col:add' || customId === 'cfg_traitrole:rolesel' ||
+                  customId === 'cfg:col:add' ||
                   customId === 'cfg:filter:add' ||
+                  customId.startsWith('cfg_traitrole:catsel:') ||
                   customId.startsWith('cfg:col:name:') ||
                   customId.startsWith('cfg:col:filter:add:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
