@@ -31,10 +31,10 @@ const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
 
 const {
   getCachedImage, setCachedImage, clearCachedImage,
-  getCachedTraits, setCachedTraits,
+  getCachedTraits, setCachedTraits, OCAS_TRAITS_CACHE_MAX,
   sweepSessions, slideshowSessions,
   recentChannelPosts, alertedEventIds,
-  checkCooldown, dedupeChannelPost, ocasTraitsCache, setCachedTraits, OCAS_TRAITS_CACHE_MAX,
+  checkCooldown, dedupeChannelPost, ocasTraitsCache,
 } = require('./lib/cache');
 
 const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock, realTraitCount } = require('./lib/rpc');
@@ -1896,6 +1896,7 @@ async function migrateMarketCollectionsToServerConfigs(){
 }
 
 client.login(DISCORD_TOKEN);
+
 
 
 
