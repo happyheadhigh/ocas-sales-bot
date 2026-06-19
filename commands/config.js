@@ -781,33 +781,172 @@ async function handleConfigButton(interaction, ctx){
   if(customId === 'cfg_traitrole:rolesel'){
     const roleId = interaction.values[0];
     const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
-    const modal  = new ModalBuilder()
-      .setCustomId('cfg_modal:traitrole:'+roleId)
-      .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category  (use "_count" for token count)')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Type   or   Background   or   _count')
-          .setRequired(true)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_trait_value')
-          .setLabel('Trait Value  (leave blank if using _count)')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Zombie   or   Gold   or   Human 4')
-          .setRequired(false)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('tr_min_count')
-          .setLabel('How many tokens needed?  (default: 1)')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('1 = own at least one · 5 = own five or more')
-          .setRequired(false)
-      ),
+
+    // Load distinct trait categories from DB
+    const catRes = await pgPool.query(
+      'SELECT DISTINCT trait_name FROM token_traits ORDER BY trait_name'
+    ).catch(()=>({ rows:[] }));
+
+    const categories = catRes.rows.map(r => r.trait_name).filter(Boolean);
+    if(!categories.length){
+      // Fallback to modal if no trait data in DB
+      const modal = new ModalBuilder()
+        .setCustomId('cfg_modal:traitrole:'+roleId)
+        .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_trait_type')
+            .setLabel('Trait Category  (use "_count" for token count)')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. Type   or   Background   or   _count')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_trait_value')
+            .setLabel('Trait Value  (leave blank if using _count)')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. Zombie   or   Gold   or   Human 4')
+            .setRequired(false)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_min_count')
+            .setLabel('How many tokens needed?  (default: 1)')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('1 = own at least one · 5 = own five or more')
+            .setRequired(false)
+        ),
+      );
+      return interaction.showModal(modal);
+    }
+
+    // Build category dropdown (cap at 25)
+    const catOptions = categories.slice(0, 24).map(c =>
+      new StringSelectMenuOptionBuilder().setLabel(c).setValue(c)
     );
-    return interaction.showModal(modal);
+    // Always include token count option
+    catOptions.unshift(new StringSelectMenuOptionBuilder()
+      .setLabel('🪙 Token Count (own N or more)')
+      .setValue('_count')
+      .setDescription('Assign role based on how many tokens the user holds')
+    );
+
+    const catMenu = new StringSelectMenuBuilder()
+      .setCustomId(`cfg_traitrole:catsel:${roleId}`)
+      .setPlaceholder('Step 2 of 3 — Pick a trait category...')
+      .addOptions(catOptions.slice(0, 25));
+
+    return interaction.editReply({
+      content: `**Adding trait role for ${role?.name || 'role'}**
+
+Step 2 of 3 — Pick the trait category:`,
+      embeds: [],
+      components: [
+        new ActionRowBuilder().addComponents(catMenu),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+        ),
+      ],
+    });
+  }
+
+  // ── Trait role: category selected → show value multi-select ───────────────
+  if(customId.startsWith('cfg_traitrole:catsel:')){
+    const parts  = customId.split(':');
+    const roleId = parts[2];
+    const category = interaction.values[0];
+
+    // Token count shortcut — go straight to count modal
+    if(category === '_count'){
+      const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+      const modal = new ModalBuilder()
+        .setCustomId('cfg_modal:traitrole:'+roleId)
+        .setTitle(`Token Count Rule`);
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_trait_type')
+            .setLabel('Trait Category')
+            .setStyle(TextInputStyle.Short)
+            .setValue('_count')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_trait_value')
+            .setLabel('Trait Value (leave blank for token count rule)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_min_count')
+            .setLabel('Minimum tokens needed')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. 5')
+            .setRequired(true)
+        ),
+      );
+      return interaction.showModal(modal);
+    }
+
+    // Load distinct values for this category
+    const valRes = await pgPool.query(
+      'SELECT DISTINCT trait_value FROM token_traits WHERE trait_name=$1 ORDER BY trait_value',
+      [category]
+    ).catch(()=>({ rows:[] }));
+
+    const values = valRes.rows.map(r => r.trait_value).filter(Boolean);
+    if(!values.length){
+      return interaction.editReply({ content: `❌ No trait values found for category **${category}**. Try again.`, embeds:[], components:[] });
+    }
+
+    const valOptions = values.slice(0, 25).map(v =>
+      new StringSelectMenuOptionBuilder().setLabel(v).setValue(v)
+    );
+
+    const valMenu = new StringSelectMenuBuilder()
+      .setCustomId(`cfg_traitrole:valsel:${roleId}:${encodeURIComponent(category)}`)
+      .setPlaceholder('Step 3 of 3 — Pick one or more values...')
+      .setMinValues(1)
+      .setMaxValues(Math.min(valOptions.length, 25))
+      .addOptions(valOptions);
+
+    return interaction.editReply({
+      content: `**Adding trait role**
+
+Category: **${category}**
+Step 3 of 3 — Pick the trait value(s) that qualify for this role:`,
+      embeds: [],
+      components: [
+        new ActionRowBuilder().addComponents(valMenu),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+        ),
+      ],
+    });
+  }
+
+  // ── Trait role: values selected → save one row per value ─────────────────
+  if(customId.startsWith('cfg_traitrole:valsel:')){
+    const parts    = customId.split(':');
+    const roleId   = parts[2];
+    const category = decodeURIComponent(parts[3]);
+    const selectedValues = interaction.values;
+
+    for(const val of selectedValues){
+      await pgPool.query(
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count)
+         VALUES ($1,$2,$3,$4,1)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO NOTHING`,
+        [guildId, roleId, category, val]
+      ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+    }
+
+    const trRes = await traitRolesQ();
+    const role  = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    return interaction.editReply({
+      content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}>:
+${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
+      embeds: [buildRolesEmbed(trRes.rows)],
+      components: rolesRow(trRes.rows),
+    });
   }
 
   // ── Roles: delete select ───────────────────────────────────────────────────
