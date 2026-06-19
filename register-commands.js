@@ -40,26 +40,6 @@ const commands = [
   new SlashCommandBuilder().setName('resume').setDescription('Resume all auto-posts').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('status').setDescription('Show current bot configuration'),
 
-  new SlashCommandBuilder().setName('market')
-    .setDescription('Universal multi-collection market tools')
-    .addSubcommand(sc=>sc.setName('add').setDescription('Add a collection sales feed to this server')
-      .addStringOption(o=>o.setName('alias').setDescription('Short name, e.g. ocas, flux, rocks').setRequired(true))
-      .addStringOption(o=>o.setName('slug').setDescription('OpenSea collection slug').setRequired(true))
-      .addStringOption(o=>o.setName('contract').setDescription('Contract address, e.g. 0x078be86...').setRequired(true))
-      .addChannelOption(o=>o.setName('sales_channel').setDescription('Sales channel; defaults to current channel').setRequired(false))
-      .addStringOption(o=>o.setName('chain').setDescription('Blockchain; default ethereum').setRequired(false).addChoices(...chainChoices)))
-    .addSubcommand(sc=>sc.setName('addhere').setDescription('Mobile-friendly: add a collection sales feed to this channel')
-      .addStringOption(o=>o.setName('alias').setDescription('Short name, e.g. ocas, flux, rocks').setRequired(true))
-      .addStringOption(o=>o.setName('slug').setDescription('OpenSea collection slug').setRequired(true))
-      .addStringOption(o=>o.setName('contract').setDescription('Contract address, e.g. 0x078be86...').setRequired(true))
-      .addStringOption(o=>o.setName('chain').setDescription('Blockchain; default ethereum').setRequired(false).addChoices(...chainChoices)))
-    .addSubcommand(sc=>sc.setName('list').setDescription('List configured market collections'))
-    .addSubcommand(sc=>sc.setName('remove').setDescription('Remove a collection from this server').addStringOption(o=>o.setName('alias').setDescription('Collection alias to remove').setRequired(true)))
-    .addSubcommand(sc=>sc.setName('channel').setDescription('Set a collection sales/default channel').addStringOption(o=>o.setName('alias').setDescription('Collection alias').setRequired(true)).addChannelOption(o=>o.setName('sales_channel').setDescription('Sales/default channel; defaults to current channel').setRequired(false)))
-    .addSubcommand(sc=>sc.setName('sales').setDescription('Show recent sales for a configured collection')
-      .addStringOption(o=>o.setName('search').setDescription('Example: ocas 5').setRequired(false))
-      .addStringOption(o=>o.setName('alias').setDescription('Collection alias; defaults by channel or OCAS').setRequired(false))
-      .addIntegerOption(o=>o.setName('count').setDescription('Number of sales, max 10').setRequired(false).setMinValue(1).setMaxValue(10))),
 
   new SlashCommandBuilder().setName('download')
   .setDescription('Download a high-res PNG for OCAS or another configured collection')
@@ -85,6 +65,8 @@ const commands = [
   new SlashCommandBuilder().setName('ranklistingfilter').setDescription('Alert when a token in an OS rank range gets listed').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addIntegerOption(o=>o.setName('min').setDescription('Minimum OS rank').setRequired(true).setMinValue(1).setMaxValue(10000)).addIntegerOption(o=>o.setName('max').setDescription('Maximum OS rank').setRequired(true).setMinValue(1).setMaxValue(10000)).addChannelOption(o=>o.setName('channel').setDescription('Channel to post rank alerts in').setRequired(false)),
   new SlashCommandBuilder().setName('removerankfilter').setDescription('Remove the rank listing alert').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('ocas').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false)),
+  new SlashCommandBuilder().setName('token').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false))
+    .addStringOption(o=>o.setName('collection').setDescription('Collection to search (defaults to primary)').setRequired(false).setAutocomplete(true)),
   new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep cheapest listed OCAS').addStringOption(o=>o.setName('search').setDescription('e.g. 10, 2eth, 0.05 floor, 10 zombie').setRequired(false)),
 
   new SlashCommandBuilder().setName('setupburn').setDescription('Set the channel for OCAS burn alerts (defaults to this channel)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addChannelOption(o=>o.setName('channel').setDescription('Channel to post burn alerts in').setRequired(false)),
