@@ -22,6 +22,7 @@ async function fetchAndStoreCollectionTraits(slug, pgPool){
     );
     if(!res.ok){ console.warn('[TraitCache] OS traits fetch failed:', res.status, slug); return; }
     const data = await res.json();
+    console.log('[TraitCache] raw keys:', JSON.stringify(Object.keys(data)), 'sample:', JSON.stringify(data).slice(0,400));
     const categories = data.categories || {};
     let count = 0;
     for(const [traitName, values] of Object.entries(categories)){
