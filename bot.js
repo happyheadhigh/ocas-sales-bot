@@ -34,7 +34,7 @@ const {
   getCachedTraits, setCachedTraits,
   sweepSessions, slideshowSessions,
   recentChannelPosts, alertedEventIds,
-  checkCooldown, dedupeChannelPost, ocasTraitsCache,
+  checkCooldown, dedupeChannelPost, ocasTraitsCache, setCachedTraits, OCAS_TRAITS_CACHE_MAX,
 } = require('./lib/cache');
 
 const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock, realTraitCount } = require('./lib/rpc');
@@ -1200,11 +1200,7 @@ client.on('interactionCreate', async (interaction)=>{
         });
         if(contractTraits && realTraitCount(contractTraits)){
           traits = contractTraits;
-          if(ocasTraitsCache.size >= OCAS_TRAITS_CACHE_MAX){
-          const oldest = [...ocasTraitsCache.keys()].slice(0, 200);
-          for(const k of oldest) ocasTraitsCache.delete(k);
-        }
-        ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+          setCachedTraits(tokenId, traits);
         }
       }
 
@@ -1218,11 +1214,7 @@ client.on('interactionCreate', async (interaction)=>{
             if(tj.ok && tj.token?.traits) traits = tj.token.traits;
           }
           if(traits){
-            if(ocasTraitsCache.size >= OCAS_TRAITS_CACHE_MAX){
-              const oldest = [...ocasTraitsCache.keys()].slice(0, 200);
-              for(const k of oldest) ocasTraitsCache.delete(k);
-            }
-            ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+            setCachedTraits(tokenId, traits);
           }
         }catch(apiErr){
           console.warn('[ShowTraits API]', apiErr.message);
@@ -1904,6 +1896,7 @@ async function migrateMarketCollectionsToServerConfigs(){
 }
 
 client.login(DISCORD_TOKEN);
+
 
 
 
