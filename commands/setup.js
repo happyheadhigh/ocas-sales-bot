@@ -225,7 +225,8 @@ function buildSummaryEmbed(state, guild){
       '→ Members verify in your verification channel — roles assigned automatically\n' +
       '→ Roles re-sync every 24 hours\n' +
       '→ Run `/setup` or `/config` anytime to change settings\n' +
-      '→ Use `/setuptraitrole` to add more trait roles later'
+      '→ Use `/setuptraitrole` to add more trait roles later\n' +
+      '→ Planning to run giveaways or burn lotteries? Set your server\'s timezone in `/config` → 🎰 Lotteries → ⚙️ Giveaway Settings — it\'s used whenever someone schedules a giveaway with a specific date'
     )
     .setFooter({ text: 'Run /setup to update · /config to manage settings' });
 }
