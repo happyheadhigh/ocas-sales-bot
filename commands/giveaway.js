@@ -134,9 +134,9 @@ async function showCustomWindowModal(interaction, type){
     ),
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('timezone')
-        .setLabel('Timezone (optional, default Europe/London)')
+        .setLabel('Timezone (optional — uses your /timezone)')
         .setStyle(TextInputStyle.Short)
-        .setPlaceholder('Europe/London')
+        .setPlaceholder('e.g. Europe/London — leave blank to use your saved one')
         .setRequired(false)
     ),
   );
@@ -271,10 +271,16 @@ async function handleDetailsModal(interaction, ctx){
     lotteryNumberFromSeed,
   } = ctx;
 
+  // Fallback order: explicit timezone typed in the custom-window modal, then
+  // the person's saved personal timezone (/timezone set), then the server default.
+  const { getUserTimezone } = require('./timezone');
+  const savedTimezone = timezone ? null : await getUserTimezone(pgPool, interaction.user.id).catch(()=>null);
+  const effectiveTimezone = timezone || savedTimezone || DEFAULT_LOTTERY_TIMEZONE;
+
   try{
     if(type === 'burn'){
       const mode = interaction.fields.getTextInputValue('mode').trim().toLowerCase() === 'burn' ? 'burn' : 'wallet';
-      const resolved = resolveLotteryWindow({ windowText, startText, endText, hours: 24, timezone: timezone || DEFAULT_LOTTERY_TIMEZONE });
+      const resolved = resolveLotteryWindow({ windowText, startText, endText, hours: 24, timezone: effectiveTimezone });
       const { start, end, timeZone } = resolved;
       if(end <= start) return interaction.editReply('End time must be after start time — check your custom window.');
       const seed = pendingDrawSeed();
@@ -300,7 +306,7 @@ async function handleDetailsModal(interaction, ctx){
     }
 
     if(type === 'giveaway' || type === 'guess'){
-      const resolved = resolveLotteryWindow({ windowText, startText, endText, hours: 24, timezone: timezone || DEFAULT_LOTTERY_TIMEZONE });
+      const resolved = resolveLotteryWindow({ windowText, startText, endText, hours: 24, timezone: effectiveTimezone });
       const { start, end } = resolved;
       const minutes = Math.max(1, Math.round((end - start) / 60000));
       const seed = type === 'giveaway' ? pendingDrawSeed() : require('crypto').randomBytes(12).toString('hex');
