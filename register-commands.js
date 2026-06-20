@@ -77,11 +77,6 @@ const commands = [
   new SlashCommandBuilder().setName('config').setDescription('Configure your bot — collections, channels, roles (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('lotteries').setDescription('View live and completed lotteries and giveaways'),
   new SlashCommandBuilder().setName('giveaway').setDescription('Start a burn lottery, giveaway, guess game, or instant draw (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-  new SlashCommandBuilder().setName('timezone').setDescription('Set your personal timezone, used for date-only inputs in /giveaway')
-    .addSubcommand(sc=>sc.setName('set').setDescription('Set your timezone')
-      .addStringOption(o=>o.setName('timezone').setDescription('e.g. America/New_York, Europe/London, Asia/Tokyo').setRequired(true)))
-    .addSubcommand(sc=>sc.setName('show').setDescription('Show your currently saved timezone'))
-    .addSubcommand(sc=>sc.setName('clear').setDescription('Clear your saved timezone (server default will be used)')),
   new SlashCommandBuilder().setName('resetverify')
     .setDescription('Clear a member\'s verification so they can verify again (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
