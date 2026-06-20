@@ -102,6 +102,9 @@ function dashboardRow(){
       new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('🎭 Roles').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('🛡️ Access').setStyle(ButtonStyle.Secondary),
     ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('🎰 Lotteries').setStyle(ButtonStyle.Secondary),
+    ),
   ];
 }
 
@@ -1159,6 +1162,25 @@ async function handleConfigButton(interaction, ctx){
   // ── Bot Access (Bot Manager role) ────────────────────────────────────────
   if(customId === 'cfg:cat:access'){
     return interaction.editReply({ content:'', embeds:[buildAccessEmbed(cfg)], components:accessRow(cfg) });
+  }
+
+  // ── Lotteries (admin view, reuses the same session/dashboard as /lotteries) ──
+  if(customId === 'cfg:cat:lotteries'){
+    const { fetchAll: fetchAllLotteries, buildDashboardEmbed: buildLotteriesEmbed, dashboardButtons: lotteriesDashboardButtons, sessions: lotterySessions } = require('./lotteries');
+    const all = await fetchAllLotteries(pgPool, guildId);
+    // Reaching this point already passed /config's own access gate, so admin controls are always on here.
+    lotterySessions.set(interaction.user.id, { page:0, filter:'all', all, isAdmin:true, fromConfig:true });
+    const { embed, pages } = buildLotteriesEmbed(all, 0, 'all');
+    const rows = lotteriesDashboardButtons(0, pages, 'all', true);
+    const liveLotteries = all.filter(r=>r.status==='active');
+    if(liveLotteries.length>0){
+      const { ButtonBuilder: BB, ButtonStyle: BS } = require('discord.js');
+      const idBtns = liveLotteries.slice(0,5).map(r=>
+        new BB().setCustomId(`ltrs:detail:${r._table}:${r.id}`).setLabel(`${r._table[0].toUpperCase()}${r.id} 🟢`).setStyle(BS.Success)
+      );
+      rows.push(new ActionRowBuilder().addComponents(idBtns));
+    }
+    return interaction.editReply({ content:'', embeds:[embed], components:rows });
   }
 
   if(customId === 'cfg:access:set'){
