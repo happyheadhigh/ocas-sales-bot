@@ -5,6 +5,18 @@ const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('
 const SEP  = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
 const PAGE  = 5; // rows per page
 
+// ── Access control ────────────────────────────────────────────────────────────
+// Anyone can view lotteries (this is a community-facing command), but Draw Now /
+// Cancel controls only show for Manage Server admins or the guild's configured
+// Bot Manager role — same gate used by /config and /setup.
+const { PermissionFlagsBits } = require('discord.js');
+function hasLotteryAdminAccess(interaction, cfg){
+  if(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return true;
+  const managerRoleId = cfg?.botManagerRoleId;
+  if(managerRoleId && interaction.member?.roles?.cache?.has(managerRoleId)) return true;
+  return false;
+}
+
 // ── Formatters ────────────────────────────────────────────────────────────────
 function fmtTime(ts){ return ts ? `<t:${Math.floor(new Date(ts).getTime()/1000)}:R>` : '—'; }
 function fmtSeed(seed){ return seed ? `\`${String(seed).slice(0,20)}${seed.length>20?'…':''}\`` : '`pending`'; }
@@ -104,26 +116,28 @@ function buildDetailEmbed(r, entryCount){
 }
 
 // ── Button rows ───────────────────────────────────────────────────────────────
-function dashboardButtons(page, pages, filter){
+function dashboardButtons(page, pages, filter, fromConfig=false){
   const filterRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('ltrs:filter:all').setLabel('All').setStyle(filter==='all'?ButtonStyle.Primary:ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('ltrs:filter:live').setLabel('🟢 Live').setStyle(filter==='live'?ButtonStyle.Primary:ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('ltrs:filter:done').setLabel('✅ Completed').setStyle(filter==='done'?ButtonStyle.Primary:ButtonStyle.Secondary),
   );
-  const navRow = new ActionRowBuilder().addComponents(
+  const navBtns = [
     new ButtonBuilder().setCustomId('ltrs:prev').setLabel('← Prev').setStyle(ButtonStyle.Secondary).setDisabled(page===0),
     new ButtonBuilder().setCustomId('ltrs:next').setLabel('Next →').setStyle(ButtonStyle.Secondary).setDisabled(page>=pages-1),
     new ButtonBuilder().setCustomId('ltrs:refresh').setLabel('🔄 Refresh').setStyle(ButtonStyle.Secondary),
-  );
+  ];
+  if(fromConfig) navBtns.push(new ButtonBuilder().setCustomId('cfg:back').setLabel('← /config').setStyle(ButtonStyle.Secondary));
+  const navRow = new ActionRowBuilder().addComponents(navBtns);
   return [filterRow, navRow];
 }
 
-function detailButtons(r){
+function detailButtons(r, isAdmin=true){
   const isLive = r.status==='active';
   const rows = [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('ltrs:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
-      ...(isLive ? [
+      ...(isLive && isAdmin ? [
         new ButtonBuilder()
           .setCustomId(`ltrs:draw:${r._table}:${r.id}`)
           .setLabel('🎲 Draw Now')
@@ -152,14 +166,16 @@ async function fetchAll(pgPool, guildId){
 // ── Main command handler ───────────────────────────────────────────────────────
 async function handleLotteriesCommand(interaction, ctx){
   await interaction.deferReply({ flags: 64 });
-  const { pgPool } = ctx;
+  const { pgPool, getConfig } = ctx;
   const all = await fetchAll(pgPool, interaction.guildId);
-  const session = { page:0, filter:'all', all };
+  const cfg = (getConfig && getConfig(interaction.guildId)) || {};
+  const isAdmin = hasLotteryAdminAccess(interaction, cfg);
+  const session = { page:0, filter:'all', all, isAdmin };
   sessions.set(interaction.user.id, session);
   const { embed, filtered, pages } = buildDashboardEmbed(all, 0, 'all');
 
   // Add clickable ID buttons for live lotteries only — completed ones don't need action buttons
-  const rows = dashboardButtons(0, pages, 'all');
+  const rows = dashboardButtons(0, pages, 'all', !!session.fromConfig);
   const liveLotteries = all.filter(r=>r.status==='active');
   if(liveLotteries.length>0){
     const idBtns = liveLotteries.slice(0,5).map(r=>
@@ -198,7 +214,7 @@ async function handleLotteriesButton(interaction, ctx){
     sessions.set(userId, session);
 
     const { embed, filtered, pages } = buildDashboardEmbed(session.all, session.page, session.filter);
-    const rows = dashboardButtons(session.page, pages, session.filter);
+    const rows = dashboardButtons(session.page, pages, session.filter, !!session.fromConfig);
     const liveItems = session.all.filter(r=>r.status==='active');
     if(liveItems.length){
       rows.push(new ActionRowBuilder().addComponents(
@@ -230,7 +246,7 @@ async function handleLotteriesButton(interaction, ctx){
       entryCount = row.qualified_wallets||0;
     }
 
-    return interaction.editReply({ embeds:[buildDetailEmbed(row, entryCount)], components:detailButtons(row) });
+    return interaction.editReply({ embeds:[buildDetailEmbed(row, entryCount)], components:detailButtons(row, !!session.isAdmin) });
   }
 
   // ── Back to dashboard ──────────────────────────────────────────────────────
@@ -238,7 +254,7 @@ async function handleLotteriesButton(interaction, ctx){
     session.all = await fetchAll(pgPool, guildId);
     sessions.set(userId, session);
     const { embed, filtered, pages } = buildDashboardEmbed(session.all, session.page, session.filter);
-    const rows = dashboardButtons(session.page, pages, session.filter);
+    const rows = dashboardButtons(session.page, pages, session.filter, !!session.fromConfig);
     const liveItems = session.all.filter(r=>r.status==='active');
     if(liveItems.length){
       rows.push(new ActionRowBuilder().addComponents(
@@ -251,6 +267,17 @@ async function handleLotteriesButton(interaction, ctx){
       ));
     }
     return interaction.editReply({ embeds:[embed], components:rows });
+  }
+
+  // ── Draw now / Cancel — admin-only backstop ─────────────────────────────────
+  // Buttons are already hidden for non-admins via detailButtons(), but check again
+  // here in case a stale component is clicked by someone who lost access since.
+  if(customId.startsWith('ltrs:draw:') || customId.startsWith('ltrs:cancel:')){
+    const { getConfig } = ctx;
+    const cfg = (getConfig && getConfig(guildId)) || {};
+    if(!hasLotteryAdminAccess(interaction, cfg)){
+      return interaction.editReply({ content: '🔒 You need Manage Server permission or the Bot Manager role to do this.', embeds:[], components:[] });
+    }
   }
 
   // ── Draw now ───────────────────────────────────────────────────────────────
@@ -271,7 +298,7 @@ async function handleLotteriesButton(interaction, ctx){
       if(updated.rows.length){
         const ec = await pgPool.query('SELECT COUNT(*) FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]}));
         const updRow = {...updated.rows[0], _table:'generic'};
-        return interaction.editReply({ content:'✅ Draw complete!', embeds:[buildDetailEmbed(updRow, parseInt(ec.rows[0].count)||0)], components:detailButtons(updRow) });
+        return interaction.editReply({ content:'✅ Draw complete!', embeds:[buildDetailEmbed(updRow, parseInt(ec.rows[0].count)||0)], components:detailButtons(updRow, true) });
       }
     }
 
@@ -286,7 +313,7 @@ async function handleLotteriesButton(interaction, ctx){
       const updated = await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1',[id]).catch(()=>({rows:[]}));
       if(updated.rows.length){
         const updRow = {...updated.rows[0], _table:'burn'};
-        return interaction.editReply({ content:'✅ Draw complete!', embeds:[buildDetailEmbed(updRow, updRow.qualified_wallets||0)], components:detailButtons(updRow) });
+        return interaction.editReply({ content:'✅ Draw complete!', embeds:[buildDetailEmbed(updRow, updRow.qualified_wallets||0)], components:detailButtons(updRow, true) });
       }
     }
 
@@ -305,12 +332,12 @@ async function handleLotteriesButton(interaction, ctx){
       const ec = table==='generic'
         ? parseInt((await pgPool.query('SELECT COUNT(*) FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]}))).rows[0].count)||0
         : updRow.qualified_wallets||0;
-      return interaction.editReply({ content:'❌ Lottery cancelled.', embeds:[buildDetailEmbed(updRow,ec)], components:detailButtons(updRow) });
+      return interaction.editReply({ content:'❌ Lottery cancelled.', embeds:[buildDetailEmbed(updRow,ec)], components:detailButtons(updRow, true) });
     }
     return interaction.editReply({ content:'❌ Cancelled.', embeds:[], components:[] });
   }
 }
 
 const LOTTERIES_COMMANDS = new Set(['lotteries']);
-module.exports = { handleLotteriesCommand, handleLotteriesButton, LOTTERIES_COMMANDS };
+module.exports = { handleLotteriesCommand, handleLotteriesButton, LOTTERIES_COMMANDS, fetchAll, buildDashboardEmbed, dashboardButtons, sessions };
 
