@@ -1180,7 +1180,52 @@ async function handleConfigButton(interaction, ctx){
       );
       rows.push(new ActionRowBuilder().addComponents(idBtns));
     }
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:lotteries:settings').setLabel('⚙️ Giveaway Settings').setStyle(ButtonStyle.Secondary)
+    ));
     return interaction.editReply({ content:'', embeds:[embed], components:rows });
+  }
+
+  // ── Giveaway settings (currently just timezone) ───────────────────────────────
+  if(customId === 'cfg:lotteries:settings'){
+    const { DEFAULT_LOTTERY_TIMEZONE } = require('../lib/constants');
+    const tz = cfg.giveawayTimezone || DEFAULT_LOTTERY_TIMEZONE;
+    const now = new Intl.DateTimeFormat('en-US', { timeZone: tz, dateStyle:'full', timeStyle:'short' }).format(new Date());
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('⚙️ Giveaway Settings')
+      .setDescription(
+        `**Timezone:** \`${tz}\`${cfg.giveawayTimezone ? '' : ' (default)'}\n` +
+        `It's currently **${now}** there.\n\n` +
+        `This is used when starting a burn lottery or giveaway in \`/giveaway\` with a date-only custom window ` +
+        `(e.g. "June 16 2026" instead of "now 24hrs"). Burn lotteries especially rely on this — the entry window ` +
+        `needs an exact start/end moment to know which on-chain burns qualify, and a date with no time of day is ` +
+        `otherwise ambiguous about which timezone it means.\n\n` +
+        `Whoever runs \`/giveaway\` can still type a different timezone directly into that screen to override this ` +
+        `for a single giveaway.`
+      );
+    return interaction.editReply({ content:'', embeds:[embed], components:[
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cfg:lotteries:settz').setLabel('✏️ Set Timezone').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      ),
+    ]});
+  }
+
+  if(customId === 'cfg:lotteries:settz'){
+    const { DEFAULT_LOTTERY_TIMEZONE } = require('../lib/constants');
+    const modal = new ModalBuilder().setCustomId('cfg_modal:lotteries:settz').setTitle('Giveaway Timezone');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('timezone')
+          .setLabel('Timezone')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Europe/London, America/New_York, Asia/Tokyo')
+          .setValue(cfg.giveawayTimezone || DEFAULT_LOTTERY_TIMEZONE)
+          .setRequired(true)
+      ),
+    );
+    return interaction.showModal(modal);
   }
 
   if(customId === 'cfg:access:set'){
@@ -1798,6 +1843,31 @@ async function handleConfigModal(interaction, ctx){
 
   await interaction.deferUpdate();
   const cfg = getConfig(guildId) || {};
+
+  // ── Set giveaway timezone ─────────────────────────────────────────────────
+  if(customId === 'cfg_modal:lotteries:settz'){
+    const { normalizeLotteryTimezone } = require('../utils/lottery');
+    const raw = interaction.fields.getTextInputValue('timezone').trim();
+    let tz;
+    try{
+      tz = normalizeLotteryTimezone(raw);
+    }catch(e){
+      return interaction.editReply({ content: `❌ ${e.message}` });
+    }
+    cfg.giveawayTimezone = tz;
+    await setConfig(guildId, cfg);
+    const now = new Intl.DateTimeFormat('en-US', { timeZone: tz, dateStyle:'full', timeStyle:'short' }).format(new Date());
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('⚙️ Giveaway Settings')
+      .setDescription(`✅ Giveaway timezone set to \`${tz}\`.\nIt's currently **${now}** there.\n\nThis is used for date-only inputs in \`/giveaway\`'s custom window (e.g. "June 16 2026") — burn lotteries especially need this since the entry window must resolve to an exact start/end moment to know which on-chain burns qualify.`);
+    return interaction.editReply({ content:'', embeds:[embed], components:[
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cfg:lotteries:settz').setLabel('✏️ Set Timezone').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      ),
+    ]});
+  }
 
   // ── Add listing filter ────────────────────────────────────────────────────
   if(customId === 'cfg_modal:filter'){
