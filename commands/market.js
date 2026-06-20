@@ -231,7 +231,7 @@ async function handleMarketCommand(commandName, ctx){
       return interaction.reply({content:'🔍 Trait search requires a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
     const _tfCool = checkCommandCooldown(interaction.user.id, 'traitfind');
     if(_tfCool) return interaction.reply({content:`⏳ Please wait **${_tfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
-    const slug       = interaction.options.getString('collection') || config.slug;
+    const slug       = interaction.options.getString('collection') || config.collectionSlug || config.slug;
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
@@ -246,11 +246,14 @@ async function handleMarketCommand(commandName, ctx){
     const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
     if(numMatch){ const n=parseInt(numMatch[1]); if(n>0&&n<=20){ want=n; workingSearch=workingSearch.replace(numMatch[0],' ').trim(); } }
 
-    // Resolve trait name+value using phrase-aware parser.
+    // Resolve trait name+value using phrase-aware parser. For non-OCAS
+    // collections, getTraitIndex reads from collection_traits (aggregate
+    // trait list) instead of token_traits (no real per-token data exists yet
+    // for other collections) — see /db/trait-index in api.js.
     let trait = '', value = '', groups = [], unmatched = [], traitParseError = null;
     if(workingSearch && RAILWAY_URL){
       try{
-        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
+        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET, slug);
         const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
         groups = resolved.groups || [];
         unmatched = resolved.unmatched || [];
@@ -269,7 +272,16 @@ async function handleMarketCommand(commandName, ctx){
     if(traitParseError) return interaction.reply({content:`I could not load the trait index from the TraitView API. ${traitParseError.message}`, flags: MessageFlags.Ephemeral});
     if(!groups.length){
       const extra = unmatched.length ? ` Unmatched words: ${unmatched.join(', ')}.` : '';
-      return interaction.reply({content:`I could not match **${workingSearch}** to known OCAS traits.${extra} Try an exact trait/value like \`zombie\`, \`gold chain\`, or \`alien epic bear\`.`, flags: MessageFlags.Ephemeral});
+      return interaction.reply({content:`I could not match **${workingSearch}** to known traits for **${slug}**.${extra} Try an exact trait/value like \`zombie\`, \`gold chain\`, or \`alien epic bear\`.`, flags: MessageFlags.Ephemeral});
+    }
+    // For non-OCAS collections, listings search works correctly (listings is
+    // properly collection-scoped) but plain token search and sales-history
+    // search don't yet — there's no real per-token trait/rank data stored for
+    // other collections (see migrations/003 notes), and /db/trait-sales is a
+    // separate, still-unscoped endpoint. Say so plainly instead of silently
+    // returning nothing or, worse, another collection's data.
+    if(!isOcasSlug(slug) && !wantListings){
+      return interaction.reply({content:`I recognized **${matchLabel}** for **${slug}**, but ${wantSales ? 'sales history search' : 'token-level search (beyond listings)'} isn't available yet for non-OCAS collections. Try \`/traitfind search:${workingSearch} listings\` to search active listings instead, which does work.`, flags: MessageFlags.Ephemeral});
     }
     await interaction.deferReply();
 
@@ -278,15 +290,15 @@ async function handleMarketCommand(commandName, ctx){
       // to active listings. "sales" keeps the existing sales-history behavior.
       if(wantListings || !wantSales){
         const listedOnly = wantListings;
-        await interaction.editReply(`Searching ${listedOnly ? 'listed tokens' : 'OCAS tokens'} matching **${matchLabel}**...`);
-        const qs = new URLSearchParams({ limit: String(want), key: API_SECRET||'' });
+        await interaction.editReply(`Searching ${listedOnly ? 'listed tokens' : 'tokens'} matching **${matchLabel}**...`);
+        const qs = new URLSearchParams({ limit: String(want), key: API_SECRET||'', slug });
         qs.set('groups', JSON.stringify(groups));
         if(listedOnly) qs.set('listed', '1');
         const label = listedOnly ? '/db/multi-trait-tokens listings API' : '/db/multi-trait-tokens token API';
         const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, label);
         const tokens = j.tokens || [];
         if(!tokens.length){
-          await interaction.editReply(`No ${listedOnly ? 'active listings' : 'OCAS tokens'} found matching **${matchLabel}**.`);
+          await interaction.editReply(`No ${listedOnly ? 'active listings' : 'tokens'} found matching **${matchLabel}**.`);
           return;
         }
         const cfg = {...config, slug};
