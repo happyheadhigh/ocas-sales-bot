@@ -83,6 +83,7 @@ function dashboardRow(){
       new ButtonBuilder().setCustomId('cfg:cat:channels').setLabel('📡 Channels').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('🔐 Verification').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('🎭 Roles').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:rankalert').setLabel('🏆 Rank Alert').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -263,6 +264,39 @@ function verificationRow(cfg){
     ),
   ];
 }
+
+// ── Rank Alert screen ────────────────────────────────────────────────────────
+function buildRankAlertEmbed(cfg){
+  const ra = cfg.rankAlert;
+  const rankLabel = ra?.rankType === 'obs' ? 'TraitView Observed' : 'OpenSea';
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('🏆 Rank Alert')
+    .setDescription(
+      SEP + '\n\n' +
+      (ra
+        ? `**Range:** #${ra.min} – #${ra.max}\n` +
+          `**Rank System:** ${rankLabel}\n` +
+          `**Channel:** ${ch(ra.channelId)} ${ra.channelId ? '' : '*(falls back to listings channel)*'}\n`
+        : '*No rank alert configured.*\n'
+      ) + '\n' +
+      '*Posts an alert whenever a token in this rank range gets listed.*'
+    )
+    .setFooter({ text: 'Only visible to you' });
+}
+
+function rankAlertRow(cfg){
+  const hasAlert = !!cfg.rankAlert;
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:rank:set').setLabel(hasAlert ? '✏️ Edit Range' : '➕ Set Rank Alert').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('cfg:rank:channel').setLabel('📌 Channel').setStyle(ButtonStyle.Secondary).setDisabled(!hasAlert),
+      new ButtonBuilder().setCustomId('cfg:rank:clear').setLabel('🗑️ Clear').setStyle(ButtonStyle.Danger).setDisabled(!hasAlert),
+      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
 
 // ── Roles screen ──────────────────────────────────────────────────────────────
 function buildRolesEmbed(traitRoles, collectionLabel){
@@ -552,6 +586,7 @@ async function handleConfigButton(interaction, ctx){
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
                   customId === 'cfg:col:add' ||
                   customId === 'cfg:filter:add' ||
+                  customId === 'cfg:rank:set' ||
                   customId.startsWith('cfg_traitrole:manual:') ||
                   customId.startsWith('cfg_filtertrait:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
@@ -1018,6 +1053,52 @@ async function handleConfigButton(interaction, ctx){
     const trRes = await traitRolesQ();
     return interaction.editReply({ content:'', embeds:[buildRolesEmbed(trRes.rows)], components:rolesRow(trRes.rows) });
   }
+  if(customId === 'cfg:cat:rankalert'){
+    return interaction.editReply({ content:'', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
+  }
+
+  if(customId === 'cfg:rank:set'){
+    const ra = cfg.rankAlert || {};
+    const modal = new ModalBuilder().setCustomId('cfg_modal:rankalert').setTitle('Set Rank Alert');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('rank_min')
+          .setLabel('Minimum rank')
+          .setStyle(TextInputStyle.Short).setPlaceholder('1')
+          .setValue(ra.min ? String(ra.min) : '')
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('rank_max')
+          .setLabel('Maximum rank')
+          .setStyle(TextInputStyle.Short).setPlaceholder('100')
+          .setValue(ra.max ? String(ra.max) : '')
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('rank_type')
+          .setLabel('Rank system: "os" (OpenSea) or "obs" (TraitView)')
+          .setStyle(TextInputStyle.Short).setPlaceholder('os')
+          .setValue(ra.rankType || 'os')
+          .setRequired(false)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
+  if(customId === 'cfg:rank:channel'){
+    const menu = new ChannelSelectMenuBuilder()
+      .setCustomId('cfg_chsel:rankalert')
+      .setPlaceholder('Pick the rank alert channel')
+      .addChannelTypes(ChannelType.GuildText);
+    return interaction.editReply({ content:'**Select the channel for rank alerts** (leave unset to use the listings channel):', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+  }
+
+  if(customId === 'cfg:rank:clear'){
+    cfg.rankAlert = null;
+    await setConfig(guildId, cfg);
+    return interaction.editReply({ content:'✅ Rank alert cleared.', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
+  }
   if(customId === 'cfg:cat:filters'){
     return interaction.editReply({ content:'', embeds:[buildFiltersEmbed(cfg)], components:filtersRow(cfg) });
   }
@@ -1437,7 +1518,14 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
     if(type === 'listings') { cfg.listingsChannel = chId; cfg.listingsChannelId = chId; }
     if(type === 'burn'){     cfg.burnChannel    = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
     if(type === 'verify')   cfg.verifyChannel  = chId;
+    if(type === 'rankalert'){
+      if(!cfg.rankAlert) cfg.rankAlert = { min:1, max:100, rankType:'os' };
+      cfg.rankAlert.channelId = chId;
+    }
     await setConfig(guildId, cfg);
+    if(type === 'rankalert'){
+      return interaction.editReply({ content:'✅ Rank alert channel set.', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
+    }
     if(type === 'verify'){
 
     // Auto-sync verification_panels with latest roles
@@ -1624,6 +1712,27 @@ async function handleConfigModal(interaction, ctx){
       embeds: [embedFn(col, colId)],
       components: rowFn(col, colId),
     });
+  }
+
+  // ── Rank Alert: min/max/type submitted ────────────────────────────────────
+  if(customId === 'cfg_modal:rankalert'){
+    const minRaw  = interaction.fields.getTextInputValue('rank_min').trim();
+    const maxRaw  = interaction.fields.getTextInputValue('rank_max').trim();
+    const typeRaw = (interaction.fields.getTextInputValue('rank_type') || 'os').trim().toLowerCase();
+
+    const min = parseInt(minRaw);
+    const max = parseInt(maxRaw);
+    if(!Number.isInteger(min) || !Number.isInteger(max) || min < 1 || max < 1 || min > 10000 || max > 10000 || min > max){
+      return interaction.editReply({ content: '❌ Min and max must be whole numbers between 1 and 10000, with min ≤ max.', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
+    }
+    const rankType = (typeRaw === 'obs') ? 'obs' : 'os';
+
+    cfg.rankAlert = {
+      min, max, rankType,
+      channelId: cfg.rankAlert?.channelId || null, // preserve existing channel if already set
+    };
+    await setConfig(guildId, cfg);
+    return interaction.editReply({ content: '✅ Rank alert saved.', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
   }
 
   // ── Add collection ─────────────────────────────────────────────────────────
