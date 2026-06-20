@@ -664,7 +664,7 @@ async function handleConfigButton(interaction, ctx){
       const preCfg = getConfig(guildId) || {};
       const isPrimaryCheck = colId === 'primary';
       const colCheck = isPrimaryCheck ? { contract: preCfg.contract } : (preCfg.collections||[])[parseInt(colId)];
-      if(isPaidFeature(colCheck, 'rankalert')) rankAlertPaidBlock = true;
+      if(isPaidFeature(colCheck, 'rankalert', interaction.user.id)) rankAlertPaidBlock = true;
     }
     customId = sectionMap[section] || customId;
   }
@@ -2070,7 +2070,7 @@ async function handleConfigModal(interaction, ctx){
 
     // Defense-in-depth: re-check paid tier at submit time
     const colCheck = isPrimary ? { contract: cfg.contract } : (cfg.collections||[])[parseInt(colId)];
-    if(isPaidFeature(colCheck, 'rankalert')){
+    if(isPaidFeature(colCheck, 'rankalert', interaction.user.id)){
       return interaction.editReply({ content: '🔒 Rank Alert requires a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', embeds:[], components:[] });
     }
 
