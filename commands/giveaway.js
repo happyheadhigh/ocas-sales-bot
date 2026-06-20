@@ -134,9 +134,9 @@ async function showCustomWindowModal(interaction, type){
     ),
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('timezone')
-        .setLabel('Timezone (optional — uses your /timezone)')
+        .setLabel('Timezone override (date-only inputs)')
         .setStyle(TextInputStyle.Short)
-        .setPlaceholder('e.g. Europe/London — leave blank to use your saved one')
+        .setPlaceholder('Leave blank to use the server default set in /config')
         .setRequired(false)
     ),
   );
@@ -265,17 +265,16 @@ async function handleDetailsModal(interaction, ctx){
   await interaction.deferReply();
 
   const {
-    pgPool, resolveLotteryWindow, DEFAULT_LOTTERY_TIMEZONE, pendingDrawSeed,
+    pgPool, config, resolveLotteryWindow, DEFAULT_LOTTERY_TIMEZONE, pendingDrawSeed,
     COLORS, buildActiveBurnLotteryComponents, formatBurnLotteryWindow,
     buildGenericLotteryStartEmbed, buildGenericLotteryComponents,
     lotteryNumberFromSeed,
   } = ctx;
 
   // Fallback order: explicit timezone typed in the custom-window modal, then
-  // the person's saved personal timezone (/timezone set), then the server default.
-  const { getUserTimezone } = require('./timezone');
-  const savedTimezone = timezone ? null : await getUserTimezone(pgPool, interaction.user.id).catch(()=>null);
-  const effectiveTimezone = timezone || savedTimezone || DEFAULT_LOTTERY_TIMEZONE;
+  // the server's configured giveaway timezone (/config → Channels → Giveaway
+  // Timezone), then the bot's hardcoded default.
+  const effectiveTimezone = timezone || config?.giveawayTimezone || DEFAULT_LOTTERY_TIMEZONE;
 
   try{
     if(type === 'burn'){
