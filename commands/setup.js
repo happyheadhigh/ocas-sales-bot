@@ -4,10 +4,23 @@ const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle, PermissionFlagsBits,
   ChannelSelectMenuBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder,
-  StringSelectMenuOptionBuilder, ChannelType,
+  StringSelectMenuOptionBuilder, ChannelType, MessageFlags,
 } = require('discord.js');
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
+
+// ── Access control ────────────────────────────────────────────────────────────
+// Same gate as /config: Manage Server permission, or the guild's configured
+// Bot Manager role (set via /config → Access). Checked in code, not just at
+// slash-command registration, since registration-level permissions can be
+// loosened by server admins via Discord's own Integrations settings.
+function hasSetupAccess(interaction, cfg){
+  if(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return true;
+  const managerRoleId = cfg?.botManagerRoleId;
+  if(managerRoleId && interaction.member?.roles?.cache?.has(managerRoleId)) return true;
+  return false;
+}
+const SETUP_NO_ACCESS_MSG = '🔒 You need **Manage Server** permission or the designated Bot Manager role to use this.';
 const OCAS_SLUG     = 'on-chain-all-stars';
 
 // Re-use trait cache helper from config (inline here to avoid circular require)
@@ -298,8 +311,12 @@ function summaryRow(){
 // ── Handlers ──────────────────────────────────────────────────────────────────
 async function handleSetupCommand(interaction, ctx){
   await interaction.deferReply({ flags: 64 }); // ephemeral
-  const { pgPool } = ctx;
+  const { pgPool, getConfig } = ctx;
   const guildId = interaction.guildId;
+  const accessCfg = (getConfig && getConfig(guildId)) || ctx.config || {};
+  if(!hasSetupAccess(interaction, accessCfg)){
+    return interaction.editReply({ content: SETUP_NO_ACCESS_MSG, embeds:[], components:[] });
+  }
   const state = await loadState(guildId, pgPool);
   state.step = state.step || 1;
 
@@ -325,9 +342,15 @@ async function resumeStep(interaction, state, ctx){
 }
 
 async function handleSetupButton(interaction, ctx){
-  const { pgPool, setConfig } = ctx;
+  const { pgPool, setConfig, getConfig } = ctx;
   const guildId  = interaction.guildId;
   const customId = interaction.customId;
+
+  // Access check first, before any defer/showModal.
+  const accessCfg = (getConfig && getConfig(guildId)) || ctx.config || {};
+  if(!hasSetupAccess(interaction, accessCfg)){
+    return interaction.reply({ content: SETUP_NO_ACCESS_MSG, flags: MessageFlags.Ephemeral }).catch(()=>{});
+  }
 
   // Defer immediately — must happen within 3s or Discord kills the interaction
   // Modals are exempt (showModal is its own response), handle those below
@@ -601,9 +624,14 @@ async function handleSetupButton(interaction, ctx){
 }
 
 async function handleSetupModal(interaction, ctx){
-  const { pgPool, setConfig } = ctx;
+  const { pgPool, setConfig, getConfig } = ctx;
   const guildId  = interaction.guildId;
   const customId = interaction.customId;
+
+  const accessCfg = (getConfig && getConfig(guildId)) || ctx.config || {};
+  if(!hasSetupAccess(interaction, accessCfg)){
+    return interaction.reply({ content: SETUP_NO_ACCESS_MSG, flags: MessageFlags.Ephemeral }).catch(()=>{});
+  }
 
   await interaction.deferUpdate();
   const state = await loadState(guildId, pgPool);
