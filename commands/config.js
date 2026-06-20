@@ -493,6 +493,56 @@ async function handleConfigCommand(interaction, ctx){
   });
 }
 
+// ── Shared trait-category/value picker for Listing & Sales filters ───────────
+async function showFilterCategoryPicker(interaction, cfg, colId, kind){
+  const { pgPool } = require('../lib/db');
+  const isPrimary = colId === 'primary';
+  const slug = isPrimary
+    ? (cfg.collectionSlug || cfg.slug || '')
+    : ((cfg.collections||[])[parseInt(colId)]?.slug || '');
+
+  const catRes = await pgPool.query(
+    `SELECT DISTINCT trait_name FROM collection_traits WHERE slug=$1 ORDER BY trait_name`,
+    [slug]
+  ).catch(()=>({ rows:[] }));
+
+  const categories = catRes.rows.map(r => r.trait_name).filter(Boolean);
+  const kindLabel = kind === 'sales' ? '💰 Sales' : '🔍 Listing';
+  const backId = kind === 'sales' ? `cfg:col:salesfilters:${colId}` : `cfg:col:filters:${colId}`;
+
+  if(!categories.length){
+    return interaction.editReply({
+      content: `**Adding ${kindLabel} Filter**\n\nNo cached trait data found for this collection yet. Re-save the slug in this collection's edit screen to fetch traits, then try again.`,
+      embeds: [],
+      components: [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+    });
+  }
+
+  const catOptions = categories.slice(0, 25).map(c =>
+    new StringSelectMenuOptionBuilder().setLabel(c).setValue(c)
+  );
+
+  const catMenu = new StringSelectMenuBuilder()
+    .setCustomId(`cfg_filtertrait:catsel:${kind}:${colId}`)
+    .setPlaceholder('Step 1 of 2 — Pick a trait category...')
+    .addOptions(catOptions);
+
+  return interaction.editReply({
+    content: `**Adding ${kindLabel} Filter**\n\nStep 1 of 2 — Pick the trait category:`,
+    embeds: [],
+    components: [
+      new ActionRowBuilder().addComponents(catMenu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  });
+}
+
 async function handleConfigButton(interaction, ctx){
   const { pgPool, getConfig, setConfig, syncBurnConfig } = ctx;
   const guildId  = interaction.guildId;
@@ -503,9 +553,8 @@ async function handleConfigButton(interaction, ctx){
                   customId === 'cfg:col:add' ||
                   customId === 'cfg:filter:add' ||
                   customId.startsWith('cfg_traitrole:manual:') ||
+                  customId.startsWith('cfg_filtertrait:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
-                  customId.startsWith('cfg:col:filter:add:') ||
-                  customId.startsWith('cfg:col:salesfilter:add:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
   if(!isModal) await interaction.deferUpdate();
 
@@ -710,20 +759,7 @@ async function handleConfigButton(interaction, ctx){
 
   if(customId.startsWith('cfg:col:filter:add:')){
     const colId = customId.split(':')[4];
-    const modal = new ModalBuilder().setCustomId(`cfg_modal:col_filter:${colId}`).setTitle('Add Collection Filter');
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('filter_trait_type')
-          .setLabel('Trait Category (e.g. Type, Background)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('Type').setRequired(true)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('filter_trait_values')
-          .setLabel('Trait Values — comma separated')
-          .setStyle(TextInputStyle.Short).setPlaceholder('Zombie, Ape, Alien').setRequired(true)
-      ),
-    );
-    return interaction.showModal(modal);
+    return showFilterCategoryPicker(interaction, cfg, colId, 'listing');
   }
 
   if(customId.startsWith('cfg_col_filter:remove:')){
@@ -784,13 +820,117 @@ async function handleConfigButton(interaction, ctx){
 
   if(customId.startsWith('cfg:col:salesfilter:add:')){
     const colId = customId.split(':')[4];
-    const modal = new ModalBuilder().setCustomId(`cfg_modal:col_salesfilter:${colId}`).setTitle('Add Sales Filter');
+    return showFilterCategoryPicker(interaction, cfg, colId, 'sales');
+  }
+
+  // ── Filter category selected → show value multi-select ─────────────────
+  if(customId.startsWith('cfg_filtertrait:catsel:')){
+    const parts = customId.split(':');
+    const kind  = parts[2];
+    const colId = parts[3];
+    const category = interaction.values[0];
+    const backId = kind === 'sales' ? `cfg:col:salesfilters:${colId}` : `cfg:col:filters:${colId}`;
+
+    const isPrimary = colId === 'primary';
+    const slug = isPrimary
+      ? (cfg.collectionSlug || cfg.slug || '')
+      : ((cfg.collections||[])[parseInt(colId)]?.slug || '');
+
+    const valRes = await pgPool.query(
+      `SELECT DISTINCT trait_value FROM collection_traits WHERE slug=$1 AND trait_name=$2 ORDER BY trait_value`,
+      [slug, category]
+    ).catch(()=>({ rows:[] }));
+
+    const values = valRes.rows.map(r => r.trait_value).filter(Boolean);
+    if(!values.length){
+      return interaction.editReply({ content: `❌ No trait values found for category **${category}**. Try again.`, embeds:[], components:[] });
+    }
+
+    if(values.length > 25){
+      return interaction.editReply({
+        content: `**${category}** has ${values.length} values — too many to list in a dropdown.\n\nClick below to enter the value(s) manually.\nExamples: ${values.slice(0,3).join(', ')}...`,
+        embeds: [],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`cfg_filtertrait:manual:${kind}:${colId}:${encodeURIComponent(category)}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+          ),
+        ],
+      });
+    }
+
+    const valOptions = values.map(v =>
+      new StringSelectMenuOptionBuilder().setLabel(v).setValue(v)
+    );
+
+    const valMenu = new StringSelectMenuBuilder()
+      .setCustomId(`cfg_filtertrait:valsel:${kind}:${colId}:${encodeURIComponent(category)}`)
+      .setPlaceholder('Step 2 of 2 — Pick one or more values...')
+      .setMinValues(1)
+      .setMaxValues(valOptions.length)
+      .addOptions(valOptions);
+
+    return interaction.editReply({
+      content: `**Adding ${kind === 'sales' ? '💰 Sales' : '🔍 Listing'} Filter**\n\nCategory: **${category}**\nStep 2 of 2 — Pick the trait value(s) to filter by:`,
+      embeds: [],
+      components: [
+        new ActionRowBuilder().addComponents(valMenu),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+    });
+  }
+
+  // ── Filter values selected → save ───────────────────────────────────────
+  if(customId.startsWith('cfg_filtertrait:valsel:')){
+    const parts    = customId.split(':');
+    const kind     = parts[2];
+    const colId    = parts[3];
+    const category = decodeURIComponent(parts[4]);
+    const selectedValues = interaction.values.map(v => v.toLowerCase());
+    const fieldKey = kind === 'sales' ? 'salesFilters' : 'listingFilters';
+    const catKey   = category.toLowerCase();
+
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      if(!cfg[fieldKey]) cfg[fieldKey] = {};
+      const existing = cfg[fieldKey][catKey] || [];
+      cfg[fieldKey][catKey] = [...new Set([...existing, ...selectedValues])];
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]){
+        if(!cols[idx][fieldKey]) cols[idx][fieldKey] = {};
+        const existing = cols[idx][fieldKey][catKey] || [];
+        cols[idx][fieldKey][catKey] = [...new Set([...existing, ...selectedValues])];
+        cfg.collections = cols;
+      }
+    }
+    await setConfig(guildId, cfg);
+
+    const col = isPrimary
+      ? { ...cfg, [fieldKey]: cfg[fieldKey]||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    const embedFn = kind === 'sales' ? buildColSalesFiltersEmbed : buildColFiltersEmbed;
+    const rowFn   = kind === 'sales' ? colSalesFiltersRow : colFiltersRow;
+    return interaction.editReply({
+      content: `✅ Added **${selectedValues.length}** value${selectedValues.length>1?'s':''} for **${category}**.`,
+      embeds: [embedFn(col, colId)],
+      components: rowFn(col, colId),
+    });
+  }
+
+  // ── Manual fallback for >25-value categories ────────────────────────────
+  if(customId.startsWith('cfg_filtertrait:manual:')){
+    const parts    = customId.split(':');
+    const kind     = parts[2];
+    const colId    = parts[3];
+    const category = decodeURIComponent(parts[4] || '');
+    const modal = new ModalBuilder()
+      .setCustomId(`cfg_modal:filtertrait:${kind}:${colId}:${encodeURIComponent(category)}`)
+      .setTitle(`${category.slice(0,30)} — manual entry`);
     modal.addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('filter_trait_type')
-          .setLabel('Trait Category (e.g. Type, Background)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('Type').setRequired(true)
-      ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('filter_trait_values')
           .setLabel('Trait Values — comma separated')
@@ -1443,6 +1583,47 @@ async function handleConfigModal(interaction, ctx){
       ? { ...cfg, salesFilters: cfg.salesFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
     return interaction.editReply({ content:'✅ Filter added.', embeds:[buildColSalesFiltersEmbed(colS, colId)], components:colSalesFiltersRow(colS, colId) });
+  }
+
+  // ── Manual entry for >25-value trait filter categories ───────────────────
+  if(customId.startsWith('cfg_modal:filtertrait:')){
+    const parts    = customId.split(':');
+    const kind     = parts[2];
+    const colId    = parts[3];
+    const category = decodeURIComponent(parts[4]).toLowerCase();
+    const valuesRaw = interaction.fields.getTextInputValue('filter_trait_values').trim();
+    const values    = valuesRaw.split(',').map(v=>v.trim().toLowerCase()).filter(Boolean);
+    if(!values.length)
+      return interaction.editReply({ content:'❌ At least one value required.' });
+
+    const fieldKey = kind === 'sales' ? 'salesFilters' : 'listingFilters';
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      if(!cfg[fieldKey]) cfg[fieldKey] = {};
+      const existing = cfg[fieldKey][category] || [];
+      cfg[fieldKey][category] = [...new Set([...existing, ...values])];
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]){
+        if(!cols[idx][fieldKey]) cols[idx][fieldKey] = {};
+        const existing = cols[idx][fieldKey][category] || [];
+        cols[idx][fieldKey][category] = [...new Set([...existing, ...values])];
+        cfg.collections = cols;
+      }
+    }
+    await setConfig(guildId, cfg);
+
+    const col = isPrimary
+      ? { ...cfg, [fieldKey]: cfg[fieldKey]||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    const embedFn = kind === 'sales' ? buildColSalesFiltersEmbed : buildColFiltersEmbed;
+    const rowFn   = kind === 'sales' ? colSalesFiltersRow : colFiltersRow;
+    return interaction.editReply({
+      content: `✅ Added **${values.length}** value${values.length>1?'s':''} for **${category}**.`,
+      embeds: [embedFn(col, colId)],
+      components: rowFn(col, colId),
+    });
   }
 
   // ── Add collection ─────────────────────────────────────────────────────────
