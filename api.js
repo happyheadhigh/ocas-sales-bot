@@ -516,15 +516,54 @@ app.get('/db/floor-before-sweep', auth, async (req, res) => {
 
 // ── GET /db/trait-index ──────────────────────────────────────────────────────
 // Full trait value index used by the Discord bot for phrase-aware /ocas search.
+// Query params:
+//   slug — optional collection_slug filter.
+//     - omitted: old unscoped behavior, reads token_traits with no filter.
+//     - 'on-chain-all-stars' (or omitted on legacy callers): reads token_traits,
+//       scoped, since that table has real per-token OCAS data.
+//     - any other slug: reads collection_traits instead. token_traits has no
+//       real per-token data for non-OCAS collections yet (nothing writes it),
+//       but collection_traits IS populated for any collection added via
+//       /config — it just can't map a trait back to specific token IDs, only
+//       say "this trait exists, with this many tokens." That's exactly what
+//       this endpoint needs for phrase parsing (it never resolves to a
+//       token ID itself — chooseTraitGroupsFromQuery just needs to know which
+//       trait_name/trait_value pairs are real, so /traitfind can match typed
+//       search text against them and pass the resolved pair to
+//       /db/multi-trait-tokens separately).
 // Returns: { ok, traits: [{trait_name, trait_value, token_count}] }
 app.get('/db/trait-index', auth, async (req, res) => {
   try {
+    const slug = req.query.slug ? String(req.query.slug).trim() : null;
+    const isOcas = !slug || slug.toLowerCase().includes('on-chain-all-stars');
+
+    if (!isOcas) {
+      const result = await pool.query(
+        `SELECT trait_name, trait_value, token_count FROM collection_traits WHERE slug=$1 ORDER BY LENGTH(trait_value) DESC, trait_value ASC`,
+        [slug]
+      );
+      res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+      return res.json({
+        ok: true,
+        traits: result.rows.map(r => ({
+          trait_name:  r.trait_name,
+          trait_value: r.trait_value,
+          token_count: parseInt(r.token_count) || 0
+        })),
+        count: result.rows.length
+      });
+    }
+
+    const params = [];
+    let slugCond = '';
+    if (slug) { params.push(slug); slugCond = ` AND tt.collection_slug = $${params.length}`; }
     const result = await pool.query(`
       SELECT trait_name, trait_value, COUNT(*)::int AS token_count
       FROM token_traits tt
       WHERE trait_name IS NOT NULL
         AND trait_value IS NOT NULL
         AND TRIM(trait_value) <> ''
+        ${slugCond}
         AND NOT EXISTS (
           SELECT 1 FROM burn_event_inputs active_burned
           JOIN burn_events active_be ON active_be.id = active_burned.burn_event_id
@@ -533,7 +572,7 @@ app.get('/db/trait-index', auth, async (req, res) => {
         )
       GROUP BY trait_name, trait_value
       ORDER BY LENGTH(trait_value) DESC, trait_value ASC
-    `);
+    `, params);
 
     res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
     res.json({
@@ -599,6 +638,11 @@ function parseTraitGroupsParam(req) {
 //   listed      — "1" for active listings only
 //   trait_count — optional exact trait count
 //   rank_min/rank_max/rank_type — optional rank filter
+//   slug        — optional collection_slug filter. If omitted, behaves exactly
+//                 as before this param existed (no collection filtering at
+//                 all) — only pass this once a caller is deliberately
+//                 collection-aware, since tokens/token_traits/listings can
+//                 all hold rows from more than one collection now.
 //   limit       — default 100, max 10000
 app.get('/db/multi-trait-tokens', auth, async (req, res) => {
   try {
@@ -610,6 +654,7 @@ app.get('/db/multi-trait-tokens', auth, async (req, res) => {
     const rankMax = req.query.rank_max ? parseInt(req.query.rank_max) : null;
     const rankType = req.query.rank_type === 'obs' ? 'obs' : 'os';
     const rankCol = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
+    const slug = req.query.slug ? String(req.query.slug).trim() : null;
     const limit = Math.min(parseInt(req.query.limit || '100'), 10000);
 
     if (!matches.length && !traitCount && rankMin === null && rankMax === null) {
@@ -633,17 +678,24 @@ app.get('/db/multi-trait-tokens', auth, async (req, res) => {
 
     const params = [];
     let p = 1;
-    if (listedOnly) query += ` JOIN listings l ON l.token_id = t.id`;
-    query += ` LEFT JOIN token_traits tt ON tt.token_id = t.id`;
+    if (listedOnly) {
+      query += ` JOIN listings l ON l.token_id = t.id` + (slug ? ` AND l.collection_slug = $${p++}` : ``);
+      if (slug) params.push(slug);
+    }
+    query += ` LEFT JOIN token_traits tt ON tt.token_id = t.id` + (slug ? ` AND tt.collection_slug = $${p++}` : ``);
+    if (slug) params.push(slug);
 
     const conditions = [ACTIVE_TOKEN_CONDITION];
+    if (slug) { conditions.push(`t.collection_slug = $${p++}`); params.push(slug); }
     groups.forEach((group, i) => {
       const ors = [];
       group.forEach(m => {
         ors.push(`(LOWER(g${i}.trait_name) = LOWER($${p++}) AND LOWER(g${i}.trait_value) = LOWER($${p++}))`);
         params.push(m.trait_name, m.trait_value);
       });
-      conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND (${ors.join(' OR ')}))`);
+      const slugCond = slug ? ` AND g${i}.collection_slug = $${p++}` : ``;
+      conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND (${ors.join(' OR ')})${slugCond})`);
+      if (slug) params.push(slug);
     });
     if (traitCount !== null && !isNaN(traitCount)) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCount); }
     if (rankMin !== null && !isNaN(rankMin)) { conditions.push(`${rankCol} >= $${p++}`); params.push(rankMin); }
