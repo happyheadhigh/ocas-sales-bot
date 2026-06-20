@@ -1077,8 +1077,8 @@ async function handleConfigButton(interaction, ctx){
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('rank_type')
-          .setLabel('Rank system: "os" (OpenSea) or "obs" (TraitView)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('os')
+          .setLabel('Rank system: os or obs')
+          .setStyle(TextInputStyle.Short).setPlaceholder('os = OpenSea, obs = TraitView')
           .setValue(ra.rankType || 'os')
           .setRequired(false)
       ),
