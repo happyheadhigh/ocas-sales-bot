@@ -95,7 +95,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction }   = require('./commands/market');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
@@ -652,6 +652,9 @@ client.on('interactionCreate', async (interaction)=>{
   if(interaction.isStringSelectMenu() && (interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col:') || interaction.customId.startsWith('cfg_filter:') || interaction.customId.startsWith('cfg_col_filter:') || interaction.customId.startsWith('cfg_col_salesfilter:') || interaction.customId.startsWith('cfg_tzsel:'))){
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('tf_browse:')){
+    return handleTraitBrowseInteraction(interaction, { pgPool });
   }
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
      (interaction.customId.startsWith('cfg_chsel:') || interaction.customId.startsWith('cfg_rolesel:'))){
