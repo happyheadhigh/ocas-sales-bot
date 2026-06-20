@@ -122,7 +122,7 @@ async function writeBatch(rows) {
     await client.query('BEGIN');
     for (const { tokenId, rank, score } of rows) {
       await client.query(
-        `UPDATE tokens SET os_rank=$1, os_score=$2 WHERE id=$3`,
+        `UPDATE tokens SET os_rank=$1, os_score=$2 WHERE id=$3 AND collection_slug='on-chain-all-stars'`,
         [rank, score, tokenId]
       );
     }
