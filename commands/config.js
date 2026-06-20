@@ -190,6 +190,9 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
       new ButtonBuilder().setCustomId(`cfg:col:clearchan:burn:${colId}`).setLabel('✕ Burn').setStyle(ButtonStyle.Danger),
     ));
   }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`cfg:col:traitroles:${colId}`).setLabel('🎭 Trait Roles').setStyle(ButtonStyle.Secondary),
+  ));
   const row2Btns = [
     new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
   ];
@@ -257,7 +260,7 @@ function verificationRow(cfg){
 }
 
 // ── Roles screen ──────────────────────────────────────────────────────────────
-function buildRolesEmbed(traitRoles){
+function buildRolesEmbed(traitRoles, collectionLabel){
   const list = traitRoles.length === 0
     ? '*No trait roles configured yet.*'
     : traitRoles.map((r, i) =>
@@ -269,7 +272,7 @@ function buildRolesEmbed(traitRoles){
 
   return new EmbedBuilder()
     .setColor(0x5865F2)
-    .setTitle('🎭 Trait Roles')
+    .setTitle(collectionLabel ? `🎭 Trait Roles — ${collectionLabel}` : '🎭 Trait Roles')
     .setDescription(
       SEP + '\n\n' +
       list + '\n\n' +
@@ -278,11 +281,14 @@ function buildRolesEmbed(traitRoles){
     .setFooter({ text: 'Only visible to you' });
 }
 
-function rolesRow(traitRoles){
+function rolesRow(traitRoles, colId){
+  const addId   = colId ? `cfg:role:add:${colId}` : 'cfg:role:add';
+  const backId  = colId ? `cfg:col:view:${colId}` : 'cfg:back';
+  const delId   = colId ? `cfg_role:delete:${colId}` : 'cfg_role:delete';
   const rows = [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('cfg:role:add').setLabel('➕ Add Trait Role').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(addId).setLabel('➕ Add Trait Role').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(backId).setLabel('← Back').setStyle(ButtonStyle.Secondary),
     ),
   ];
   if(traitRoles.length > 0){
@@ -294,7 +300,7 @@ function rolesRow(traitRoles){
     );
     rows.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
-        .setCustomId('cfg_role:delete')
+        .setCustomId(delId)
         .setPlaceholder('🗑️ Remove a trait role...')
         .addOptions(options)
     ));
@@ -451,6 +457,14 @@ async function handleConfigButton(interaction, ctx){
     [guildId]
   ).catch(()=>({ rows:[] }));
 
+  // colSlug=null returns only rules with NULL collection_slug (primary collection); pass a slug for collection-specific rules
+  const traitRolesQFor = (colSlug) => pgPool.query(
+    colSlug
+      ? 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug=$2 ORDER BY trait_type, trait_value'
+      : 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug IS NULL ORDER BY trait_type, trait_value',
+    colSlug ? [guildId, colSlug] : [guildId]
+  ).catch(()=>({ rows:[] }));
+
   // ── Back to dashboard ──────────────────────────────────────────────────────
   if(customId === 'cfg:back'){
     const trRes = await traitRolesQ();
@@ -584,6 +598,36 @@ async function handleConfigButton(interaction, ctx){
       .setPlaceholder('Pick the Burn Alerts channel')
       .addChannelTypes(ChannelType.GuildText);
     return interaction.editReply({ content:'**Select the 🔥 Burn Alerts channel:**', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+  }
+
+  // ── Per-collection Trait Roles ──────────────────────────────────────────────
+  if(customId.startsWith('cfg:col:traitroles:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName || 'Primary Collection' }
+      : (cfg.collections||[])[parseInt(colId)];
+    if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
+
+    // Primary collection's rules are stored with collection_slug=NULL for backward compatibility
+    const colSlug = isPrimary ? null : col.slug;
+    const trRes = await traitRolesQFor(colSlug);
+    return interaction.editReply({
+      content: '',
+      embeds: [buildRolesEmbed(trRes.rows, col.name || col.slug)],
+      components: rolesRow(trRes.rows, colId),
+    });
+  }
+
+  // Back to a specific collection's edit screen from its Trait Roles view
+  if(customId.startsWith('cfg:col:view:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{} }
+      : (cfg.collections||[])[parseInt(colId)];
+    if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
 
   // Remove extra collection
@@ -797,27 +841,31 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // ── Roles: add ─────────────────────────────────────────────────────────────
-  if(customId === 'cfg:role:add'){
+  if(customId === 'cfg:role:add' || customId.startsWith('cfg:role:add:')){
+    const addColId = customId.startsWith('cfg:role:add:') ? customId.split(':')[3] : '';
     const roleMenu = new RoleSelectMenuBuilder()
-      .setCustomId('cfg_traitrole:rolesel')
+      .setCustomId(addColId ? `cfg_traitrole:rolesel:${addColId}` : 'cfg_traitrole:rolesel')
       .setPlaceholder('Pick a role to assign...');
+    const cancelId = addColId ? `cfg:col:traitroles:${addColId}` : 'cfg:cat:roles';
     return interaction.editReply({
       content: '**Step 1 of 3 — Pick the Discord role to assign:**',
       embeds: [],
       components: [
         new ActionRowBuilder().addComponents(roleMenu),
         new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+          new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
         ),
       ],
     });
   }
 
   if(customId.startsWith('cfg_traitrole:manual:')){
-    const roleId = customId.split(':')[2];
+    const mParts = customId.split(':');
+    const roleId = mParts[2];
+    const manColId = mParts[3] || '';
     const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     const modal = new ModalBuilder()
-      .setCustomId('cfg_modal:traitrole:'+roleId)
+      .setCustomId(`cfg_modal:traitrole:${roleId}${manColId ? ':'+manColId : ''}`)
       .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
     modal.addComponents(
       new ActionRowBuilder().addComponents(
@@ -845,19 +893,28 @@ async function handleConfigButton(interaction, ctx){
     return interaction.showModal(modal);
   }
 
-  if(customId === 'cfg_traitrole:rolesel'){
+  if(customId === 'cfg_traitrole:rolesel' || customId.startsWith('cfg_traitrole:rolesel:')){
+    const rsColId = customId.startsWith('cfg_traitrole:rolesel:') ? customId.split(':')[2] : '';
     const roleId = interaction.values[0];
     const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
 
-    // Load distinct trait categories — try collection_traits first, fall back to token_traits
-    const slug = cfg.collectionSlug || cfg.slug || '';
-    console.log('[TraitRole] looking up traits for slug:', slug, '| cfg keys:', Object.keys(cfg).filter(k=>k.includes('slug')||k.includes('Slug')));
+    // Resolve which collection's slug to use for the trait lookup
+    let slug;
+    if(rsColId && rsColId !== 'primary'){
+      const col = (cfg.collections||[])[parseInt(rsColId)];
+      slug = col?.slug || '';
+    } else {
+      slug = cfg.collectionSlug || cfg.slug || '';
+    }
+    const cancelId = rsColId ? `cfg:col:traitroles:${rsColId}` : 'cfg:cat:roles';
+    const suffix = rsColId ? `:${rsColId}` : '';
+
     const catRes = await pgPool.query(
       `SELECT DISTINCT trait_name FROM collection_traits WHERE slug=$1 ORDER BY trait_name`,
       [slug]
     ).catch(()=>({ rows:[] }));
-    if(!catRes.rows.length){
-      // fallback to token_traits if collection_traits not yet populated
+    if(!catRes.rows.length && !rsColId){
+      // fallback to legacy token_traits only for the primary/no-collection flow
       const fallback = await pgPool.query('SELECT DISTINCT trait_name FROM token_traits ORDER BY trait_name').catch(()=>({ rows:[] }));
       catRes.rows = fallback.rows;
     }
@@ -871,8 +928,8 @@ async function handleConfigButton(interaction, ctx){
         embeds: [],
         components: [
           new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}${suffix}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
           ),
         ],
       });
@@ -890,7 +947,7 @@ async function handleConfigButton(interaction, ctx){
     );
 
     const catMenu = new StringSelectMenuBuilder()
-      .setCustomId(`cfg_traitrole:catsel:${roleId}`)
+      .setCustomId(`cfg_traitrole:catsel:${roleId}${suffix}`)
       .setPlaceholder('Step 2 of 3 — Pick a trait category...')
       .addOptions(catOptions.slice(0, 25));
 
@@ -902,7 +959,7 @@ Step 2 of 3 — Pick the trait category:`,
       components: [
         new ActionRowBuilder().addComponents(catMenu),
         new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+          new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
         ),
       ],
     });
@@ -912,7 +969,10 @@ Step 2 of 3 — Pick the trait category:`,
   if(customId.startsWith('cfg_traitrole:catsel:')){
     const parts  = customId.split(':');
     const roleId = parts[2];
+    const catColId = parts[3] || '';
     const category = interaction.values[0];
+    const cancelId = catColId ? `cfg:col:traitroles:${catColId}` : 'cfg:cat:roles';
+    const suffix = catColId ? `:${catColId}` : '';
 
     // Token count shortcut — already deferred, so show a button that opens the modal next click
     if(category === '_count'){
@@ -921,21 +981,26 @@ Step 2 of 3 — Pick the trait category:`,
         embeds: [],
         components: [
           new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}`).setLabel('✏️ Set Token Count').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}${suffix}`).setLabel('✏️ Set Token Count').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
           ),
         ],
       });
     }
 
-    // Load distinct values for this category
-    const cfgForSlug = getConfig(guildId) || {};
-    const slugForVal = cfgForSlug.collectionSlug || cfgForSlug.slug || '';
+    // Load distinct values for this category — scoped to the selected collection if applicable
+    let slugForVal;
+    if(catColId && catColId !== 'primary'){
+      const col = (cfg.collections||[])[parseInt(catColId)];
+      slugForVal = col?.slug || '';
+    } else {
+      slugForVal = cfg.collectionSlug || cfg.slug || '';
+    }
     let valRes = await pgPool.query(
       `SELECT DISTINCT trait_value FROM collection_traits WHERE slug=$1 AND trait_name=$2 ORDER BY trait_value`,
       [slugForVal, category]
     ).catch(()=>({ rows:[] }));
-    if(!valRes.rows.length){
+    if(!valRes.rows.length && !catColId){
       valRes = await pgPool.query(
         'SELECT DISTINCT trait_value FROM token_traits WHERE trait_name=$1 ORDER BY trait_value',
         [category]
@@ -954,8 +1019,8 @@ Step 2 of 3 — Pick the trait category:`,
         embeds: [],
         components: [
           new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}${suffix}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
           ),
         ],
       });
@@ -966,7 +1031,7 @@ Step 2 of 3 — Pick the trait category:`,
     );
 
     const valMenu = new StringSelectMenuBuilder()
-      .setCustomId(`cfg_traitrole:valsel:${roleId}:${encodeURIComponent(category)}`)
+      .setCustomId(`cfg_traitrole:valsel:${roleId}:${encodeURIComponent(category)}${suffix}`)
       .setPlaceholder('Step 3 of 3 — Pick one or more values...')
       .setMinValues(1)
       .setMaxValues(valOptions.length)
@@ -981,7 +1046,7 @@ Step 3 of 3 — Pick the trait value(s) that qualify for this role:`,
       components: [
         new ActionRowBuilder().addComponents(valMenu),
         new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+          new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
         ),
       ],
     });
@@ -992,33 +1057,53 @@ Step 3 of 3 — Pick the trait value(s) that qualify for this role:`,
     const parts    = customId.split(':');
     const roleId   = parts[2];
     const category = decodeURIComponent(parts[3]);
+    const valColId = parts[4] || '';
     const selectedValues = interaction.values;
+
+    // Resolve collection_slug to store with each rule — NULL for primary, slug for extra collections
+    let collectionSlugForSave = null;
+    let colLabel;
+    if(valColId && valColId !== 'primary'){
+      const col = (cfg.collections||[])[parseInt(valColId)];
+      collectionSlugForSave = col?.slug || null;
+      colLabel = col?.name || col?.slug;
+    }
 
     for(const val of selectedValues){
       await pgPool.query(
-        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count)
-         VALUES ($1,$2,$3,$4,1)
-         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO NOTHING`,
-        [guildId, roleId, category, val]
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,$3,$4,1,$5)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
+        [guildId, roleId, category, val, collectionSlugForSave]
       ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
     }
 
-    const trRes = await traitRolesQ();
+    const trRes = valColId ? await traitRolesQFor(collectionSlugForSave) : await traitRolesQ();
     const role  = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     return interaction.editReply({
       content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}>:
 ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
-      embeds: [buildRolesEmbed(trRes.rows)],
-      components: rolesRow(trRes.rows),
+      embeds: [buildRolesEmbed(trRes.rows, colLabel)],
+      components: rolesRow(trRes.rows, valColId || undefined),
     });
   }
 
   // ── Roles: delete select ───────────────────────────────────────────────────
-  if(customId === 'cfg_role:delete'){
+  if(customId === 'cfg_role:delete' || customId.startsWith('cfg_role:delete:')){
+    const delColId = customId.startsWith('cfg_role:delete:') ? customId.split(':')[2] : '';
     const rowId = parseInt(interaction.values[0]);
     await pgPool.query('DELETE FROM trait_roles WHERE id=$1 AND guild_id=$2', [rowId, guildId]).catch(()=>{});
-    const trRes = await traitRolesQ();
-    return interaction.editReply({ content:'', embeds:[buildRolesEmbed(trRes.rows)], components:rolesRow(trRes.rows) });
+
+    let delCollectionSlug = null;
+    let delColLabel;
+    if(delColId && delColId !== 'primary'){
+      const col = (cfg.collections||[])[parseInt(delColId)];
+      delCollectionSlug = col?.slug || null;
+      delColLabel = col?.name || col?.slug;
+    }
+
+    const trRes = delColId ? await traitRolesQFor(delCollectionSlug) : await traitRolesQ();
+    return interaction.editReply({ content:'', embeds:[buildRolesEmbed(trRes.rows, delColLabel)], components:rolesRow(trRes.rows, delColId || undefined) });
   }
 
   // ── Channel select menus ───────────────────────────────────────────────────
@@ -1230,7 +1315,9 @@ async function handleConfigModal(interaction, ctx){
 
   // ── Add trait role ─────────────────────────────────────────────────────────
   if(customId.startsWith('cfg_modal:traitrole:')){
-    const roleId      = customId.split(':')[2];
+    const modParts     = customId.split(':');
+    const roleId        = modParts[2];
+    const modColId       = modParts[3] || '';
     const traitTypeRaw = interaction.fields.getTextInputValue('tr_trait_type').trim();
     const traitVal     = interaction.fields.getTextInputValue('tr_trait_value').trim();
     const minCount     = parseInt(interaction.fields.getTextInputValue('tr_min_count').trim()) || 1;
@@ -1241,19 +1328,35 @@ async function handleConfigModal(interaction, ctx){
     if(!role)
       return interaction.editReply({ content:'❌ Role not found. Please try again.' });
 
+    // Resolve collection_slug — NULL for primary, slug for extra collections
+    let modCollectionSlug = null;
+    let modColLabel;
+    if(modColId && modColId !== 'primary'){
+      const col = (cfg.collections||[])[parseInt(modColId)];
+      modCollectionSlug = col?.slug || null;
+      modColLabel = col?.name || col?.slug;
+    }
+
     await pgPool.query(
-      `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO NOTHING`,
-      [guildId, roleId, traitType, traitVal||'', minCount]
+      `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$6`,
+      [guildId, roleId, traitType, traitVal||'', minCount, modCollectionSlug]
     ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
 
-    const trRes = await pgPool.query(
-      'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
-      [guildId]
-    ).catch(()=>({ rows:[] }));
+    const trRes = modColId
+      ? await pgPool.query(
+          modCollectionSlug
+            ? 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug=$2 ORDER BY trait_type, trait_value'
+            : 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug IS NULL ORDER BY trait_type, trait_value',
+          modCollectionSlug ? [guildId, modCollectionSlug] : [guildId]
+        ).catch(()=>({ rows:[] }))
+      : await pgPool.query(
+          'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
+          [guildId]
+        ).catch(()=>({ rows:[] }));
 
-    return interaction.editReply({ content:'✅ Trait role added.', embeds:[buildRolesEmbed(trRes.rows)], components:rolesRow(trRes.rows) });
+    return interaction.editReply({ content:'✅ Trait role added.', embeds:[buildRolesEmbed(trRes.rows, modColLabel)], components:rolesRow(trRes.rows, modColId || undefined) });
   }
 }
 
