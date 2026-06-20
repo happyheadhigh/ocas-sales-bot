@@ -99,11 +99,11 @@ function dashboardRow(){
       new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('📦 Collections').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:channels').setLabel('📡 Channels').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('🔐 Verification').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('🛡️ Access').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('🎰 Lotteries').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('🎭 Roles').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('🎭 Roles').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('🛡️ Access').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('🎰 Lotteries').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
