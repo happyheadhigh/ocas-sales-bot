@@ -438,7 +438,6 @@ async function handleConfigButton(interaction, ctx){
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
                   customId === 'cfg:col:add' ||
                   customId === 'cfg:filter:add' ||
-                  customId.startsWith('cfg_traitrole:catsel:') ||
                   customId.startsWith('cfg_traitrole:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
                   customId.startsWith('cfg:col:filter:add:') ||
@@ -915,35 +914,18 @@ Step 2 of 3 — Pick the trait category:`,
     const roleId = parts[2];
     const category = interaction.values[0];
 
-    // Token count shortcut — go straight to count modal
+    // Token count shortcut — already deferred, so show a button that opens the modal next click
     if(category === '_count'){
-      const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
-      const modal = new ModalBuilder()
-        .setCustomId('cfg_modal:traitrole:'+roleId)
-        .setTitle(`Token Count Rule`);
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tr_trait_type')
-            .setLabel('Trait Category')
-            .setStyle(TextInputStyle.Short)
-            .setValue('_count')
-            .setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tr_trait_value')
-            .setLabel('Trait Value (leave blank for token count rule)')
-            .setStyle(TextInputStyle.Short)
-            .setRequired(false)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tr_min_count')
-            .setLabel('Minimum tokens needed')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('e.g. 5')
-            .setRequired(true)
-        ),
-      );
-      return interaction.showModal(modal);
+      return interaction.editReply({
+        content: `**Token Count Rule**\n\nClick below to set the minimum token count for this role.`,
+        embeds: [],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}`).setLabel('✏️ Set Token Count').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+          ),
+        ],
+      });
     }
 
     // Load distinct values for this category
@@ -965,36 +947,18 @@ Step 2 of 3 — Pick the trait category:`,
       return interaction.editReply({ content: `❌ No trait values found for category **${category}**. Try again.`, embeds:[], components:[] });
     }
 
-    // If more than 25 values, fall back to modal — Discord select menus cap at 25
+    // If more than 25 values, fall back to manual entry — Discord select menus cap at 25
     if(values.length > 25){
-      const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
-      const modal = new ModalBuilder()
-        .setCustomId('cfg_modal:traitrole:'+roleId)
-        .setTitle(`${category} — too many to list`);
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tr_trait_type')
-            .setLabel('Trait Category')
-            .setStyle(TextInputStyle.Short)
-            .setValue(category)
-            .setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tr_trait_value')
-            .setLabel(`Trait Value (${values.length} options — type one)`)
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder(`e.g. ${values.slice(0,3).join(', ')}...`)
-            .setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tr_min_count')
-            .setLabel('Minimum tokens needed (default: 1)')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('1')
-            .setRequired(false)
-        ),
-      );
-      return interaction.showModal(modal);
+      return interaction.editReply({
+        content: `**${category}** has ${values.length} values — too many to list in a dropdown.\n\nClick below to enter the trait value manually.\nExamples: ${values.slice(0,3).join(', ')}...`,
+        embeds: [],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+          ),
+        ],
+      });
     }
 
     const valOptions = values.map(v =>
