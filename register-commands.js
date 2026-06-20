@@ -104,6 +104,7 @@ const commands = [
 
   new SlashCommandBuilder().setName('setupverification')
     .setDescription('Setup a wallet verification panel in a channel (Admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o=>o.setName('channel').setDescription('Channel to post the verification panel').setRequired(true))
     .addRoleOption(o=>o.setName('role').setDescription('Role to assign after verification').setRequired(false))
     .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum OCAS tokens required (0 = any wallet)').setRequired(false).setMinValue(0))
@@ -112,7 +113,7 @@ const commands = [
 
 
 
-  new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)'),
+  new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('config').setDescription('Configure your bot — collections, channels, roles (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('lotteries').setDescription('View and manage all lotteries and giveaways (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('resetverify')
