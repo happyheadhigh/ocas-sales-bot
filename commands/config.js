@@ -165,6 +165,8 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
       `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\n` +
       (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\n` : '') +
       `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\n` +
+      `**Sales Filters:** ${Object.keys(col.salesFilters||{}).length} active\n` +
+      `**Status:** ${col.paused ? '⏸️ Paused' : '▶️ Active'}\n` +
       (isOcas ? '\n🔥 **OCAS** — full feature set active.\n' : '') +
       '\n*Changes save immediately.*'
     )
@@ -175,7 +177,11 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`cfg:col:name:${colId}`).setLabel('✏️ Name').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:filters:${colId}`).setLabel('🔍 Filters').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:filters:${colId}`).setLabel('🔍 Listing Filters').setStyle(ButtonStyle.Secondary),
+  );
+  const row1c = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`cfg:col:salesfilters:${colId}`).setLabel('💰 Sales Filters').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:pause:${colId}`).setLabel('⏸️ Pause/Resume').setStyle(ButtonStyle.Secondary),
   );
   const row1b = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
@@ -183,7 +189,7 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
     new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:clearchan:listings:${colId}`).setLabel('✕ Listings').setStyle(ButtonStyle.Danger),
   );
-  const rows = [row1, row1b];
+  const rows = [row1, row1c, row1b];
   if(isOcas){
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`cfg:col:burnchan:${colId}`).setLabel('🔥 Burn Alerts Ch.').setStyle(ButtonStyle.Secondary),
@@ -421,6 +427,59 @@ function colFiltersRow(col, colId){
   return rows;
 }
 
+// ── Per-collection Sales Filters screen ──────────────────────────────────────
+function buildColSalesFiltersEmbed(col, colId){
+  const filters = col.salesFilters || {};
+  const entries = Object.entries(filters);
+  const name = col.name || col.slug || 'Collection';
+  let list = entries.length === 0
+    ? '*No filters — all sales post.*\n'
+    : entries.map(([k,v]) => `**${k}:** ${Array.isArray(v)?v.join(', '):v}`).join('\n') + '\n';
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(`💰 Sales Filters — ${name}`)
+    .setDescription(
+      SEP + '\n\n' +
+      'Only sales matching these traits will post for this collection.\n' +
+      'Leave empty to post all sales.\n\n' +
+      '**Active filters:**\n' + list
+    )
+    .setFooter({ text: 'Only visible to you' });
+}
+
+function colSalesFiltersRow(col, colId){
+  const filters = col.salesFilters || {};
+  const hasFilters = Object.keys(filters).length > 0;
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`cfg:col:salesfilter:add:${colId}`).setLabel('➕ Add Filter').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`cfg:col:salesfilters:back:${colId}`).setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+  if(hasFilters){
+    const options = [];
+    for(const [k, vals] of Object.entries(filters)){
+      const arr = Array.isArray(vals) ? vals : [vals];
+      for(const v of arr){
+        if(options.length >= 25) break;
+        options.push(new StringSelectMenuOptionBuilder()
+          .setLabel(`${k}: ${v}`)
+          .setValue(`${k}::${v}`)
+        );
+      }
+    }
+    if(options.length > 0){
+      rows.push(new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`cfg_col_salesfilter:remove:${colId}`)
+          .setPlaceholder('🗑️ Remove a value...')
+          .addOptions(options)
+      ));
+    }
+  }
+  return rows;
+}
+
 async function handleConfigCommand(interaction, ctx){
   await interaction.deferReply({ flags: 64 });
   const { pgPool, getConfig } = ctx;
@@ -447,6 +506,7 @@ async function handleConfigButton(interaction, ctx){
                   customId.startsWith('cfg_traitrole:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
                   customId.startsWith('cfg:col:filter:add:') ||
+                  customId.startsWith('cfg:col:salesfilter:add:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
   if(!isModal) await interaction.deferUpdate();
 
@@ -485,7 +545,7 @@ async function handleConfigButton(interaction, ctx){
     const colId = interaction.values[0];
     const isPrimary = colId === 'primary';
     const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{} }
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
@@ -624,7 +684,7 @@ async function handleConfigButton(interaction, ctx){
     const colId = customId.split(':')[3];
     const isPrimary = colId === 'primary';
     const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{} }
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
@@ -701,6 +761,101 @@ async function handleConfigButton(interaction, ctx){
       ? { ...cfg, listingFilters: cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
     return interaction.editReply({ content:'✅ Filter removed.', embeds:[buildColFiltersEmbed(col, colId)], components:colFiltersRow(col, colId) });
+  }
+
+  // ── Sales Filters screen ─────────────────────────────────────────────────
+  if(customId.startsWith('cfg:col:salesfilters:back:')){
+    const colId = customId.split(':')[4];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
+      : (cfg.collections||[])[parseInt(colId)];
+    if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+  }
+
+  if(customId.startsWith('cfg:col:salesfilters:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { ...cfg, slug: cfg.collectionSlug||cfg.slug, salesFilters: cfg.salesFilters||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    return interaction.editReply({ content:'', embeds:[buildColSalesFiltersEmbed(col, colId)], components:colSalesFiltersRow(col, colId) });
+  }
+
+  if(customId.startsWith('cfg:col:salesfilter:add:')){
+    const colId = customId.split(':')[4];
+    const modal = new ModalBuilder().setCustomId(`cfg_modal:col_salesfilter:${colId}`).setTitle('Add Sales Filter');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('filter_trait_type')
+          .setLabel('Trait Category (e.g. Type, Background)')
+          .setStyle(TextInputStyle.Short).setPlaceholder('Type').setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('filter_trait_values')
+          .setLabel('Trait Values — comma separated')
+          .setStyle(TextInputStyle.Short).setPlaceholder('Zombie, Ape, Alien').setRequired(true)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
+  if(customId.startsWith('cfg_col_salesfilter:remove:')){
+    const parts = customId.split(':');
+    const colId = parts[2];
+    const [traitType, traitVal] = interaction.values[0].split('::');
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      const filters = cfg.salesFilters || {};
+      if(filters[traitType]){
+        const arr = Array.isArray(filters[traitType]) ? filters[traitType] : [filters[traitType]];
+        const updated = arr.filter(v => v !== traitVal);
+        if(updated.length === 0) delete filters[traitType];
+        else filters[traitType] = updated;
+      }
+      cfg.salesFilters = filters;
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]){
+        const filters = cols[idx].salesFilters || {};
+        if(filters[traitType]){
+          const arr = Array.isArray(filters[traitType]) ? filters[traitType] : [filters[traitType]];
+          const updated = arr.filter(v => v !== traitVal);
+          if(updated.length === 0) delete filters[traitType];
+          else filters[traitType] = updated;
+        }
+        cols[idx].salesFilters = filters;
+        cfg.collections = cols;
+      }
+    }
+    await setConfig(guildId, cfg);
+    const col = isPrimary
+      ? { ...cfg, salesFilters: cfg.salesFilters||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    return interaction.editReply({ content:'✅ Filter removed.', embeds:[buildColSalesFiltersEmbed(col, colId)], components:colSalesFiltersRow(col, colId) });
+  }
+
+  // ── Pause/Resume toggle (per collection) ─────────────────────────────────
+  if(customId.startsWith('cfg:col:pause:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      cfg.paused = !cfg.paused;
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]) cols[idx].paused = !cols[idx].paused;
+      cfg.collections = cols;
+    }
+    await setConfig(guildId, cfg);
+    const col = isPrimary
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
+      : (cfg.collections||[])[parseInt(colId)];
+    if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
+    const status = col.paused ? '⏸️ Paused' : '▶️ Resumed';
+    return interaction.editReply({ content:`${status} for ${col.name||col.slug}.`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
 
   if(customId.startsWith('cfg:col:remove:')){
@@ -1260,6 +1415,35 @@ async function handleConfigModal(interaction, ctx){
       ? { ...cfg, listingFilters: cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
     return interaction.editReply({ content:'✅ Filter added.', embeds:[buildColFiltersEmbed(col, colId)], components:colFiltersRow(col, colId) });
+  }
+
+  if(customId.startsWith('cfg_modal:col_salesfilter:')){
+    const colId     = customId.split(':')[2];
+    const traitType = interaction.fields.getTextInputValue('filter_trait_type').trim().toLowerCase();
+    const valuesRaw = interaction.fields.getTextInputValue('filter_trait_values').trim();
+    const values    = valuesRaw.split(',').map(v=>v.trim().toLowerCase()).filter(Boolean);
+    if(!traitType || !values.length)
+      return interaction.editReply({ content:'❌ Trait category and at least one value required.' });
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      if(!cfg.salesFilters) cfg.salesFilters = {};
+      const existing = cfg.salesFilters[traitType] || [];
+      cfg.salesFilters[traitType] = [...new Set([...existing, ...values])];
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]){
+        if(!cols[idx].salesFilters) cols[idx].salesFilters = {};
+        const existing = cols[idx].salesFilters[traitType] || [];
+        cols[idx].salesFilters[traitType] = [...new Set([...existing, ...values])];
+        cfg.collections = cols;
+      }
+    }
+    await setConfig(guildId, cfg);
+    const colS = isPrimary
+      ? { ...cfg, salesFilters: cfg.salesFilters||{} }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    return interaction.editReply({ content:'✅ Filter added.', embeds:[buildColSalesFiltersEmbed(colS, colId)], components:colSalesFiltersRow(colS, colId) });
   }
 
   // ── Add collection ─────────────────────────────────────────────────────────
