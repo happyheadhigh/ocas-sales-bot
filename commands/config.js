@@ -670,7 +670,7 @@ async function handleConfigButton(interaction, ctx){
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
                   customId === 'cfg:col:add' ||
                   customId === 'cfg:filter:add' ||
-                  customId === 'cfg:rank:set' ||
+                  customId.startsWith('cfg:rank:set:') ||
                   customId.startsWith('cfg_traitrole:manual:') ||
                   customId.startsWith('cfg_filtertrait:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
