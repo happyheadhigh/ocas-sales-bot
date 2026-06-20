@@ -100,6 +100,7 @@ const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
 const { handleLotteryCommand, LOTTERY_COMMANDS } = require('./commands/lottery');
+const { handleGiveawayCommand, handleGiveawayInteraction, GIVEAWAY_COMMANDS } = require('./commands/giveaway');
 const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
 const { handleDownloadCommand, DOWNLOAD_COMMANDS } = require('./commands/download');
 const { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS } = require('./commands/setup');
@@ -615,6 +616,12 @@ client.on('interactionCreate', async (interaction)=>{
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigModal(interaction, cfgCtx);
   }
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('gva_modal:')){
+    const gGuildId = interaction.guildId;
+    const gConfig = getConfig(gGuildId);
+    const gIsAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+    return handleGiveawayInteraction(interaction, buildCtx(interaction, gGuildId, gConfig, gIsAdmin));
+  }
 
   if(interaction.isButton() && interaction.customId.startsWith('setup:')){
     const setupCtx = { pgPool, setConfig };
@@ -626,6 +633,12 @@ client.on('interactionCreate', async (interaction)=>{
   }
   if(interaction.isButton() && interaction.customId.startsWith('ltrs:')){
     return handleLotteriesButton(interaction, { pgPool, getConfig });
+  }
+  if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('gva:')){
+    const gGuildId = interaction.guildId;
+    const gConfig = getConfig(gGuildId);
+    const gIsAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+    return handleGiveawayInteraction(interaction, buildCtx(interaction, gGuildId, gConfig, gIsAdmin));
   }
   // Channel + role select menus from setup wizard
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
@@ -1672,6 +1685,7 @@ client.on('interactionCreate', async (interaction)=>{
   if(TOKEN_COMMANDS.has(commandName))   return handleTokenCommand(commandName, ctx);
   if(BURN_COMMANDS.has(commandName))    return handleBurnCommand(commandName, ctx);
   if(LOTTERY_COMMANDS.has(commandName)) return handleLotteryCommand(commandName, ctx);
+  if(GIVEAWAY_COMMANDS.has(commandName)) return handleGiveawayCommand(interaction, ctx);
   if(SETUP_COMMANDS.has(commandName))    return handleSetupCommand(interaction, ctx);
   if(CONFIG_COMMANDS.has(commandName))   return handleConfigCommand(interaction, { pgPool, getConfig, setConfig });
   if(LOTTERIES_COMMANDS.has(commandName)) return handleLotteriesCommand(interaction, { pgPool, getConfig });
