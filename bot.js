@@ -1118,7 +1118,7 @@ client.on('interactionCreate', async (interaction)=>{
       const r=await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1',[lotteryId]); const row=r.rows[0];
       if(!row) return interaction.editReply({content:'Lottery not found.'});
       if(row.status!=='active' || new Date(row.end_time)<=new Date()) return interaction.editReply({content:'This lottery is closed.'});
-      if(row.type!=='giveaway') return interaction.editReply({content:'This is a guess lottery. Use /lottery guess.'});
+      if(row.type!=='giveaway') return interaction.editReply({content:'This is a guess lottery — use the **Submit Guess** button instead.'});
       const username=interaction.member?.displayName||interaction.user?.globalName||interaction.user?.username||interaction.user.id;
       await pgPool.query(`INSERT INTO generic_lottery_entries (lottery_id,user_id,username) VALUES ($1,$2,$3) ON CONFLICT (lottery_id,user_id) DO UPDATE SET username=EXCLUDED.username`,[lotteryId,interaction.user.id,username]);
       const count=await getGenericLotteryEntryCount(lotteryId);
@@ -1136,6 +1136,44 @@ client.on('interactionCreate', async (interaction)=>{
       }catch(_){}
       return interaction.editReply({content:`You are entered in lottery #${lotteryId}. Current entries: ${count}.`});
     }catch(e){ return interaction.editReply({content:'Could not enter lottery: '+e.message}).catch(()=>{}); }
+  }
+  // ── Guess lottery: button opens a modal asking for the number ────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('lottery_guess:')){
+    const { ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+    const lotteryId = parseInt(interaction.customId.split(':')[1]);
+    const modal = new ModalBuilder().setCustomId(`lottery_guess_modal:${lotteryId}`).setTitle('Submit Your Guess');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('number').setLabel('Your guess').setStyle(TextInputStyle.Short)
+          .setPlaceholder('Enter a number').setRequired(true)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('lottery_guess_modal:')){
+    const lotteryId = parseInt(interaction.customId.split(':')[1]);
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(()=>{});
+    try{
+      const numRaw = interaction.fields.getTextInputValue('number').trim();
+      const number = parseInt(numRaw);
+      if(!Number.isInteger(number)) return interaction.editReply({ content:'Please enter a whole number.' });
+      const r = await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1', [lotteryId]);
+      const row = r.rows[0];
+      if(!row) return interaction.editReply({ content:'Lottery not found.' });
+      if(row.status !== 'active' || new Date(row.end_time) <= new Date())
+        return interaction.editReply({ content:'This guess event is closed.' });
+      if(number < row.min_number || number > row.max_number)
+        return interaction.editReply({ content:`Guess must be between ${row.min_number} and ${row.max_number}.` });
+      const username = interaction.member?.displayName || interaction.user?.globalName || interaction.user?.username || interaction.user.id;
+      await pgPool.query(
+        `INSERT INTO generic_lottery_entries (lottery_id, user_id, username, guess_number)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (lottery_id, user_id) DO UPDATE SET
+           username=EXCLUDED.username, guess_number=EXCLUDED.guess_number, entered_at=NOW()`,
+        [row.id, interaction.user.id, username, number]
+      );
+      return interaction.editReply({ content:`Your guess for lottery #${row.id} is **${number}**.` });
+    }catch(e){ return interaction.editReply({content:'Could not submit guess: '+e.message}).catch(()=>{}); }
   }
   // ── Slideshow button handler ───────────────────────────────────────────────
   // ── Show More button — opens slideshow of remaining results ──────────────
