@@ -439,6 +439,7 @@ async function handleConfigButton(interaction, ctx){
                   customId === 'cfg:col:add' ||
                   customId === 'cfg:filter:add' ||
                   customId.startsWith('cfg_traitrole:catsel:') ||
+                  customId.startsWith('cfg_traitrole:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
                   customId.startsWith('cfg:col:filter:add:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
@@ -802,7 +803,7 @@ async function handleConfigButton(interaction, ctx){
       .setCustomId('cfg_traitrole:rolesel')
       .setPlaceholder('Pick a role to assign...');
     return interaction.editReply({
-      content: '**Step 1 of 2 — Pick the Discord role to assign:**',
+      content: '**Step 1 of 3 — Pick the Discord role to assign:**',
       embeds: [],
       components: [
         new ActionRowBuilder().addComponents(roleMenu),
@@ -811,6 +812,38 @@ async function handleConfigButton(interaction, ctx){
         ),
       ],
     });
+  }
+
+  if(customId.startsWith('cfg_traitrole:manual:')){
+    const roleId = customId.split(':')[2];
+    const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    const modal = new ModalBuilder()
+      .setCustomId('cfg_modal:traitrole:'+roleId)
+      .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_trait_type')
+          .setLabel('Trait Category  (use "_count" for token count)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Type   or   Background   or   _count')
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_trait_value')
+          .setLabel('Trait Value  (leave blank if using _count)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Zombie   or   Gold   or   Human 4')
+          .setRequired(false)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_min_count')
+          .setLabel('How many tokens needed?  (default: 1)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('1 = own at least one · 5 = own five or more')
+          .setRequired(false)
+      ),
+    );
+    return interaction.showModal(modal);
   }
 
   if(customId === 'cfg_traitrole:rolesel'){
@@ -832,34 +865,18 @@ async function handleConfigButton(interaction, ctx){
 
     const categories = catRes.rows.map(r => r.trait_name).filter(Boolean);
     if(!categories.length){
-      // Fallback to modal if no trait data in DB
-      const modal = new ModalBuilder()
-        .setCustomId('cfg_modal:traitrole:'+roleId)
-        .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tr_trait_type')
-            .setLabel('Trait Category  (use "_count" for token count)')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('e.g. Type   or   Background   or   _count')
-            .setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tr_trait_value')
-            .setLabel('Trait Value  (leave blank if using _count)')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('e.g. Zombie   or   Gold   or   Human 4')
-            .setRequired(false)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tr_min_count')
-            .setLabel('How many tokens needed?  (default: 1)')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('1 = own at least one · 5 = own five or more')
-            .setRequired(false)
-        ),
-      );
-      return interaction.showModal(modal);
+      // No trait data available — can't showModal here since interaction is already deferred.
+      // Show a button that opens the manual-entry modal on next click instead.
+      return interaction.editReply({
+        content: `**Adding trait role for ${role?.name || 'role'}**\n\nNo cached trait data found for this collection yet. Click below to enter the trait manually.`,
+        embeds: [],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+          ),
+        ],
+      });
     }
 
     // Build category dropdown (cap at 25)
