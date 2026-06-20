@@ -190,6 +190,10 @@ async function showDetailsModal(interaction, type, windowText, _unused){
       new TextInputBuilder().setCustomId('range').setLabel('Number range, e.g. 1-100').setStyle(TextInputStyle.Short)
         .setPlaceholder('1-100').setValue('1-100').setRequired(true)
     ));
+    rows.push(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('winnermode').setLabel('Winner mode: closest or exact').setStyle(TextInputStyle.Short)
+        .setPlaceholder('closest = nearest guess wins, exact = must match exactly').setValue('closest').setRequired(false)
+    ));
   }
   modal.addComponents(...rows);
 
@@ -258,9 +262,7 @@ async function handleDetailsModal(interaction, ctx){
         .addFields(
           { name:'ID', value:String(row.id), inline:true },
           { name:'Window', value:formatBurnLotteryWindow(start, end, timeZone), inline:false },
-          { name:'Timezone', value:timeZone, inline:true },
           { name:'Mode', value: mode === 'burn' ? 'One entry per burn' : 'One entry per wallet', inline:true },
-          { name:'Channel', value:`<#${channel.id}>`, inline:true },
         )
         .setTimestamp()], components:buildActiveBurnLotteryComponents(row.id) });
       await pgPool.query('UPDATE burn_lotteries SET message_id=$1 WHERE id=$2', [msg.id, row.id]).catch(()=>{});
@@ -282,7 +284,8 @@ async function handleDetailsModal(interaction, ctx){
         minN = Math.min(parseInt(m[1]), parseInt(m[2]));
         maxN = Math.max(parseInt(m[1]), parseInt(m[2]));
         if(minN === maxN) return interaction.editReply('Min and max cannot match.');
-        winnerMode = 'closest';
+        const winnerModeRaw = interaction.fields.getTextInputValue('winnermode').trim().toLowerCase();
+        winnerMode = winnerModeRaw === 'exact' ? 'exact' : 'closest';
         winning = lotteryNumberFromSeed(`${seed}:winning-number`, minN, maxN);
       }
 
