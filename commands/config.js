@@ -9,6 +9,7 @@ const {
 } = require('discord.js');
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
+const { isPaidFeature } = require('./market');
 
 // ── Fetch & cache traits from OpenSea for a collection slug ──────────────────
 async function fetchAndStoreCollectionTraits(slug, pgPool){
@@ -83,7 +84,6 @@ function dashboardRow(){
       new ButtonBuilder().setCustomId('cfg:cat:channels').setLabel('📡 Channels').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('🔐 Verification').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('🎭 Roles').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('cfg:cat:rankalert').setLabel('🏆 Rank Alert').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -155,6 +155,8 @@ function collectionsRow(cfg){
 // Single collection edit embed
 function buildCollectionEditEmbed(col, isPrimary, cfg={}){
   const isOcas = col.contract?.toLowerCase() === OCAS_CONTRACT;
+  const ra = col.rankAlert;
+  const raLabel = ra ? `#${ra.min}–#${ra.max} (${ra.rankType==='obs'?'TraitView':'OpenSea'})` : 'Not set';
   return new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle(`📦 Edit: ${col.name || col.slug || 'Collection'}${isPrimary?' *(primary)*':''}`)
@@ -167,46 +169,46 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
       (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\n` : '') +
       `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\n` +
       `**Sales Filters:** ${Object.keys(col.salesFilters||{}).length} active\n` +
+      `**Rank Alert:** ${raLabel}${!isOcas ? ' 🔒' : ''}\n` +
       `**Status:** ${col.paused ? '⏸️ Paused' : '▶️ Active'}\n` +
-      (isOcas ? '\n🔥 **OCAS** — full feature set active.\n' : '') +
-      '\n*Changes save immediately.*'
+      (isOcas ? '\n🔥 **OCAS** — full feature set active.\n' : '\n🔒 *Rank Alert requires a paid tier for non-OCAS collections.*\n') +
+      '\n*Use the dropdown below to edit a section.*'
     )
     .setFooter({ text: 'Only visible to you' });
 }
 
 function collectionEditRow(colId, isPrimary, isOcas=false){
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`cfg:col:name:${colId}`).setLabel('✏️ Name').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:filters:${colId}`).setLabel('🔍 Listings').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:salesfilters:${colId}`).setLabel('💰 Sales').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:pause:${colId}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
-  );
-  const row1b = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:clearchan:sales:${colId}`).setLabel('✕ Sales').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:clearchan:listings:${colId}`).setLabel('✕ Listings').setStyle(ButtonStyle.Danger),
-  );
-  const rows = [row1, row1b];
-  const row3Btns = [
-    new ButtonBuilder().setCustomId(`cfg:col:traitroles:${colId}`).setLabel('🎭 Trait Roles').setStyle(ButtonStyle.Secondary),
+  const options = [
+    new StringSelectMenuOptionBuilder().setLabel('Name').setEmoji('✏️').setValue('name').setDescription('Edit the display name'),
+    new StringSelectMenuOptionBuilder().setLabel('Slug').setEmoji('🔗').setValue('slug').setDescription('Edit the OpenSea collection slug'),
+    new StringSelectMenuOptionBuilder().setLabel('Sales Channel').setEmoji('🟢').setValue('saleschan').setDescription('Where sales post'),
+    new StringSelectMenuOptionBuilder().setLabel('Listings Channel').setEmoji('📋').setValue('listchan').setDescription('Where listings post'),
+    new StringSelectMenuOptionBuilder().setLabel('Listing Filters').setEmoji('🔍').setValue('filters').setDescription('Only post matching listings'),
+    new StringSelectMenuOptionBuilder().setLabel('Sales Filters').setEmoji('💰').setValue('salesfilters').setDescription('Only post matching sales'),
+    new StringSelectMenuOptionBuilder().setLabel('Rank Alert').setEmoji('🏆').setValue('rankalert').setDescription(isOcas ? 'Alert when a rank range gets listed' : '🔒 Paid tier required'),
+    new StringSelectMenuOptionBuilder().setLabel('Trait Roles').setEmoji('🎭').setValue('traitroles').setDescription('Auto-assign roles by trait'),
+    new StringSelectMenuOptionBuilder().setLabel('Pause / Resume').setEmoji('⏸️').setValue('pause').setDescription('Toggle auto-posting'),
   ];
   if(isOcas){
-    row3Btns.push(
-      new ButtonBuilder().setCustomId(`cfg:col:burnchan:${colId}`).setLabel('🔥 Burn Ch.').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`cfg:col:clearchan:burn:${colId}`).setLabel('✕ Burn').setStyle(ButtonStyle.Danger),
-    );
+    options.push(new StringSelectMenuOptionBuilder().setLabel('Burn Alerts Channel').setEmoji('🔥').setValue('burnchan').setDescription('Where burn alerts post'));
   }
-  rows.push(new ActionRowBuilder().addComponents(row3Btns));
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`cfg_col:section:${colId}`)
+    .setPlaceholder('⚙️ Select a section to edit...')
+    .addOptions(options);
+
   const row2Btns = [
     new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
   ];
   if(!isPrimary) row2Btns.push(
     new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)
   );
-  rows.push(new ActionRowBuilder().addComponents(row2Btns));
-  return rows;
+
+  return [
+    new ActionRowBuilder().addComponents(menu),
+    new ActionRowBuilder().addComponents(row2Btns),
+  ];
 }
 
 // ── Channels screen ───────────────────────────────────────────────────────────
@@ -266,12 +268,12 @@ function verificationRow(cfg){
 }
 
 // ── Rank Alert screen ────────────────────────────────────────────────────────
-function buildRankAlertEmbed(cfg){
-  const ra = cfg.rankAlert;
+function buildRankAlertEmbed(col, colId, colLabel){
+  const ra = col.rankAlert;
   const rankLabel = ra?.rankType === 'obs' ? 'TraitView Observed' : 'OpenSea';
   return new EmbedBuilder()
     .setColor(0x5865F2)
-    .setTitle('🏆 Rank Alert')
+    .setTitle(colLabel ? `🏆 Rank Alert — ${colLabel}` : '🏆 Rank Alert')
     .setDescription(
       SEP + '\n\n' +
       (ra
@@ -285,14 +287,15 @@ function buildRankAlertEmbed(cfg){
     .setFooter({ text: 'Only visible to you' });
 }
 
-function rankAlertRow(cfg){
-  const hasAlert = !!cfg.rankAlert;
+function rankAlertRow(col, colId){
+  const hasAlert = !!col.rankAlert;
+  const backId = colId ? `cfg:col:view:${colId}` : 'cfg:back';
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('cfg:rank:set').setLabel(hasAlert ? '✏️ Edit Range' : '➕ Set Rank Alert').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('cfg:rank:channel').setLabel('📌 Channel').setStyle(ButtonStyle.Secondary).setDisabled(!hasAlert),
-      new ButtonBuilder().setCustomId('cfg:rank:clear').setLabel('🗑️ Clear').setStyle(ButtonStyle.Danger).setDisabled(!hasAlert),
-      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:rank:set:${colId}`).setLabel(hasAlert ? '✏️ Edit Range' : '➕ Set Rank Alert').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`cfg:rank:channel:${colId}`).setLabel('📌 Channel').setStyle(ButtonStyle.Secondary).setDisabled(!hasAlert),
+      new ButtonBuilder().setCustomId(`cfg:rank:clear:${colId}`).setLabel('🗑️ Clear').setStyle(ButtonStyle.Danger).setDisabled(!hasAlert),
+      new ButtonBuilder().setCustomId(backId).setLabel('← Back').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -580,7 +583,36 @@ async function showFilterCategoryPicker(interaction, cfg, colId, kind){
 async function handleConfigButton(interaction, ctx){
   const { pgPool, getConfig, setConfig, syncBurnConfig } = ctx;
   const guildId  = interaction.guildId;
-  const customId = interaction.customId;
+  let customId   = interaction.customId;
+
+  // ── Collection edit dropdown: translate the selected section into its legacy customId ──
+  // The dropdown (cfg_col:section:colId) replaced the old per-button customIds; rather than
+  // duplicate every handler below, we resolve the chosen section here and let the existing
+  // if(customId.startsWith(...)) chain handle it unchanged.
+  let rankAlertPaidBlock = false;
+  if(customId.startsWith('cfg_col:section:')){
+    const colId   = customId.split(':')[2];
+    const section = interaction.values[0];
+    const sectionMap = {
+      name:          `cfg:col:name:${colId}`,
+      slug:          `cfg:col:slug:${colId}`,
+      saleschan:     `cfg:col:saleschan:${colId}`,
+      listchan:      `cfg:col:listchan:${colId}`,
+      burnchan:      `cfg:col:burnchan:${colId}`,
+      filters:       `cfg:col:filters:${colId}`,
+      salesfilters:  `cfg:col:salesfilters:${colId}`,
+      rankalert:     `cfg:col:rankalert:${colId}`,
+      traitroles:    `cfg:col:traitroles:${colId}`,
+      pause:         `cfg:col:pause:${colId}`,
+    };
+    if(section === 'rankalert'){
+      const preCfg = getConfig(guildId) || {};
+      const isPrimaryCheck = colId === 'primary';
+      const colCheck = isPrimaryCheck ? { contract: preCfg.contract } : (preCfg.collections||[])[parseInt(colId)];
+      if(isPaidFeature(colCheck, 'rankalert')) rankAlertPaidBlock = true;
+    }
+    customId = sectionMap[section] || customId;
+  }
 
   // Modals open with showModal (their own response) — everything else defers first
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
@@ -594,6 +626,14 @@ async function handleConfigButton(interaction, ctx){
   if(!isModal) await interaction.deferUpdate();
 
   const cfg = getConfig(guildId) || {};
+
+  if(rankAlertPaidBlock){
+    return interaction.editReply({ content: '🔒 Rank Alert requires a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', embeds:[], components:[
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(customId.replace('cfg:col:rankalert:', 'cfg:col:view:')).setLabel('← Back').setStyle(ButtonStyle.Secondary)
+      )
+    ]});
+  }
 
   const traitRolesQ = () => pgPool.query(
     'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
@@ -1053,13 +1093,23 @@ async function handleConfigButton(interaction, ctx){
     const trRes = await traitRolesQ();
     return interaction.editReply({ content:'', embeds:[buildRolesEmbed(trRes.rows)], components:rolesRow(trRes.rows) });
   }
-  if(customId === 'cfg:cat:rankalert'){
-    return interaction.editReply({ content:'', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
+  // ── Rank Alert (per-collection) ──────────────────────────────────────────
+  if(customId.startsWith('cfg:col:rankalert:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { rankAlert: cfg.rankAlert || null }
+      : (cfg.collections||[])[parseInt(colId)] || {};
+    const colLabel = isPrimary ? (cfg.contractName || 'Primary Collection') : (col.name || col.slug);
+    return interaction.editReply({ content:'', embeds:[buildRankAlertEmbed(col, colId, colLabel)], components:rankAlertRow(col, colId) });
   }
 
-  if(customId === 'cfg:rank:set'){
-    const ra = cfg.rankAlert || {};
-    const modal = new ModalBuilder().setCustomId('cfg_modal:rankalert').setTitle('Set Rank Alert');
+  if(customId.startsWith('cfg:rank:set:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary ? { rankAlert: cfg.rankAlert||null } : ((cfg.collections||[])[parseInt(colId)]||{});
+    const ra = col.rankAlert || {};
+    const modal = new ModalBuilder().setCustomId(`cfg_modal:rankalert:${colId}`).setTitle('Set Rank Alert');
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('rank_min')
@@ -1086,18 +1136,29 @@ async function handleConfigButton(interaction, ctx){
     return interaction.showModal(modal);
   }
 
-  if(customId === 'cfg:rank:channel'){
+  if(customId.startsWith('cfg:rank:channel:')){
+    const colId = customId.split(':')[3];
     const menu = new ChannelSelectMenuBuilder()
-      .setCustomId('cfg_chsel:rankalert')
+      .setCustomId(`cfg_chsel:rankalert:${colId}`)
       .setPlaceholder('Pick the rank alert channel')
       .addChannelTypes(ChannelType.GuildText);
     return interaction.editReply({ content:'**Select the channel for rank alerts** (leave unset to use the listings channel):', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
   }
 
-  if(customId === 'cfg:rank:clear'){
-    cfg.rankAlert = null;
+  if(customId.startsWith('cfg:rank:clear:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      cfg.rankAlert = null;
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]) cols[idx].rankAlert = null;
+      cfg.collections = cols;
+    }
     await setConfig(guildId, cfg);
-    return interaction.editReply({ content:'✅ Rank alert cleared.', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
+    const col = isPrimary ? { rankAlert: null } : ((cfg.collections||[])[parseInt(colId)]||{});
+    return interaction.editReply({ content:'✅ Rank alert cleared.', embeds:[buildRankAlertEmbed(col, colId)], components:rankAlertRow(col, colId) });
   }
   if(customId === 'cfg:cat:filters'){
     return interaction.editReply({ content:'', embeds:[buildFiltersEmbed(cfg)], components:filtersRow(cfg) });
@@ -1519,12 +1580,27 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
     if(type === 'burn'){     cfg.burnChannel    = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
     if(type === 'verify')   cfg.verifyChannel  = chId;
     if(type === 'rankalert'){
-      if(!cfg.rankAlert) cfg.rankAlert = { min:1, max:100, rankType:'os' };
-      cfg.rankAlert.channelId = chId;
+      const raColId = parts[2];
+      const raIsPrimary = raColId === 'primary';
+      if(raIsPrimary){
+        if(!cfg.rankAlert) cfg.rankAlert = { min:1, max:100, rankType:'os' };
+        cfg.rankAlert.channelId = chId;
+      } else {
+        const cols = cfg.collections || [];
+        const idx = parseInt(raColId);
+        if(cols[idx]){
+          if(!cols[idx].rankAlert) cols[idx].rankAlert = { min:1, max:100, rankType:'os' };
+          cols[idx].rankAlert.channelId = chId;
+        }
+        cfg.collections = cols;
+      }
     }
     await setConfig(guildId, cfg);
     if(type === 'rankalert'){
-      return interaction.editReply({ content:'✅ Rank alert channel set.', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
+      const raColId = parts[2];
+      const raIsPrimary = raColId === 'primary';
+      const col = raIsPrimary ? { rankAlert: cfg.rankAlert||null } : ((cfg.collections||[])[parseInt(raColId)]||{});
+      return interaction.editReply({ content:'✅ Rank alert channel set.', embeds:[buildRankAlertEmbed(col, raColId)], components:rankAlertRow(col, raColId) });
     }
     if(type === 'verify'){
 
@@ -1715,24 +1791,45 @@ async function handleConfigModal(interaction, ctx){
   }
 
   // ── Rank Alert: min/max/type submitted ────────────────────────────────────
-  if(customId === 'cfg_modal:rankalert'){
+  if(customId.startsWith('cfg_modal:rankalert:')){
+    const colId = customId.split(':')[2];
+    const isPrimary = colId === 'primary';
+
+    // Defense-in-depth: re-check paid tier at submit time
+    const colCheck = isPrimary ? { contract: cfg.contract } : (cfg.collections||[])[parseInt(colId)];
+    if(isPaidFeature(colCheck, 'rankalert')){
+      return interaction.editReply({ content: '🔒 Rank Alert requires a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', embeds:[], components:[] });
+    }
+
     const minRaw  = interaction.fields.getTextInputValue('rank_min').trim();
     const maxRaw  = interaction.fields.getTextInputValue('rank_max').trim();
     const typeRaw = (interaction.fields.getTextInputValue('rank_type') || 'os').trim().toLowerCase();
 
     const min = parseInt(minRaw);
     const max = parseInt(maxRaw);
+    const existingRankAlert = isPrimary ? cfg.rankAlert : ((cfg.collections||[])[parseInt(colId)]?.rankAlert);
     if(!Number.isInteger(min) || !Number.isInteger(max) || min < 1 || max < 1 || min > 10000 || max > 10000 || min > max){
-      return interaction.editReply({ content: '❌ Min and max must be whole numbers between 1 and 10000, with min ≤ max.', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
+      const col = isPrimary ? { rankAlert: existingRankAlert||null } : ((cfg.collections||[])[parseInt(colId)]||{});
+      return interaction.editReply({ content: '❌ Min and max must be whole numbers between 1 and 10000, with min ≤ max.', embeds:[buildRankAlertEmbed(col, colId)], components:rankAlertRow(col, colId) });
     }
     const rankType = (typeRaw === 'obs') ? 'obs' : 'os';
 
-    cfg.rankAlert = {
+    const newRankAlert = {
       min, max, rankType,
-      channelId: cfg.rankAlert?.channelId || null, // preserve existing channel if already set
+      channelId: existingRankAlert?.channelId || null, // preserve existing channel if already set
     };
+    if(isPrimary){
+      cfg.rankAlert = newRankAlert;
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]) cols[idx].rankAlert = newRankAlert;
+      cfg.collections = cols;
+    }
     await setConfig(guildId, cfg);
-    return interaction.editReply({ content: '✅ Rank alert saved.', embeds:[buildRankAlertEmbed(cfg)], components:rankAlertRow(cfg) });
+
+    const col = isPrimary ? { rankAlert: cfg.rankAlert } : ((cfg.collections||[])[parseInt(colId)]||{});
+    return interaction.editReply({ content: '✅ Rank alert saved.', embeds:[buildRankAlertEmbed(col, colId)], components:rankAlertRow(col, colId) });
   }
 
   // ── Add collection ─────────────────────────────────────────────────────────
