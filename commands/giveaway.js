@@ -113,10 +113,24 @@ async function showCustomWindowModal(interaction, type){
   modal.addComponents(
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('window')
-        .setLabel('When + duration')
+        .setLabel('Shorthand (use this OR start/end below)')
         .setStyle(TextInputStyle.Short)
         .setPlaceholder('now 24hrs, today-10am 7days, 06-07-2026-3pm')
-        .setRequired(true)
+        .setRequired(false)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('start')
+        .setLabel('OR: start date (leave blank for "now")')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('June 16 2026, or 2026-06-16')
+        .setRequired(false)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('end')
+        .setLabel('OR: end date (leave blank for "now")')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('now, or June 20 2026')
+        .setRequired(false)
     ),
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('timezone')
@@ -132,18 +146,31 @@ async function showCustomWindowModal(interaction, type){
 // ── Custom window modal submit → go to details modal ──────────────────────────
 async function handleCustomWindowModal(interaction, ctx){
   const type = interaction.customId.split(':')[2];
-  const windowText = interaction.fields.getTextInputValue('window').trim();
-  const timezone = interaction.fields.getTextInputValue('timezone').trim() || null;
+  const windowText = interaction.fields.getTextInputValue('window').trim() || null;
+  const startText  = interaction.fields.getTextInputValue('start').trim() || null;
+  const endText    = interaction.fields.getTextInputValue('end').trim() || null;
+  const timezone   = interaction.fields.getTextInputValue('timezone').trim() || null;
+
+  if(!windowText && !startText && !endText){
+    return interaction.reply({ content: '❌ Fill in either the shorthand field, or a start/end date.', flags: MessageFlags.Ephemeral });
+  }
 
   const session = sessions.get(interaction.user.id) || {};
+  // windowText takes priority if both are somehow filled — matches resolveLotteryWindow's own precedence
   session.windowText = windowText;
-  session.timezone = timezone;
+  session.startText  = startText;
+  session.endText    = endText;
+  session.timezone   = timezone;
   sessions.set(interaction.user.id, session);
+
+  const summary = windowText
+    ? `\`${windowText}\``
+    : `**${startText || 'now'}** → **${endText || 'now'}**`;
 
   // Modals can't chain directly into another modal from a modal submit —
   // Discord requires a button/select click in between. Show a confirm button.
   return interaction.reply({
-    content: `**Window set:** \`${windowText}\`${timezone ? ` (${timezone})` : ''}\n\nClick below to finish setting up your ${type === 'burn' ? 'burn lottery' : type === 'guess' ? 'guess lottery' : 'giveaway'}.`,
+    content: `**Window set:** ${summary}${timezone ? ` (${timezone})` : ''}\n\nClick below to finish setting up your ${type === 'burn' ? 'burn lottery' : type === 'guess' ? 'guess lottery' : 'giveaway'}.`,
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`gva:details:${type}`).setLabel('➕ Continue').setStyle(ButtonStyle.Primary),
@@ -227,6 +254,8 @@ async function handleDetailsModal(interaction, ctx){
   const type = interaction.customId.split(':')[2];
   const session = sessions.get(interaction.user.id) || {};
   const windowText = session.windowText;
+  const startText  = session.startText;
+  const endText    = session.endText;
   const timezone = session.timezone;
   const guildId = interaction.guildId;
 
@@ -245,7 +274,7 @@ async function handleDetailsModal(interaction, ctx){
   try{
     if(type === 'burn'){
       const mode = interaction.fields.getTextInputValue('mode').trim().toLowerCase() === 'burn' ? 'burn' : 'wallet';
-      const resolved = resolveLotteryWindow({ windowText, hours: 24, timezone: timezone || DEFAULT_LOTTERY_TIMEZONE });
+      const resolved = resolveLotteryWindow({ windowText, startText, endText, hours: 24, timezone: timezone || DEFAULT_LOTTERY_TIMEZONE });
       const { start, end, timeZone } = resolved;
       if(end <= start) return interaction.editReply('End time must be after start time — check your custom window.');
       const seed = pendingDrawSeed();
@@ -271,7 +300,7 @@ async function handleDetailsModal(interaction, ctx){
     }
 
     if(type === 'giveaway' || type === 'guess'){
-      const resolved = resolveLotteryWindow({ windowText, hours: 24, timezone: timezone || DEFAULT_LOTTERY_TIMEZONE });
+      const resolved = resolveLotteryWindow({ windowText, startText, endText, hours: 24, timezone: timezone || DEFAULT_LOTTERY_TIMEZONE });
       const { start, end } = resolved;
       const minutes = Math.max(1, Math.round((end - start) / 60000));
       const seed = type === 'giveaway' ? pendingDrawSeed() : require('crypto').randomBytes(12).toString('hex');
