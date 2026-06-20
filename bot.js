@@ -100,7 +100,6 @@ const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
 const { handleGiveawayCommand, handleGiveawayInteraction, GIVEAWAY_COMMANDS } = require('./commands/giveaway');
-const { handleTimezoneCommand, getUserTimezone, TIMEZONE_COMMANDS } = require('./commands/timezone');
 const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
 const { handleDownloadCommand, DOWNLOAD_COMMANDS } = require('./commands/download');
 const { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS } = require('./commands/setup');
@@ -1723,7 +1722,6 @@ client.on('interactionCreate', async (interaction)=>{
   if(TOKEN_COMMANDS.has(commandName))   return handleTokenCommand(commandName, ctx);
   if(BURN_COMMANDS.has(commandName))    return handleBurnCommand(commandName, ctx);
   if(GIVEAWAY_COMMANDS.has(commandName)) return handleGiveawayCommand(interaction, ctx);
-  if(TIMEZONE_COMMANDS.has(commandName)) return handleTimezoneCommand(interaction, ctx);
   if(SETUP_COMMANDS.has(commandName))    return handleSetupCommand(interaction, ctx);
   if(CONFIG_COMMANDS.has(commandName))   return handleConfigCommand(interaction, { pgPool, getConfig, setConfig });
   if(LOTTERIES_COMMANDS.has(commandName)) return handleLotteriesCommand(interaction, { pgPool, getConfig });
