@@ -272,91 +272,98 @@ function collectStringsDeep(obj, out=[]){
 // ── Trait role sync ─────────────────────────────────────────────────────────
 async function syncTraitRoles(guild, discordId, wallet){
   try{
-    // Get all trait roles configured for this guild
+    // Get all trait roles configured for this guild — collection_slug NULL means "primary collection"
     const traitRolesRes = await pgPool.query(
-      'SELECT trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1',
+      'SELECT trait_type, trait_value, role_id, minimum_count, collection_slug FROM trait_roles WHERE guild_id=$1',
       [guild.id]
     );
 
+    if(!traitRolesRes.rows.length) return { assigned: [], skipped: [], alreadyHad: [] }; // No trait roles configured
 
-    if(!traitRolesRes.rows.length) return; // No trait roles configured
+    const cfg = getConfig(guild.id) || {};
+    const primarySlug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+    const extraCollections = (cfg.collections || []).filter(c => c.slug);
 
-    // Get all OCAS tokens owned by this wallet from our token_traits table
-    // Join with nft_transfers or use token_traits directly keyed by owner
-    // token_traits has: token_id, trait_type, trait_value
-    // We need to know which tokens this wallet owns
-    // Use OpenSea NFT ownership endpoint for the collection
-    const osRes = await fetch(
-      `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?collection=on-chain-all-stars&limit=200`,
-      { headers: osHeaders() }
-    );
-    if(!osRes.ok){
-      console.error('[TraitSync] OpenSea NFT fetch failed:', osRes.status);
-      return;
-    }
-    const osData = await osRes.json();
-    const ownedTokenIds = (osData.nfts||[]).map(n => parseInt(n.identifier)).filter(Boolean);
-
-    if(!ownedTokenIds.length){
-      // No OCAS tokens — remove all trait roles
-      const member = await guild.members.fetch(discordId).catch(()=>null);
-      if(!member) return;
-      for(const tr of traitRolesRes.rows){
-        if(member.roles.cache.has(tr.role_id))
-          await member.roles.remove(tr.role_id).catch(()=>{});
-      }
-      return;
+    // Group rules by their target collection slug (NULL/primary rules go under primarySlug)
+    const rulesBySlug = {};
+    for(const tr of traitRolesRes.rows){
+      const slug = tr.collection_slug || primarySlug;
+      if(!rulesBySlug[slug]) rulesBySlug[slug] = [];
+      rulesBySlug[slug].push(tr);
     }
 
-    // Get trait counts for owned tokens from our DB
-    const traitsRes = await pgPool.query(
-      'SELECT trait_name, trait_value, COUNT(*) as count FROM token_traits WHERE token_id = ANY($1::int[]) GROUP BY trait_name, trait_value',
-      [ownedTokenIds]
-    );
-    // Build a count map: 'Type::Zombie' -> 3 (trait_name maps to trait_type in rules)
-    const traitCounts = {};
-    for(const r of traitsRes.rows)
-      traitCounts[r.trait_name+'::'+r.trait_value] = parseInt(r.count);
-    // Also store total OCAS count for collection-wide rules
-    traitCounts['Collection::OCAS'] = ownedTokenIds.length;
-
-    // Fetch the member
     const member = await guild.members.fetch(discordId).catch(()=>null);
-    if(!member) return;
+    if(!member) return { assigned: [], skipped: [], alreadyHad: [] };
 
     const rolesSummary = { assigned: [], skipped: [], alreadyHad: [] };
+    let totalOwnedAcrossCollections = 0;
 
-    // Add/remove roles based on trait count vs minimum_count threshold
-    for(const tr of traitRolesRes.rows){
-      const hasRole  = member.roles.cache.has(tr.role_id);
-      let count;
-      if(tr.trait_type === '_count'){
-        // Token count rule — check total holdings
-        count = ownedTokenIds.length;
-      } else {
-        count = traitCounts[tr.trait_type+'::'+tr.trait_value] || traitCounts[tr.trait_type+'::'+String(tr.trait_value||'')] || 0;
+    // Process each collection separately — fetch ownership + traits scoped to that slug
+    for(const slug of Object.keys(rulesBySlug)){
+      const rules = rulesBySlug[slug];
+
+      const osRes = await fetch(
+        `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?collection=${slug}&limit=200`,
+        { headers: osHeaders() }
+      );
+      if(!osRes.ok){
+        console.error('[TraitSync] OpenSea NFT fetch failed for', slug, ':', osRes.status);
+        continue;
       }
-      const meetsMin = count >= (parseInt(tr.minimum_count) || 1);
-      const minNeeded = parseInt(tr.minimum_count) || 1;
-      const meetsMinFixed = count >= minNeeded;
-      if(meetsMinFixed !== meetsMin) console.log('[TraitSync] FIXED meetsMin for', tr.trait_type, tr.trait_value, ':', meetsMin, '->', meetsMinFixed);
-      console.log('[TraitSync] rule:', tr.trait_type, tr.trait_value||'', '>=', minNeeded, '| count:', count, '| meets:', meetsMinFixed);
-      if(meetsMinFixed && !hasRole){
-        const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
-        if(!conflict){
-          await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
-          rolesSummary.assigned.push(tr.role_id);
-        } else {
-          console.log('[TraitSync] SKIP add — role managed by other bot:', tr.role_id);
-          rolesSummary.skipped.push(tr.role_id);
+      const osData = await osRes.json();
+      const ownedTokenIds = (osData.nfts||[]).map(n => parseInt(n.identifier)).filter(Boolean);
+      totalOwnedAcrossCollections += ownedTokenIds.length;
+
+      // Build trait count map for this collection's owned tokens.
+      // Primary OCAS collection uses the legacy token_traits table (rich on-chain data);
+      // other collections derive trait counts from the OpenSea per-NFT trait list directly.
+      const traitCounts = {};
+      if(slug === primarySlug){
+        if(ownedTokenIds.length){
+          const traitsRes = await pgPool.query(
+            'SELECT trait_name, trait_value, COUNT(*) as count FROM token_traits WHERE token_id = ANY($1::int[]) GROUP BY trait_name, trait_value',
+            [ownedTokenIds]
+          );
+          for(const r of traitsRes.rows)
+            traitCounts[r.trait_name+'::'+r.trait_value] = parseInt(r.count);
         }
-      } else if(meetsMinFixed && hasRole){
-        rolesSummary.alreadyHad.push(tr.role_id);
+      } else {
+        for(const nft of (osData.nfts || [])){
+          for(const t of (nft.traits || [])){
+            const key = t.trait_type + '::' + t.value;
+            traitCounts[key] = (traitCounts[key] || 0) + 1;
+          }
+        }
       }
-      // Only remove roles WE added — don't remove if another bot manages it
-      if(!meetsMinFixed && hasRole){
-        const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
-        if(!conflict) await member.roles.remove(tr.role_id).catch(()=>{});
+
+      for(const tr of rules){
+        const hasRole = member.roles.cache.has(tr.role_id);
+        let count;
+        if(tr.trait_type === '_count'){
+          count = ownedTokenIds.length;
+        } else {
+          count = traitCounts[tr.trait_type+'::'+tr.trait_value] || traitCounts[tr.trait_type+'::'+String(tr.trait_value||'')] || 0;
+        }
+        const minNeeded = parseInt(tr.minimum_count) || 1;
+        const meetsMin = count >= minNeeded;
+        console.log('[TraitSync]', slug, '| rule:', tr.trait_type, tr.trait_value||'', '>=', minNeeded, '| count:', count, '| meets:', meetsMin);
+
+        if(meetsMin && !hasRole){
+          const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
+          if(!conflict){
+            await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
+            rolesSummary.assigned.push(tr.role_id);
+          } else {
+            console.log('[TraitSync] SKIP add — role managed by other bot:', tr.role_id);
+            rolesSummary.skipped.push(tr.role_id);
+          }
+        } else if(meetsMin && hasRole){
+          rolesSummary.alreadyHad.push(tr.role_id);
+        }
+        if(!meetsMin && hasRole){
+          const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
+          if(!conflict) await member.roles.remove(tr.role_id).catch(()=>{});
+        }
       }
     }
 
@@ -370,16 +377,16 @@ async function syncTraitRoles(guild, discordId, wallet){
       // Verified role — any registered wallet
       if(role_id && !member.roles.cache.has(role_id))
         await member.roles.add(role_id).catch(()=>{});
-      // Holder role — must own ≥1 token
+      // Holder role — must own ≥1 token across any configured collection
       if(holder_role_id){
-        if(ownedTokenIds.length >= 1 && !member.roles.cache.has(holder_role_id))
+        if(totalOwnedAcrossCollections >= 1 && !member.roles.cache.has(holder_role_id))
           await member.roles.add(holder_role_id).catch(()=>{});
-        if(ownedTokenIds.length === 0 && member.roles.cache.has(holder_role_id))
+        if(totalOwnedAcrossCollections === 0 && member.roles.cache.has(holder_role_id))
           await member.roles.remove(holder_role_id).catch(()=>{});
       }
     }
 
-    console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', ownedTokenIds.length, '| assigned:', rolesSummary.assigned.length, '| skipped:', rolesSummary.skipped.length);
+    console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', totalOwnedAcrossCollections, '| assigned:', rolesSummary.assigned.length, '| skipped:', rolesSummary.skipped.length);
     return rolesSummary;
   }catch(e){
     console.error('[TraitSync] Error:', e.message);
@@ -672,7 +679,7 @@ client.on('interactionCreate', async (interaction)=>{
     );
     return interaction.showModal(modal);
   }
-  if(interaction.isRoleSelectMenu() && interaction.customId === 'cfg_traitrole:rolesel'){
+  if(interaction.isRoleSelectMenu() && (interaction.customId === 'cfg_traitrole:rolesel' || interaction.customId.startsWith('cfg_traitrole:rolesel:'))){
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
