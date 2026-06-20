@@ -637,7 +637,7 @@ client.on('interactionCreate', async (interaction)=>{
     const setupCtx = { pgPool, setConfig };
     return handleSetupButton(interaction, setupCtx);
   }
-  if(interaction.isStringSelectMenu() && (interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col:') || interaction.customId.startsWith('cfg_filter:') || interaction.customId.startsWith('cfg_col_filter:'))){
+  if(interaction.isStringSelectMenu() && (interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col:') || interaction.customId.startsWith('cfg_filter:') || interaction.customId.startsWith('cfg_col_filter:') || interaction.customId.startsWith('cfg_col_salesfilter:'))){
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
