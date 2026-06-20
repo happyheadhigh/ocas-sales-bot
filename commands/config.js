@@ -823,7 +823,12 @@ async function handleConfigButton(interaction, ctx){
       .setCustomId(`cfg_chsel:col:${field}:${colId}`)
       .setPlaceholder(`Pick the ${label} channel`)
       .addChannelTypes(ChannelType.GuildText);
-    return interaction.editReply({ content:`**Select the ${label} channel:**`, embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.editReply({ content:`**Select the ${label} channel:**`, embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`cfg:col:view:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
   }
 
   if(customId.startsWith('cfg:col:burnchan:')){
@@ -832,7 +837,12 @@ async function handleConfigButton(interaction, ctx){
       .setCustomId(`cfg_chsel:col:burnchan:${colId}`)
       .setPlaceholder('Pick the Burn Alerts channel')
       .addChannelTypes(ChannelType.GuildText);
-    return interaction.editReply({ content:'**Select the 🔥 Burn Alerts channel:**', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.editReply({ content:'**Select the 🔥 Burn Alerts channel:**', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`cfg:col:view:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
   }
 
   // ── Per-collection Trait Roles ──────────────────────────────────────────────
@@ -1153,7 +1163,12 @@ async function handleConfigButton(interaction, ctx){
 
   if(customId === 'cfg:access:set'){
     const menu = new RoleSelectMenuBuilder().setCustomId('cfg_rolesel:botmanager').setPlaceholder('Pick the Bot Manager role');
-    return interaction.editReply({ content:'**Select the role that should be able to use `/config`** (in addition to Manage Server admins):', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.editReply({ content:'**Select the role that should be able to use `/config`** (in addition to Manage Server admins):', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
   }
 
   if(customId === 'cfg:access:clear'){
@@ -1211,7 +1226,12 @@ async function handleConfigButton(interaction, ctx){
       .setCustomId(`cfg_chsel:rankalert:${colId}`)
       .setPlaceholder('Pick the rank alert channel')
       .addChannelTypes(ChannelType.GuildText);
-    return interaction.editReply({ content:'**Select the channel for rank alerts** (leave unset to use the listings channel):', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.editReply({ content:'**Select the channel for rank alerts** (leave unset to use the listings channel):', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`cfg:col:rankalert:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
   }
 
   if(customId.startsWith('cfg:rank:clear:')){
@@ -1287,7 +1307,12 @@ async function handleConfigButton(interaction, ctx){
       .setCustomId('cfg_chsel:'+type)
       .setPlaceholder('Pick the '+label+' channel')
       .addChannelTypes(ChannelType.GuildText);
-    return interaction.editReply({ content:`**Select the ${label} channel:**`, embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.editReply({ content:`**Select the ${label} channel:**`, embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cfg:cat:channels').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
   }
 
   // ── Verification edits ─────────────────────────────────────────────────────
@@ -1296,15 +1321,30 @@ async function handleConfigButton(interaction, ctx){
       .setCustomId('cfg_chsel:verify')
       .setPlaceholder('Pick the verification channel')
       .addChannelTypes(ChannelType.GuildText);
-    return interaction.editReply({ content:'**Select the verification channel:**', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.editReply({ content:'**Select the verification channel:**', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
   }
   if(customId === 'cfg:ver:role'){
     const menu = new RoleSelectMenuBuilder().setCustomId('cfg_rolesel:verify').setPlaceholder('Pick the ✅ Verified Wallet role');
-    return interaction.editReply({ content:'**Select the ✅ Verified Wallet role:**', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.editReply({ content:'**Select the ✅ Verified Wallet role:**', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
   }
   if(customId === 'cfg:ver:holder'){
     const menu = new RoleSelectMenuBuilder().setCustomId('cfg_rolesel:holder').setPlaceholder('Pick the 🏆 Holder role');
-    return interaction.editReply({ content:'**Select the 🏆 Holder role:**', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.editReply({ content:'**Select the 🏆 Holder role:**', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
   }
   if(customId === 'cfg:ver:deploy'){
     try{
