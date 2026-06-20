@@ -625,7 +625,7 @@ client.on('interactionCreate', async (interaction)=>{
     return handleConfigButton(interaction, cfgCtx);
   }
   if(interaction.isButton() && interaction.customId.startsWith('ltrs:')){
-    return handleLotteriesButton(interaction, { pgPool });
+    return handleLotteriesButton(interaction, { pgPool, getConfig });
   }
   // Channel + role select menus from setup wizard
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
@@ -1674,7 +1674,7 @@ client.on('interactionCreate', async (interaction)=>{
   if(LOTTERY_COMMANDS.has(commandName)) return handleLotteryCommand(commandName, ctx);
   if(SETUP_COMMANDS.has(commandName))    return handleSetupCommand(interaction, ctx);
   if(CONFIG_COMMANDS.has(commandName))   return handleConfigCommand(interaction, { pgPool, getConfig, setConfig });
-  if(LOTTERIES_COMMANDS.has(commandName)) return handleLotteriesCommand(interaction, { pgPool });
+  if(LOTTERIES_COMMANDS.has(commandName)) return handleLotteriesCommand(interaction, { pgPool, getConfig });
   if(MISC_COMMANDS.has(commandName))    return handleMiscCommand(commandName, ctx);
   // ── /synctraits (manual trigger) ─────────────────────────────────────────────
   if(commandName==='resetverify'){
