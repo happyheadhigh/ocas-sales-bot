@@ -99,7 +99,6 @@ const { handleMarketCommand, MARKET_COMMANDS }   = require('./commands/market');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
-const { handleLotteryCommand, LOTTERY_COMMANDS } = require('./commands/lottery');
 const { handleGiveawayCommand, handleGiveawayInteraction, GIVEAWAY_COMMANDS } = require('./commands/giveaway');
 const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
 const { handleDownloadCommand, DOWNLOAD_COMMANDS } = require('./commands/download');
@@ -1722,7 +1721,6 @@ client.on('interactionCreate', async (interaction)=>{
   if(OCAS_COMMANDS.has(commandName))    return handleOcasCommand(commandName, ctx);
   if(TOKEN_COMMANDS.has(commandName))   return handleTokenCommand(commandName, ctx);
   if(BURN_COMMANDS.has(commandName))    return handleBurnCommand(commandName, ctx);
-  if(LOTTERY_COMMANDS.has(commandName)) return handleLotteryCommand(commandName, ctx);
   if(GIVEAWAY_COMMANDS.has(commandName)) return handleGiveawayCommand(interaction, ctx);
   if(SETUP_COMMANDS.has(commandName))    return handleSetupCommand(interaction, ctx);
   if(CONFIG_COMMANDS.has(commandName))   return handleConfigCommand(interaction, { pgPool, getConfig, setConfig });
