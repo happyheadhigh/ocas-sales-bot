@@ -670,10 +670,11 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // Modals open with showModal (their own response) — everything else defers first
+  const tzCustomPicked = customId === 'cfg_tzsel:lotteries' && interaction.values?.[0] === 'custom';
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
                   customId === 'cfg:col:add' ||
                   customId === 'cfg:filter:add' ||
-                  customId === 'cfg:lotteries:settz' ||
+                  tzCustomPicked ||
                   customId.startsWith('cfg:rank:set:') ||
                   customId.startsWith('cfg_traitrole:manual:') ||
                   customId.startsWith('cfg_filtertrait:manual:') ||
@@ -1214,28 +1215,77 @@ async function handleConfigButton(interaction, ctx){
         `Whoever runs \`/giveaway\` can still type a different timezone directly into that screen to override this ` +
         `for a single giveaway.`
       );
+    const tzMenu = new StringSelectMenuBuilder()
+      .setCustomId('cfg_tzsel:lotteries')
+      .setPlaceholder('Pick a timezone...')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('UK / London').setValue('Europe/London').setDescription('GMT/BST'),
+        new StringSelectMenuOptionBuilder().setLabel('Western Europe').setValue('Europe/Paris').setDescription('Paris, Berlin, Madrid, Rome — CET/CEST'),
+        new StringSelectMenuOptionBuilder().setLabel('Eastern Europe').setValue('Europe/Athens').setDescription('Athens, Helsinki, Kyiv — EET/EEST'),
+        new StringSelectMenuOptionBuilder().setLabel('US Eastern').setValue('America/New_York').setDescription('New York, Miami, Toronto — ET'),
+        new StringSelectMenuOptionBuilder().setLabel('US Central').setValue('America/Chicago').setDescription('Chicago, Dallas, Mexico City — CT'),
+        new StringSelectMenuOptionBuilder().setLabel('US Mountain').setValue('America/Denver').setDescription('Denver, Phoenix — MT'),
+        new StringSelectMenuOptionBuilder().setLabel('US Pacific').setValue('America/Los_Angeles').setDescription('Los Angeles, Seattle, Vancouver — PT'),
+        new StringSelectMenuOptionBuilder().setLabel('Brazil').setValue('America/Sao_Paulo').setDescription('São Paulo — BRT'),
+        new StringSelectMenuOptionBuilder().setLabel('UAE / Gulf').setValue('Asia/Dubai').setDescription('Dubai, Abu Dhabi — GST'),
+        new StringSelectMenuOptionBuilder().setLabel('India').setValue('Asia/Kolkata').setDescription('Mumbai, Delhi, Bangalore — IST'),
+        new StringSelectMenuOptionBuilder().setLabel('Singapore / Malaysia').setValue('Asia/Singapore').setDescription('SGT'),
+        new StringSelectMenuOptionBuilder().setLabel('Hong Kong / China').setValue('Asia/Hong_Kong').setDescription('HKT/CST'),
+        new StringSelectMenuOptionBuilder().setLabel('Japan').setValue('Asia/Tokyo').setDescription('Tokyo, Osaka — JST'),
+        new StringSelectMenuOptionBuilder().setLabel('South Korea').setValue('Asia/Seoul').setDescription('Seoul — KST'),
+        new StringSelectMenuOptionBuilder().setLabel('Australia East').setValue('Australia/Sydney').setDescription('Sydney, Melbourne — AEST/AEDT'),
+        new StringSelectMenuOptionBuilder().setLabel('Australia West').setValue('Australia/Perth').setDescription('Perth — AWST'),
+        new StringSelectMenuOptionBuilder().setLabel('New Zealand').setValue('Pacific/Auckland').setDescription('Auckland — NZST/NZDT'),
+        new StringSelectMenuOptionBuilder().setLabel('UTC').setValue('UTC').setDescription('No daylight saving offset'),
+        new StringSelectMenuOptionBuilder().setLabel('Custom...').setValue('custom').setDescription('Type any IANA timezone manually'),
+      );
     return interaction.editReply({ content:'', embeds:[embed], components:[
+      new ActionRowBuilder().addComponents(tzMenu),
       new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('cfg:lotteries:settz').setLabel('✏️ Set Timezone').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('← Back').setStyle(ButtonStyle.Secondary),
       ),
     ]});
   }
 
-  if(customId === 'cfg:lotteries:settz'){
-    const { DEFAULT_LOTTERY_TIMEZONE } = require('../lib/constants');
-    const modal = new ModalBuilder().setCustomId('cfg_modal:lotteries:settz').setTitle('Giveaway Timezone');
-    modal.addComponents(
+  if(customId === 'cfg_tzsel:lotteries'){
+    const picked = interaction.values[0];
+
+    if(picked === 'custom'){
+      const { DEFAULT_LOTTERY_TIMEZONE } = require('../lib/constants');
+      const modal = new ModalBuilder().setCustomId('cfg_modal:lotteries:settz').setTitle('Custom Timezone');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('timezone')
+            .setLabel('Timezone (IANA format)')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. Europe/Madrid, America/Sao_Paulo, Asia/Manila')
+            .setValue(cfg.giveawayTimezone || DEFAULT_LOTTERY_TIMEZONE)
+            .setRequired(true)
+        ),
+      );
+      return interaction.showModal(modal);
+    }
+
+    const { normalizeLotteryTimezone } = require('../utils/lottery');
+    let tz;
+    try{
+      tz = normalizeLotteryTimezone(picked);
+    }catch(e){
+      return interaction.editReply({ content: `❌ ${e.message}` });
+    }
+    cfg.giveawayTimezone = tz;
+    await setConfig(guildId, cfg);
+    const now = new Intl.DateTimeFormat('en-US', { timeZone: tz, dateStyle:'full', timeStyle:'short' }).format(new Date());
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('⚙️ Giveaway Settings')
+      .setDescription(`✅ Giveaway timezone set to \`${tz}\`.\nIt's currently **${now}** there.\n\nThis is used for date-only inputs in \`/giveaway\`'s custom window (e.g. "June 16 2026") — burn lotteries especially need this since the entry window must resolve to an exact start/end moment to know which on-chain burns qualify.`);
+    return interaction.editReply({ content:'', embeds:[embed], components:[
       new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('timezone')
-          .setLabel('Timezone')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Europe/London, America/New_York, Asia/Tokyo')
-          .setValue(cfg.giveawayTimezone || DEFAULT_LOTTERY_TIMEZONE)
-          .setRequired(true)
+        new ButtonBuilder().setCustomId('cfg:lotteries:settings').setLabel('✏️ Change Timezone').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('← Back').setStyle(ButtonStyle.Secondary),
       ),
-    );
-    return interaction.showModal(modal);
+    ]});
   }
 
   if(customId === 'cfg:access:set'){
@@ -1873,7 +1923,7 @@ async function handleConfigModal(interaction, ctx){
       .setDescription(`✅ Giveaway timezone set to \`${tz}\`.\nIt's currently **${now}** there.\n\nThis is used for date-only inputs in \`/giveaway\`'s custom window (e.g. "June 16 2026") — burn lotteries especially need this since the entry window must resolve to an exact start/end moment to know which on-chain burns qualify.`);
     return interaction.editReply({ content:'', embeds:[embed], components:[
       new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('cfg:lotteries:settz').setLabel('✏️ Set Timezone').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('cfg:lotteries:settings').setLabel('✏️ Change Timezone').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('← Back').setStyle(ButtonStyle.Secondary),
       ),
     ]});
