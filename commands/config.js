@@ -5,11 +5,27 @@ const {
   ModalBuilder, TextInputBuilder, TextInputStyle,
   ChannelSelectMenuBuilder, RoleSelectMenuBuilder,
   StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
-  ChannelType,
+  ChannelType, PermissionFlagsBits, MessageFlags,
 } = require('discord.js');
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const { isPaidFeature } = require('./market');
+
+// ── Access control ────────────────────────────────────────────────────────────
+// /config is gated to: server members with Manage Server permission, OR a
+// guild-configured "Bot Manager" role (cfg.botManagerRoleId). This is checked
+// in code on every entry point (slash command, button, select menu, modal) —
+// not just at slash-command registration — since Discord lets server admins
+// loosen a bot's default command permissions via Integrations settings without
+// the bot owner knowing, so the registration-level permission alone isn't safe.
+function hasConfigAccess(interaction, cfg){
+  if(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return true;
+  const managerRoleId = cfg?.botManagerRoleId;
+  if(managerRoleId && interaction.member?.roles?.cache?.has(managerRoleId)) return true;
+  return false;
+}
+
+const NO_ACCESS_MSG = '🔒 You need **Manage Server** permission or the designated Bot Manager role to use this.';
 
 // ── Fetch & cache traits from OpenSea for a collection slug ──────────────────
 async function fetchAndStoreCollectionTraits(slug, pgPool){
@@ -84,6 +100,32 @@ function dashboardRow(){
       new ButtonBuilder().setCustomId('cfg:cat:channels').setLabel('📡 Channels').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('🔐 Verification').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:roles').setLabel('🎭 Roles').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('🛡️ Access').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+// ── Access (Bot Manager role) screen ──────────────────────────────────────────
+function buildAccessEmbed(cfg){
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('🛡️ Bot Access')
+    .setDescription(
+      SEP + '\n\n' +
+      '**Manage Server** permission always has access to `/config`.\n\n' +
+      `**Bot Manager Role:** ${cfg.botManagerRoleId ? `<@&${cfg.botManagerRoleId}>` : '*Not set*'}\n\n` +
+      '*Members with this role can also use `/config`, even without\nManage Server permission — useful for delegating bot management.*'
+    )
+    .setFooter({ text: 'Only visible to you' });
+}
+
+function accessRow(cfg){
+  const hasRole = !!cfg.botManagerRoleId;
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:access:set').setLabel(hasRole ? '✏️ Change Role' : '➕ Set Bot Manager Role').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('cfg:access:clear').setLabel('🗑️ Clear').setStyle(ButtonStyle.Danger).setDisabled(!hasRole),
+      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -520,6 +562,9 @@ async function handleConfigCommand(interaction, ctx){
   await interaction.deferReply({ flags: 64 });
   const { pgPool, getConfig } = ctx;
   const cfg = getConfig(interaction.guildId) || {};
+  if(!hasConfigAccess(interaction, cfg)){
+    return interaction.editReply({ content: NO_ACCESS_MSG, embeds:[], components:[] });
+  }
   const trRes = await pgPool.query(
     'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
     [interaction.guildId]
@@ -584,6 +629,13 @@ async function handleConfigButton(interaction, ctx){
   const { pgPool, getConfig, setConfig, syncBurnConfig } = ctx;
   const guildId  = interaction.guildId;
   let customId   = interaction.customId;
+
+  // Access check first, before any defer/showModal — a stale or shared component
+  // shouldn't let a non-admin act on it even if they weren't the one who ran /config.
+  const accessCfg = getConfig(guildId) || {};
+  if(!hasConfigAccess(interaction, accessCfg)){
+    return interaction.reply({ content: NO_ACCESS_MSG, flags: MessageFlags.Ephemeral }).catch(()=>{});
+  }
 
   // ── Collection edit dropdown: translate the selected section into its legacy customId ──
   // The dropdown (cfg_col:section:colId) replaced the old per-button customIds; rather than
@@ -1093,6 +1145,23 @@ async function handleConfigButton(interaction, ctx){
     const trRes = await traitRolesQ();
     return interaction.editReply({ content:'', embeds:[buildRolesEmbed(trRes.rows)], components:rolesRow(trRes.rows) });
   }
+
+  // ── Bot Access (Bot Manager role) ────────────────────────────────────────
+  if(customId === 'cfg:cat:access'){
+    return interaction.editReply({ content:'', embeds:[buildAccessEmbed(cfg)], components:accessRow(cfg) });
+  }
+
+  if(customId === 'cfg:access:set'){
+    const menu = new RoleSelectMenuBuilder().setCustomId('cfg_rolesel:botmanager').setPlaceholder('Pick the Bot Manager role');
+    return interaction.editReply({ content:'**Select the role that should be able to use `/config`** (in addition to Manage Server admins):', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+  }
+
+  if(customId === 'cfg:access:clear'){
+    cfg.botManagerRoleId = null;
+    await setConfig(guildId, cfg);
+    return interaction.editReply({ content:'✅ Bot Manager role cleared.', embeds:[buildAccessEmbed(cfg)], components:accessRow(cfg) });
+  }
+
   // ── Rank Alert (per-collection) ──────────────────────────────────────────
   if(customId.startsWith('cfg:col:rankalert:')){
     const colId = customId.split(':')[3];
@@ -1627,6 +1696,13 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
   if(customId.startsWith('cfg_rolesel:')){
     const type   = customId.split(':')[1];
     const roleId = interaction.values[0];
+
+    if(type === 'botmanager'){
+      cfg.botManagerRoleId = roleId;
+      await setConfig(guildId, cfg);
+      return interaction.editReply({ content:'✅ Bot Manager role set.', embeds:[buildAccessEmbed(cfg)], components:accessRow(cfg) });
+    }
+
     if(type === 'verify') cfg.verifyRole = roleId;
     if(type === 'holder') cfg.holderRole = roleId;
     await setConfig(guildId, cfg);
@@ -1652,6 +1728,11 @@ async function handleConfigModal(interaction, ctx){
   const { pgPool, getConfig, setConfig, syncBurnConfig } = ctx;
   const guildId  = interaction.guildId;
   const customId = interaction.customId;
+
+  const accessCfgModal = getConfig(guildId) || {};
+  if(!hasConfigAccess(interaction, accessCfgModal)){
+    return interaction.reply({ content: NO_ACCESS_MSG, flags: MessageFlags.Ephemeral }).catch(()=>{});
+  }
 
   await interaction.deferUpdate();
   const cfg = getConfig(guildId) || {};
