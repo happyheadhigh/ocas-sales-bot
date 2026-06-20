@@ -691,6 +691,18 @@ client.on('interactionCreate', async (interaction)=>{
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_filtertrait:catsel:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_filtertrait:valsel:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('cfg_filtertrait:manual:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
   if(interaction.isButton() && interaction.customId.startsWith('cfg_traitrole:manual:')){
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
