@@ -1741,38 +1741,7 @@ client.on('interactionCreate', async (interaction)=>{
     }
   }
 
-  if(commandName==='setupverification'){
-    await interaction.deferReply({flags:64});
-    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
-      return interaction.editReply({content:'❌ You need Manage Server permission.'});
-    const svChannel  = interaction.options.getChannel('channel');
-    const svRole     = interaction.options.getRole('role');
-    const svMin      = interaction.options.getInteger('minimum') ?? 0;
-    const svWelcome  = interaction.options.getString('message') || 'Verify your wallet to get access.';
-    const svGuildId  = interaction.guildId;
-    try{
-      const svEmbed = new EmbedBuilder()
-        .setColor(0x5865F2)
-        .setTitle('Wallet Verification')
-        .setDescription(svWelcome + (svMin > 0 ? '\n\nRequires: **'+svMin+'+ OCAS token'+(svMin>1?'s':'')+'**' : ''))
-        .setFooter({text:'Click the button below to get started'});
-      const svBtn = new ButtonBuilder()
-        .setCustomId('start_verification:'+svGuildId)
-        .setLabel('Start Verification')
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji('🔗');
-      const svMsg = await svChannel.send({embeds:[svEmbed], components:[new ActionRowBuilder().addComponents(svBtn)]});
-      await pgPool.query(
-        'INSERT INTO verification_panels (guild_id,channel_id,role_id,min_tokens,message_id,welcome_text) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (guild_id) DO UPDATE SET channel_id=$2,role_id=$3,min_tokens=$4,message_id=$5,welcome_text=$6',
-        [svGuildId, svChannel.id, svRole?.id||null, svMin, svMsg.id, svWelcome]
-      );
-      const roleStr = svRole ? '. Members get <@&'+svRole.id+'> after verifying.' : '.';
-      return interaction.editReply({content:'✅ Verification panel posted in <#'+svChannel.id+'>'+roleStr});
-    }catch(e){
-      console.error('[SetupVerification]', e.message);
-      return interaction.editReply({content:'❌ Failed — check I have permission to post in that channel.'});
-    }
-  }
+
 
 
     if(DOWNLOAD_COMMANDS.has(commandName)) return handleDownloadCommand(interaction, { getConfig, osHeaders });
