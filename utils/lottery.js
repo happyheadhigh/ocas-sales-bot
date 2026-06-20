@@ -28,10 +28,26 @@ function isPendingDrawSeed(seed){
 }
 
 // ── Date/time parsing ─────────────────────────────────────────────────────────
-function parseLotteryDate(s, fallback = null){
+function parseLotteryDate(s, fallback = null, timeZone = DEFAULT_LOTTERY_TIMEZONE){
   if(!s) return fallback;
   const v = String(s).trim().toLowerCase();
   if(v === 'now') return new Date();
+
+  // Date-only inputs (no time-of-day, no explicit UTC offset) are ambiguous —
+  // native `new Date(...)` parses these as midnight UTC, which silently shifts
+  // the actual moment by hours depending on the configured lottery timezone.
+  // Resolve these as midnight in the lottery's timezone instead, so "June 16
+  // 2026" means midnight in Europe/London (or whatever was configured), not UTC.
+  const dateOnly = v.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/)                         // 2026-06-16
+    || v.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/)                                      // 06-16-2026
+    || v.match(/^([a-z]+)\s+(\d{1,2}),?\s+(\d{4})$/);                                        // June 16 2026 / June 16, 2026
+  if(dateOnly && !/\d{1,2}:\d{2}|am|pm|utc|gmt|z$/.test(v)){
+    const probe = new Date(s); // still use native parsing to resolve year/month/day correctly, including month names
+    if(!Number.isNaN(probe.getTime())){
+      return zonedDateTimeToUtc(probe.getUTCFullYear(), probe.getUTCMonth() + 1, probe.getUTCDate(), 0, 0, 0, timeZone);
+    }
+  }
+
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? fallback : d;
 }
