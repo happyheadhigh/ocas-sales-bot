@@ -673,6 +673,7 @@ async function handleConfigButton(interaction, ctx){
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
                   customId === 'cfg:col:add' ||
                   customId === 'cfg:filter:add' ||
+                  customId === 'cfg:lotteries:settz' ||
                   customId.startsWith('cfg:rank:set:') ||
                   customId.startsWith('cfg_traitrole:manual:') ||
                   customId.startsWith('cfg_filtertrait:manual:') ||
@@ -1172,6 +1173,18 @@ async function handleConfigButton(interaction, ctx){
     lotterySessions.set(interaction.user.id, { page:0, filter:'all', all, isAdmin:true, fromConfig:true });
     const { embed, pages } = buildLotteriesEmbed(all, 0, 'all');
     const rows = lotteriesDashboardButtons(0, pages, 'all', true);
+    // Nav row (row index 1) already has Prev/Next/Refresh/←config — append Giveaway
+    // Settings onto the same row so it sits right next to the /config button.
+    const navRow = rows[1];
+    if(navRow && navRow.components && navRow.components.length < 5){
+      navRow.addComponents(
+        new ButtonBuilder().setCustomId('cfg:lotteries:settings').setLabel('⚙️ Settings').setStyle(ButtonStyle.Secondary)
+      );
+    } else {
+      rows.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cfg:lotteries:settings').setLabel('⚙️ Giveaway Settings').setStyle(ButtonStyle.Secondary)
+      ));
+    }
     const liveLotteries = all.filter(r=>r.status==='active');
     if(liveLotteries.length>0){
       const { ButtonBuilder: BB, ButtonStyle: BS } = require('discord.js');
@@ -1180,9 +1193,6 @@ async function handleConfigButton(interaction, ctx){
       );
       rows.push(new ActionRowBuilder().addComponents(idBtns));
     }
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('cfg:lotteries:settings').setLabel('⚙️ Giveaway Settings').setStyle(ButtonStyle.Secondary)
-    ));
     return interaction.editReply({ content:'', embeds:[embed], components:rows });
   }
 
