@@ -141,7 +141,7 @@ async function handleMarketCommand(commandName, ctx){
     const slug=interaction.options.getString('collection')||config.slug;
     const contract=config.contract||'';
     if(!slug) return interaction.reply({content:'Run `/setup` first.', flags: MessageFlags.Ephemeral});
-    if(!contract) return interaction.reply({content:'Set a contract with `/setcollection`.', flags: MessageFlags.Ephemeral});
+    if(!contract) return interaction.reply({content:'Set a collection contract in `/config` → Collections.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const chainForSale=config.chain||'ethereum';
