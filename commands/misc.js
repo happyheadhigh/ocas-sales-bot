@@ -43,7 +43,6 @@ async function handleMiscCommand(commandName, ctx){
       '`/synctraits` — Manually sync trait roles for all verified members',
       '`/resetverify` — Clear a member\'s verification so they can re-verify',
       '`/lotteries` — View and manage burn lotteries & giveaways',
-      '`/pause` / `/resume` — Pause/resume auto-posts',
       '`/status` — Show server config',
     ].join('\n');
     await interaction.reply({embeds:[new EmbedBuilder()
@@ -59,50 +58,6 @@ async function handleMiscCommand(commandName, ctx){
       )], flags: MessageFlags.Ephemeral});
     return;
   }
-
-// ── /register ─────────────────────────────────────────────────────────────────
-if(commandName==='register'){
-  await interaction.deferReply({ephemeral:true});
-  const { pgPool } = require('../lib/db');
-  const { osHeaders, osAgent } = require('../lib/poll');
-  const { ButtonBuilder, ButtonStyle, ActionRowBuilder } = require('discord.js');
-  const wallet    = (interaction.options.getString('wallet')||'').trim().toLowerCase();
-  const discordId = interaction.user.id;
-
-  if(!/^0x[0-9a-f]{40}$/i.test(wallet))
-    return interaction.editReply({content:'❌ Invalid wallet address. Must be 0x followed by 40 hex characters.'});
-
-  const code = `OCAS-verify-${Math.random().toString(36).slice(2,8).toUpperCase()}`;
-  const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
-
-  try{
-    await pgPool.query(
-      `INSERT INTO verification_codes (discord_id, wallet, code, expires_at)
-       VALUES ($1,$2,$3,$4)
-       ON CONFLICT (discord_id) DO UPDATE SET wallet=$2, code=$3, expires_at=$4`,
-      [discordId, wallet, code, expiresAt]
-    );
-    const verifyBtn = new ButtonBuilder()
-      .setCustomId(`verify_wallet:${discordId}:${wallet}`)
-      .setLabel("I've Added It — Verify Now")
-      .setStyle(ButtonStyle.Success)
-      .setEmoji('✅');
-    const btnRow = new ActionRowBuilder().addComponents(verifyBtn);
-    return interaction.editReply({content:[
-      `**Step 1:** Go to your OpenSea profile:`,
-      `https://opensea.io/${wallet}`,
-      ``,
-      `**Step 2:** Edit your bio and add this code anywhere:`,
-      `\`\`\`${code}\`\`\``,
-      `**Step 3:** Click the button below once your bio is saved.`,
-      ``,
-      `⏱ Expires in 30 minutes.`,
-    ].join('\n'), components:[btnRow]});
-  }catch(e){
-    console.error('[Register]', e.message);
-    return interaction.editReply({content:'❌ Registration failed. Please try again.'});
-  }
-}
 
 // ── /myregistration ───────────────────────────────────────────────────────────
 if(commandName==='myregistration'){
