@@ -21,23 +21,9 @@ const chainChoices = [
 ];
 
 const commands = [
-  new SlashCommandBuilder().setName('setsales').setDescription('Configure sales channel and collection')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addChannelOption(o=>o.setName('channel').setDescription('Channel to post sales in').setRequired(true))
-    .addStringOption(o=>o.setName('collection').setDescription('OpenSea collection slug (e.g. on-chain-all-stars)').setRequired(true))
-    .addStringOption(o=>o.setName('contract').setDescription('Contract address (e.g. 0x078be86...)').setRequired(false))
-    .addStringOption(o=>o.setName('chain').setDescription('Blockchain (default: ethereum)').setRequired(false).addChoices(...chainChoices)),
 
 
 
-
-  new SlashCommandBuilder().setName('setchannel').setDescription('Change the sales channel').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addChannelOption(o=>o.setName('channel').setDescription('New sales channel').setRequired(true)),
-  new SlashCommandBuilder().setName('setcollection').setDescription('Change the collection being watched').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption(o=>o.setName('slug').setDescription('OpenSea collection slug').setRequired(true)).addStringOption(o=>o.setName('contract').setDescription('Contract address').setRequired(false)),
-  new SlashCommandBuilder().setName('salesfilter').setDescription('Only auto-post sales where a trait matches').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Type)').setRequired(true)).addStringOption(o=>o.setName('value').setDescription('Trait value (e.g. Zombie)').setRequired(true)),
-  new SlashCommandBuilder().setName('traitlistingfilter').setDescription('Only auto-post listings where a trait matches').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption(o=>o.setName('trait').setDescription('Trait name (e.g. Background)').setRequired(true)).addStringOption(o=>o.setName('value').setDescription('Trait value (e.g. Blue)').setRequired(true)),
-  new SlashCommandBuilder().setName('clearallfilters').setDescription('Clear all trait filters and rank alert').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-  new SlashCommandBuilder().setName('pause').setDescription('Pause all auto-posts').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-  new SlashCommandBuilder().setName('resume').setDescription('Resume all auto-posts').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('status').setDescription('Show current bot configuration'),
 
 
@@ -55,21 +41,17 @@ const commands = [
   new SlashCommandBuilder().setName('traitfind').setDescription('Find sales or listings by trait — e.g. zombie, gold chain listings').addStringOption(o=>o.setName('search').setDescription('Trait + optional mode/count').setRequired(true)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false).setAutocomplete(true)),
   new SlashCommandBuilder().setName('listings').setDescription('Show recent new listings').addIntegerOption(o=>o.setName('count').setDescription('Number of listings (max 20, default 5)').setRequired(false).setMinValue(1).setMaxValue(20)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false).setAutocomplete(true)),
   new SlashCommandBuilder().setName('myalert').setDescription('Get personal DMs when matching sales or listings happen').addStringOption(o=>o.setName('trait').setDescription('Trait name to filter by').setRequired(false)).addStringOption(o=>o.setName('value').setDescription('Trait value to filter by').setRequired(false)).addBooleanOption(o=>o.setName('sales').setDescription('DM me for sales? (default: true)').setRequired(false)).addBooleanOption(o=>o.setName('listings').setDescription('DM me for listings? (default: true)').setRequired(false)).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
-  new SlashCommandBuilder().setName('removetraitfilter').setDescription('Remove a specific trait value from a sales or listing filter').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption(o=>o.setName('type').setDescription('Which filter to modify').setRequired(true).addChoices({name:'Sales',value:'sales'},{name:'Listings',value:'listings'})).addStringOption(o=>o.setName('trait').setDescription('Trait name').setRequired(true)).addStringOption(o=>o.setName('value').setDescription('Value to remove').setRequired(true)),
   new SlashCommandBuilder().setName('debuglisting').setDescription('Show raw listing event data to diagnose issues (admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false)),
   new SlashCommandBuilder().setName('myalertclear').setDescription('Remove your personal DM alert').addStringOption(o=>o.setName('trait').setDescription('Remove just this trait filter').setRequired(false)).addStringOption(o=>o.setName('value').setDescription('Specific value to remove').setRequired(false)),
   new SlashCommandBuilder().setName('myalertstatus').setDescription('See your current personal alert settings'),
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 
   new SlashCommandBuilder().setName('rankfind').setDescription('Find listings or sales by OS rank range — e.g. 1-100').addStringOption(o=>o.setName('search').setDescription('Range + optional mode').setRequired(false)),
-  new SlashCommandBuilder().setName('ranklistingfilter').setDescription('Alert when a token in an OS rank range gets listed').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addIntegerOption(o=>o.setName('min').setDescription('Minimum OS rank').setRequired(true).setMinValue(1).setMaxValue(10000)).addIntegerOption(o=>o.setName('max').setDescription('Maximum OS rank').setRequired(true).setMinValue(1).setMaxValue(10000)).addChannelOption(o=>o.setName('channel').setDescription('Channel to post rank alerts in').setRequired(false)),
-  new SlashCommandBuilder().setName('removerankfilter').setDescription('Remove the rank listing alert').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('ocas').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false)),
   new SlashCommandBuilder().setName('token').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection to search (defaults to primary)').setRequired(false).setAutocomplete(true)),
   new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep cheapest listed OCAS').addStringOption(o=>o.setName('search').setDescription('e.g. 10, 2eth, 0.05 floor, 10 zombie').setRequired(false)),
 
-  new SlashCommandBuilder().setName('setupburn').setDescription('Set the channel for OCAS burn alerts (defaults to this channel)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addChannelOption(o=>o.setName('channel').setDescription('Channel to post burn alerts in').setRequired(false)),
   new SlashCommandBuilder().setName('burnstats').setDescription('Show OCAS Burn Machine stats — total burned, created, estimated supply'),
   new SlashCommandBuilder().setName('burnlatest').setDescription('Show recent finalized OCAS burn events').addIntegerOption(o=>o.setName('count').setDescription('Number of burns to show (max 10, default 1)').setRequired(false).setMinValue(1).setMaxValue(10)),
   new SlashCommandBuilder().setName('burn').setDescription('Show burn status and lineage for a token').addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(true).setMinValue(1).setMaxValue(10000)),
@@ -101,14 +83,6 @@ const commands = [
 
 
 
-
-  new SlashCommandBuilder().setName('setupverification')
-    .setDescription('Setup a wallet verification panel in a channel (Admin only)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addChannelOption(o=>o.setName('channel').setDescription('Channel to post the verification panel').setRequired(true))
-    .addRoleOption(o=>o.setName('role').setDescription('Role to assign after verification').setRequired(false))
-    .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum OCAS tokens required (0 = any wallet)').setRequired(false).setMinValue(0))
-    .addStringOption(o=>o.setName('message').setDescription('Custom welcome message for the panel').setRequired(false)),
 
 
 
