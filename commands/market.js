@@ -1,6 +1,6 @@
 'use strict';
 
-const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
+const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
 const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
 
@@ -52,6 +52,70 @@ function isPaidFeature(cfg, featureName, userId){
                  (cfg?.contract||'').toLowerCase() === '0x078be86f3104a32313a47815792230a3808642cc';
   if(isOcas) return false; // OCAS always free
   return !(cfg?.isPaidTier === true);
+}
+
+function isOcasSlug(slug){
+  return (slug||'').toLowerCase().includes('on-chain-all-stars');
+}
+
+// ── Trait browse (no search text typed) ──────────────────────────────────────
+// For collections without a working token-level search index (anything that
+// isn't OCAS right now — see lib/db.js: tokens/token_traits have no
+// collection_slug column, so trait→token lookups can't be scoped correctly
+// yet). This still lets someone discover what trait categories and values
+// exist for a collection, sourced from collection_traits (which IS scoped
+// correctly per-slug), without claiming to search tokens it can't actually
+// search correctly.
+async function showTraitBrowseCategories(interaction, pgPool, slug){
+  const catRes = await pgPool.query(
+    `SELECT trait_name, COUNT(DISTINCT trait_value) AS value_count, SUM(token_count) AS total_tokens
+     FROM collection_traits WHERE slug=$1 GROUP BY trait_name ORDER BY trait_name`,
+    [slug]
+  ).catch(()=>({ rows:[] }));
+
+  if(!catRes.rows.length){
+    return interaction.reply({
+      content: `No cached trait data found for **${slug}** yet. Add this collection in \`/config\` → Collections first — traits are cached automatically when a collection's slug is saved.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`tf_browse:cat:${slug}`)
+    .setPlaceholder('Pick a trait category...')
+    .addOptions(catRes.rows.slice(0,25).map(r =>
+      new StringSelectMenuOptionBuilder()
+        .setLabel(r.trait_name)
+        .setValue(r.trait_name)
+        .setDescription(`${r.value_count} value${r.value_count==1?'':'s'}`)
+    ));
+
+  return interaction.reply({
+    content: `**🔍 Browse ${slug} traits**\n\nNo search text was provided, so here's what's available — pick a category to see its values.`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function showTraitBrowseValues(interaction, pgPool, slug, category){
+  const valRes = await pgPool.query(
+    `SELECT trait_value, token_count FROM collection_traits WHERE slug=$1 AND trait_name=$2 ORDER BY token_count DESC, trait_value`,
+    [slug, category]
+  ).catch(()=>({ rows:[] }));
+
+  if(!valRes.rows.length){
+    return interaction.update({ content: `No values found for **${category}**.`, components: [] });
+  }
+
+  const lines = valRes.rows.slice(0,25).map(r => `• **${r.trait_value}** — ${r.token_count} token${r.token_count==1?'':'s'}`);
+  const more = valRes.rows.length > 25 ? `\n…and ${valRes.rows.length - 25} more.` : '';
+
+  return interaction.update({
+    content: `**🔍 ${slug} — ${category}**\n\n${lines.join('\n')}${more}\n\n` +
+      `Token-level search isn't available yet for non-OCAS collections — this is a list of what exists, not a live search. ` +
+      `To find specific listings with this trait, filter by it directly on OpenSea for now.`,
+    components: [],
+  });
 }
 
 // ── Smart collection resolver ──────────────────────────────────────────────────
@@ -197,7 +261,10 @@ async function handleMarketCommand(commandName, ctx){
     const matchLabel = traitGroupsLabel(groups, value || workingSearch);
 
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    if(!workingSearch) return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie`, `/traitfind search:zombie listings`, or `/traitfind search:zombie sales`', flags: MessageFlags.Ephemeral});
+    if(!workingSearch){
+      if(!isOcasSlug(slug)) return showTraitBrowseCategories(interaction, pgPool, slug);
+      return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie`, `/traitfind search:zombie listings`, or `/traitfind search:zombie sales`', flags: MessageFlags.Ephemeral});
+    }
     if(!RAILWAY_URL) return interaction.reply({content:'Trait search needs the internal TraitView API URL so it can read the token DB/cache. Set `RAILWAY_API_URL` in this Railway service.', flags: MessageFlags.Ephemeral});
     if(traitParseError) return interaction.reply({content:`I could not load the trait index from the TraitView API. ${traitParseError.message}`, flags: MessageFlags.Ephemeral});
     if(!groups.length){
@@ -847,4 +914,15 @@ const MARKET_COMMANDS = new Set([
   'myalert','myalertclear','myalertstatus','rankfind','sweep',
 ]);
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature };
+// ── /traitfind browse flow — category dropdown follow-up ─────────────────────
+async function handleTraitBrowseInteraction(interaction, ctx){
+  const { pgPool } = ctx;
+  const customId = interaction.customId;
+  if(customId.startsWith('tf_browse:cat:')){
+    const slug = customId.slice('tf_browse:cat:'.length);
+    const category = interaction.values[0];
+    return showTraitBrowseValues(interaction, pgPool, slug, category);
+  }
+}
+
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction };
