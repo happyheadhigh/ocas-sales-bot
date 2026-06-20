@@ -177,11 +177,9 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`cfg:col:name:${colId}`).setLabel('✏️ Name').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:slug:${colId}`).setLabel('🔗 Slug').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:filters:${colId}`).setLabel('🔍 Listing Filters').setStyle(ButtonStyle.Secondary),
-  );
-  const row1c = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`cfg:col:salesfilters:${colId}`).setLabel('💰 Sales Filters').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`cfg:col:pause:${colId}`).setLabel('⏸️ Pause/Resume').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:filters:${colId}`).setLabel('🔍 Listings').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:salesfilters:${colId}`).setLabel('💰 Sales').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`cfg:col:pause:${colId}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
   );
   const row1b = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`cfg:col:saleschan:${colId}`).setLabel('🟢 Sales Ch.').setStyle(ButtonStyle.Secondary),
@@ -189,16 +187,17 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
     new ButtonBuilder().setCustomId(`cfg:col:listchan:${colId}`).setLabel('📋 Listings Ch.').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`cfg:col:clearchan:listings:${colId}`).setLabel('✕ Listings').setStyle(ButtonStyle.Danger),
   );
-  const rows = [row1, row1c, row1b];
-  if(isOcas){
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`cfg:col:burnchan:${colId}`).setLabel('🔥 Burn Alerts Ch.').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`cfg:col:clearchan:burn:${colId}`).setLabel('✕ Burn').setStyle(ButtonStyle.Danger),
-    ));
-  }
-  rows.push(new ActionRowBuilder().addComponents(
+  const rows = [row1, row1b];
+  const row3Btns = [
     new ButtonBuilder().setCustomId(`cfg:col:traitroles:${colId}`).setLabel('🎭 Trait Roles').setStyle(ButtonStyle.Secondary),
-  ));
+  ];
+  if(isOcas){
+    row3Btns.push(
+      new ButtonBuilder().setCustomId(`cfg:col:burnchan:${colId}`).setLabel('🔥 Burn Ch.').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:col:clearchan:burn:${colId}`).setLabel('✕ Burn').setStyle(ButtonStyle.Danger),
+    );
+  }
+  rows.push(new ActionRowBuilder().addComponents(row3Btns));
   const row2Btns = [
     new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
   ];
