@@ -63,20 +63,6 @@ const commands = [
     .addStringOption(o=>o.setName('mode').setDescription('survivors = refresh all burn survivors; token = single token (default)').setRequired(false).addChoices({name:'Single token',value:'token'},{name:'All burn survivors',value:'survivors'}))
     .addIntegerOption(o=>o.setName('token').setDescription('Token ID (required for single token mode)').setRequired(false).setMinValue(1).setMaxValue(10000)),
 
-  new SlashCommandBuilder().setName('burnlottery').setDescription('Schedule or draw an OCAS burn lottery').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addSubcommand(sc=>sc.setName('start').setDescription('Start a burn lottery that auto-draws when the window ends')
-      .addStringOption(o=>o.setName('window').setDescription('When + duration, e.g. now 24hrs, today-10am 7days, 06-07-2026-3pm, uk:06-07-2026-3pm').setRequired(false))
-      .addStringOption(o=>o.setName('mode').setDescription('Entry mode').setRequired(false).addChoices({name:'One entry per wallet',value:'wallet'},{name:'One entry per burn',value:'burn'}))
-      .addStringOption(o=>o.setName('timezone').setDescription('Optional timezone override; default is Europe/London').setRequired(false)))
-    .addSubcommand(sc=>sc.setName('draw').setDescription('Draw immediately from a past window or a scheduled lottery ID')
-      .addIntegerOption(o=>o.setName('id').setDescription('Draw a scheduled lottery ID').setRequired(false))
-      .addStringOption(o=>o.setName('window').setDescription('Past window, e.g. yesterday-10am 24hrs, 06-07-2026-3pm 1week, uk:06-07-2026-3pm 1week').setRequired(false))
-      .addStringOption(o=>o.setName('mode').setDescription('Entry mode').setRequired(false).addChoices({name:'One entry per wallet',value:'wallet'},{name:'One entry per burn',value:'burn'}))
-      .addStringOption(o=>o.setName('timezone').setDescription('Optional timezone override; default is Europe/London').setRequired(false)))
-    .addSubcommand(sc=>sc.setName('status').setDescription('Show recent/scheduled burn lotteries').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(false)))
-    .addSubcommand(sc=>sc.setName('cancel').setDescription('Cancel an active scheduled burn lottery').addIntegerOption(o=>o.setName('id').setDescription('Lottery ID').setRequired(true))),
-
-
 
   new SlashCommandBuilder().setName('myregistration')
     .setDescription('Show your current wallet registration status'),
