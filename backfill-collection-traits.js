@@ -240,8 +240,13 @@ async function writePage(nfts) {
       }
       // Also ensure a tokens row exists for this id+slug, with trait_count
       // set, since /db/multi-trait-tokens joins against tokens for rank/
-      // count filtering. ON CONFLICT preserves any existing rank data —
-      // this backfill only ever touches traits, never os_rank/obs_rank.
+      // count filtering — without a tokens row, this token's traits would
+      // be saved but invisible to search. Only trait_count is supplied;
+      // obs_rank/rarity_score are intentionally left out (migration 006
+      // made them nullable) since this script has no real rank data to
+      // offer — that requires a separate rank-computation pass this
+      // collection doesn't have yet. ON CONFLICT preserves any existing
+      // rank data on a row that already exists.
       await client.query(
         `INSERT INTO tokens (id, collection_slug, trait_count)
          VALUES ($1,$2,$3)
