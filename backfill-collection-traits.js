@@ -137,7 +137,14 @@ async function fetchPage(pageKey, retries = 0) {
 }
 
 // ── Write one page's worth of token traits to DB ─────────────────────────────
+let _debugDumped = false;
 async function writePage(nfts) {
+  if (!_debugDumped && nfts.length) {
+    _debugDumped = true;
+    console.log('\n🔍 DEBUG — first token raw shape:');
+    console.log(JSON.stringify(nfts[0], null, 2).slice(0, 3000));
+    console.log('🔍 END DEBUG\n');
+  }
   if (DRY_RUN || !nfts.length) return { written: 0, skipped: 0 };
   const client = await pool.connect();
   let written = 0, skipped = 0;
