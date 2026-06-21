@@ -140,7 +140,7 @@ app.get('/db/tokens', auth, async (req, res) => {
     const result = await pool.query(query, params);
     res.json({
       ok: true,
-      tokens: result.rows.map(r => ({ id: parseInt(r.id), obs_rank: parseInt(r.obs_rank) })),
+      tokens: result.rows.map(r => ({ id: parseInt(r.id), obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null })),
       count: result.rows.length
     });
   } catch (e) {
@@ -175,10 +175,10 @@ app.get('/db/token/:id', auth, async (req, res) => {
       ok: true,
       token: {
         id: parseInt(t.id),
-        obs_rank: parseInt(t.obs_rank),
+        obs_rank: t.obs_rank ? parseInt(t.obs_rank) : null,
         os_rank:  t.os_rank  ? parseInt(t.os_rank)    : null,
         os_score: t.os_score ? parseFloat(t.os_score) : null,
-        rarity_score: parseFloat(t.rarity_score),
+        rarity_score: t.rarity_score != null ? parseFloat(t.rarity_score) : null,
         trait_count: actualTraitCount,
         traits
       }
@@ -221,7 +221,7 @@ app.get('/db/trait-floor', auth, async (req, res) => {
       ok: true,
       floor: result.rows.length ? {
         token_id: parseInt(result.rows[0].id),
-        obs_rank: parseInt(result.rows[0].obs_rank),
+        obs_rank: result.rows[0].obs_rank ? parseInt(result.rows[0].obs_rank) : null,
         price_eth: parseFloat(result.rows[0].price_eth),
         url: result.rows[0].url
       } : null
@@ -321,7 +321,7 @@ app.get('/db/floor-trend', auth, async (req, res) => {
         price_eth: parseFloat(r.price_eth),
         currency: r.currency,
         sale_ts: r.sale_ts,
-        obs_rank: parseInt(r.obs_rank)
+        obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null
       })),
       count: result.rows.length
     });
@@ -908,7 +908,7 @@ app.get('/db/rank-listings', auth, async (req, res) => {
       rank_max: rankMax,
       listings: result.rows.map(r => ({
         token_id:    parseInt(r.token_id),
-        obs_rank:    parseInt(r.obs_rank),
+        obs_rank:    r.obs_rank ? parseInt(r.obs_rank) : null,
         os_rank:     r.os_rank     ? parseInt(r.os_rank)    : null,
         os_score:    r.os_score    ? parseFloat(r.os_score) : null,
         trait_count: r.trait_count ? parseInt(r.trait_count) : null,
