@@ -1,0 +1,39 @@
+-- migrations/006_make_rank_columns_nullable.sql
+--
+-- tokens.obs_rank and tokens.rarity_score are NOT NULL with no default.
+-- That was fine when only OCAS existed — every OCAS row already has real
+-- values, computed by the existing rank-sync background job (lib/rank-sync.js)
+-- and an initial rank backfill. It breaks the moment a non-OCAS collection's
+-- token needs a row: there is no rank-computation path for any collection
+-- other than OCAS anywhere in this codebase yet, so backfill-collection-traits.js
+-- has no real value to supply. Confirmed live via a real CryptoPunks backfill
+-- attempt failing with "null value in column obs_rank violates not-null
+-- constraint".
+--
+-- A placeholder default (e.g. -1) was considered and rejected — it would
+-- actively corrupt every rank-sorted query and rank_min/rank_max filter,
+-- since an unranked token would either sort to the very top of "best rank
+-- first" listings or be silently excluded/included incorrectly by range
+-- filters, depending on the value chosen. NULL is the honest representation:
+-- "this token has no rank yet."
+--
+-- Postgres's default ORDER BY ... ASC already sorts NULLs last (verified
+-- directly), and the codebase already has an established pattern for
+-- NULL-safe ranking via COALESCE(t.os_rank, t.obs_rank, 999999) used
+-- elsewhere (api.js burn/wallet ordering) — os_rank is already nullable
+-- today. This migration brings obs_rank/rarity_score in line with that
+-- same already-proven pattern rather than inventing a new approach.
+--
+-- Application-layer null guards were also added in api.js — every
+-- parseInt(t.obs_rank) / parseFloat(t.rarity_score) call that lacked a
+-- null check was found and fixed to return null cleanly instead of NaN.
+--
+-- Existing OCAS rows are unaffected — all 10,000 already have real values
+-- for both columns; dropping the NOT NULL constraint doesn't touch any
+-- existing data, it only stops blocking new rows that don't have a value
+-- yet.
+--
+-- Safe to run more than once.
+
+ALTER TABLE tokens ALTER COLUMN obs_rank DROP NOT NULL;
+ALTER TABLE tokens ALTER COLUMN rarity_score DROP NOT NULL;
