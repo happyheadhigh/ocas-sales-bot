@@ -1,15 +1,26 @@
 /**
  * TraitView API Server
- * Runs on Railway alongside the Discord bot.
- * Connects to Railway Postgres and serves HTTP endpoints
- * that the Cloudflare Worker calls.
+ * Runs as its own separate Railway service (NOT in the same container as
+ * the Discord bot — confirmed via deploy logs showing this process never
+ * starts when only the bot service is redeployed). Connects to Railway
+ * Postgres and serves HTTP endpoints that the Cloudflare Worker calls.
  * 
- * Deploy: add this file to your Railway bot project.
+ * Deploy: this file's own Railway service, separate from bot.js's service.
  * Set environment variables: DATABASE_URL, API_SECRET
  */
 
 const express = require('express');
 const { Pool } = require('pg');
+
+// Loaded at module level (not lazily inside a route handler) specifically
+// so its setInterval-driven sync loops actually start the moment this
+// process boots. Previously this was require()'d only inside the manual
+// /db/listings/sync handler, which meant sync-listings.js's top-level code
+// — including both setInterval calls — never ran at all unless someone
+// manually hit that endpoint at least once. That's the real reason no
+// [sync] log lines were ever appearing, on this version or the version
+// before today's rewrite.
+const syncListingsModule = require('./sync-listings');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -272,9 +283,8 @@ app.get('/db/holders/trait', auth, async (req, res) => {
 // ── GET /db/listings/sync — manually trigger a sync for all configured collections ──
 app.get('/db/listings/sync', auth, async (req, res) => {
   try {
-    const { syncAllListings } = require('./sync-listings');
     res.json({ ok: true, message: 'Sync triggered for all configured collections — running in background' });
-    syncAllListings();
+    syncListingsModule.syncAllListings();
   } catch(e) {
     res.status(500).json({ ok: false, error: e.message });
   }
