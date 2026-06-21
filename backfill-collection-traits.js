@@ -20,6 +20,13 @@
  *   node backfill-collection-traits.js --contract 0xABC... --slug some-collection --resume-from 0x1388
  *     (resume-from accepts the last pageKey printed before a crash/stop)
  *
+ * Safety: this script refuses to run against OCAS (on-chain-all-stars, by
+ * slug or contract address) under any circumstances, including --dry-run,
+ * unless --i-know-what-im-doing is also passed. OCAS already has correct
+ * trait data maintained by the burn machine's priority system; this script
+ * has no awareness of that and would overwrite it with Alchemy's current
+ * snapshot. This is not expected to ever be overridden in practice.
+ *
  * Progress is checkpointed after every page to
  * backfill-collection-traits-progress-<slug>.json so it can be safely
  * stopped and resumed (per-slug file, so multiple collections' progress
@@ -66,6 +73,34 @@ if (!DATABASE_URL) { console.error('Missing DATABASE_URL'); process.exit(1); }
 if (!CONTRACT)     { console.error('Missing --contract 0x...'); process.exit(1); }
 if (!SLUG)         { console.error('Missing --slug collection-slug'); process.exit(1); }
 if (!/^0x[a-fA-F0-9]{40}$/.test(CONTRACT)) { console.error('--contract does not look like a valid address:', CONTRACT); process.exit(1); }
+
+// ── OCAS guard ───────────────────────────────────────────────────────────────
+// This script does an unscoped delete+insert of whatever Alchemy currently
+// reports per token, with zero awareness of OCAS's burn-machine
+// SOURCE_PRIORITY system (burn-finalized-survivor > backfill-chunks > ...).
+// A survivor token's traits can change after a burn; that's tracked
+// correctly by the burn-aware writers in lib/embeds.js / lib/images.js.
+// Running this script against OCAS would blindly overwrite that with
+// Alchemy's current snapshot, discarding which write should actually win.
+// OCAS already has good, carefully-maintained trait data from its original
+// backfill — it does not need this script and must never have it run for
+// real. Blocked outright (including --dry-run, since the point of this
+// guard is removing any judgment call about which flag combo is "safe
+// enough" rather than relying on remembering not to run it) unless the
+// override flag below is explicitly passed.
+const OCAS_SLUG_LOWER     = 'on-chain-all-stars';
+const OCAS_CONTRACT_LOWER = '0x078be86f3104a32313a47815792230a3808642cc';
+const FORCE_OCAS = process.argv.includes('--i-know-what-im-doing');
+if (!FORCE_OCAS && (SLUG.toLowerCase() === OCAS_SLUG_LOWER || CONTRACT.toLowerCase() === OCAS_CONTRACT_LOWER)) {
+  console.error(
+    '\n🛑 Refusing to run against OCAS (on-chain-all-stars).\n' +
+    '   This script does not respect the burn-machine\'s trait write priority\n' +
+    '   and would overwrite burn survivor trait data with Alchemy\'s current\n' +
+    '   snapshot. OCAS already has good data from its original backfill.\n' +
+    '   If you are certain this is intentional, re-run with --i-know-what-im-doing.\n'
+  );
+  process.exit(1);
+}
 
 const CHECKPOINT_FILE = path.join(__dirname, `backfill-collection-traits-progress-${SLUG}.json`);
 
