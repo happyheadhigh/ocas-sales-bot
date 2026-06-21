@@ -141,8 +141,20 @@ let _debugDumped = false;
 async function writePage(nfts) {
   if (!_debugDumped && nfts.length) {
     _debugDumped = true;
-    console.log('\n🔍 DEBUG — first token raw shape:');
-    console.log(JSON.stringify(nfts[0], null, 2).slice(0, 3000));
+    const nft = nfts[0];
+    const rawCopy = nft.raw ? { ...nft.raw } : nft.raw;
+    if (rawCopy?.metadata) {
+      rawCopy.metadata = { ...rawCopy.metadata };
+      if (rawCopy.metadata.image) rawCopy.metadata.image = '[omitted, length=' + String(rawCopy.metadata.image).length + ']';
+    }
+    console.log('\n🔍 DEBUG — first token (image data omitted):');
+    console.log(JSON.stringify({
+      tokenId: nft.tokenId,
+      tokenUri: nft.tokenUri,
+      raw: rawCopy,
+      collection: nft.collection,
+      timeLastUpdated: nft.timeLastUpdated,
+    }, null, 2));
     console.log('🔍 END DEBUG\n');
   }
   if (DRY_RUN || !nfts.length) return { written: 0, skipped: 0 };
