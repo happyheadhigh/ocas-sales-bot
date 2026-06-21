@@ -2113,7 +2113,23 @@ async function handleConfigModal(interaction, ctx){
     if(!cfg.collections) cfg.collections = [];
     cfg.collections.push({ name, slug, contract:contract||null, salesChannel:null, listingsChannel:null });
     await setConfig(guildId, cfg);
-    return interaction.editReply({ content:'✅ Collection added.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
+
+    // Paid-tier servers get an automatic trait backfill for any new
+    // non-OCAS collection — this is what powers /traitfind, /rankfind,
+    // and trait-filtered listings for that collection. Free tier still
+    // gets listings/sales immediately (separate sync, unaffected by this).
+    // Skips silently if this slug was already backfilled by ANY server
+    // in the past — see lib/auto-backfill.js for the detection logic.
+    let waitMsg = '';
+    if(cfg.isPaidTier === true && slug && contract){
+      try{
+        const { maybeStartBackfill } = require('../lib/auto-backfill');
+        const result = await maybeStartBackfill(pgPool, { contract, slug });
+        if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
+      }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
+    }
+
+    return interaction.editReply({ content:`✅ Collection added.${waitMsg}`, embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
 
   // ── Edit collection field (contract or slug) ───────────────────────────────
@@ -2123,6 +2139,7 @@ async function handleConfigModal(interaction, ctx){
     const colId = parts[3];
     const val   = interaction.fields.getTextInputValue('value_input').trim();
     const isPrimary = colId === 'primary';
+    let waitMsg = '';
 
     if(isPrimary){
       if(field==='contract'){
@@ -2135,6 +2152,18 @@ async function handleConfigModal(interaction, ctx){
       if(field==='slug'){
         cfg.collectionSlug = val.toLowerCase();
         fetchAndStoreCollectionTraits(cfg.collectionSlug, pgPool).catch(()=>{});
+
+        // Primary-collection slug being set is the completion point for a
+        // /setup-driven non-OCAS collection (contract is set in a separate
+        // prior modal submission, slug here) — same auto-backfill trigger
+        // as cfg_modal:addcol, for the same reason.
+        if(cfg.isPaidTier === true && cfg.collectionSlug && cfg.contract){
+          try{
+            const { maybeStartBackfill } = require('../lib/auto-backfill');
+            const result = await maybeStartBackfill(pgPool, { contract: cfg.contract, slug: cfg.collectionSlug });
+            if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
+          }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
+        }
       }
     } else {
       const idx = parseInt(colId);
@@ -2153,7 +2182,7 @@ async function handleConfigModal(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
       : cfg.collections[parseInt(colId)];
-    return interaction.editReply({ content:'✅ Updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:`✅ Updated.${waitMsg}`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
 
   // ── Add trait role ─────────────────────────────────────────────────────────
