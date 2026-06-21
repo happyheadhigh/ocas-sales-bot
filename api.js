@@ -269,12 +269,12 @@ app.get('/db/holders/trait', auth, async (req, res) => {
   }
 });
 
-// ── GET /db/listings/sync — manually trigger a sync ──────────────────────────
+// ── GET /db/listings/sync — manually trigger a sync for all configured collections ──
 app.get('/db/listings/sync', auth, async (req, res) => {
   try {
-    const { syncListings } = require('./sync-listings');
-    res.json({ ok: true, message: 'Sync triggered — running in background' });
-    syncListings();
+    const { syncAllListings } = require('./sync-listings');
+    res.json({ ok: true, message: 'Sync triggered for all configured collections — running in background' });
+    syncAllListings();
   } catch(e) {
     res.status(500).json({ ok: false, error: e.message });
   }
