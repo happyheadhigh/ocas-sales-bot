@@ -14,6 +14,9 @@
  * Usage:
  *   node backfill-collection-traits.js --contract 0xABC... --slug some-collection
  *   node backfill-collection-traits.js --contract 0xABC... --slug some-collection --dry-run
+ *   node backfill-collection-traits.js --contract 0xABC... --slug some-collection --dry-run --debug
+ *     (--debug prints the first token's raw Alchemy response shape once,
+ *     useful when verifying a new/unfamiliar collection before a real run)
  *   node backfill-collection-traits.js --contract 0xABC... --slug some-collection --resume-from 0x1388
  *     (resume-from accepts the last pageKey printed before a crash/stop)
  *
@@ -49,6 +52,7 @@ const DELAY_MS       = 300;   // ms between page requests
 const PAGE_SIZE      = 100;   // Alchemy's max per getNFTsForContract call
 
 const DRY_RUN        = process.argv.includes('--dry-run');
+const DEBUG_DUMP      = process.argv.includes('--debug');
 const CONTRACT_ARG   = process.argv.indexOf('--contract');
 const SLUG_ARG       = process.argv.indexOf('--slug');
 const RESUME_ARG     = process.argv.indexOf('--resume-from');
@@ -139,7 +143,7 @@ async function fetchPage(pageKey, retries = 0) {
 // ── Write one page's worth of token traits to DB ─────────────────────────────
 let _debugDumped = false;
 async function writePage(nfts) {
-  if (!_debugDumped && nfts.length) {
+  if (DEBUG_DUMP && !_debugDumped && nfts.length) {
     _debugDumped = true;
     const nft = nfts[0];
     const rawCopy = nft.raw ? { ...nft.raw } : nft.raw;
@@ -157,7 +161,25 @@ async function writePage(nfts) {
     }, null, 2));
     console.log('🔍 END DEBUG\n');
   }
-  if (DRY_RUN || !nfts.length) return { written: 0, skipped: 0 };
+  if (!nfts.length) return { written: 0, skipped: 0 };
+
+  // In dry-run mode, parse and count exactly as normal but skip the DB
+  // entirely — no pool.connect(), no queries. This is what was broken
+  // before: the old early-return short-circuited before counting anything,
+  // so dry-run always reported 0/0 regardless of whether the data was good.
+  if (DRY_RUN) {
+    let written = 0, skipped = 0;
+    for (const nft of nfts) {
+      const tokenId = parseInt(nft.tokenId);
+      if (!tokenId && tokenId !== 0) { skipped++; continue; }
+      const rawAttrs = nft.raw?.metadata?.attributes;
+      const attrs = Array.isArray(rawAttrs) ? rawAttrs.map(normalizeTraitAttribute).filter(Boolean) : [];
+      if (!attrs.length) { skipped++; continue; }
+      written++;
+    }
+    return { written, skipped };
+  }
+
   const client = await pool.connect();
   let written = 0, skipped = 0;
   try {
