@@ -450,6 +450,21 @@ async function checkRoleConflict(guild, roleId){
 
 // Cache of role conflicts per guild to avoid repeated audit log fetches
 const _roleConflictCache = new Map(); // 'guildId:roleId' -> {result, ts}
+
+// ── Trait index cache — per slug, 10-min TTL ─────────────────────────────────
+const _traitIndexCache = new Map();
+async function getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug) {
+  const cached = _traitIndexCache.get(slug);
+  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached.rows;
+  try {
+    const rows = await getTraitIndex(RAILWAY_URL, API_SECRET, slug);
+    _traitIndexCache.set(slug, { rows, ts: Date.now() });
+    return rows;
+  } catch(e) {
+    if (cached) return cached.rows;
+    throw e;
+  }
+}
 async function isRoleManagedByOtherBot(guild, roleId){
   const key = guild.id+':'+roleId;
   const cached = _roleConflictCache.get(key);
@@ -471,21 +486,26 @@ client.on('interactionCreate', async (interaction)=>{
     const cfg = getConfig(guildId) || {};
     const commandName = interaction.commandName;
 
-    // trait/value autocomplete for traitfind
+    // trait/value autocomplete for traitfind — uses in-memory cache for instant response
     if(commandName === 'traitfind' && (focused.name === 'trait' || focused.name === 'value')){
       const RAILWAY_URL = getRailwayApiUrl();
       const API_SECRET = process.env.API_SECRET;
       const colInput = interaction.options.getString('collection') || null;
-      // resolve slug: check collections array first, then top-level
-      let slug = cfg.slug || cfg.collectionSlug || 'on-chain-all-stars';
+      const allCols = [];
+      const primarySlug = cfg.collectionSlug || cfg.slug;
+      if(primarySlug) allCols.push({ slug: primarySlug, name: cfg.contractName || primarySlug });
+      for(const c of cfg.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+      if(!colInput && allCols.length > 1 && focused.name === 'trait'){
+        return interaction.respond([{ name: '← Select a collection first', value: '__select_collection__' }]);
+      }
+      let slug = primarySlug || 'on-chain-all-stars';
       if(colInput){
-        const allCols = cfg.collections || [];
         const match = allCols.find(c => c.slug === colInput || c.name === colInput);
         if(match) slug = match.slug;
         else slug = colInput;
       }
       try {
-        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET, slug);
+        const traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug);
         let choices = [];
         if(focused.name === 'trait'){
           const names = [...new Set(traitIndex.map(t => t.trait_name))];
@@ -693,7 +713,12 @@ client.on('interactionCreate', async (interaction)=>{
     return handleConfigButton(interaction, cfgCtx);
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('tf_browse:')){
-    return handleTraitBrowseInteraction(interaction, { pgPool });
+    const tfCtx = {
+      pgPool, getConfig, getRailwayApiUrl, getCachedTraitIndex,
+      buildSaleEmbed, buildListingEmbed, postEmbeds, fetchBotApiJson,
+      buildTokenSearchEmbed, fetchTokenMetaFromDb, traitObjectToArray,
+    };
+    return handleTraitBrowseInteraction(interaction, tfCtx);
   }
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
      (interaction.customId.startsWith('cfg_chsel:') || interaction.customId.startsWith('cfg_rolesel:'))){
