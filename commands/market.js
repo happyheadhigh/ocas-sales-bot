@@ -329,7 +329,7 @@ async function handleMarketCommand(commandName, ctx){
     return;
   }
 
-  // /myalert
+  // /myalert — personal DM alert setup
   if(commandName==='myalert'){
     const alertColInput = interaction.options.getString('collection') || null;
     const alertResolved = resolveCollectionFromServerCfg(config, alertColInput);
@@ -342,6 +342,29 @@ async function handleMarketCommand(commandName, ctx){
     const alertListings=interaction.options.getBoolean('listings')??false;
     const slug=interaction.options.getString('collection')||config.slug;
     if(!slug) return interaction.reply({content:'Provide a collection or run `/setup` in a configured server first.', flags: MessageFlags.Ephemeral});
+
+    // No args — launch guided wizard
+    if(!trait && !value && !interaction.options.getBoolean('sales') && !interaction.options.getBoolean('listings') && !alertColInput){
+      const allCols = [];
+      const primarySlug = config.collectionSlug || config.slug;
+      if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
+      for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+      if(!allCols.length) return interaction.reply({ content: 'Run `/setup` first to configure a collection.', flags: MessageFlags.Ephemeral });
+      if(allCols.length === 1){
+        return showMaTraitPicker(interaction, ctx, allCols[0].slug);
+      }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('ma_browse:col')
+        .setPlaceholder('Pick a collection...')
+        .addOptions(allCols.slice(0,25).map(c =>
+          new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)
+        ));
+      return interaction.reply({
+        content: '**🔔 My Alert** — Pick a collection:',
+        components: [new ActionRowBuilder().addComponents(menu)],
+        flags: MessageFlags.Ephemeral,
+      });
+    }
 
     const existing=getAlert(interaction.user.id)||{};
     const filters={...(existing.traitFilters||{})};
@@ -925,4 +948,199 @@ async function handleTraitBrowseInteraction(interaction, ctx){
   }
 }
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction };
+// ── /myalert guided flow helpers ─────────────────────────────────────────────
+async function showMaTraitPicker(interaction, ctx, slug){
+  const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
+  const RAILWAY_URL = getRailwayApiUrl();
+  const API_SECRET = process.env.API_SECRET;
+  let traitIndex = [];
+  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
+  const traitNames = [...new Set(traitIndex.map(t => t.trait_name))].slice(0, 25);
+  if(!traitNames.length){
+    const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
+    return interaction[replyFn]({ content: `No trait data found for **${slug}** yet.`, flags: MessageFlags.Ephemeral });
+  }
+  const traitValueCounts = {};
+  for(const t of traitIndex){ if(!traitValueCounts[t.trait_name]) traitValueCounts[t.trait_name]=0; traitValueCounts[t.trait_name]++; }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`ma_browse:trait:${slug}`)
+    .setPlaceholder('Pick a trait to filter by...')
+    .addOptions(traitNames.map(n => new StringSelectMenuOptionBuilder()
+      .setLabel(n).setValue(n)
+      .setDescription(`${traitValueCounts[n]||0} value${traitValueCounts[n]===1?'':'s'}`)
+    ));
+  const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
+  return interaction[replyFn]({
+    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by (or skip to alert on all tokens):`,
+    components: [
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`ma_browse:skiptr:${slug}`).setLabel('Skip — alert on all traits').setStyle(ButtonStyle.Secondary)
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function showMaValuePicker(interaction, ctx, slug, traitName){
+  const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
+  const RAILWAY_URL = getRailwayApiUrl();
+  const API_SECRET = process.env.API_SECRET;
+  let traitIndex = [];
+  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
+  const valueRows = traitIndex.filter(t => t.trait_name === traitName).slice(0, 25);
+  if(!valueRows.length){
+    return interaction.update({ content: `No values found for **${traitName}**.`, components: [] });
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`ma_browse:val:${slug}:${traitName}`)
+    .setPlaceholder(`Pick ${traitName} value(s)...`)
+    .setMinValues(1)
+    .setMaxValues(Math.min(valueRows.length, 25))
+    .addOptions(valueRows.map(r => new StringSelectMenuOptionBuilder()
+      .setLabel(r.trait_value).setValue(r.trait_value)
+      .setDescription(`${r.token_count} token${r.token_count===1?'':'s'}`)
+    ));
+  return interaction.update({
+    content: `**🔔 My Alert — ${slug} › ${traitName}**\n\nPick one or more values (hold/tap to multi-select):`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+async function showMaTypePicker(interaction, slug, traitName, traitValues){
+  const valEncoded = (traitValues || []).join('|');
+  const traitEncoded = traitName || '';
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`ma_browse:type:${slug}:${traitEncoded}:${valEncoded}`)
+    .setPlaceholder('What should trigger a DM?')
+    .setMinValues(1)
+    .setMaxValues(2)
+    .addOptions([
+      new StringSelectMenuOptionBuilder().setLabel('Sales').setDescription('DM me when a matching token sells').setValue('sales'),
+      new StringSelectMenuOptionBuilder().setLabel('Listings').setDescription('DM me when a matching token is listed').setValue('listings'),
+    ]);
+  const filterSummary = traitName
+    ? `**${traitName}:** ${(traitValues||[]).join(', ')}`
+    : 'All tokens (no trait filter)';
+  return interaction.update({
+    content: `**🔔 My Alert — ${slug}**\n\nFilter: ${filterSummary}\n\nWhat should trigger a DM?`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+async function showMaConfirm(interaction, ctx, slug, traitName, traitValues, alertTypes){
+  const { getAlert } = ctx;
+  const existing = getAlert(interaction.user.id) || {};
+  const existingFilters = existing.traitFilters || {};
+  const previewFilters = { ...existingFilters };
+  if(traitName && traitValues && traitValues.length){
+    const current = previewFilters[traitName];
+    const existing_arr = current ? (Array.isArray(current) ? current : [current]) : [];
+    const merged = [...new Set([...existing_arr, ...traitValues])];
+    previewFilters[traitName] = merged.length === 1 ? merged[0] : merged;
+  }
+  const alertSales = alertTypes.includes('sales');
+  const alertListings = alertTypes.includes('listings');
+  const fmtF = f => Object.keys(f||{}).length===0 ? 'none (all tokens)' :
+    Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+  const valEncoded = (traitValues||[]).join('|');
+  const traitEncoded = traitName || '';
+  const typeEncoded = alertTypes.join('|');
+  const embed = new EmbedBuilder()
+    .setTitle('🔔 Confirm Alert')
+    .setColor(0x5865F2)
+    .setDescription([
+      `**Collection:** ${slug}`,
+      `**Sales DMs:** ${alertSales ? '✅ on' : '❌ off'}`,
+      `**Listing DMs:** ${alertListings ? '✅ on' : '❌ off'}`,
+      `**Filters after save:**`,
+      fmtF(previewFilters),
+    ].join('\n'));
+  const confirmRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`ma_browse:confirm:${slug}:${traitEncoded}:${valEncoded}:${typeEncoded}`)
+      .setLabel('Set Alert').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('ma_browse:cancel')
+      .setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  return interaction.update({ content: '', embeds: [embed], components: [confirmRow] });
+}
+
+// ── /myalert wizard — select menu + button follow-ups ────────────────────────
+async function handleMyAlertInteraction(interaction, ctx){
+  const { getAlert, setAlert } = ctx;
+  const customId = interaction.customId;
+
+  if(customId === 'ma_browse:col'){
+    const slug = interaction.values[0];
+    return showMaTraitPicker(interaction, ctx, slug);
+  }
+  if(customId.startsWith('ma_browse:trait:')){
+    const slug = customId.slice('ma_browse:trait:'.length);
+    const traitName = interaction.values[0];
+    return showMaValuePicker(interaction, ctx, slug, traitName);
+  }
+  if(customId.startsWith('ma_browse:skiptr:')){
+    const slug = customId.slice('ma_browse:skiptr:'.length);
+    return showMaTypePicker(interaction, slug, null, null);
+  }
+  if(customId.startsWith('ma_browse:val:')){
+    const parts = customId.slice('ma_browse:val:'.length).split(':');
+    const slug = parts[0];
+    const traitName = parts.slice(1).join(':');
+    const traitValues = interaction.values;
+    return showMaTypePicker(interaction, slug, traitName, traitValues);
+  }
+  if(customId.startsWith('ma_browse:type:')){
+    const parts = customId.slice('ma_browse:type:'.length).split(':');
+    const slug = parts[0];
+    const traitName = parts[1] || null;
+    const valEncoded = parts.slice(2).join(':');
+    const traitValues = valEncoded ? valEncoded.split('|').filter(Boolean) : [];
+    const alertTypes = interaction.values;
+    return showMaConfirm(interaction, ctx, slug, traitName, traitValues, alertTypes);
+  }
+  if(customId.startsWith('ma_browse:confirm:')){
+    const parts = customId.slice('ma_browse:confirm:'.length).split(':');
+    const slug = parts[0];
+    const traitName = parts[1] || null;
+    const valEncoded = parts[2] || '';
+    const typeEncoded = parts[3] || 'sales';
+    const traitValues = valEncoded ? valEncoded.split('|').filter(Boolean) : [];
+    const alertTypes = typeEncoded.split('|').filter(Boolean);
+    const alertSales = alertTypes.includes('sales');
+    const alertListings = alertTypes.includes('listings');
+    const existing = getAlert(interaction.user.id) || {};
+    const filters = { ...(existing.traitFilters || {}) };
+    if(traitName && traitValues.length){
+      const current = filters[traitName];
+      const existing_arr = current ? (Array.isArray(current) ? current : [current]) : [];
+      const merged = [...new Set([...existing_arr, ...traitValues])];
+      filters[traitName] = merged.length === 1 ? merged[0] : merged;
+    }
+    setAlert(interaction.user.id, { slug, traitFilters: filters, alertSales, alertListings });
+    const fmtF = f => Object.keys(f||{}).length===0 ? 'none (all tokens)' :
+      Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+    const embed = new EmbedBuilder()
+      .setTitle('✅ Alert Set!')
+      .setColor(0x57F287)
+      .setDescription([
+        `**Collection:** ${slug}`,
+        `**Sales DMs:** ${alertSales ? '✅ on' : '❌ off'}`,
+        `**Listing DMs:** ${alertListings ? '✅ on' : '❌ off'}`,
+        `**Filters:**`,
+        fmtF(filters),
+        '',
+        'Use `/myalert` again to add more filters.',
+        'Use `/myalertclear` to remove your alert.',
+      ].join('\n'));
+    return interaction.update({ content: '', embeds: [embed], components: [] });
+  }
+  if(customId === 'ma_browse:cancel'){
+    return interaction.update({ content: 'Alert wizard cancelled.', embeds: [], components: [] });
+  }
+}
+
+
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker };
