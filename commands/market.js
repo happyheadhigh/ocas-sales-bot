@@ -251,6 +251,7 @@ async function handleMarketCommand(commandName, ctx){
     const matchLabel = traitOpt && valueOpt ? `${traitOpt}: ${valueOpt}` : (valueOpt || traitOpt);
 
     await interaction.deferReply();
+    const cfg = _tfResolved ? {...config, ..._tfResolved} : {...config, slug};
 
     try{
       // ── Sales mode ─────────────────────────────────────────────────────────
@@ -261,7 +262,6 @@ async function handleMarketCommand(commandName, ctx){
         const j = await fetchBotApiJson(`${RAILWAY_URL}/db/trait-sales?${qs}`, '/db/trait-sales API');
         const sales = j.sales || [];
         if(!sales.length){ await interaction.editReply(`No sales found for **${matchLabel}**.`); return; }
-        const cfg = _tfResolved ? {...config, ..._tfResolved} : {...config, slug};
         const toShow = sales.slice(0, want);
         const saleEmbeds = await Promise.all(toShow.map(async sale => {
           const dbMeta = await fetchTokenMetaFromDb(sale.token_id).catch(()=>null);
@@ -293,7 +293,6 @@ async function handleMarketCommand(commandName, ctx){
         await interaction.editReply(`No ${listedOnly ? 'active listings' : 'tokens'} found matching **${matchLabel}**.`);
         return;
       }
-      const cfg = _tfResolved ? {...config, ..._tfResolved} : {...config, slug};
       const embeds = await Promise.all(tokens.map(async t => {
         const tokenId = t.token_id ?? t.id ?? t.identifier;
         if(listedOnly){
@@ -318,39 +317,6 @@ async function handleMarketCommand(commandName, ctx){
         `Found **${tokens.length}** ${listedOnly ? 'listing' : 'token'}${tokens.length===1?'':'s'} matching **${matchLabel}**${listedOnly ? ' (cheapest first)' : ''}:`);
       return;
 
-      // ── Contract fallback — fetch traits for matched tokens directly from chain ─
-      // Only fires when Railway DB is unavailable. Contract is always authoritative.
-      if(groups.length){
-        try{
-          await interaction.editReply(`🔍 Fetching on-chain traits for **${matchLabel}**...`);
-          // We don't have token IDs without the DB, so this is a best-effort single-token lookup
-          // using the trait search term to at least surface what we can from the contract.
-          console.log('[traitfind] contract fallback triggered for groups:', JSON.stringify(groups));
-        }catch(e){ console.warn('[traitfind] contract fallback error:', e.message); }
-      }
-
-      // ── OpenSea fallback (sales only) ──────────────────────────────────────
-      await interaction.editReply(`🔍 Searching OpenSea sales for **${trait ? trait+': ' : ''}${value}**...`);
-      const traitLow=trait.toLowerCase(), valueLow=value.toLowerCase();
-      const matched=[];let cursor=null;let pages=0;
-      while(matched.length<want&&pages<15){
-        const qs=new URLSearchParams({event_type:'sale',limit:'100'});
-        if(cursor) qs.set('next',cursor);
-        const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?${qs}`,{headers:osHeaders()});
-        if(!r.ok) break;
-        const j=await r.json();const sales=j.asset_events||[];if(!sales.length) break;
-        for(const sale of sales){
-          if(matched.length>=want) break;
-          const lookup={};
-          for(const t of (sale.nft?.traits||[])) lookup[t.trait_type?.toLowerCase()]=String(t.value).toLowerCase();
-          if(lookup[traitLow]===valueLow) matched.push(sale);
-        }
-        cursor=j.next||null;if(!cursor) break;pages++;
-      }
-      if(!matched.length){ await interaction.editReply(`No sales found with **${trait ? trait+': ' : ''}${value}** in the last ~${pages*100} sales.`); return; }
-      const cfg={...config,slug};
-      await interaction.editReply(`Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (OpenSea, last ~${pages*100}):`);
-      for(const sale of matched){const embed=await buildSaleEmbed(sale,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
     }catch(e){
       console.warn('[traitfind]', e.message);
       await interaction.editReply(`I could not load trait results from the TraitView API. ${e.message}`);
