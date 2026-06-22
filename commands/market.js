@@ -274,15 +274,6 @@ async function handleMarketCommand(commandName, ctx){
       const extra = unmatched.length ? ` Unmatched words: ${unmatched.join(', ')}.` : '';
       return interaction.reply({content:`I could not match **${workingSearch}** to known traits for **${slug}**.${extra} Try an exact trait/value like \`zombie\`, \`gold chain\`, or \`alien epic bear\`.`, flags: MessageFlags.Ephemeral});
     }
-    // For non-OCAS collections, listings search works correctly (listings is
-    // properly collection-scoped) but plain token search and sales-history
-    // search don't yet — there's no real per-token trait/rank data stored for
-    // other collections (see migrations/003 notes), and /db/trait-sales is a
-    // separate, still-unscoped endpoint. Say so plainly instead of silently
-    // returning nothing or, worse, another collection's data.
-    if(!isOcasSlug(slug) && !wantListings){
-      return interaction.reply({content:`I recognized **${matchLabel}** for **${slug}**, but ${wantSales ? 'sales history search' : 'token-level search (beyond listings)'} isn't available yet for non-OCAS collections. Try \`/traitfind search:${workingSearch} listings\` to search active listings instead, which does work.`, flags: MessageFlags.Ephemeral});
-    }
     await interaction.deferReply();
 
     try{
