@@ -43,14 +43,11 @@ function formatSweepTokenLine(item){
 
 
 // ── Paid tier check ────────────────────────────────────────────────────────────
-// OCAS is always free. Other collections need isPaidTier=true for premium features.
-// The bot owner (OWNER_DISCORD_IDS) bypasses this entirely, for any collection,
-// so they can test paid features without needing to flag a collection as paid.
 function isPaidFeature(cfg, featureName, userId){
   if(userId && OWNER_DISCORD_IDS.has(String(userId))) return false;
   const isOcas = (cfg?.contract||cfg?.collectionSlug||cfg?.slug||'').toLowerCase().includes('on-chain-all-stars') ||
                  (cfg?.contract||'').toLowerCase() === '0x078be86f3104a32313a47815792230a3808642cc';
-  if(isOcas) return false; // OCAS always free
+  if(isOcas) return false;
   return !(cfg?.isPaidTier === true);
 }
 
@@ -58,71 +55,7 @@ function isOcasSlug(slug){
   return (slug||'').toLowerCase().includes('on-chain-all-stars');
 }
 
-// ── Trait browse (no search text typed) ──────────────────────────────────────
-// For collections without a working token-level search index (anything that
-// isn't OCAS right now — see lib/db.js: tokens/token_traits have no
-// collection_slug column, so trait→token lookups can't be scoped correctly
-// yet). This still lets someone discover what trait categories and values
-// exist for a collection, sourced from collection_traits (which IS scoped
-// correctly per-slug), without claiming to search tokens it can't actually
-// search correctly.
-async function showTraitBrowseCategories(interaction, pgPool, slug){
-  const catRes = await pgPool.query(
-    `SELECT trait_name, COUNT(DISTINCT trait_value) AS value_count, SUM(token_count) AS total_tokens
-     FROM collection_traits WHERE slug=$1 GROUP BY trait_name ORDER BY trait_name`,
-    [slug]
-  ).catch(()=>({ rows:[] }));
-
-  if(!catRes.rows.length){
-    return interaction.reply({
-      content: `No cached trait data found for **${slug}** yet. Add this collection in \`/config\` → Collections first — traits are cached automatically when a collection's slug is saved.`,
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`tf_browse:cat:${slug}`)
-    .setPlaceholder('Pick a trait category...')
-    .addOptions(catRes.rows.slice(0,25).map(r =>
-      new StringSelectMenuOptionBuilder()
-        .setLabel(r.trait_name)
-        .setValue(r.trait_name)
-        .setDescription(`${r.value_count} value${r.value_count==1?'':'s'}`)
-    ));
-
-  return interaction.reply({
-    content: `**🔍 Browse ${slug} traits**\n\nNo search text was provided, so here's what's available — pick a category to see its values.`,
-    components: [new ActionRowBuilder().addComponents(menu)],
-    flags: MessageFlags.Ephemeral,
-  });
-}
-
-async function showTraitBrowseValues(interaction, pgPool, slug, category){
-  const valRes = await pgPool.query(
-    `SELECT trait_value, token_count FROM collection_traits WHERE slug=$1 AND trait_name=$2 ORDER BY token_count DESC, trait_value`,
-    [slug, category]
-  ).catch(()=>({ rows:[] }));
-
-  if(!valRes.rows.length){
-    return interaction.update({ content: `No values found for **${category}**.`, components: [] });
-  }
-
-  const lines = valRes.rows.slice(0,25).map(r => `• **${r.trait_value}** — ${r.token_count} token${r.token_count==1?'':'s'}`);
-  const more = valRes.rows.length > 25 ? `\n…and ${valRes.rows.length - 25} more.` : '';
-
-  return interaction.update({
-    content: `**🔍 ${slug} — ${category}**\n\n${lines.join('\n')}${more}\n\n` +
-      `Token-level search isn't available yet for non-OCAS collections — this is a list of what exists, not a live search. ` +
-      `To find specific listings with this trait, filter by it directly on OpenSea for now.`,
-    components: [],
-  });
-}
-
 // ── Smart collection resolver ──────────────────────────────────────────────────
-// Returns the best matching collection config from server_configs.
-// If collectionInput is given, matches by slug or name.
-// If only 1 collection configured, returns it automatically.
-// If 2+ collections and no input, returns primary.
 function resolveCollectionFromServerCfg(serverCfg, collectionInput){
   if(!serverCfg) return null;
   const primary = {
@@ -139,7 +72,6 @@ function resolveCollectionFromServerCfg(serverCfg, collectionInput){
   const all = [primary, ...extras].filter(c => c.slug);
 
   if(!collectionInput) {
-    // No input — return primary always
     return primary.slug ? primary : null;
   }
 
@@ -225,7 +157,7 @@ async function handleMarketCommand(commandName, ctx){
     return;
   }
 
-  // /traitfind - token search by default; add "listings" or "sales" for those modes.
+  // /traitfind
   if(commandName==='traitfind'){
     const _tfCool = checkCommandCooldown(interaction.user.id, 'traitfind');
     if(_tfCool) return interaction.reply({content:`⏳ Please wait **${_tfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
@@ -243,10 +175,32 @@ async function handleMarketCommand(commandName, ctx){
     const wantSales    = modeOpt === 'sales';
 
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    if(!traitOpt && !valueOpt) return interaction.reply({content:'Select a **trait** and/or **value** to search.', flags: MessageFlags.Ephemeral});
+
+    // No args — launch guided select menu wizard
+    if(!traitOpt && !valueOpt){
+      const allCols = [];
+      const primarySlug = config.collectionSlug || config.slug;
+      if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
+      for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+      if(!allCols.length) return interaction.reply({ content: 'Run `/setup` first to configure a collection.', flags: MessageFlags.Ephemeral });
+      if(allCols.length === 1){
+        return showTfTraitPicker(interaction, ctx, allCols[0].slug);
+      }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('tf_browse:col')
+        .setPlaceholder('Pick a collection...')
+        .addOptions(allCols.slice(0, 25).map(c =>
+          new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)
+        ));
+      return interaction.reply({
+        content: '**🔍 Trait Find** — Pick a collection to search:',
+        components: [new ActionRowBuilder().addComponents(menu)],
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
     if(!RAILWAY_URL) return interaction.reply({content:'Trait search needs the internal TraitView API URL. Set `RAILWAY_API_URL` in this Railway service.', flags: MessageFlags.Ephemeral});
 
-    // Build groups directly from structured inputs — skip phrase parser
     const groups = [[{ trait_name: traitOpt || '_any', trait_value: valueOpt }]];
     const matchLabel = traitOpt && valueOpt ? `${traitOpt}: ${valueOpt}` : (valueOpt || traitOpt);
 
@@ -254,7 +208,6 @@ async function handleMarketCommand(commandName, ctx){
     const cfg = _tfResolved ? {...config, ..._tfResolved} : {...config, slug};
 
     try{
-      // ── Sales mode ─────────────────────────────────────────────────────────
       if(wantSales){
         await interaction.editReply(`🔍 Searching **${matchLabel}** in full sales history...`);
         const qs = new URLSearchParams({ trait: traitOpt, value: valueOpt, limit: String(Math.min(want, 200)), sort: 'desc' });
@@ -280,7 +233,6 @@ async function handleMarketCommand(commandName, ctx){
         return;
       }
 
-      // ── Tokens / Listings mode (default) ───────────────────────────────────
       const listedOnly = wantListings;
       await interaction.editReply(`Searching ${listedOnly ? 'listed tokens' : 'tokens'} matching **${matchLabel}**...`);
       const qs = new URLSearchParams({ limit: String(want), key: API_SECRET||'', slug });
@@ -336,18 +288,18 @@ async function handleMarketCommand(commandName, ctx){
     if(!colSlug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
-      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=listing&limit=${count}`,{headers:osHeaders()});
+      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(colSlug)}?event_type=listing&limit=${count}`,{headers:osHeaders()});
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const listings=(await r.json()).asset_events||[];
       if(!listings.length){await interaction.editReply('No listings found.');return;}
-      const cfg={...config,slug};
+      const cfg={...config,slug:colSlug};
       const embeds=await Promise.all(listings.reverse().map(l=>buildListingEmbed(l,cfg).catch(()=>null)));
-      await postEmbeds(interaction, embeds.filter(Boolean), `${listings.length} recent listings for **${slug}**:`);
+      await postEmbeds(interaction, embeds.filter(Boolean), `${listings.length} recent listings for **${colSlug}**:`);
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
   }
 
-  // /debuglisting — show raw listing event to diagnose parsing issues
+  // /debuglisting
   if(commandName==='debuglisting'){
     const slug=interaction.options.getString('collection')||config.slug;
     if(!slug) return interaction.reply({content:'Provide a collection.', flags: MessageFlags.Ephemeral});
@@ -377,7 +329,7 @@ async function handleMarketCommand(commandName, ctx){
     return;
   }
 
-    // /myalert — personal DM alert setup
+  // /myalert
   if(commandName==='myalert'){
     const alertColInput = interaction.options.getString('collection') || null;
     const alertResolved = resolveCollectionFromServerCfg(config, alertColInput);
@@ -394,7 +346,6 @@ async function handleMarketCommand(commandName, ctx){
     const existing=getAlert(interaction.user.id)||{};
     const filters={...(existing.traitFilters||{})};
 
-    // Stack multiple values for same trait (OR logic) — same as server filters
     if(trait&&value){
       const current=filters[trait];
       if(!current) filters[trait]=value;
@@ -426,7 +377,6 @@ async function handleMarketCommand(commandName, ctx){
     const trait=interaction.options.getString('trait');
     const value=interaction.options.getString('value');
     if(trait){
-      // Remove just one trait/value from the alert
       const alert=getAlert(interaction.user.id);
       if(!alert){ await interaction.reply({content:'You have no alert set.', flags: MessageFlags.Ephemeral}); return; }
       const filters={...(alert.traitFilters||{})};
@@ -464,8 +414,7 @@ async function handleMarketCommand(commandName, ctx){
     return;
   }
 
-  // /help
-  // /rankfilter — show currently listed tokens filtered by OS rank range
+  // /rankfind
   if(commandName==='rankfind'){
     if(isPaidFeature(config, 'rankfind', interaction.user.id))
       return interaction.reply({content:'📊 Rank search requires a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
@@ -489,8 +438,6 @@ async function handleMarketCommand(commandName, ctx){
     await interaction.deferReply();
     const contract = (_rfResolved?.contract || config.contract || '');
     try{
-
-      // ── Sales mode ─────────────────────────────────────────────────────────
       if(wantSales){
         const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, limit: '20', sort: 'desc' });
         if(API_SECRET) qs.set('key', API_SECRET);
@@ -499,9 +446,7 @@ async function handleMarketCommand(commandName, ctx){
         if(!sales.length){ await interaction.editReply(`No sales found for OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
         const cfg = _rfResolved ? {...config, ..._rfResolved} : {...config, slug: rfSlug};
         const saleEmbeds = await Promise.all(sales.map(async sale => {
-          const tokenTraits = sale.traits && typeof sale.traits==='object'
-            ? traitObjectToArray(sale.traits)
-            : [];
+          const tokenTraits = sale.traits && typeof sale.traits==='object' ? traitObjectToArray(sale.traits) : [];
           const isWethSale = (sale.currency||'ETH').toUpperCase() === 'WETH';
           const syntheticSale = {
             nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits, os_rank: sale.os_rank },
@@ -516,7 +461,6 @@ async function handleMarketCommand(commandName, ctx){
         return;
       }
 
-      // ── Listings mode (default) ────────────────────────────────────────────
       const qs = new URLSearchParams({ listed: '1', rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
       if(API_SECRET) qs.set('key', API_SECRET);
       const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, '/db/multi-trait-tokens rank listings API');
@@ -557,7 +501,6 @@ async function handleMarketCommand(commandName, ctx){
     return;
   }
 
-
   if(commandName==='sweep'){
     const sweepColInput = interaction.options.getString('collection') || null;
     const sweepResolved = resolveCollectionFromServerCfg(config, sweepColInput);
@@ -570,15 +513,12 @@ async function handleMarketCommand(commandName, ctx){
     console.log('[/sweep] RAILWAY_URL set:', !!RAILWAY_URL, 'search:', rawSearch);
     await interaction.deferReply();
     try{
-
-      // ── Parse sweep mode ──────────────────────────────────────────────────
       let sweepMode   = 'count';
       let sweepCount  = 10;
       let budget      = null;
       let targetFloor = null;
       let workingSearch = rawSearch;
 
-      // Budget mode: "2eth", "1eth zombie", "0.5eth zombie hoodie"
       const budgetMatch = workingSearch.match(/(?:^|\s)([\d.]+)\s*eth(?=\s|$)/i);
       if(budgetMatch){
         sweepMode = 'budget';
@@ -586,7 +526,6 @@ async function handleMarketCommand(commandName, ctx){
         workingSearch = workingSearch.replace(budgetMatch[0], ' ').trim();
       }
 
-      // Target-floor mode: "0.05 floor", "0.1 floor zombie"
       if(sweepMode === 'count'){
         const floorNumMatch = workingSearch.match(/(?:^|\s)([\d.]+)\s+floor(?=\s|$)/i);
         if(floorNumMatch){
@@ -594,12 +533,10 @@ async function handleMarketCommand(commandName, ctx){
           targetFloor = parseFloat(floorNumMatch[1]);
           workingSearch = workingSearch.replace(floorNumMatch[0], ' ').trim();
         } else {
-          // Strip stray "floor" keyword if no number preceded it
           workingSearch = workingSearch.replace(/(?:^|\s)floor(?=\s|$)/gi, ' ').trim();
         }
       }
 
-      // Count mode: extract standalone integer
       if(sweepMode === 'count'){
         const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
         if(numMatch){
@@ -608,7 +545,6 @@ async function handleMarketCommand(commandName, ctx){
         }
       }
 
-      // ── Extract trait count e.g. "15 traits" ──────────────────────────────
       let traitCount = null;
       const tcMatch = workingSearch.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
       if(tcMatch){
@@ -616,7 +552,6 @@ async function handleMarketCommand(commandName, ctx){
         workingSearch = workingSearch.replace(tcMatch[0], ' ').trim();
       }
 
-      // ── Simple depluralize ────────────────────────────────────────────────
       const PLURAL_OVERRIDES = {
         zombies: 'zombie', hoodies: 'hoodie', skeletons: 'skeleton',
         apes: 'ape', aliens: 'alien', robots: 'robot'
@@ -631,7 +566,6 @@ async function handleMarketCommand(commandName, ctx){
         return w;
       }).join(' ').trim();
 
-      // ── Phrase-aware trait matching ────────────────────────────────────────
       let matchedGroups = [];
       workingSearch = workingSearch.replace(/[,+]/g,' ').replace(/\b(and|with|plus)\b/gi,' ').replace(/\s+/g,' ').trim();
 
@@ -649,7 +583,6 @@ async function handleMarketCommand(commandName, ctx){
         }
       }
 
-      // ── Build label + title ────────────────────────────────────────────────
       const labelParts = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
       if(traitCount !== null) labelParts.push(traitCount + ' traits');
       const traitLabel = labelParts.length ? labelParts.join(' · ') : 'OCAS';
@@ -659,10 +592,8 @@ async function handleMarketCommand(commandName, ctx){
       else if(sweepMode === 'floor') modeTitle = `Floor Sweep Ξ${targetFloor} · ${traitLabel}`;
       else modeTitle = `Sweep ${sweepCount} · ${traitLabel}`;
 
-      // ── Determine fetch limit ──────────────────────────────────────────────
       const fetchLimit = (sweepMode === 'count') ? sweepCount + 1 : 1000;
 
-      // ── Fetch listings from DB ─────────────────────────────────────────────
       let allFetched = [];
       if(!matchedGroups.length && traitCount === null){
         console.log('[/sweep] plain sweep from DB, mode:', sweepMode);
@@ -703,7 +634,6 @@ async function handleMarketCommand(commandName, ctx){
         return;
       }
 
-      // ── Apply mode logic ───────────────────────────────────────────────────
       let sweepListings = [];
       let postSweepToken = null;
       const fmt = n => n.toFixed(4);
@@ -732,7 +662,6 @@ async function handleMarketCommand(commandName, ctx){
         postSweepToken = allFetched[sweepCount] || null;
       }
 
-      // ── Compute stats ──────────────────────────────────────────────────────
       const available  = sweepListings.length;
       const short      = sweepMode === 'count' && available < sweepCount;
       const prices     = sweepListings.map(t => parseFloat(t.price_eth));
@@ -742,7 +671,6 @@ async function handleMarketCommand(commandName, ctx){
       const highest    = prices[prices.length-1];
       const floorAfter = postSweepToken ? parseFloat(postSweepToken.price_eth) : null;
 
-      // ── Build embed description ────────────────────────────────────────────
       let desc = '';
       if(sweepMode === 'budget'){
         const remaining = budget - totalEth;
@@ -776,11 +704,9 @@ async function handleMarketCommand(commandName, ctx){
         .setColor(COLORS.OCAS_GREEN)
         .setDescription(desc.slice(0, 4090));
 
-      // ── All tokens behind private Show All Tokens button ──────────────────
       const components = [];
       const sessionId = interaction.id;
       const cleanSweepListings = sweepListings.map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
-      // Cap total concurrent sweep sessions to prevent unbounded memory growth
       if(sweepSessions.size >= 100){
         const oldest = sweepSessions.keys().next().value;
         sweepSessions.delete(oldest);
@@ -810,14 +736,163 @@ const MARKET_COMMANDS = new Set([
   'myalert','myalertclear','myalertstatus','rankfind','sweep',
 ]);
 
-// ── /traitfind browse flow — category dropdown follow-up ─────────────────────
+// ── /traitfind guided flow helpers ───────────────────────────────────────────
+async function showTfTraitPicker(interaction, ctx, slug){
+  const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
+  const RAILWAY_URL = getRailwayApiUrl();
+  const API_SECRET = process.env.API_SECRET;
+  let traitIndex = [];
+  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
+  const traitNames = [...new Set(traitIndex.map(t => t.trait_name))].slice(0, 25);
+  if(!traitNames.length){
+    const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
+    return interaction[replyFn]({ content: `No trait data found for **${slug}** yet. Make sure the collection is added via \`/config\`.`, flags: MessageFlags.Ephemeral });
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`tf_browse:trait:${slug}`)
+    .setPlaceholder('Pick a trait category...')
+    .addOptions(traitNames.map(n => new StringSelectMenuOptionBuilder().setLabel(n).setValue(n)));
+  const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
+  return interaction[replyFn]({
+    content: `**🔍 Trait Find — ${slug}**\n\nPick a trait category:`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function showTfValuePicker(interaction, ctx, slug, traitName){
+  const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
+  const RAILWAY_URL = getRailwayApiUrl();
+  const API_SECRET = process.env.API_SECRET;
+  let traitIndex = [];
+  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
+  const values = [...new Set(
+    traitIndex.filter(t => t.trait_name === traitName).map(t => t.trait_value)
+  )].slice(0, 25);
+  if(!values.length){
+    return interaction.update({ content: `No values found for **${traitName}**.`, components: [] });
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`tf_browse:val:${slug}:${traitName}`)
+    .setPlaceholder(`Pick a ${traitName} value...`)
+    .addOptions(values.map(v => new StringSelectMenuOptionBuilder().setLabel(v).setValue(v)));
+  return interaction.update({
+    content: `**🔍 Trait Find — ${slug} › ${traitName}**\n\nPick a value:`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+async function showTfModePicker(interaction, slug, traitName, traitValue){
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`tf_browse:mode:${slug}:${traitName}:${traitValue}`)
+    .setPlaceholder('What do you want to see?')
+    .addOptions([
+      new StringSelectMenuOptionBuilder().setLabel('Tokens').setDescription('All tokens with this trait').setValue('tokens'),
+      new StringSelectMenuOptionBuilder().setLabel('Listings').setDescription('Active listings only — cheapest first').setValue('listings'),
+      new StringSelectMenuOptionBuilder().setLabel('Sales').setDescription('Recent sales history').setValue('sales'),
+    ]);
+  return interaction.update({
+    content: `**🔍 Trait Find — ${slug} › ${traitName}: ${traitValue}**\n\nWhat would you like to see?`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+// ── /traitfind browse flow — select menu follow-ups ───────────────────────────
 async function handleTraitBrowseInteraction(interaction, ctx){
-  const { pgPool } = ctx;
+  const { pgPool, getConfig, getRailwayApiUrl, getCachedTraitIndex,
+          buildSaleEmbed, buildListingEmbed, postEmbeds, fetchBotApiJson,
+          buildTokenSearchEmbed, fetchTokenMetaFromDb, traitObjectToArray } = ctx;
   const customId = interaction.customId;
-  if(customId.startsWith('tf_browse:cat:')){
-    const slug = customId.slice('tf_browse:cat:'.length);
-    const category = interaction.values[0];
-    return showTraitBrowseValues(interaction, pgPool, slug, category);
+
+  if(customId === 'tf_browse:col'){
+    const slug = interaction.values[0];
+    return showTfTraitPicker(interaction, ctx, slug);
+  }
+
+  if(customId.startsWith('tf_browse:trait:')){
+    const slug = customId.slice('tf_browse:trait:'.length);
+    const traitName = interaction.values[0];
+    return showTfValuePicker(interaction, ctx, slug, traitName);
+  }
+
+  if(customId.startsWith('tf_browse:val:')){
+    const parts = customId.slice('tf_browse:val:'.length).split(':');
+    const slug = parts[0];
+    const traitName = parts.slice(1).join(':');
+    const traitValue = interaction.values[0];
+    return showTfModePicker(interaction, slug, traitName, traitValue);
+  }
+
+  if(customId.startsWith('tf_browse:mode:')){
+    const parts = customId.slice('tf_browse:mode:'.length).split(':');
+    const slug = parts[0];
+    const traitName = parts[1];
+    const traitValue = parts.slice(2).join(':');
+    const mode = interaction.values[0];
+
+    await interaction.update({ content: `🔍 Searching **${traitName}: ${traitValue}** in **${slug}** (${mode})...`, components: [] });
+
+    const guildId = interaction.guildId;
+    const config = getConfig(guildId) || {};
+    const RAILWAY_URL = getRailwayApiUrl();
+    const API_SECRET = process.env.API_SECRET;
+    const cfg = { ...config, slug };
+    const want = 20;
+    const groups = [[{ trait_name: traitName, trait_value: traitValue }]];
+    const matchLabel = `${traitName}: ${traitValue}`;
+
+    try {
+      if(mode === 'sales'){
+        const qs = new URLSearchParams({ trait: traitName, value: traitValue, limit: '20', sort: 'desc' });
+        if(API_SECRET) qs.set('key', API_SECRET);
+        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/trait-sales?${qs}`, '/db/trait-sales');
+        const sales = j.sales || [];
+        if(!sales.length){ await interaction.editReply({ content: `No sales found for **${matchLabel}**.`, components:[] }); return; }
+        const saleEmbeds = await Promise.all(sales.slice(0,want).map(async sale => {
+          const dbMeta = await fetchTokenMetaFromDb(sale.token_id).catch(()=>null);
+          const tokenTraits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
+          const syntheticSale = {
+            nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
+            buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
+            payment: { symbol: 'ETH', token_address: '', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
+            event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
+          };
+          return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+        }));
+        await postEmbeds(interaction, saleEmbeds.filter(Boolean), `Found **${j.count}** sale${j.count===1?'':'s'} with **${matchLabel}**:`);
+        return;
+      }
+
+      const listedOnly = mode === 'listings';
+      const qs = new URLSearchParams({ limit: String(want), key: API_SECRET||'', slug });
+      qs.set('groups', JSON.stringify(groups));
+      if(listedOnly) qs.set('listed', '1');
+      const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, '/db/multi-trait-tokens');
+      const tokens = j.tokens || [];
+      if(!tokens.length){ await interaction.editReply({ content: `No ${listedOnly?'listings':'tokens'} found for **${matchLabel}**.`, components:[] }); return; }
+      const embeds = await Promise.all(tokens.map(async t => {
+        const tokenId = t.token_id ?? t.id ?? t.identifier;
+        if(listedOnly){
+          const priceWei = t.price_eth!=null ? String(BigInt(Math.round(t.price_eth*1e18))) : '0';
+          const fakeListingObj = {
+            token_id: tokenId,
+            asset: { token_id: String(tokenId), identifier: String(tokenId), name:'#'+tokenId, traits: t.traits?.__attributes||[] },
+            payment: { quantity: priceWei, decimals:18, symbol:'ETH', token_address:'' },
+            maker: t.seller||'', url: t.url||null, os_rank: t.os_rank||null,
+            _dbToken: { traits: t.traits||{}, obs_rank: t.obs_rank||null, os_rank: t.os_rank||null },
+          };
+          return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
+        }
+        const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+        return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
+      }));
+      await postEmbeds(interaction, embeds.filter(Boolean),
+        `Found **${tokens.length}** ${listedOnly?'listing':'token'}${tokens.length===1?'':'s'} matching **${matchLabel}**${listedOnly?' (cheapest first)':''}:`);
+    } catch(e) {
+      console.warn('[tf_browse:mode]', e.message);
+      await interaction.editReply({ content: `Search failed: ${e.message}`, components:[] });
+    }
+    return;
   }
 }
 
