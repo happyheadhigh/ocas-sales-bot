@@ -227,8 +227,6 @@ async function handleMarketCommand(commandName, ctx){
 
   // /traitfind - token search by default; add "listings" or "sales" for those modes.
   if(commandName==='traitfind'){
-    if(isPaidFeature(config, 'traitfind', interaction.user.id))
-      return interaction.reply({content:'🔍 Trait search requires a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
     const _tfCool = checkCommandCooldown(interaction.user.id, 'traitfind');
     if(_tfCool) return interaction.reply({content:`⏳ Please wait **${_tfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const slug       = interaction.options.getString('collection') || config.collectionSlug || config.slug;
@@ -304,21 +302,25 @@ async function handleMarketCommand(commandName, ctx){
         const cfg = {...config, slug};
         const embeds = await Promise.all(tokens.map(async t => {
           const tokenId = t.token_id ?? t.id ?? t.identifier;
-          const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+          // For listedOnly, traits come from the API response (already scoped by
+          // collection_slug) — don't call fetchTokenMetaFromDb which has no slug
+          // param and would return OCAS data for overlapping token IDs.
           if(listedOnly){
             const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
+            const scopedDbToken = { traits: t.traits || {}, obs_rank: t.obs_rank || null, os_rank: t.os_rank || null };
             const fakeListingObj = {
               token_id: tokenId,
               asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
-                       traits: dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [] },
+                       traits: t.traits?.__attributes || [] },
               payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
               maker: t.seller || '',
               url: t.url || null,
               os_rank: t.os_rank || null,
-              _dbToken: dbMeta,
+              _dbToken: scopedDbToken,
             };
             return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
           }
+          const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
           return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
         }));
         await postEmbeds(interaction, embeds.filter(Boolean),
