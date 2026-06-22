@@ -465,9 +465,48 @@ async function isRoleManagedByOtherBot(guild, roleId){
 client.on('interactionCreate', async (interaction)=>{
   // ── Autocomplete for collection slugs ───────────────────────────────────────
   if(interaction.isAutocomplete()){
-    const focused = interaction.options.getFocused().toLowerCase();
+    const focused = interaction.options.getFocused(true); // {name, value}
+    const focusedValue = focused.value.toLowerCase();
     const guildId = interaction.guildId;
     const cfg = getConfig(guildId) || {};
+    const commandName = interaction.commandName;
+
+    // trait/value autocomplete for traitfind
+    if(commandName === 'traitfind' && (focused.name === 'trait' || focused.name === 'value')){
+      const RAILWAY_URL = getRailwayApiUrl();
+      const API_SECRET = process.env.API_SECRET;
+      const colInput = interaction.options.getString('collection') || null;
+      // resolve slug: check collections array first, then top-level
+      let slug = cfg.slug || cfg.collectionSlug || 'on-chain-all-stars';
+      if(colInput){
+        const allCols = cfg.collections || [];
+        const match = allCols.find(c => c.slug === colInput || c.name === colInput);
+        if(match) slug = match.slug;
+        else slug = colInput;
+      }
+      try {
+        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET, slug);
+        let choices = [];
+        if(focused.name === 'trait'){
+          const names = [...new Set(traitIndex.map(t => t.trait_name))];
+          choices = names
+            .filter(n => n.toLowerCase().includes(focusedValue))
+            .slice(0, 25)
+            .map(n => ({ name: n, value: n }));
+        } else {
+          const selectedTrait = (interaction.options.getString('trait') || '').toLowerCase();
+          const vals = traitIndex
+            .filter(t => (!selectedTrait || t.trait_name.toLowerCase() === selectedTrait) && t.trait_value.toLowerCase().includes(focusedValue))
+            .map(t => t.trait_value);
+          choices = [...new Set(vals)].slice(0, 25).map(v => ({ name: v, value: v }));
+        }
+        return interaction.respond(choices);
+      } catch(e) {
+        return interaction.respond([]);
+      }
+    }
+
+    // collection slug autocomplete (all commands)
     const choices = [];
     if(cfg.slug || cfg.collectionSlug){
       const slug = cfg.slug || cfg.collectionSlug;
@@ -478,7 +517,7 @@ client.on('interactionCreate', async (interaction)=>{
       if(col.slug) choices.push({ name: `${col.name||col.slug} (${col.slug})`, value: col.slug });
     }
     const filtered = choices
-      .filter(c => c.name.toLowerCase().includes(focused) || c.value.toLowerCase().includes(focused))
+      .filter(c => c.name.toLowerCase().includes(focusedValue) || c.value.toLowerCase().includes(focusedValue))
       .slice(0, 25);
     return interaction.respond(filtered.length ? filtered : choices.slice(0,25));
   }
