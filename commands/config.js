@@ -2114,14 +2114,21 @@ async function handleConfigModal(interaction, ctx){
     cfg.collections.push({ name, slug, contract:contract||null, salesChannel:null, listingsChannel:null });
     await setConfig(guildId, cfg);
 
-    // Paid-tier servers get an automatic trait backfill for any new
-    // non-OCAS collection — this is what powers /traitfind, /rankfind,
-    // and trait-filtered listings for that collection. Free tier still
-    // gets listings/sales immediately (separate sync, unaffected by this).
-    // Skips silently if this slug was already backfilled by ANY server
-    // in the past — see lib/auto-backfill.js for the detection logic.
+    // Every server gets an automatic trait backfill for any new non-OCAS
+    // collection — this is what powers /traitfind, /rankfind, and trait-
+    // filtered listings for that collection. Free tier now includes this
+    // (confirmed safe: a single collection backfill is ~100 Alchemy calls
+    // total, and the lock in lib/auto-backfill.js guarantees any given
+    // slug is only ever backfilled once across all servers/time, so the
+    // repeated-manual-invocation pattern that caused a real CU spike during
+    // tonight's debugging — same collection re-backfilled many times with
+    // no lock — cannot happen through this automated path). Skips silently
+    // if this slug was already backfilled by ANY server in the past — see
+    // lib/auto-backfill.js for the detection logic. Rank computation
+    // remains the actual paid-tier differentiator, separately, and is not
+    // part of this backfill at all.
     let waitMsg = '';
-    if(cfg.isPaidTier === true && slug && contract){
+    if(slug && contract){
       try{
         const { maybeStartBackfill } = require('../lib/auto-backfill');
         const result = await maybeStartBackfill(pgPool, { contract, slug });
@@ -2156,8 +2163,8 @@ async function handleConfigModal(interaction, ctx){
         // Primary-collection slug being set is the completion point for a
         // /setup-driven non-OCAS collection (contract is set in a separate
         // prior modal submission, slug here) — same auto-backfill trigger
-        // as cfg_modal:addcol, for the same reason.
-        if(cfg.isPaidTier === true && cfg.collectionSlug && cfg.contract){
+        // as cfg_modal:addcol, free tier, for the same reason (see comment there).
+        if(cfg.collectionSlug && cfg.contract){
           try{
             const { maybeStartBackfill } = require('../lib/auto-backfill');
             const result = await maybeStartBackfill(pgPool, { contract: cfg.contract, slug: cfg.collectionSlug });
