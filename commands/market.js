@@ -387,7 +387,7 @@ async function handleMarketCommand(commandName, ctx){
     const trait=interaction.options.getString('trait')?.toLowerCase().trim();
     const value=interaction.options.getString('value')?.toLowerCase().trim();
     const alertSales=interaction.options.getBoolean('sales')??true;
-    const alertListings=interaction.options.getBoolean('listings')??true;
+    const alertListings=interaction.options.getBoolean('listings')??false;
     const slug=interaction.options.getString('collection')||config.slug;
     if(!slug) return interaction.reply({content:'Provide a collection or run `/setup` in a configured server first.', flags: MessageFlags.Ephemeral});
 
