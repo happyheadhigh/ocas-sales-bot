@@ -666,57 +666,101 @@ app.get('/db/multi-trait-tokens', auth, async (req, res) => {
     const rankCol = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
     const slug = req.query.slug ? String(req.query.slug).trim() : null;
     const limit = Math.min(parseInt(req.query.limit || '100'), 10000);
+    // Non-OCAS collections have no rows in `tokens` (backfill only writes
+    // token_traits). For listedOnly queries on non-OCAS slugs, drive off
+    // listings instead so we see all listed tokens regardless.
+    const isOcasSlug = !slug || slug === 'on-chain-all-stars';
+    const useListingsDriven = listedOnly && slug && !isOcasSlug;
 
     if (!matches.length && !traitCount && rankMin === null && rankMax === null) {
       return res.status(400).json({ ok: false, error: 'provide matches, trait_count, or rank filter' });
     }
 
-    let query = `SELECT t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count`;
-    if (listedOnly) query += `, l.price_eth, l.url`;
-    query += `,
-      jsonb_build_object(
-        '__attributes',
-        COALESCE(
-          jsonb_agg(
-            jsonb_build_object('trait_type', tt.trait_name, 'value', tt.trait_value)
-            ORDER BY COALESCE(tt.trait_index, 0), tt.trait_name
-          ) FILTER (WHERE tt.trait_name IS NOT NULL),
-          '[]'::jsonb
-        )
-      ) AS traits`;
-    query += ` FROM tokens t`;
+    let query, params = [], p = 1;
 
-    const params = [];
-    let p = 1;
-    if (listedOnly) {
-      query += ` JOIN listings l ON l.token_id = t.id` + (slug ? ` AND l.collection_slug = $${p++}` : ``);
-      if (slug) params.push(slug);
-    }
-    query += ` LEFT JOIN token_traits tt ON tt.token_id = t.id` + (slug ? ` AND tt.collection_slug = $${p++}` : ``);
-    if (slug) params.push(slug);
+    if (useListingsDriven) {
+      // ── Listings-driven path (non-OCAS collections) ──────────────────────
+      // Drive off listings table so all listed tokens are visible even when
+      // the tokens table has no row for this collection.
+      query = `SELECT l.token_id AS id, NULL::int AS obs_rank, NULL::int AS os_rank,
+        NULL::float AS os_score, NULL::float AS rarity_score, NULL::int AS trait_count,
+        l.price_eth, l.url,
+        jsonb_build_object(
+          '__attributes',
+          COALESCE(
+            jsonb_agg(
+              jsonb_build_object('trait_type', tt.trait_name, 'value', tt.trait_value)
+              ORDER BY COALESCE(tt.trait_index, 0), tt.trait_name
+            ) FILTER (WHERE tt.trait_name IS NOT NULL),
+            '[]'::jsonb
+          )
+        ) AS traits
+        FROM listings l
+        LEFT JOIN token_traits tt ON tt.token_id = l.token_id AND tt.collection_slug = $${p++}`;
+      params.push(slug);
 
-    const conditions = [ACTIVE_TOKEN_CONDITION];
-    if (slug) { conditions.push(`t.collection_slug = $${p++}`); params.push(slug); }
-    groups.forEach((group, i) => {
-      const ors = [];
-      group.forEach(m => {
-        ors.push(`(LOWER(g${i}.trait_name) = LOWER($${p++}) AND LOWER(g${i}.trait_value) = LOWER($${p++}))`);
-        params.push(m.trait_name, m.trait_value);
+      const conditions = [`l.collection_slug = $${p++}`];
+      params.push(slug);
+      groups.forEach((group, gi) => {
+        const ors = [];
+        group.forEach(m => {
+          ors.push(`(LOWER(g${gi}.trait_name) = LOWER($${p++}) AND LOWER(g${gi}.trait_value) = LOWER($${p++}))`);
+          params.push(m.trait_name, m.trait_value);
+        });
+        conditions.push(`EXISTS (SELECT 1 FROM token_traits g${gi} WHERE g${gi}.token_id = l.token_id AND g${gi}.collection_slug = $${p++} AND (${ors.join(' OR ')}))`);
+        params.push(slug);
       });
-      const slugCond = slug ? ` AND g${i}.collection_slug = $${p++}` : ``;
-      conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND (${ors.join(' OR ')})${slugCond})`);
-      if (slug) params.push(slug);
-    });
-    if (traitCount !== null && !isNaN(traitCount)) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCount); }
-    if (rankMin !== null && !isNaN(rankMin)) { conditions.push(`${rankCol} >= $${p++}`); params.push(rankMin); }
-    if (rankMax !== null && !isNaN(rankMax)) { conditions.push(`${rankCol} <= $${p++}`); params.push(rankMax); }
-    if (conditions.length) query += ` WHERE ${conditions.join(' AND ')}`;
+      if (conditions.length) query += ` WHERE ${conditions.join(' AND ')}`;
+      query += ` GROUP BY l.token_id, l.price_eth, l.url ORDER BY l.price_eth ASC`;
+      query += ` LIMIT $${p++}`;
+      params.push(limit);
+    } else {
+      // ── Tokens-driven path (OCAS, or non-listed queries) ─────────────────
+      query = `SELECT t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count`;
+      if (listedOnly) query += `, l.price_eth, l.url`;
+      query += `,
+        jsonb_build_object(
+          '__attributes',
+          COALESCE(
+            jsonb_agg(
+              jsonb_build_object('trait_type', tt.trait_name, 'value', tt.trait_value)
+              ORDER BY COALESCE(tt.trait_index, 0), tt.trait_name
+            ) FILTER (WHERE tt.trait_name IS NOT NULL),
+            '[]'::jsonb
+          )
+        ) AS traits`;
+      query += ` FROM tokens t`;
 
-    query += listedOnly
-      ? ` GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count, l.price_eth, l.url ORDER BY l.price_eth ASC, t.obs_rank ASC`
-      : ` GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count ORDER BY t.obs_rank ASC`;
-    query += ` LIMIT $${p++}`;
-    params.push(limit);
+      if (listedOnly) {
+        query += ` JOIN listings l ON l.token_id = t.id` + (slug ? ` AND l.collection_slug = $${p++}` : ``);
+        if (slug) params.push(slug);
+      }
+      query += ` LEFT JOIN token_traits tt ON tt.token_id = t.id` + (slug ? ` AND tt.collection_slug = $${p++}` : ``);
+      if (slug) params.push(slug);
+
+      const conditions = [ACTIVE_TOKEN_CONDITION];
+      if (slug) { conditions.push(`t.collection_slug = $${p++}`); params.push(slug); }
+      groups.forEach((group, i) => {
+        const ors = [];
+        group.forEach(m => {
+          ors.push(`(LOWER(g${i}.trait_name) = LOWER($${p++}) AND LOWER(g${i}.trait_value) = LOWER($${p++}))`);
+          params.push(m.trait_name, m.trait_value);
+        });
+        const slugCond = slug ? ` AND g${i}.collection_slug = $${p++}` : ``;
+        conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND (${ors.join(' OR ')})${slugCond})`);
+        if (slug) params.push(slug);
+      });
+      if (traitCount !== null && !isNaN(traitCount)) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCount); }
+      if (rankMin !== null && !isNaN(rankMin)) { conditions.push(`${rankCol} >= $${p++}`); params.push(rankMin); }
+      if (rankMax !== null && !isNaN(rankMax)) { conditions.push(`${rankCol} <= $${p++}`); params.push(rankMax); }
+      if (conditions.length) query += ` WHERE ${conditions.join(' AND ')}`;
+
+      query += listedOnly
+        ? ` GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count, l.price_eth, l.url ORDER BY l.price_eth ASC, t.obs_rank ASC`
+        : ` GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.rarity_score, t.trait_count ORDER BY t.obs_rank ASC`;
+      query += ` LIMIT $${p++}`;
+      params.push(limit);
+    }
 
     const result = await pool.query(query, params);
     // Never cache listing results — prices and availability change frequently
