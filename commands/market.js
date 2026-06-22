@@ -229,7 +229,9 @@ async function handleMarketCommand(commandName, ctx){
   if(commandName==='traitfind'){
     const _tfCool = checkCommandCooldown(interaction.user.id, 'traitfind');
     if(_tfCool) return interaction.reply({content:`⏳ Please wait **${_tfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
-    const slug       = interaction.options.getString('collection') || config.collectionSlug || config.slug;
+    const _tfColInput = interaction.options.getString('collection') || null;
+    const _tfResolved = resolveCollectionFromServerCfg(config, _tfColInput);
+    const slug       = _tfResolved?.slug || config.collectionSlug || config.slug;
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
@@ -299,7 +301,7 @@ async function handleMarketCommand(commandName, ctx){
           await interaction.editReply(`No ${listedOnly ? 'active listings' : 'tokens'} found matching **${matchLabel}**.`);
           return;
         }
-        const cfg = {...config, slug};
+        const cfg = _tfResolved ? {...config, ..._tfResolved} : {...config, slug};
         const embeds = await Promise.all(tokens.map(async t => {
           const tokenId = t.token_id ?? t.id ?? t.identifier;
           // For listedOnly, traits come from the API response (already scoped by
