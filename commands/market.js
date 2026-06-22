@@ -232,162 +232,91 @@ async function handleMarketCommand(commandName, ctx){
     const _tfColInput = interaction.options.getString('collection') || null;
     const _tfResolved = resolveCollectionFromServerCfg(config, _tfColInput);
     const slug       = _tfResolved?.slug || config.collectionSlug || config.slug;
-    const rawSearch  = (interaction.options.getString('search') || '').trim();
+    const traitOpt   = (interaction.options.getString('trait') || '').trim();
+    const valueOpt   = (interaction.options.getString('value') || '').trim();
+    const modeOpt    = interaction.options.getString('mode') || 'tokens';
+    const want       = Math.min(interaction.options.getInteger('count') || 20, 50);
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
 
-    // Detect mode: tokens default, or explicit listings/sales.
-    const wantListings = /\blistings?\b/i.test(rawSearch);
-    const wantSales    = /\bsales?\b/i.test(rawSearch);
-    let workingSearch = rawSearch.replace(/\b(listings?|sales?)\b/gi, ' ').trim();
-
-    // Parse count: first standalone number (default 10, max 20)
-    let want = 10;
-    const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
-    if(numMatch){ const n=parseInt(numMatch[1]); if(n>0&&n<=20){ want=n; workingSearch=workingSearch.replace(numMatch[0],' ').trim(); } }
-
-    // Resolve trait name+value using phrase-aware parser. For non-OCAS
-    // collections, getTraitIndex reads from collection_traits (aggregate
-    // trait list) instead of token_traits (no real per-token data exists yet
-    // for other collections) — see /db/trait-index in api.js.
-    let trait = '', value = '', groups = [], unmatched = [], traitParseError = null;
-    if(workingSearch && RAILWAY_URL){
-      try{
-        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET, slug);
-        const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
-        groups = resolved.groups || [];
-        unmatched = resolved.unmatched || [];
-        if(groups.length){ trait = groups[0][0].trait_name; value = groups[0][0].trait_value; }
-      }catch(e){ traitParseError = e; console.warn('[traitfind] parser error:', e.message); }
-    }
-    if(!trait && workingSearch){ value=workingSearch; }
-    const matchLabel = traitGroupsLabel(groups, value || workingSearch);
+    const wantListings = modeOpt === 'listings';
+    const wantSales    = modeOpt === 'sales';
 
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    if(!workingSearch){
-      if(!isOcasSlug(slug)) return showTraitBrowseCategories(interaction, pgPool, slug);
-      return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie`, `/traitfind search:zombie listings`, or `/traitfind search:zombie sales`', flags: MessageFlags.Ephemeral});
-    }
-    if(!RAILWAY_URL) return interaction.reply({content:'Trait search needs the internal TraitView API URL so it can read the token DB/cache. Set `RAILWAY_API_URL` in this Railway service.', flags: MessageFlags.Ephemeral});
-    if(traitParseError) return interaction.reply({content:`I could not load the trait index from the TraitView API. ${traitParseError.message}`, flags: MessageFlags.Ephemeral});
-    if(!groups.length){
-      const extra = unmatched.length ? ` Unmatched words: ${unmatched.join(', ')}.` : '';
-      return interaction.reply({content:`I could not match **${workingSearch}** to known traits for **${slug}**.${extra} Try an exact trait/value like \`zombie\`, \`gold chain\`, or \`alien epic bear\`.`, flags: MessageFlags.Ephemeral});
-    }
+    if(!traitOpt && !valueOpt) return interaction.reply({content:'Select a **trait** and/or **value** to search.', flags: MessageFlags.Ephemeral});
+    if(!RAILWAY_URL) return interaction.reply({content:'Trait search needs the internal TraitView API URL. Set `RAILWAY_API_URL` in this Railway service.', flags: MessageFlags.Ephemeral});
+
+    // Build groups directly from structured inputs — skip phrase parser
+    const groups = [[{ trait_name: traitOpt || '_any', trait_value: valueOpt }]];
+    const matchLabel = traitOpt && valueOpt ? `${traitOpt}: ${valueOpt}` : (valueOpt || traitOpt);
+
     await interaction.deferReply();
 
     try{
-      // Token search is the default. "listings" narrows the same trait search
-      // to active listings. "sales" keeps the existing sales-history behavior.
-      if(wantListings || !wantSales){
-        const listedOnly = wantListings;
-        await interaction.editReply(`Searching ${listedOnly ? 'listed tokens' : 'tokens'} matching **${matchLabel}**...`);
-        const qs = new URLSearchParams({ limit: String(want), key: API_SECRET||'', slug });
-        qs.set('groups', JSON.stringify(groups));
-        if(listedOnly) qs.set('listed', '1');
-        const label = listedOnly ? '/db/multi-trait-tokens listings API' : '/db/multi-trait-tokens token API';
-        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, label);
-        const tokens = j.tokens || [];
-        if(!tokens.length){
-          await interaction.editReply(`No ${listedOnly ? 'active listings' : 'tokens'} found matching **${matchLabel}**.`);
-          return;
-        }
+      // ── Sales mode ─────────────────────────────────────────────────────────
+      if(wantSales){
+        await interaction.editReply(`🔍 Searching **${matchLabel}** in full sales history...`);
+        const qs = new URLSearchParams({ trait: traitOpt, value: valueOpt, limit: String(Math.min(want, 200)), sort: 'desc' });
+        if(API_SECRET) qs.set('key', API_SECRET);
+        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/trait-sales?${qs}`, '/db/trait-sales API');
+        const sales = j.sales || [];
+        if(!sales.length){ await interaction.editReply(`No sales found for **${matchLabel}**.`); return; }
         const cfg = _tfResolved ? {...config, ..._tfResolved} : {...config, slug};
-        const embeds = await Promise.all(tokens.map(async t => {
-          const tokenId = t.token_id ?? t.id ?? t.identifier;
-          // For listedOnly, traits come from the API response (already scoped by
-          // collection_slug) — don't call fetchTokenMetaFromDb which has no slug
-          // param and would return OCAS data for overlapping token IDs.
-          if(listedOnly){
-            const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
-            const scopedDbToken = { traits: t.traits || {}, obs_rank: t.obs_rank || null, os_rank: t.os_rank || null };
-            const fakeListingObj = {
-              token_id: tokenId,
-              asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
-                       traits: t.traits?.__attributes || [] },
-              payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
-              maker: t.seller || '',
-              url: t.url || null,
-              os_rank: t.os_rank || null,
-              _dbToken: scopedDbToken,
-            };
-            return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
-          }
-          const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-          return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
+        const toShow = sales.slice(0, want);
+        const saleEmbeds = await Promise.all(toShow.map(async sale => {
+          const dbMeta = await fetchTokenMetaFromDb(sale.token_id).catch(()=>null);
+          const tokenTraits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
+          const syntheticSale = {
+            nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
+            buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
+            payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH'?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
+            event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
+          };
+          return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
         }));
-        await postEmbeds(interaction, embeds.filter(Boolean),
-          `Found **${tokens.length}** ${listedOnly ? 'listing' : 'token'}${tokens.length===1?'':'s'} matching **${matchLabel}**${listedOnly ? ' (cheapest first)' : ''}:`);
+        const totalNote = j.count > want ? ` (showing ${want} of ${j.count} total)` : '';
+        await postEmbeds(interaction, saleEmbeds.filter(Boolean),
+          `Found **${j.count}** sale${j.count===1?'':'s'} with **${matchLabel}**${totalNote}:`);
         return;
       }
 
-      // ── Listings mode ──────────────────────────────────────────────────────
-      if(wantListings && RAILWAY_URL){
-        await interaction.editReply(`🔍 Searching listed tokens with **${trait ? trait+': ' : ''}${value}**...`);
-        // Use multi-trait-tokens with listed=1 — build a single-group filter
-        const groups = [[{ trait_name: trait || '_any', trait_value: value }]];
-        // For single known trait, use groups param; otherwise fall back to trait-sales endpoint
-        const qs = new URLSearchParams({ listed:'1', limit: String(want), key: API_SECRET||'' });
-        if(trait) qs.set('groups', JSON.stringify([[{ trait_name: trait, trait_value: value }]]));
-        const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
-        if(r.ok){
-          const j = await r.json();
-          if(!j.ok) throw new Error(j.error || 'API error');
-          const tokens = j.tokens || [];
-          if(!tokens.length){ await interaction.editReply(`No listed tokens found with **${trait ? trait+': ' : ''}${value}**.`); return; }
-          const contract = config.contract || '';
-          const listEmbeds = await Promise.all(tokens.map(async t => {
-            const tokenId = t.token_id ?? t.id ?? t.identifier;
-            const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-            const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
-            const fakeListingObj = {
-              token_id: tokenId,
-              asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
-                       traits: dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [] },
-              payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
-              maker: t.seller || '',
-              url: t.url || null,
-              _dbToken: dbMeta,
-            };
-            return buildListingEmbed(fakeListingObj, {...config, slug}).catch(()=>null);
-          }));
-          await postEmbeds(interaction, listEmbeds.filter(Boolean),
-            `Found **${tokens.length}** listing${tokens.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (cheapest first):`);
-          return;
-        }
+      // ── Tokens / Listings mode (default) ───────────────────────────────────
+      const listedOnly = wantListings;
+      await interaction.editReply(`Searching ${listedOnly ? 'listed tokens' : 'tokens'} matching **${matchLabel}**...`);
+      const qs = new URLSearchParams({ limit: String(want), key: API_SECRET||'', slug });
+      qs.set('groups', JSON.stringify(groups));
+      if(listedOnly) qs.set('listed', '1');
+      const label = listedOnly ? '/db/multi-trait-tokens listings API' : '/db/multi-trait-tokens token API';
+      const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, label);
+      const tokens = j.tokens || [];
+      if(!tokens.length){
+        await interaction.editReply(`No ${listedOnly ? 'active listings' : 'tokens'} found matching **${matchLabel}**.`);
+        return;
       }
-
-      // ── Sales mode (default) ───────────────────────────────────────────────
-      if(RAILWAY_URL){
-        await interaction.editReply(`🔍 Searching **${trait ? trait+': ' : ''}${value}** in full sales history...`);
-        const qs = new URLSearchParams({ trait, value, limit: String(Math.min(want, 200)), sort: 'desc' });
-        if(API_SECRET) qs.set('key', API_SECRET);
-        const r = await fetch(`${RAILWAY_URL}/db/trait-sales?${qs}`);
-        if(r.ok){
-          const j = await r.json();
-          if(!j.ok) throw new Error(j.error || 'DB error');
-          const sales = j.sales || [];
-          if(!sales.length){ await interaction.editReply(`No sales found for **${trait ? trait+': ' : ''}${value}** (searched ${j.count ?? 'all'} records).`); return; }
-          const cfg = {...config, slug};
-          const toShow = sales.slice(0, want);
-          const saleEmbeds = await Promise.all(toShow.map(async sale => {
-            const dbMeta = await fetchTokenMetaFromDb(sale.token_id).catch(()=>null);
-            const tokenTraits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
-            const syntheticSale = {
-              nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
-              buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
-              payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH'?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
-              event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
-            };
-            return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
-          }));
-          const totalNote = j.count > want ? ` (showing ${want} of ${j.count} total)` : '';
-          await postEmbeds(interaction, saleEmbeds.filter(Boolean),
-            `Found **${j.count}** sale${j.count===1?'':'s'} with **${trait ? trait+': ' : ''}${value}**${totalNote}:`);
-          return;
+      const cfg = _tfResolved ? {...config, ..._tfResolved} : {...config, slug};
+      const embeds = await Promise.all(tokens.map(async t => {
+        const tokenId = t.token_id ?? t.id ?? t.identifier;
+        if(listedOnly){
+          const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
+          const scopedDbToken = { traits: t.traits || {}, obs_rank: t.obs_rank || null, os_rank: t.os_rank || null };
+          const fakeListingObj = {
+            token_id: tokenId,
+            asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
+                     traits: t.traits?.__attributes || [] },
+            payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
+            maker: t.seller || '',
+            url: t.url || null,
+            os_rank: t.os_rank || null,
+            _dbToken: scopedDbToken,
+          };
+          return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
         }
-        console.warn('[traitfind] Railway DB call failed, falling back to OpenSea');
-      }
+        const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+        return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
+      }));
+      await postEmbeds(interaction, embeds.filter(Boolean),
+        `Found **${tokens.length}** ${listedOnly ? 'listing' : 'token'}${tokens.length===1?'':'s'} matching **${matchLabel}**${listedOnly ? ' (cheapest first)' : ''}:`);
+      return;
 
       // ── Contract fallback — fetch traits for matched tokens directly from chain ─
       // Only fires when Railway DB is unavailable. Contract is always authoritative.
@@ -576,29 +505,23 @@ async function handleMarketCommand(commandName, ctx){
       return interaction.reply({content:'📊 Rank search requires a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
     const _rfCool = checkCommandCooldown(interaction.user.id, 'rankfind');
     if(_rfCool) return interaction.reply({content:`⏳ Please wait **${_rfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
-    const rawSearch  = (interaction.options.getString('search') || '').trim();
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
-
-    // Detect mode: sales or listings (default)
-    const wantSales    = /\bsales?\b/i.test(rawSearch);
+    const rankMin  = interaction.options.getInteger('min_rank') || 1;
+    const rankMax  = interaction.options.getInteger('max_rank') || 100;
+    const modeRf   = interaction.options.getString('mode') || 'listings';
+    const sortBy   = interaction.options.getString('sort') || 'price';
+    const wantSales    = modeRf === 'sales';
     const wantListings = !wantSales;
-    let workingSearch = rawSearch.replace(/\b(listings?|sales?)\b/gi, ' ').trim();
+    const _rfColInput  = interaction.options.getString('collection') || null;
+    const _rfResolved  = resolveCollectionFromServerCfg(config, _rfColInput);
+    const rfSlug       = _rfResolved?.slug || config.collectionSlug || config.slug;
 
-    // Parse range: "1-100", "1 to 100"
-    let rankMin = 1, rankMax = 100;
-    const rangeMatch = workingSearch.match(/(\d+)\s*(?:-|to|–)\s*(\d+)/);
-    if(rangeMatch){ rankMin = parseInt(rangeMatch[1]); rankMax = parseInt(rangeMatch[2]); }
-    else { const numMatch = workingSearch.match(/(\d+)/); if(numMatch) rankMax = parseInt(numMatch[1]); }
-
-    // Parse sort for listings mode: 'rank'/'best' or default 'price'/'cheapest'
-    const sortBy = /\b(rank|best)\b/i.test(workingSearch) ? 'rank' : 'price';
-
-    if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured. Set it to your internal/public TraitView API URL in this Railway service.', flags: MessageFlags.Ephemeral });
-    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. Try: "1-100" or "1-500 rank"', flags: MessageFlags.Ephemeral });
+    if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured.', flags: MessageFlags.Ephemeral });
+    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. min_rank must be ≤ max_rank and within 1–10000.', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
-    const contract = config.contract || '';
+    const contract = (_rfResolved?.contract || config.contract || '');
     try{
 
       // ── Sales mode ─────────────────────────────────────────────────────────
@@ -608,7 +531,7 @@ async function handleMarketCommand(commandName, ctx){
         const j = await fetchBotApiJson(`${RAILWAY_URL}/db/rank-sales?${qs}`, '/db/rank-sales API');
         const sales = j.sales || [];
         if(!sales.length){ await interaction.editReply(`No sales found for OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
-        const cfg = {...config};
+        const cfg = _rfResolved ? {...config, ..._rfResolved} : {...config, slug: rfSlug};
         const saleEmbeds = await Promise.all(sales.map(async sale => {
           const tokenTraits = sale.traits && typeof sale.traits==='object'
             ? traitObjectToArray(sale.traits)
