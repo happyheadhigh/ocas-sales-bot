@@ -1242,7 +1242,6 @@ async function handleMaClearInteraction(interaction, ctx){
         fmtF(filters),
       ].join('\n'));
     const rows = [];
-    const rows = [];
     const valueBtns2 = [];
     for(const [trait, val] of Object.entries(filters)){
       const vals = Array.isArray(val) ? val : [val];
