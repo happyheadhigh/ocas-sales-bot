@@ -415,11 +415,9 @@ async function handleMarketCommand(commandName, ctx){
       setAlert(interaction.user.id,{...alert,traitFilters:filters});
       const remaining=Object.keys(filters).length===0?'none':Object.entries(filters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
       await interaction.reply({content:`Removed filter. Remaining: ${remaining}`, flags: MessageFlags.Ephemeral});
-    } else {
-      deleteAlert(interaction.user.id);
-      await interaction.reply({content:'Your personal alert has been fully removed.', flags: MessageFlags.Ephemeral});
+      return;
     }
-    return;
+    return showMaClearWizard(interaction, { getAlert, deleteAlert, setAlert });
   }
 
   // /myalertstatus
@@ -749,6 +747,11 @@ async function handleMarketCommand(commandName, ctx){
     return;
   }
 
+  // /me — personal hub
+  if(commandName==='me'){
+    return showMeHub(interaction, ctx);
+  }
+
   // /burnlatest
 
   // /ocas — placeholder
@@ -756,7 +759,7 @@ async function handleMarketCommand(commandName, ctx){
 
 const MARKET_COMMANDS = new Set([
   'lastsale','recentsales','sale','traitfind','listings','debuglisting',
-  'myalert','myalertclear','myalertstatus','rankfind','sweep',
+  'myalert','myalertclear','myalertstatus','rankfind','sweep','me',
 ]);
 
 // ── /traitfind guided flow helpers ───────────────────────────────────────────
@@ -957,8 +960,8 @@ async function showMaTraitPicker(interaction, ctx, slug){
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
   const traitNames = [...new Set(traitIndex.map(t => t.trait_name))].slice(0, 25);
   if(!traitNames.length){
-    const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
-    return interaction[replyFn]({ content: `No trait data found for **${slug}** yet.`, flags: MessageFlags.Ephemeral });
+    const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
+    return interaction[replyFn]({ content: `No trait data found for **${slug}** yet.`, ...(replyFn !== 'update' ? { flags: MessageFlags.Ephemeral } : {}) });
   }
   const traitValueCounts = {};
   for(const t of traitIndex){ if(!traitValueCounts[t.trait_name]) traitValueCounts[t.trait_name]=0; traitValueCounts[t.trait_name]++; }
@@ -969,17 +972,14 @@ async function showMaTraitPicker(interaction, ctx, slug){
       .setLabel(n).setValue(n)
       .setDescription(`${traitValueCounts[n]||0} value${traitValueCounts[n]===1?'':'s'}`)
     ));
-  const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
-  return interaction[replyFn]({
-    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by (or skip to alert on all tokens):`,
-    components: [
-      new ActionRowBuilder().addComponents(menu),
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`ma_browse:skiptr:${slug}`).setLabel('Skip — alert on all traits').setStyle(ButtonStyle.Secondary)
-      ),
-    ],
-    flags: MessageFlags.Ephemeral,
-  });
+  const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
+  const replyOpts = {
+    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by:`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+    embeds: [],
+  };
+  if(replyFn !== 'update') replyOpts.flags = MessageFlags.Ephemeral;
+  return interaction[replyFn](replyOpts);
 }
 
 async function showMaValuePicker(interaction, ctx, slug, traitName){
@@ -1135,12 +1135,669 @@ async function handleMyAlertInteraction(interaction, ctx){
         'Use `/myalert` again to add more filters.',
         'Use `/myalertclear` to remove your alert.',
       ].join('\n'));
-    return interaction.update({ content: '', embeds: [embed], components: [] });
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({ content: '', embeds: [embed], components: [backRow] });
   }
   if(customId === 'ma_browse:cancel'){
-    return interaction.update({ content: 'Alert wizard cancelled.', embeds: [], components: [] });
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({ content: 'Alert wizard cancelled.', embeds: [], components: [backRow] });
   }
 }
 
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker };
+// ── /myalertclear wizard ─────────────────────────────────────────────────────
+async function showMaClearWizard(interaction, ctx){
+  const { getAlert } = ctx;
+  const alert = getAlert(interaction.user.id);
+  if(!alert || (!Object.keys(alert.traitFilters||{}).length && !alert.slug)){
+    const naFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'reply';
+    return interaction[naFn]({ content: 'You have no alert set. Use `/me` to set one.', embeds:[], components:[], ...(naFn !== 'update' ? { flags: MessageFlags.Ephemeral } : {}) });
+  }
+  const filters = alert.traitFilters || {};
+  const fmtF = f => Object.keys(f).length===0 ? 'none (all tokens)' :
+    Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+  const embed = new EmbedBuilder()
+    .setTitle('🔔 My Alert')
+    .setColor(0x5865F2)
+    .setDescription([
+      `**Collection:** ${alert.slug||'any'}`,
+      `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
+      `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+      `**Filters:**`,
+      fmtF(filters),
+    ].join('\n'));
+  const rows = [];
+  const traitKeys = Object.keys(filters);
+  if(traitKeys.length){
+    // Build one button per value, not per trait
+    const valueBtns = [];
+    for(const [trait, val] of Object.entries(filters)){
+      const vals = Array.isArray(val) ? val : [val];
+      for(const v of vals){
+        valueBtns.push(
+          new ButtonBuilder()
+            .setCustomId(`mac_browse:val:${trait}:${v}`)
+            .setLabel(`✕ ${trait}: ${v}`.slice(0, 80))
+            .setStyle(ButtonStyle.Danger)
+        );
+      }
+    }
+    for(let i = 0; i < Math.min(valueBtns.length, 16); i += 4){
+      rows.push(new ActionRowBuilder().addComponents(valueBtns.slice(i, i+4)));
+    }
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  ));
+  const clearReplyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'reply';
+  const clearOpts = { embeds: [embed], components: rows };
+  if(clearReplyFn !== 'update') clearOpts.flags = MessageFlags.Ephemeral;
+  return interaction[clearReplyFn](clearOpts);
+}
+
+async function handleMaClearInteraction(interaction, ctx){
+  const { getAlert, setAlert, deleteAlert } = ctx;
+  const customId = interaction.customId;
+  if(customId === 'mac_browse:all'){
+    deleteAlert(interaction.user.id);
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({ content: '✅ Your alert has been fully removed.', embeds: [], components: [backRow] });
+  }
+  if(customId === 'mac_browse:cancel'){
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({ content: 'No changes made.', embeds: [], components: [backRow] });
+  }
+  if(customId.startsWith('mac_browse:val:')){
+    // Format: mac_browse:val:traitName:traitValue
+    const rest = customId.slice('mac_browse:val:'.length);
+    const colonIdx = rest.indexOf(':');
+    const traitKey = rest.slice(0, colonIdx);
+    const traitVal = rest.slice(colonIdx + 1);
+    const alert = getAlert(interaction.user.id);
+    if(!alert) return interaction.update({ content: 'No alert found.', embeds: [], components: [] });
+    const filters = { ...(alert.traitFilters||{}) };
+    const current = filters[traitKey];
+    if(Array.isArray(current)){
+      const updated = current.filter(v => v !== traitVal);
+      if(updated.length === 0) delete filters[traitKey];
+      else if(updated.length === 1) filters[traitKey] = updated[0];
+      else filters[traitKey] = updated;
+    } else {
+      delete filters[traitKey];
+    }
+    setAlert(interaction.user.id, { ...alert, traitFilters: filters });
+    const fmtF = f => Object.keys(f).length===0 ? 'none (all tokens)' :
+      Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+    const embed = new EmbedBuilder()
+      .setTitle('🔔 My Alert')
+      .setColor(0x5865F2)
+      .setDescription([
+        `**Collection:** ${alert.slug||'any'}`,
+        `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
+        `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+        `**Filters:**`,
+        fmtF(filters),
+      ].join('\n'));
+    const rows = [];
+    const valueBtns2 = [];
+    for(const [trait, val] of Object.entries(filters)){
+      const vals = Array.isArray(val) ? val : [val];
+      for(const v of vals){
+        valueBtns2.push(
+          new ButtonBuilder()
+            .setCustomId(`mac_browse:val:${trait}:${v}`)
+            .setLabel(`✕ ${trait}: ${v}`.slice(0, 80))
+            .setStyle(ButtonStyle.Danger)
+        );
+      }
+    }
+    for(let i = 0; i < Math.min(valueBtns2.length, 16); i += 4){
+      rows.push(new ActionRowBuilder().addComponents(valueBtns2.slice(i, i+4)));
+    }
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Done').setStyle(ButtonStyle.Secondary),
+    ));
+    return interaction.update({ embeds: [embed], components: rows });
+  }
+}
+
+// ── /me hub helpers ──────────────────────────────────────────────────────────
+function parseCooldown(str){
+  // Parses "30m", "2h", "1d", or plain number (treated as minutes)
+  // Returns minutes as integer
+  if(!str) return 60; // default 1 hour
+  const s = String(str).trim().toLowerCase();
+  const match = s.match(/^(\d+(?:\.\d+)?)\s*([mhd]?)$/);
+  if(!match) return 60;
+  const val = parseFloat(match[1]);
+  const unit = match[2] || 'm';
+  if(unit === 'd') return Math.round(val * 24 * 60);
+  if(unit === 'h') return Math.round(val * 60);
+  return Math.round(val); // minutes
+}
+
+function formatCooldown(minutes){
+  if(minutes >= 1440) return `${(minutes/1440).toFixed(1).replace(/\.0$/,'')}d`;
+  if(minutes >= 60)   return `${(minutes/60).toFixed(1).replace(/\.0$/,'')}h`;
+  return `${minutes}m`;
+}
+
+// ── /me hub — main entry ──────────────────────────────────────────────────────
+async function showMeHub(interaction, ctx){
+  const { getAlert, pgPool } = ctx;
+  const userId = interaction.user.id;
+  const fmtF = f => !f || Object.keys(f).length===0 ? 'none' :
+    Object.entries(f).map(([k,v]) => `${k}: ${Array.isArray(v)?v.join(', '):v}`).join(' · ');
+
+  // Build summary lines
+  const summaryLines = [];
+
+  // Trait alert
+  const alert = getAlert(userId);
+  if(alert){
+    summaryLines.push(`📣 **Trait Alert** — ${alert.slug||'any'} · Sales: ${alert.alertSales?'✅':'❌'} · Listings: ${alert.alertListings?'✅':'❌'}`);
+    summaryLines.push(`  Filters: ${fmtF(alert.traitFilters)}`);
+  } else {
+    summaryLines.push('📣 **Trait Alert** — not set');
+  }
+
+  // Price alerts
+  if(pgPool){
+    const pa = await pgPool.query(
+      `SELECT COUNT(*) AS cnt FROM user_price_alerts WHERE discord_id=$1`, [userId]
+    ).catch(()=>null);
+    const paCnt = parseInt(pa?.rows[0]?.cnt||0);
+    summaryLines.push(`🏷️ **Price Alerts** — ${paCnt > 0 ? `${paCnt} active` : 'none set'}`);
+
+    const fa = await pgPool.query(
+      `SELECT slug, threshold_eth FROM user_floor_alerts WHERE discord_id=$1`, [userId]
+    ).catch(()=>null);
+    if(fa?.rows.length){
+      summaryLines.push(`📉 **Floor Alerts** — ${fa.rows.map(r=>`${r.slug} < Ξ${parseFloat(r.threshold_eth).toFixed(3)}`).join(', ')}`);
+    } else {
+      summaryLines.push('📉 **Floor Alerts** — none set');
+    }
+  }
+
+  // Wallet status
+  if(pgPool){
+    const walletReg = await pgPool.query(
+      `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+      [userId]
+    ).catch(()=>null);
+    const w = walletReg?.rows[0]?.wallet;
+    if(w) summaryLines.push(`💼 **Wallet** — \`${w.slice(0,6)}...${w.slice(-4)}\` verified ✅`);
+    else summaryLines.push('💼 **Wallet** — not verified');
+  } else {
+    summaryLines.push('💼 **Wallet** — not verified');
+  }
+
+  const nav = new StringSelectMenuBuilder()
+    .setCustomId('me_browse:nav')
+    .setPlaceholder('Select a section to manage...')
+    .addOptions([
+      new StringSelectMenuOptionBuilder().setLabel('📣 Trait Alert').setDescription('Sales & listing DMs by trait').setValue('trait_alert'),
+      new StringSelectMenuOptionBuilder().setLabel('🏷️ Price Alerts').setDescription('DM when a token drops below a price').setValue('price_alerts'),
+      new StringSelectMenuOptionBuilder().setLabel('📉 Floor Alerts').setDescription('DM when a collection floor drops').setValue('floor_alerts'),
+      new StringSelectMenuOptionBuilder().setLabel('💼 Wallet').setDescription('Verification & wallet analytics').setValue('wallet'),
+    ]);
+
+  const embed = new EmbedBuilder()
+    .setTitle('👤 My Settings')
+    .setColor(0x5865F2)
+    .setDescription(summaryLines.join('\n'))
+    .setFooter({ text: 'Your settings are private — only you can see this' });
+
+  const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
+  const meOpts = { embeds: [embed], components: [new ActionRowBuilder().addComponents(nav)] };
+  if(replyFn !== 'update') meOpts.flags = MessageFlags.Ephemeral;
+  return interaction[replyFn](meOpts);
+}
+
+// ── /me section renderers ─────────────────────────────────────────────────────
+async function showMeTraitAlert(interaction, ctx){
+  const { getAlert } = ctx;
+  const alert = getAlert(interaction.user.id);
+  const fmtF = f => !f || Object.keys(f).length===0 ? 'none (all tokens)' :
+    Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+
+  const desc = alert ? [
+    `**Collection:** ${alert.slug||'any'}`,
+    `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
+    `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+    `**Filters:**`,
+    fmtF(alert.traitFilters),
+  ].join('\n') : 'No trait alert set.';
+
+  const embed = new EmbedBuilder()
+    .setTitle('📣 Trait Alert')
+    .setColor(0x5865F2)
+    .setDescription(desc);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:alert:set').setLabel('Add Alert').setStyle(ButtonStyle.Success),
+  );
+  if(alert) row.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:alert:clear').setLabel('Manage / Clear').setStyle(ButtonStyle.Danger),
+  );
+  row.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
+}
+
+async function showMePriceAlerts(interaction, ctx){
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+  let desc = 'No price alerts set.';
+  let hasAlerts = false;
+  const rows = [];
+
+  if(pgPool){
+    const res = await pgPool.query(
+      `SELECT id, token_id, slug, threshold_eth, alert_once, repeat_alert, triggered_at FROM user_price_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
+      [userId]
+    ).catch(()=>null);
+    if(res?.rows.length){
+      hasAlerts = true;
+      desc = res.rows.map(r =>
+        `**#${r.token_id}** (${r.slug}) — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)} ${r.triggered_at?'✅ triggered':r.repeat_alert?'🔁 repeat':'1x'}`
+      ).join('\n');
+      const btns = res.rows.map(r =>
+        new ButtonBuilder().setCustomId(`me_browse:pricealert:remove:${r.id}`)
+          .setLabel(`Remove #${r.token_id}`).setStyle(ButtonStyle.Danger)
+      );
+      for(let i=0;i<btns.length;i+=4) rows.push(new ActionRowBuilder().addComponents(btns.slice(i,i+4)));
+    }
+  }
+
+  const embed = new EmbedBuilder().setTitle('🏷️ Price Alerts').setColor(0x5865F2).setDescription(desc);
+
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:pricealert:set').setLabel('Add Price Alert').setStyle(ButtonStyle.Success),
+  );
+  if(hasAlerts) actionRow.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:pricealert:clearall').setLabel('Remove All').setStyle(ButtonStyle.Danger),
+  );
+  actionRow.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+  rows.push(actionRow);
+
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: rows });
+}
+
+async function showMeFloorAlerts(interaction, ctx){
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+  let desc = 'No floor alerts set.';
+  let hasAlerts = false;
+  const rows = [];
+
+  if(pgPool){
+    const res = await pgPool.query(
+      `SELECT id, slug, threshold_eth, cooldown_minutes, last_alerted_at FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
+      [userId]
+    ).catch(()=>null);
+    if(res?.rows.length){
+      hasAlerts = true;
+      desc = res.rows.map(r =>
+        `**${r.slug}** — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)} (cooldown: ${formatCooldown(r.cooldown_minutes||60)}${r.last_alerted_at?' · last alerted '+new Date(r.last_alerted_at).toLocaleDateString():''})`
+      ).join('\n');
+      const btns = res.rows.map(r =>
+        new ButtonBuilder().setCustomId(`me_browse:flooralert:remove:${r.id}`)
+          .setLabel(`Remove ${r.slug}`).setStyle(ButtonStyle.Danger)
+      );
+      for(let i=0;i<btns.length;i+=4) rows.push(new ActionRowBuilder().addComponents(btns.slice(i,i+4)));
+    }
+  }
+
+  const embed = new EmbedBuilder().setTitle('📉 Floor Alerts').setColor(0x5865F2).setDescription(desc);
+
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:flooralert:set').setLabel('Add Floor Alert').setStyle(ButtonStyle.Success),
+  );
+  if(hasAlerts) actionRow.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:flooralert:clearall').setLabel('Remove All').setStyle(ButtonStyle.Danger),
+  );
+  actionRow.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+  rows.push(actionRow);
+
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: rows });
+}
+
+async function showMeWallet(interaction, ctx){
+  const { pgPool, getConfig, getRailwayApiUrl, fetchBotApiJson } = ctx;
+  const userId = interaction.user.id;
+  const guildId = interaction.guildId;
+
+  // Look up verified wallet
+  let wallet = null;
+  if(pgPool){
+    const reg = await pgPool.query(
+      `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true LIMIT 1`,
+      [userId, guildId]
+    ).catch(()=>null);
+    wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
+
+    // Also check global row if no guild-specific
+    if(!wallet){
+      const globalReg = await pgPool.query(
+        `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+        [userId]
+      ).catch(()=>null);
+      wallet = globalReg?.rows[0]?.wallet?.toLowerCase() || null;
+    }
+  }
+
+  // ── Unverified ──────────────────────────────────────────────────────────────
+  if(!wallet){
+    const embed = new EmbedBuilder()
+      .setTitle('💼 Wallet — Not Verified')
+      .setColor(0x5865F2)
+      .setDescription([
+        'Link your wallet to unlock portfolio analytics, P&L tracking, and leaderboards.',
+        '',
+        'To verify, find the **Verify Wallet** button in your server\'s verification channel.',
+      ].join('\n'));
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    );
+    const updateFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply';
+    return interaction[updateFn]({ embeds: [embed], components: [row] });
+  }
+
+  // ── Verified — fetch wallet data ────────────────────────────────────────────
+  const RAILWAY_URL = getRailwayApiUrl();
+  const API_SECRET = process.env.API_SECRET;
+  const shortWallet = wallet.slice(0,6) + '...' + wallet.slice(-4);
+
+  let collectionBreakdowns = [];
+
+  // Per-collection breakdown from wallet_token_intervals
+  if(pgPool){
+    const config = getConfig(guildId) || {};
+    const cols = [];
+    if(config.collectionSlug || config.slug) cols.push({ slug: config.collectionSlug || config.slug, name: config.contractName || config.collectionSlug || config.slug });
+    for(const c of config.collections || []) { if(c.slug) cols.push({ slug: c.slug, name: c.name || c.slug }); }
+    if(!cols.find(c => c.slug === 'on-chain-all-stars')) cols.push({ slug: 'on-chain-all-stars', name: 'On-Chain All Stars' });
+
+    for(const col of cols){
+      try {
+        const held = await pgPool.query(
+          `SELECT COUNT(*) AS cnt FROM wallet_token_intervals WHERE wallet_address=$1 AND collection_slug=$2 AND disposed_at IS NULL`,
+          [wallet, col.slug]
+        );
+        const heldCount = parseInt(held.rows[0]?.cnt || 0);
+        if(heldCount === 0) continue;
+
+        const floor = await pgPool.query(
+          `SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug=$1`,
+          [col.slug]
+        );
+        const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
+
+        // P&L
+        const pnl = await pgPool.query(
+          `SELECT
+            COALESCE(SUM(CASE WHEN disposed_at IS NOT NULL THEN sale_eth - cost_eth END), 0) AS realized,
+            COALESCE(AVG(CASE WHEN disposed_at IS NULL THEN cost_eth END), 0) AS avg_cost
+           FROM wallet_token_intervals
+           WHERE wallet_address=$1 AND collection_slug=$2`,
+          [wallet, col.slug]
+        );
+
+        collectionBreakdowns.push({
+          name: col.name,
+          slug: col.slug,
+          held: heldCount,
+          floorEth,
+          estimatedValue: floorEth ? heldCount * floorEth : null,
+          realizedPnl: parseFloat(pnl.rows[0]?.realized || 0),
+          avgCost: parseFloat(pnl.rows[0]?.avg_cost || 0),
+        });
+      } catch(e){ console.warn('[WalletTab] breakdown:', e.message); }
+    }
+  }
+
+  // ── Build embed ─────────────────────────────────────────────────────────────
+  const fmt = n => n >= 1 ? n.toFixed(3) : n.toFixed(4);
+  const pnlStr = n => n >= 0 ? `+Ξ ${fmt(n)}` : `-Ξ ${fmt(Math.abs(n))}`;
+
+  const descLines = [
+    `🔗 **Wallet:** \`${shortWallet}\``,
+    '',
+  ];
+
+  if(collectionBreakdowns.length){
+    for(const col of collectionBreakdowns){
+      descLines.push(`**${col.name}**`);
+      descLines.push(`  Holdings: **${col.held}** token${col.held===1?'':'s'}`);
+      if(col.floorEth) descLines.push(`  Floor: **Ξ ${fmt(col.floorEth)}** · Est. value: **Ξ ${fmt(col.estimatedValue)}**`);
+      if(col.realizedPnl !== 0) descLines.push(`  Realized P&L: **${pnlStr(col.realizedPnl)}**`);
+      if(col.avgCost > 0) descLines.push(`  Avg. cost basis: **Ξ ${fmt(col.avgCost)}**`);
+      descLines.push('');
+    }
+  } else {
+    descLines.push('_No holdings data found yet._');
+    descLines.push('_Click **🔄 Sync Wallet** to load your portfolio data._');
+  }
+
+  // Totals across collections
+  if(collectionBreakdowns.length > 1){
+    const totalEst = collectionBreakdowns.reduce((a, c) => a + (c.estimatedValue || 0), 0);
+    const totalRealized = collectionBreakdowns.reduce((a, c) => a + c.realizedPnl, 0);
+    if(totalEst > 0) descLines.push(`**Total Est. Value: Ξ ${fmt(totalEst)}**`);
+    if(totalRealized !== 0) descLines.push(`**Total Realized P&L: ${pnlStr(totalRealized)}**`);
+    descLines.push('');
+  }
+
+  descLines.push(`📊 [View full analytics on TraitView](https://traitview.com/wallet/${wallet})`);
+
+  const embed = new EmbedBuilder()
+    .setTitle('💼 Wallet')
+    .setColor(0x57F287)
+    .setDescription(descLines.join('\n'));
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync Wallet').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+
+  const updateFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply';
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
+}
+
+// ── /me interaction handler ───────────────────────────────────────────────────
+async function handleMeInteraction(interaction, ctx){
+  const { getAlert, setAlert, deleteAlert, getConfig, pgPool } = ctx;
+  const customId = interaction.customId;
+
+  // Nav dropdown
+  if(customId === 'me_browse:nav'){
+    const section = interaction.values[0];
+    if(section === 'trait_alert') return showMeTraitAlert(interaction, ctx);
+    if(section === 'price_alerts') return showMePriceAlerts(interaction, ctx);
+    if(section === 'floor_alerts') return showMeFloorAlerts(interaction, ctx);
+    if(section === 'wallet') return showMeWallet(interaction, ctx);
+  }
+
+  // Back to hub
+  if(customId === 'me_browse:back') return showMeHub(interaction, ctx);
+
+  // ── Trait alert ──────────────────────────────────────────────────────────────
+  if(customId === 'me_browse:alert:set'){
+    const guildId = interaction.guildId;
+    const config = getConfig(guildId) || {};
+    const allCols = [];
+    const primarySlug = config.collectionSlug || config.slug;
+    if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
+    for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+    if(!allCols.length) return interaction.update({ content: 'No collections configured on this server.', embeds:[], components:[] });
+    if(allCols.length === 1) return showMaTraitPicker(interaction, ctx, allCols[0].slug);
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('ma_browse:col')
+      .setPlaceholder('Pick a collection...')
+      .addOptions(allCols.slice(0,25).map(c => new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)));
+    return interaction.update({ content: '**📣 Trait Alert** — Pick a collection:', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+  }
+
+  if(customId === 'me_browse:alert:clear'){
+    return showMaClearWizard(interaction, { getAlert, deleteAlert, setAlert });
+  }
+
+  // ── Price alerts ─────────────────────────────────────────────────────────────
+  if(customId === 'me_browse:pricealert:set'){
+    const guildId = interaction.guildId;
+    const config = getConfig(guildId) || {};
+    const allCols = [];
+    const primarySlug = config.collectionSlug || config.slug;
+    if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
+    for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+    if(!allCols.length) return interaction.update({ content: 'No collections configured.', embeds:[], components:[] });
+    if(allCols.length === 1) return showPriceAlertModal(interaction, allCols[0].slug);
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('me_browse:pricealert:col')
+      .setPlaceholder('Pick a collection...')
+      .addOptions(allCols.slice(0,25).map(c => new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)));
+    return interaction.update({ content: '**🏷️ Price Alert** — Pick a collection:', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+  }
+
+  if(customId.startsWith('me_browse:pricealert:col')){
+    return showPriceAlertModal(interaction, interaction.values[0]);
+  }
+
+  if(customId.startsWith('me_browse:pricealert:remove:')){
+    const id = parseInt(customId.split(':').pop());
+    await pgPool.query(`DELETE FROM user_price_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return showMePriceAlerts(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:pricealert:clearall'){
+    await pgPool.query(`DELETE FROM user_price_alerts WHERE discord_id=$1`, [interaction.user.id]).catch(()=>{});
+    return showMePriceAlerts(interaction, ctx);
+  }
+
+  // ── Floor alerts ─────────────────────────────────────────────────────────────
+  if(customId === 'me_browse:flooralert:set'){
+    const guildId = interaction.guildId;
+    const config = getConfig(guildId) || {};
+    const allCols = [];
+    const primarySlug = config.collectionSlug || config.slug;
+    if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
+    for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+    if(!allCols.length) return interaction.update({ content: 'No collections configured.', embeds:[], components:[] });
+    if(allCols.length === 1) return showFloorAlertModal(interaction, allCols[0].slug);
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('me_browse:flooralert:col')
+      .setPlaceholder('Pick a collection...')
+      .addOptions(allCols.slice(0,25).map(c => new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)));
+    return interaction.update({ content: '**📉 Floor Alert** — Pick a collection:', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+  }
+
+  if(customId.startsWith('me_browse:flooralert:col')){
+    return showFloorAlertModal(interaction, interaction.values[0]);
+  }
+
+  if(customId.startsWith('me_browse:flooralert:remove:')){
+    const id = parseInt(customId.split(':').pop());
+    await pgPool.query(`DELETE FROM user_floor_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return showMeFloorAlerts(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:flooralert:clearall'){
+    await pgPool.query(`DELETE FROM user_floor_alerts WHERE discord_id=$1`, [interaction.user.id]).catch(()=>{});
+    return showMeFloorAlerts(interaction, ctx);
+  }
+
+  // ── Wallet sync ─────────────────────────────────────────────────────────────
+  if(customId === 'me_browse:wallet:sync'){
+    const { pgPool, getConfig } = ctx;
+    const guildId = interaction.guildId;
+    const userId = interaction.user.id;
+
+    // Check if verified first
+    const reg = await pgPool.query(
+      `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+      [userId]
+    ).catch(()=>null);
+    const wallet = reg?.rows[0]?.wallet;
+
+    if(!wallet){
+      return interaction.update({
+        embeds: [new EmbedBuilder().setTitle('💼 Wallet').setColor(0xED4245).setDescription('❌ No verified wallet found. Verify your wallet first.')],
+        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary))],
+      });
+    }
+
+    // Fire-and-forget — don't await
+    const { syncWalletForUser } = require('../lib/wallet-backfill');
+    syncWalletForUser(userId, guildId, pgPool, process.env.ALCHEMY_API_KEY, getConfig).catch(e => {
+      console.warn('[WalletSync]', e.message);
+    });
+
+    // Show "syncing in background" message with a check-back button
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:wallet').setLabel('🔃 Refresh').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({
+      embeds: [new EmbedBuilder()
+        .setTitle('💼 Wallet — Syncing')
+        .setColor(0x5865F2)
+        .setDescription([
+          `🔄 Syncing wallet data for \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``,
+          '',
+          'This runs in the background and takes a few seconds per collection.',
+          'Click **🔃 Refresh** in a moment to see your updated data.',
+        ].join('\n'))],
+      components: [row],
+    });
+  }
+
+  // Refresh wallet tab
+  if(customId === 'me_browse:wallet'){
+    return showMeWallet(interaction, ctx);
+  }
+}
+
+// ── Modal launchers ───────────────────────────────────────────────────────────
+async function showPriceAlertModal(interaction, slug){
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const modal = new ModalBuilder().setCustomId(`me_modal:pricealert:${slug}`).setTitle(`Price Alert — ${slug}`);
+  modal.addComponents(
+    new AR().addComponents(new TextInputBuilder().setCustomId('token_id').setLabel('Token ID (e.g. 1234)').setStyle(TextInputStyle.Short).setRequired(true)),
+    new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Alert when listed below (ETH, e.g. 0.05)').setStyle(TextInputStyle.Short).setRequired(true)),
+    new AR().addComponents(new TextInputBuilder().setCustomId('once').setLabel('Alert once or repeat? (once / repeat)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('once')),
+  );
+  return interaction.showModal(modal);
+}
+
+async function showFloorAlertModal(interaction, slug){
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const modal = new ModalBuilder().setCustomId(`me_modal:flooralert:${slug}`).setTitle(`Floor Alert — ${slug}`);
+  modal.addComponents(
+    new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Alert when floor drops below (ETH)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('0.05')),
+    new AR().addComponents(new TextInputBuilder().setCustomId('cooldown').setLabel('Cooldown (e.g. 30m, 2h, 1d)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('1h')),
+  );
+  return interaction.showModal(modal);
+}
+
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction };
