@@ -1549,7 +1549,7 @@ async function showMeWallet(interaction, ctx){
         if(heldCount === 0) continue;
 
         const floor = await pgPool.query(
-          `SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug=$1`,
+          `SELECT MIN(list_price) AS floor_eth FROM listings WHERE collection_slug=$1`,
           [col.slug]
         );
         const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
