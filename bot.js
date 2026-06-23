@@ -96,6 +96,7 @@ const {
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
 const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction }   = require('./commands/market');
+const { backfillWallet } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
@@ -635,6 +636,9 @@ client.on('interactionCreate', async (interaction)=>{
        ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,verified=true,verified_at=NOW(),updated_at=NOW()`,
       [discordId, guildId, primaryWallet]
     ).catch(e => console.error('[SVModal] reg insert:', e.message));
+
+    // Trigger wallet backfill (fire-and-forget)
+    backfillWallet(primaryWallet, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
 
     // Assign roles
     try{
@@ -1185,6 +1189,8 @@ client.on('interactionCreate', async (interaction)=>{
       [discordId, gid, wallet]
     ).catch(e=>console.error('[SVDone] upsertReg failed guild='+gid+':', e.message));
     await upsertReg(svGuild);
+    // Trigger wallet backfill (fire-and-forget)
+    backfillWallet(wallet, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
     // Global cross-server record — DELETE existing global row for this wallet/discord_id then re-insert
     console.log('[SVDone] saving global row for discord_id:', discordId, 'wallet:', wallet.slice(0,8));
     try {
