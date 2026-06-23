@@ -1792,7 +1792,16 @@ async function handleMeInteraction(interaction, ctx){
     } catch(e) { console.warn('[WalletProgress]', e.message); }
 
     if(!statusRows.length){
-      return showMeWallet(interaction, ctx);
+      // No sync status found — likely table not created yet or sync hasn't started
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync Wallet').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      );
+      return interaction.update({
+        embeds: [new EmbedBuilder().setTitle('💼 Wallet').setColor(0x5865F2)
+          .setDescription('No sync data found yet. Tap **🔄 Sync Wallet** to start.')],
+        components: [row],
+      });
     }
 
     const done = statusRows.filter(r => r.status === 'done').length;
