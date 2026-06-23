@@ -747,6 +747,11 @@ async function handleMarketCommand(commandName, ctx){
     return;
   }
 
+  // /me — personal hub
+  if(commandName==='me'){
+    return showMeHub(interaction, ctx);
+  }
+
   // /burnlatest
 
   // /ocas — placeholder
@@ -754,7 +759,7 @@ async function handleMarketCommand(commandName, ctx){
 
 const MARKET_COMMANDS = new Set([
   'lastsale','recentsales','sale','traitfind','listings','debuglisting',
-  'myalert','myalertclear','myalertstatus','rankfind','sweep',
+  'myalert','myalertclear','myalertstatus','rankfind','sweep','me',
 ]);
 
 // ── /traitfind guided flow helpers ───────────────────────────────────────────
@@ -1225,4 +1230,96 @@ async function handleMaClearInteraction(interaction, ctx){
   }
 }
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction };
+// ── /me hub ───────────────────────────────────────────────────────────────────
+async function showMeHub(interaction, ctx){
+  const { getAlert } = ctx;
+  const userId = interaction.user.id;
+  const alert = getAlert(userId);
+
+  const fmtF = f => !f || Object.keys(f).length===0 ? 'none (all tokens)' :
+    Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+
+  // Build alerts section
+  let alertDesc = 'No alert set.';
+  if(alert){
+    alertDesc = [
+      `**Collection:** ${alert.slug||'any'}`,
+      `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
+      `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+      `**Filters:**`,
+      fmtF(alert.traitFilters),
+    ].join('\n');
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`👤 My Settings`)
+    .setColor(0x5865F2)
+    .setDescription([
+      '**📣 Alert**',
+      alertDesc,
+      '',
+      '**💼 Wallet**',
+      '_Verification coming soon_',
+      '',
+      '**⚙️ Preferences**',
+      '_More settings coming soon_',
+    ].join('\n'))
+    .setFooter({ text: 'Use the buttons below to manage your settings' });
+
+  // Action buttons
+  const alertRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('me_browse:alert:set')
+      .setLabel(alert ? 'Edit Alert' : 'Set Alert')
+      .setStyle(alert ? ButtonStyle.Primary : ButtonStyle.Success),
+  );
+
+  if(alert){
+    alertRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId('me_browse:alert:clear')
+        .setLabel('Manage Alert')
+        .setStyle(ButtonStyle.Secondary),
+    );
+  }
+
+  return interaction.reply({ embeds: [embed], components: [alertRow], flags: MessageFlags.Ephemeral });
+}
+
+// ── /me interaction handler ───────────────────────────────────────────────────
+async function handleMeInteraction(interaction, ctx){
+  const { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex } = ctx;
+  const customId = interaction.customId;
+
+  // Alert tab — set/edit launches myalert wizard
+  if(customId === 'me_browse:alert:set'){
+    const guildId = interaction.guildId;
+    const config = getConfig(guildId) || {};
+    const allCols = [];
+    const primarySlug = config.collectionSlug || config.slug;
+    if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
+    for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+    if(!allCols.length) return interaction.update({ content: 'Run `/setup` first to configure a collection.', embeds: [], components: [] });
+    if(allCols.length === 1){
+      return showMaTraitPicker(interaction, ctx, allCols[0].slug);
+    }
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('ma_browse:col')
+      .setPlaceholder('Pick a collection...')
+      .addOptions(allCols.slice(0,25).map(c =>
+        new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)
+      ));
+    return interaction.update({
+      content: '**🔔 Set Alert** — Pick a collection:',
+      embeds: [],
+      components: [new ActionRowBuilder().addComponents(menu)],
+    });
+  }
+
+  // Alert tab — manage/clear launches clear wizard
+  if(customId === 'me_browse:alert:clear'){
+    return showMaClearWizard(interaction, { getAlert, deleteAlert, setAlert });
+  }
+}
+
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction };

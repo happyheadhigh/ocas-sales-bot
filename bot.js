@@ -95,7 +95,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction }   = require('./commands/market');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
@@ -727,6 +727,10 @@ client.on('interactionCreate', async (interaction)=>{
   if(interaction.isButton() && interaction.customId.startsWith('mac_browse:')){
     const macCtx = { getAlert, setAlert, deleteAlert };
     return handleMaClearInteraction(interaction, macCtx);
+  }
+  if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
+    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex };
+    return handleMeInteraction(interaction, meCtx);
   }
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
      (interaction.customId.startsWith('cfg_chsel:') || interaction.customId.startsWith('cfg_rolesel:'))){
