@@ -1549,7 +1549,7 @@ async function showMeWallet(interaction, ctx){
         if(heldCount === 0) continue;
 
         const floor = await pgPool.query(
-          `SELECT MIN(list_price) AS floor_eth FROM listings WHERE collection_slug=$1`,
+          `SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug=$1`,
           [col.slug]
         );
         const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
@@ -1809,14 +1809,36 @@ async function handleMeInteraction(interaction, ctx){
     const allDone = done === total;
 
     const progressLines = statusRows.map(r => {
-      if(r.status === 'done') return `✅ ${r.slug}${r.token_count > 0 ? ` (${r.token_count} held)` : ''}`;
-      if(r.status === 'error') return `❌ ${r.slug} — error`;
-      return `⏳ ${r.slug}`;
+      if(r.status === 'done') return `✅ ${r.slug}${r.token_count > 0 ? ` (${r.token_count} held)` : ' (0 found)'}`;
+      if(r.status === 'error') return `❌ ${r.slug} — sync error`;
+      return `⏳ ${r.slug} — syncing...`;
     });
 
     if(allDone){
-      // All done — show wallet data
-      return showMeWallet(interaction, ctx);
+      const totalHeld = statusRows.reduce((a, r) => a + (r.token_count || 0), 0);
+      if(totalHeld > 0){
+        // Data found — show wallet tab
+        return showMeWallet(interaction, ctx);
+      }
+      // All done but 0 tokens found — show progress summary so user can see what happened
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Re-sync').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      );
+      return interaction.update({
+        embeds: [new EmbedBuilder()
+          .setTitle('💼 Wallet — Sync Complete')
+          .setColor(0x5865F2)
+          .setDescription([
+            `Sync finished — no token holdings found.`,
+            '',
+            ...progressLines,
+            '',
+            'If you hold tokens in these collections, try **🔄 Re-sync**.',
+            'If the issue persists check Railway logs for `[WalletBackfill]` entries.',
+          ].join('\n'))],
+        components: [row],
+      });
     }
 
     const row = new ActionRowBuilder().addComponents(
