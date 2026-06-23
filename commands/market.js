@@ -960,8 +960,8 @@ async function showMaTraitPicker(interaction, ctx, slug){
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
   const traitNames = [...new Set(traitIndex.map(t => t.trait_name))].slice(0, 25);
   if(!traitNames.length){
-    const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
-    return interaction[replyFn]({ content: `No trait data found for **${slug}** yet.`, flags: MessageFlags.Ephemeral });
+    const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
+    return interaction[replyFn]({ content: `No trait data found for **${slug}** yet.`, ...(replyFn !== 'update' ? { flags: MessageFlags.Ephemeral } : {}) });
   }
   const traitValueCounts = {};
   for(const t of traitIndex){ if(!traitValueCounts[t.trait_name]) traitValueCounts[t.trait_name]=0; traitValueCounts[t.trait_name]++; }
@@ -972,12 +972,14 @@ async function showMaTraitPicker(interaction, ctx, slug){
       .setLabel(n).setValue(n)
       .setDescription(`${traitValueCounts[n]||0} value${traitValueCounts[n]===1?'':'s'}`)
     ));
-  const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
-  return interaction[replyFn]({
+  const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
+  const replyOpts = {
     content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by:`,
     components: [new ActionRowBuilder().addComponents(menu)],
-    flags: MessageFlags.Ephemeral,
-  });
+    embeds: [],
+  };
+  if(replyFn !== 'update') replyOpts.flags = MessageFlags.Ephemeral;
+  return interaction[replyFn](replyOpts);
 }
 
 async function showMaValuePicker(interaction, ctx, slug, traitName){
@@ -1152,7 +1154,8 @@ async function showMaClearWizard(interaction, ctx){
   const { getAlert } = ctx;
   const alert = getAlert(interaction.user.id);
   if(!alert || (!Object.keys(alert.traitFilters||{}).length && !alert.slug)){
-    return interaction.reply({ content: 'You have no alert set. Use `/myalert` to create one.', flags: MessageFlags.Ephemeral });
+    const naFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'reply';
+    return interaction[naFn]({ content: 'You have no alert set. Use `/me` to set one.', embeds:[], components:[], ...(naFn !== 'update' ? { flags: MessageFlags.Ephemeral } : {}) });
   }
   const filters = alert.traitFilters || {};
   const fmtF = f => Object.keys(f).length===0 ? 'none (all tokens)' :
@@ -1191,7 +1194,10 @@ async function showMaClearWizard(interaction, ctx){
     new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
   ));
-  return interaction.reply({ embeds: [embed], components: rows, flags: MessageFlags.Ephemeral });
+  const clearReplyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'reply';
+  const clearOpts = { embeds: [embed], components: rows };
+  if(clearReplyFn !== 'update') clearOpts.flags = MessageFlags.Ephemeral;
+  return interaction[clearReplyFn](clearOpts);
 }
 
 async function handleMaClearInteraction(interaction, ctx){
@@ -1341,12 +1347,10 @@ async function showMeHub(interaction, ctx){
     .setDescription(summaryLines.join('\n'))
     .setFooter({ text: 'Your settings are private — only you can see this' });
 
-  const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
-  return interaction[replyFn]({
-    embeds: [embed],
-    components: [new ActionRowBuilder().addComponents(nav)],
-    flags: MessageFlags.Ephemeral,
-  });
+  const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
+  const meOpts = { embeds: [embed], components: [new ActionRowBuilder().addComponents(nav)] };
+  if(replyFn !== 'update') meOpts.flags = MessageFlags.Ephemeral;
+  return interaction[replyFn](meOpts);
 }
 
 // ── /me section renderers ─────────────────────────────────────────────────────
