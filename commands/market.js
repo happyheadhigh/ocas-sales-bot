@@ -1747,15 +1747,23 @@ async function handleMeInteraction(interaction, ctx){
       });
     }
 
+    // Build collection list to show in progress
+    const config = getConfig(guildId) || {};
+    const syncCols = [];
+    if(config.contract) syncCols.push(config.contractName || config.collectionSlug || config.slug || 'OCAS');
+    for(const c of config.collections || []) { if(c.slug) syncCols.push(c.name || c.slug); }
+    if(!syncCols.find(n => n.toLowerCase().includes('all-stars') || n.toLowerCase() === 'ocas')) syncCols.push('On-Chain All Stars');
+
     // Fire-and-forget — don't await
     const { syncWalletForUser } = require('../lib/wallet-backfill');
     syncWalletForUser(userId, guildId, pgPool, process.env.ALCHEMY_API_KEY, getConfig).catch(e => {
       console.warn('[WalletSync]', e.message);
     });
 
-    // Show "syncing in background" message with a check-back button
+    // Show initial progress screen
+    const progressLines = syncCols.map(n => `⏳ ${n}`);
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('me_browse:wallet').setLabel('🔃 Refresh').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('me_browse:wallet:progress').setLabel('🔃 Check Progress').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     );
     return interaction.update({
@@ -1763,16 +1771,62 @@ async function handleMeInteraction(interaction, ctx){
         .setTitle('💼 Wallet — Syncing')
         .setColor(0x5865F2)
         .setDescription([
-          `🔄 Syncing wallet data for \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``,
+          `🔄 Syncing wallet \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``,
           '',
-          'This runs in the background and takes a few seconds per collection.',
-          'Click **🔃 Refresh** in a moment to see your updated data.',
+          ...progressLines,
+          '',
+          'Tap **🔃 Check Progress** to update.',
         ].join('\n'))],
       components: [row],
     });
   }
 
-  // Refresh wallet tab
+  // Check sync progress
+  if(customId === 'me_browse:wallet:progress'){
+    const { pgPool, getConfig } = ctx;
+    const userId = interaction.user.id;
+    const { getSyncStatus } = require('../lib/wallet-backfill');
+    const statusRows = await getSyncStatus(userId, pgPool);
+
+    if(!statusRows.length){
+      return showMeWallet(interaction, ctx);
+    }
+
+    const done = statusRows.filter(r => r.status === 'done').length;
+    const total = statusRows.length;
+    const allDone = done === total;
+
+    const progressLines = statusRows.map(r => {
+      if(r.status === 'done') return `✅ ${r.slug}${r.token_count > 0 ? ` (${r.token_count} held)` : ''}`;
+      if(r.status === 'error') return `❌ ${r.slug} — error`;
+      return `⏳ ${r.slug}`;
+    });
+
+    if(allDone){
+      // All done — show wallet data
+      return showMeWallet(interaction, ctx);
+    }
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:wallet:progress').setLabel('🔃 Check Progress').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({
+      embeds: [new EmbedBuilder()
+        .setTitle(`💼 Wallet — Syncing (${done}/${total})`)
+        .setColor(0x5865F2)
+        .setDescription([
+          `Syncing ${total} collection${total===1?'':'s'}...`,
+          '',
+          ...progressLines,
+          '',
+          allDone ? 'All done!' : 'Still syncing — tap Check Progress again in a moment.',
+        ].join('\n'))],
+      components: [row],
+    });
+  }
+
+  // Direct wallet tab refresh
   if(customId === 'me_browse:wallet'){
     return showMeWallet(interaction, ctx);
   }
