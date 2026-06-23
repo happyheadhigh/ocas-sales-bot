@@ -1472,16 +1472,159 @@ async function showMeFloorAlerts(interaction, ctx){
 }
 
 async function showMeWallet(interaction, ctx){
+  const { pgPool, getConfig, getRailwayApiUrl, fetchBotApiJson } = ctx;
+  const userId = interaction.user.id;
+  const guildId = interaction.guildId;
+
+  // Look up verified wallet
+  let wallet = null;
+  if(pgPool){
+    const reg = await pgPool.query(
+      `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true LIMIT 1`,
+      [userId, guildId]
+    ).catch(()=>null);
+    wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
+
+    // Also check global row if no guild-specific
+    if(!wallet){
+      const globalReg = await pgPool.query(
+        `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+        [userId]
+      ).catch(()=>null);
+      wallet = globalReg?.rows[0]?.wallet?.toLowerCase() || null;
+    }
+  }
+
+  // ── Unverified ──────────────────────────────────────────────────────────────
+  if(!wallet){
+    const embed = new EmbedBuilder()
+      .setTitle('💼 Wallet — Not Verified')
+      .setColor(0x5865F2)
+      .setDescription([
+        'Link your wallet to unlock portfolio analytics, P&L tracking, and leaderboards.',
+        '',
+        'To verify, find the **Verify Wallet** button in your server\'s verification channel.',
+      ].join('\n'));
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    );
+    const updateFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply';
+    return interaction[updateFn]({ embeds: [embed], components: [row] });
+  }
+
+  // ── Verified — fetch wallet data ────────────────────────────────────────────
+  const RAILWAY_URL = getRailwayApiUrl();
+  const API_SECRET = process.env.API_SECRET;
+  const shortWallet = wallet.slice(0,6) + '...' + wallet.slice(-4);
+
+  let summary = null;
+  let collectionBreakdowns = [];
+
+  if(RAILWAY_URL){
+    try {
+      const res = await fetchBotApiJson(
+        `${RAILWAY_URL}/db/wallet/${wallet}/summary?key=${API_SECRET||''}`,
+        'wallet summary'
+      );
+      summary = res.summary || null;
+    } catch(e){ console.warn('[WalletTab] summary fetch:', e.message); }
+  }
+
+  // Per-collection breakdown from wallet_token_intervals
+  if(pgPool){
+    const config = getConfig(guildId) || {};
+    const cols = [];
+    if(config.collectionSlug || config.slug) cols.push({ slug: config.collectionSlug || config.slug, name: config.contractName || config.collectionSlug || config.slug });
+    for(const c of config.collections || []) { if(c.slug) cols.push({ slug: c.slug, name: c.name || c.slug }); }
+    if(!cols.find(c => c.slug === 'on-chain-all-stars')) cols.push({ slug: 'on-chain-all-stars', name: 'On-Chain All Stars' });
+
+    for(const col of cols){
+      try {
+        const held = await pgPool.query(
+          `SELECT COUNT(*) AS cnt FROM wallet_token_intervals WHERE wallet_address=$1 AND collection_slug=$2 AND disposed_at IS NULL`,
+          [wallet, col.slug]
+        );
+        const heldCount = parseInt(held.rows[0]?.cnt || 0);
+        if(heldCount === 0) continue;
+
+        const floor = await pgPool.query(
+          `SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug=$1`,
+          [col.slug]
+        );
+        const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
+
+        // P&L
+        const pnl = await pgPool.query(
+          `SELECT
+            COALESCE(SUM(CASE WHEN disposed_at IS NOT NULL THEN sale_eth - cost_eth END), 0) AS realized,
+            COALESCE(AVG(CASE WHEN disposed_at IS NULL THEN cost_eth END), 0) AS avg_cost
+           FROM wallet_token_intervals
+           WHERE wallet_address=$1 AND collection_slug=$2`,
+          [wallet, col.slug]
+        );
+
+        collectionBreakdowns.push({
+          name: col.name,
+          slug: col.slug,
+          held: heldCount,
+          floorEth,
+          estimatedValue: floorEth ? heldCount * floorEth : null,
+          realizedPnl: parseFloat(pnl.rows[0]?.realized || 0),
+          avgCost: parseFloat(pnl.rows[0]?.avg_cost || 0),
+        });
+      } catch(e){ console.warn('[WalletTab] breakdown:', e.message); }
+    }
+  }
+
+  // ── Build embed ─────────────────────────────────────────────────────────────
+  const fmt = n => n >= 1 ? n.toFixed(3) : n.toFixed(4);
+  const pnlStr = n => n >= 0 ? `+Ξ ${fmt(n)}` : `-Ξ ${fmt(Math.abs(n))}`;
+
+  const descLines = [
+    `🔗 **Wallet:** \`${shortWallet}\``,
+    '',
+  ];
+
+  if(collectionBreakdowns.length){
+    for(const col of collectionBreakdowns){
+      descLines.push(`**${col.name}**`);
+      descLines.push(`  Holdings: **${col.held}** token${col.held===1?'':'s'}`);
+      if(col.floorEth) descLines.push(`  Floor: **Ξ ${fmt(col.floorEth)}** · Est. value: **Ξ ${fmt(col.estimatedValue)}**`);
+      if(col.realizedPnl !== 0) descLines.push(`  Realized P&L: **${pnlStr(col.realizedPnl)}**`);
+      if(col.avgCost > 0) descLines.push(`  Avg. cost basis: **Ξ ${fmt(col.avgCost)}**`);
+      descLines.push('');
+    }
+  } else if(summary) {
+    descLines.push(`Holdings: **${summary.owned_count}** token${summary.owned_count===1?'':'s'}`);
+    if(summary.best_rank) descLines.push(`Best rank: **⬥ #${summary.best_rank.toLocaleString()}**`);
+    if(summary.estimated_floor_value) descLines.push(`Est. value: **Ξ ${fmt(summary.estimated_floor_value)}**`);
+  } else {
+    descLines.push('_Wallet data is syncing... Check back in a moment._');
+  }
+
+  // Total estimated value
+  const totalEst = collectionBreakdowns.reduce((a, c) => a + (c.estimatedValue || 0), 0);
+  const totalRealized = collectionBreakdowns.reduce((a, c) => a + c.realizedPnl, 0);
+  if(collectionBreakdowns.length > 1){
+    descLines.push(`**Total Est. Value: Ξ ${fmt(totalEst)}**`);
+    if(totalRealized !== 0) descLines.push(`**Total Realized P&L: ${pnlStr(totalRealized)}**`);
+    descLines.push('');
+  }
+
+  descLines.push(`📊 [View full analytics on TraitView](https://traitview.com/wallet/${wallet})`);
+
   const embed = new EmbedBuilder()
     .setTitle('💼 Wallet')
-    .setColor(0x5865F2)
-    .setDescription('Wallet verification coming soon.\n\nOnce verified your wallet will be linked to your Discord account for portfolio analytics, leaderboards, and auto-role assignment.');
+    .setColor(0x57F287)
+    .setDescription(descLines.join('\n'));
 
   const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync Wallet').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
   );
 
-  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  const updateFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply';
   return interaction[updateFn]({ embeds: [embed], components: [row] });
 }
 
@@ -1585,6 +1728,31 @@ async function handleMeInteraction(interaction, ctx){
   if(customId === 'me_browse:flooralert:clearall'){
     await pgPool.query(`DELETE FROM user_floor_alerts WHERE discord_id=$1`, [interaction.user.id]).catch(()=>{});
     return showMeFloorAlerts(interaction, ctx);
+  }
+
+  // ── Wallet sync ─────────────────────────────────────────────────────────────
+  if(customId === 'me_browse:wallet:sync'){
+    const { pgPool, getConfig } = ctx;
+    const guildId = interaction.guildId;
+    const userId = interaction.user.id;
+
+    await interaction.update({
+      embeds: [new EmbedBuilder().setTitle('💼 Wallet').setColor(0x5865F2).setDescription('🔄 Syncing your wallet data... This may take a few seconds.')],
+      components: [],
+    });
+
+    const { syncWalletForUser } = require('../lib/wallet-backfill');
+    const result = await syncWalletForUser(userId, guildId, pgPool, process.env.ALCHEMY_API_KEY, getConfig).catch(e => ({ error: e.message }));
+
+    if(result.error){
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      );
+      return interaction.editReply({ embeds: [new EmbedBuilder().setTitle('💼 Wallet').setColor(0xED4245).setDescription(`❌ Sync failed: ${result.error}`)], components: [row] });
+    }
+
+    // Re-render wallet tab with fresh data
+    return showMeWallet(interaction, ctx);
   }
 }
 

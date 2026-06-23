@@ -733,7 +733,7 @@ client.on('interactionCreate', async (interaction)=>{
     return handleMaClearInteraction(interaction, macCtx);
   }
   if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
-    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool };
+    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson };
     return handleMeInteraction(interaction, meCtx);
   }
 
