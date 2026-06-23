@@ -2114,6 +2114,12 @@ async function handleConfigModal(interaction, ctx){
     cfg.collections.push({ name, slug, contract:contract||null, salesChannel:null, listingsChannel:null });
     await setConfig(guildId, cfg);
 
+    // Backfill all verified wallets in this server for the new collection
+    if(slug && contract){
+      const { backfillServerWallets } = require('../lib/wallet-backfill');
+      backfillServerWallets(guildId, contract, slug, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+    }
+
     // Every server gets an automatic trait backfill for any new non-OCAS
     // collection — this is what powers /traitfind, /rankfind, and trait-
     // filtered listings for that collection. Free tier now includes this
@@ -2183,6 +2189,11 @@ async function handleConfigModal(interaction, ctx){
       if(field==='slug'){
         cfg.collections[idx].slug = val.toLowerCase();
         fetchAndStoreCollectionTraits(cfg.collections[idx].slug, pgPool).catch(()=>{});
+        // Trigger wallet backfill if both contract and slug are now set
+        if(cfg.collections[idx].contract && cfg.collections[idx].slug){
+          const { backfillServerWallets } = require('../lib/wallet-backfill');
+          backfillServerWallets(guildId, cfg.collections[idx].contract, cfg.collections[idx].slug, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+        }
       }
     }
     await setConfig(guildId, cfg);
