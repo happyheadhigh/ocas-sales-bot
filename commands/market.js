@@ -1230,124 +1230,203 @@ async function handleMaClearInteraction(interaction, ctx){
   }
 }
 
-// ── /me hub ───────────────────────────────────────────────────────────────────
-async function showMeHub(interaction, ctx){
-  const { getAlert, pgPool } = ctx;
-  const userId = interaction.user.id;
-  const alert = getAlert(userId);
+// ── /me hub helpers ──────────────────────────────────────────────────────────
+function parseCooldown(str){
+  // Parses "30m", "2h", "1d", or plain number (treated as minutes)
+  // Returns minutes as integer
+  if(!str) return 60; // default 1 hour
+  const s = String(str).trim().toLowerCase();
+  const match = s.match(/^(\d+(?:\.\d+)?)\s*([mhd]?)$/);
+  if(!match) return 60;
+  const val = parseFloat(match[1]);
+  const unit = match[2] || 'm';
+  if(unit === 'd') return Math.round(val * 24 * 60);
+  if(unit === 'h') return Math.round(val * 60);
+  return Math.round(val); // minutes
+}
 
+function formatCooldown(minutes){
+  if(minutes >= 1440) return `${(minutes/1440).toFixed(1).replace(/\.0$/,'')}d`;
+  if(minutes >= 60)   return `${(minutes/60).toFixed(1).replace(/\.0$/,'')}h`;
+  return `${minutes}m`;
+}
+
+// ── /me hub — main entry ──────────────────────────────────────────────────────
+async function showMeHub(interaction, ctx){
+  const nav = new StringSelectMenuBuilder()
+    .setCustomId('me_browse:nav')
+    .setPlaceholder('What would you like to manage?')
+    .addOptions([
+      new StringSelectMenuOptionBuilder().setLabel('📣 Trait Alert').setDescription('Sales & listing DMs by trait').setValue('trait_alert'),
+      new StringSelectMenuOptionBuilder().setLabel('🏷️ Price Alerts').setDescription('DM when a token drops below a price').setValue('price_alerts'),
+      new StringSelectMenuOptionBuilder().setLabel('📉 Floor Alerts').setDescription('DM when a collection floor drops').setValue('floor_alerts'),
+      new StringSelectMenuOptionBuilder().setLabel('💼 Wallet').setDescription('Verification & wallet analytics').setValue('wallet'),
+    ]);
+
+  const embed = new EmbedBuilder()
+    .setTitle('👤 My Settings')
+    .setColor(0x5865F2)
+    .setDescription('Select a section to manage your personal settings.')
+    .setFooter({ text: 'Your settings are private — only you can see this' });
+
+  const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
+  return interaction[replyFn]({
+    embeds: [embed],
+    components: [new ActionRowBuilder().addComponents(nav)],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+// ── /me section renderers ─────────────────────────────────────────────────────
+async function showMeTraitAlert(interaction, ctx){
+  const { getAlert } = ctx;
+  const alert = getAlert(interaction.user.id);
   const fmtF = f => !f || Object.keys(f).length===0 ? 'none (all tokens)' :
     Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
 
-  // Build alerts section
-  let alertDesc = 'No alert set.';
-  if(alert){
-    alertDesc = [
-      `**Collection:** ${alert.slug||'any'}`,
-      `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
-      `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
-      `**Filters:**`,
-      fmtF(alert.traitFilters),
-    ].join('\n');
-  }
-
-  // Build price alerts section
-  let priceAlertDesc = 'No price alerts set.';
-  if(pgPool){
-    const paRes = await pgPool.query(
-      `SELECT token_id, threshold_eth, slug, alert_once, repeat_alert, triggered_at FROM user_price_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 10`,
-      [userId]
-    ).catch(()=>null);
-    if(paRes?.rows.length){
-      priceAlertDesc = paRes.rows.map(r =>
-        `**#${r.token_id}** (${r.slug}) — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)}${r.triggered_at ? ' ✅ triggered' : ''}`
-      ).join('\n');
-    }
-  }
-
-  // Build floor alerts section
-  let floorAlertDesc = 'No floor alerts set.';
-  if(pgPool){
-    const faRes = await pgPool.query(
-      `SELECT slug, threshold_eth, cooldown_hours, last_alerted_at FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 10`,
-      [userId]
-    ).catch(()=>null);
-    if(faRes?.rows.length){
-      floorAlertDesc = faRes.rows.map(r =>
-        `**${r.slug}** — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)} (cooldown: ${r.cooldown_hours}h)`
-      ).join('\n');
-    }
-  }
+  const desc = alert ? [
+    `**Collection:** ${alert.slug||'any'}`,
+    `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
+    `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+    `**Filters:**`,
+    fmtF(alert.traitFilters),
+  ].join('\n') : 'No trait alert set.';
 
   const embed = new EmbedBuilder()
-    .setTitle(`👤 My Settings`)
+    .setTitle('📣 Trait Alert')
     .setColor(0x5865F2)
-    .setDescription([
-      '**📣 Trait Alert**',
-      alertDesc,
-      '',
-      '**🏷️ Price Alerts**',
-      priceAlertDesc,
-      '',
-      '**📉 Floor Alerts**',
-      floorAlertDesc,
-      '',
-      '**💼 Wallet**',
-      '_Verification coming soon_',
-    ].join('\n'))
-    .setFooter({ text: 'Use the buttons below to manage your settings' });
+    .setDescription(desc);
 
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('me_browse:alert:set')
-      .setLabel(alert ? 'Edit Trait Alert' : 'Set Trait Alert')
-      .setStyle(alert ? ButtonStyle.Primary : ButtonStyle.Success),
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:alert:set').setLabel(alert ? 'Edit Alert' : 'Set Alert').setStyle(alert ? ButtonStyle.Primary : ButtonStyle.Success),
   );
-  if(alert){
-    row1.addComponents(
-      new ButtonBuilder()
-        .setCustomId('me_browse:alert:clear')
-        .setLabel('Manage Trait Alert')
-        .setStyle(ButtonStyle.Secondary),
-    );
-  }
-
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('me_browse:pricealert:set')
-      .setLabel('Add Price Alert')
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId('me_browse:flooralert:set')
-      .setLabel('Add Floor Alert')
-      .setStyle(ButtonStyle.Primary),
+  if(alert) row.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:alert:clear').setLabel('Manage / Clear').setStyle(ButtonStyle.Danger),
+  );
+  row.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
   );
 
-  const components = [row1, row2];
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
+}
 
-  // Add manage buttons if alerts exist
-  const hasPriceAlerts = priceAlertDesc !== 'No price alerts set.';
-  const hasFloorAlerts = floorAlertDesc !== 'No floor alerts set.';
-  if(hasPriceAlerts || hasFloorAlerts){
-    const row3 = new ActionRowBuilder();
-    if(hasPriceAlerts) row3.addComponents(
-      new ButtonBuilder().setCustomId('me_browse:pricealert:manage').setLabel('Manage Price Alerts').setStyle(ButtonStyle.Secondary)
-    );
-    if(hasFloorAlerts) row3.addComponents(
-      new ButtonBuilder().setCustomId('me_browse:flooralert:manage').setLabel('Manage Floor Alerts').setStyle(ButtonStyle.Secondary)
-    );
-    components.push(row3);
+async function showMePriceAlerts(interaction, ctx){
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+  let desc = 'No price alerts set.';
+  let hasAlerts = false;
+  const rows = [];
+
+  if(pgPool){
+    const res = await pgPool.query(
+      `SELECT id, token_id, slug, threshold_eth, alert_once, repeat_alert, triggered_at FROM user_price_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
+      [userId]
+    ).catch(()=>null);
+    if(res?.rows.length){
+      hasAlerts = true;
+      desc = res.rows.map(r =>
+        `**#${r.token_id}** (${r.slug}) — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)} ${r.triggered_at?'✅ triggered':r.repeat_alert?'🔁 repeat':'1x'}`
+      ).join('\n');
+      const btns = res.rows.map(r =>
+        new ButtonBuilder().setCustomId(`me_browse:pricealert:remove:${r.id}`)
+          .setLabel(`Remove #${r.token_id}`).setStyle(ButtonStyle.Danger)
+      );
+      for(let i=0;i<btns.length;i+=4) rows.push(new ActionRowBuilder().addComponents(btns.slice(i,i+4)));
+    }
   }
 
-  return interaction.reply({ embeds: [embed], components, flags: MessageFlags.Ephemeral });
+  const embed = new EmbedBuilder().setTitle('🏷️ Price Alerts').setColor(0x5865F2).setDescription(desc);
+
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:pricealert:set').setLabel('Add Price Alert').setStyle(ButtonStyle.Success),
+  );
+  if(hasAlerts) actionRow.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:pricealert:clearall').setLabel('Remove All').setStyle(ButtonStyle.Danger),
+  );
+  actionRow.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+  rows.push(actionRow);
+
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: rows });
+}
+
+async function showMeFloorAlerts(interaction, ctx){
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+  let desc = 'No floor alerts set.';
+  let hasAlerts = false;
+  const rows = [];
+
+  if(pgPool){
+    const res = await pgPool.query(
+      `SELECT id, slug, threshold_eth, cooldown_minutes, last_alerted_at FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
+      [userId]
+    ).catch(()=>null);
+    if(res?.rows.length){
+      hasAlerts = true;
+      desc = res.rows.map(r =>
+        `**${r.slug}** — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)} (cooldown: ${formatCooldown(r.cooldown_minutes||60)}${r.last_alerted_at?' · last alerted '+new Date(r.last_alerted_at).toLocaleDateString():''})`
+      ).join('\n');
+      const btns = res.rows.map(r =>
+        new ButtonBuilder().setCustomId(`me_browse:flooralert:remove:${r.id}`)
+          .setLabel(`Remove ${r.slug}`).setStyle(ButtonStyle.Danger)
+      );
+      for(let i=0;i<btns.length;i+=4) rows.push(new ActionRowBuilder().addComponents(btns.slice(i,i+4)));
+    }
+  }
+
+  const embed = new EmbedBuilder().setTitle('📉 Floor Alerts').setColor(0x5865F2).setDescription(desc);
+
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:flooralert:set').setLabel('Add Floor Alert').setStyle(ButtonStyle.Success),
+  );
+  if(hasAlerts) actionRow.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:flooralert:clearall').setLabel('Remove All').setStyle(ButtonStyle.Danger),
+  );
+  actionRow.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+  rows.push(actionRow);
+
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: rows });
+}
+
+async function showMeWallet(interaction, ctx){
+  const embed = new EmbedBuilder()
+    .setTitle('💼 Wallet')
+    .setColor(0x5865F2)
+    .setDescription('Wallet verification coming soon.\n\nOnce verified your wallet will be linked to your Discord account for portfolio analytics, leaderboards, and auto-role assignment.');
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
 }
 
 // ── /me interaction handler ───────────────────────────────────────────────────
 async function handleMeInteraction(interaction, ctx){
-  const { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex } = ctx;
+  const { getAlert, setAlert, deleteAlert, getConfig, pgPool } = ctx;
   const customId = interaction.customId;
 
-  // Alert tab — set/edit launches myalert wizard
+  // Nav dropdown
+  if(customId === 'me_browse:nav'){
+    const section = interaction.values[0];
+    if(section === 'trait_alert') return showMeTraitAlert(interaction, ctx);
+    if(section === 'price_alerts') return showMePriceAlerts(interaction, ctx);
+    if(section === 'floor_alerts') return showMeFloorAlerts(interaction, ctx);
+    if(section === 'wallet') return showMeWallet(interaction, ctx);
+  }
+
+  // Back to hub
+  if(customId === 'me_browse:back') return showMeHub(interaction, ctx);
+
+  // ── Trait alert ──────────────────────────────────────────────────────────────
   if(customId === 'me_browse:alert:set'){
     const guildId = interaction.guildId;
     const config = getConfig(guildId) || {};
@@ -1355,55 +1434,29 @@ async function handleMeInteraction(interaction, ctx){
     const primarySlug = config.collectionSlug || config.slug;
     if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
     for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
-    if(!allCols.length) return interaction.update({ content: 'Run `/setup` first to configure a collection.', embeds: [], components: [] });
-    if(allCols.length === 1){
-      return showMaTraitPicker(interaction, ctx, allCols[0].slug);
-    }
+    if(!allCols.length) return interaction.update({ content: 'No collections configured on this server.', embeds:[], components:[] });
+    if(allCols.length === 1) return showMaTraitPicker(interaction, ctx, allCols[0].slug);
     const menu = new StringSelectMenuBuilder()
       .setCustomId('ma_browse:col')
       .setPlaceholder('Pick a collection...')
-      .addOptions(allCols.slice(0,25).map(c =>
-        new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)
-      ));
-    return interaction.update({
-      content: '**🔔 Set Alert** — Pick a collection:',
-      embeds: [],
-      components: [new ActionRowBuilder().addComponents(menu)],
-    });
+      .addOptions(allCols.slice(0,25).map(c => new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)));
+    return interaction.update({ content: '**📣 Trait Alert** — Pick a collection:', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
   }
 
-  // Alert tab — manage/clear launches clear wizard
   if(customId === 'me_browse:alert:clear'){
     return showMaClearWizard(interaction, { getAlert, deleteAlert, setAlert });
   }
 
-  // Price alert — set
+  // ── Price alerts ─────────────────────────────────────────────────────────────
   if(customId === 'me_browse:pricealert:set'){
-    const { getConfig, pgPool } = ctx;
     const guildId = interaction.guildId;
     const config = getConfig(guildId) || {};
     const allCols = [];
     const primarySlug = config.collectionSlug || config.slug;
     if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
     for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
-
-    if(allCols.length === 0) return interaction.update({ content: 'No collections configured.', embeds:[], components:[] });
-
-    // If only one collection skip picker, go straight to token/price input via modal
-    const targetSlug = allCols.length === 1 ? allCols[0].slug : null;
-    if(targetSlug){
-      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
-      const modal = new ModalBuilder()
-        .setCustomId(`me_modal:pricealert:${targetSlug}`)
-        .setTitle('Set Price Alert');
-      modal.addComponents(
-        new AR().addComponents(new TextInputBuilder().setCustomId('token_id').setLabel('Token ID (e.g. 1234)').setStyle(TextInputStyle.Short).setRequired(true)),
-        new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Alert when listed below (ETH, e.g. 0.05)').setStyle(TextInputStyle.Short).setRequired(true)),
-        new AR().addComponents(new TextInputBuilder().setCustomId('once').setLabel('Alert once or repeat? (once / repeat)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('once')),
-      );
-      return interaction.showModal(modal);
-    }
-    // Multi-collection — show collection picker first
+    if(!allCols.length) return interaction.update({ content: 'No collections configured.', embeds:[], components:[] });
+    if(allCols.length === 1) return showPriceAlertModal(interaction, allCols[0].slug);
     const menu = new StringSelectMenuBuilder()
       .setCustomId('me_browse:pricealert:col')
       .setPlaceholder('Pick a collection...')
@@ -1412,56 +1465,22 @@ async function handleMeInteraction(interaction, ctx){
   }
 
   if(customId.startsWith('me_browse:pricealert:col')){
-    const slug = interaction.values[0];
-    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
-    const modal = new ModalBuilder().setCustomId(`me_modal:pricealert:${slug}`).setTitle('Set Price Alert');
-    modal.addComponents(
-      new AR().addComponents(new TextInputBuilder().setCustomId('token_id').setLabel('Token ID (e.g. 1234)').setStyle(TextInputStyle.Short).setRequired(true)),
-      new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Alert when listed below (ETH, e.g. 0.05)').setStyle(TextInputStyle.Short).setRequired(true)),
-      new AR().addComponents(new TextInputBuilder().setCustomId('once').setLabel('Alert once or repeat? (once / repeat)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('once')),
-    );
-    return interaction.showModal(modal);
-  }
-
-  // Price alert — manage (show list with remove buttons)
-  if(customId === 'me_browse:pricealert:manage'){
-    const { pgPool } = ctx;
-    const res = await pgPool.query(
-      `SELECT id, token_id, slug, threshold_eth, triggered_at FROM user_price_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
-      [interaction.user.id]
-    ).catch(()=>({rows:[]}));
-    if(!res.rows.length) return interaction.update({ content: 'No price alerts found.', embeds:[], components:[] });
-    const rows = [];
-    const btns = res.rows.map(r =>
-      new ButtonBuilder()
-        .setCustomId(`me_browse:pricealert:remove:${r.id}`)
-        .setLabel(`#${r.token_id} Ξ${parseFloat(r.threshold_eth).toFixed(3)}${r.triggered_at?' ✅':''}`)
-        .setStyle(ButtonStyle.Danger)
-    );
-    for(let i=0;i<btns.length;i+=4) rows.push(new ActionRowBuilder().addComponents(btns.slice(i,i+4)));
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('me_browse:pricealert:clearall').setLabel('Remove All').setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId('me_browse:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
-    ));
-    return interaction.update({ content: '**🏷️ Price Alerts** — tap to remove:', embeds:[], components: rows });
+    return showPriceAlertModal(interaction, interaction.values[0]);
   }
 
   if(customId.startsWith('me_browse:pricealert:remove:')){
-    const { pgPool } = ctx;
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`DELETE FROM user_price_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
-    return interaction.update({ content: '✅ Price alert removed.', embeds:[], components:[] });
+    return showMePriceAlerts(interaction, ctx);
   }
 
   if(customId === 'me_browse:pricealert:clearall'){
-    const { pgPool } = ctx;
     await pgPool.query(`DELETE FROM user_price_alerts WHERE discord_id=$1`, [interaction.user.id]).catch(()=>{});
-    return interaction.update({ content: '✅ All price alerts removed.', embeds:[], components:[] });
+    return showMePriceAlerts(interaction, ctx);
   }
 
-  // Floor alert — set
+  // ── Floor alerts ─────────────────────────────────────────────────────────────
   if(customId === 'me_browse:flooralert:set'){
-    const { getConfig, pgPool } = ctx;
     const guildId = interaction.guildId;
     const config = getConfig(guildId) || {};
     const allCols = [];
@@ -1469,17 +1488,7 @@ async function handleMeInteraction(interaction, ctx){
     if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
     for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
     if(!allCols.length) return interaction.update({ content: 'No collections configured.', embeds:[], components:[] });
-
-    const targetSlug = allCols.length === 1 ? allCols[0].slug : null;
-    if(targetSlug){
-      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
-      const modal = new ModalBuilder().setCustomId(`me_modal:flooralert:${targetSlug}`).setTitle('Set Floor Alert');
-      modal.addComponents(
-        new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Alert when floor drops below (ETH)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('0.05')),
-        new AR().addComponents(new TextInputBuilder().setCustomId('cooldown').setLabel('Cooldown between alerts (hours)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('1')),
-      );
-      return interaction.showModal(modal);
-    }
+    if(allCols.length === 1) return showFloorAlertModal(interaction, allCols[0].slug);
     const menu = new StringSelectMenuBuilder()
       .setCustomId('me_browse:flooralert:col')
       .setPlaceholder('Pick a collection...')
@@ -1488,48 +1497,41 @@ async function handleMeInteraction(interaction, ctx){
   }
 
   if(customId.startsWith('me_browse:flooralert:col')){
-    const slug = interaction.values[0];
-    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
-    const modal = new ModalBuilder().setCustomId(`me_modal:flooralert:${slug}`).setTitle('Set Floor Alert');
-    modal.addComponents(
-      new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Alert when floor drops below (ETH)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('0.05')),
-      new AR().addComponents(new TextInputBuilder().setCustomId('cooldown').setLabel('Cooldown between alerts (hours)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('1')),
-    );
-    return interaction.showModal(modal);
-  }
-
-  // Floor alert — manage
-  if(customId === 'me_browse:flooralert:manage'){
-    const { pgPool } = ctx;
-    const res = await pgPool.query(
-      `SELECT id, slug, threshold_eth, cooldown_hours FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
-      [interaction.user.id]
-    ).catch(()=>({rows:[]}));
-    if(!res.rows.length) return interaction.update({ content: 'No floor alerts found.', embeds:[], components:[] });
-    const btns = res.rows.map(r =>
-      new ButtonBuilder()
-        .setCustomId(`me_browse:flooralert:remove:${r.id}`)
-        .setLabel(`${r.slug} Ξ${parseFloat(r.threshold_eth).toFixed(3)}`)
-        .setStyle(ButtonStyle.Danger)
-    );
-    const rows = [];
-    for(let i=0;i<btns.length;i+=4) rows.push(new ActionRowBuilder().addComponents(btns.slice(i,i+4)));
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('me_browse:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
-    ));
-    return interaction.update({ content: '**📉 Floor Alerts** — tap to remove:', embeds:[], components: rows });
+    return showFloorAlertModal(interaction, interaction.values[0]);
   }
 
   if(customId.startsWith('me_browse:flooralert:remove:')){
-    const { pgPool } = ctx;
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`DELETE FROM user_floor_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
-    return interaction.update({ content: '✅ Floor alert removed.', embeds:[], components:[] });
+    return showMeFloorAlerts(interaction, ctx);
   }
 
-  if(customId === 'me_browse:back'){
-    return showMeHub(interaction, ctx);
+  if(customId === 'me_browse:flooralert:clearall'){
+    await pgPool.query(`DELETE FROM user_floor_alerts WHERE discord_id=$1`, [interaction.user.id]).catch(()=>{});
+    return showMeFloorAlerts(interaction, ctx);
   }
+}
+
+// ── Modal launchers ───────────────────────────────────────────────────────────
+async function showPriceAlertModal(interaction, slug){
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const modal = new ModalBuilder().setCustomId(`me_modal:pricealert:${slug}`).setTitle(`Price Alert — ${slug}`);
+  modal.addComponents(
+    new AR().addComponents(new TextInputBuilder().setCustomId('token_id').setLabel('Token ID (e.g. 1234)').setStyle(TextInputStyle.Short).setRequired(true)),
+    new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Alert when listed below (ETH, e.g. 0.05)').setStyle(TextInputStyle.Short).setRequired(true)),
+    new AR().addComponents(new TextInputBuilder().setCustomId('once').setLabel('Alert once or repeat? (once / repeat)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('once')),
+  );
+  return interaction.showModal(modal);
+}
+
+async function showFloorAlertModal(interaction, slug){
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const modal = new ModalBuilder().setCustomId(`me_modal:flooralert:${slug}`).setTitle(`Floor Alert — ${slug}`);
+  modal.addComponents(
+    new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Alert when floor drops below (ETH)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('0.05')),
+    new AR().addComponents(new TextInputBuilder().setCustomId('cooldown').setLabel('Cooldown (e.g. 30m, 2h, 1d)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('1h')),
+  );
+  return interaction.showModal(modal);
 }
 
 module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction };

@@ -736,7 +736,7 @@ client.on('interactionCreate', async (interaction)=>{
   // Modal submissions for price/floor alerts
   if(interaction.isModalSubmit() && interaction.customId.startsWith('me_modal:')){
     const parts = interaction.customId.split(':');
-    const alertType = parts[1]; // pricealert or flooralert
+    const alertType = parts[1];
     const slug = parts.slice(2).join(':');
 
     if(alertType === 'pricealert'){
@@ -746,36 +746,52 @@ client.on('interactionCreate', async (interaction)=>{
       const alertOnce = onceVal !== 'repeat';
       const repeatAlert = !alertOnce;
       if(isNaN(tokenId) || isNaN(threshold) || threshold <= 0){
-        return interaction.reply({ content: '❌ Invalid token ID or threshold. Token ID must be a number, threshold must be ETH amount like 0.05.', flags: MessageFlags.Ephemeral });
+        return interaction.reply({ content: '❌ Invalid token ID or threshold. Token ID must be a number, threshold must be ETH like 0.05.', flags: MessageFlags.Ephemeral });
       }
       await pgPool.query(
         `INSERT INTO user_price_alerts (discord_id, slug, token_id, threshold_eth, alert_once, repeat_alert)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT DO NOTHING`,
+         VALUES ($1,$2,$3,$4,$5,$6)`,
         [interaction.user.id, slug, tokenId, threshold, alertOnce, repeatAlert]
       ).catch(()=>{});
-      return interaction.reply({
+      // Reply then show price alerts section
+      await interaction.reply({
         content: `✅ Price alert set! I'll DM you when **#${tokenId}** (${slug}) is listed below **Ξ ${threshold.toFixed(4)}** (${alertOnce ? 'once' : 'repeating'}).`,
         flags: MessageFlags.Ephemeral
       });
+      return;
     }
 
     if(alertType === 'flooralert'){
       const threshold = parseFloat(interaction.fields.getTextInputValue('threshold').trim());
-      const cooldown = parseInt(interaction.fields.getTextInputValue('cooldown').trim() || '1') || 1;
+      const cooldownStr = interaction.fields.getTextInputValue('cooldown').trim() || '1h';
+      // Parse cooldown — supports 30m, 2h, 1d, or plain number (minutes)
+      const cooldownMinutes = (() => {
+        const s = cooldownStr.toLowerCase();
+        const m = s.match(/^([\d.]+)\s*([mhd]?)$/);
+        if(!m) return 60;
+        const val = parseFloat(m[1]);
+        const unit = m[2] || 'm';
+        if(unit === 'd') return Math.round(val * 24 * 60);
+        if(unit === 'h') return Math.round(val * 60);
+        return Math.round(val);
+      })();
       if(isNaN(threshold) || threshold <= 0){
         return interaction.reply({ content: '❌ Invalid threshold. Enter an ETH amount like 0.05.', flags: MessageFlags.Ephemeral });
       }
       await pgPool.query(
-        `INSERT INTO user_floor_alerts (discord_id, slug, threshold_eth, cooldown_hours)
+        `INSERT INTO user_floor_alerts (discord_id, slug, threshold_eth, cooldown_minutes)
          VALUES ($1,$2,$3,$4)
-         ON CONFLICT (discord_id, slug) DO UPDATE SET threshold_eth=$3, cooldown_hours=$4`,
-        [interaction.user.id, slug, threshold, cooldown]
+         ON CONFLICT (discord_id, slug) DO UPDATE SET threshold_eth=$3, cooldown_minutes=$4`,
+        [interaction.user.id, slug, threshold, cooldownMinutes]
       ).catch(()=>{});
-      return interaction.reply({
-        content: `✅ Floor alert set! I'll DM you when the **${slug}** floor drops below **Ξ ${threshold.toFixed(4)}** (cooldown: ${cooldown}h).`,
+      const cdDisplay = cooldownMinutes >= 1440 ? `${(cooldownMinutes/1440).toFixed(1).replace(/\.0$/,'')}d`
+        : cooldownMinutes >= 60 ? `${(cooldownMinutes/60).toFixed(1).replace(/\.0$/,'')}h`
+        : `${cooldownMinutes}m`;
+      await interaction.reply({
+        content: `✅ Floor alert set! I'll DM you when the **${slug}** floor drops below **Ξ ${threshold.toFixed(4)}** (cooldown: ${cdDisplay}).`,
         flags: MessageFlags.Ephemeral
       });
+      return;
     }
   }
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
