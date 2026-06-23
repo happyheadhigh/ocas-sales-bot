@@ -754,8 +754,10 @@ client.on('interactionCreate', async (interaction)=>{
         [interaction.user.id, slug, tokenId, threshold, alertOnce, repeatAlert]
       ).catch(()=>{});
       // Reply then show price alerts section
+      const { ActionRowBuilder: AR2, ButtonBuilder: BB2, ButtonStyle: BS2 } = require('discord.js');
       await interaction.reply({
         content: `✅ Price alert set! I'll DM you when **#${tokenId}** (${slug}) is listed below **Ξ ${threshold.toFixed(4)}** (${alertOnce ? 'once' : 'repeating'}).`,
+        components: [new AR2().addComponents(new BB2().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(BS2.Secondary))],
         flags: MessageFlags.Ephemeral
       });
       return;
@@ -787,8 +789,10 @@ client.on('interactionCreate', async (interaction)=>{
       const cdDisplay = cooldownMinutes >= 1440 ? `${(cooldownMinutes/1440).toFixed(1).replace(/\.0$/,'')}d`
         : cooldownMinutes >= 60 ? `${(cooldownMinutes/60).toFixed(1).replace(/\.0$/,'')}h`
         : `${cooldownMinutes}m`;
+      const { ActionRowBuilder: AR3, ButtonBuilder: BB3, ButtonStyle: BS3 } = require('discord.js');
       await interaction.reply({
         content: `✅ Floor alert set! I'll DM you when the **${slug}** floor drops below **Ξ ${threshold.toFixed(4)}** (cooldown: ${cdDisplay}).`,
+        components: [new AR3().addComponents(new BB3().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(BS3.Secondary))],
         flags: MessageFlags.Ephemeral
       });
       return;

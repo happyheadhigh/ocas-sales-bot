@@ -974,13 +974,8 @@ async function showMaTraitPicker(interaction, ctx, slug){
     ));
   const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
   return interaction[replyFn]({
-    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by (or skip to alert on all tokens):`,
-    components: [
-      new ActionRowBuilder().addComponents(menu),
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`ma_browse:skiptr:${slug}`).setLabel('Skip — alert on all traits').setStyle(ButtonStyle.Secondary)
-      ),
-    ],
+    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by:`,
+    components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -1138,10 +1133,16 @@ async function handleMyAlertInteraction(interaction, ctx){
         'Use `/myalert` again to add more filters.',
         'Use `/myalertclear` to remove your alert.',
       ].join('\n'));
-    return interaction.update({ content: '', embeds: [embed], components: [] });
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({ content: '', embeds: [embed], components: [backRow] });
   }
   if(customId === 'ma_browse:cancel'){
-    return interaction.update({ content: 'Alert wizard cancelled.', embeds: [], components: [] });
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({ content: 'Alert wizard cancelled.', embeds: [], components: [backRow] });
   }
 }
 
@@ -1188,10 +1189,16 @@ async function handleMaClearInteraction(interaction, ctx){
   const customId = interaction.customId;
   if(customId === 'mac_browse:all'){
     deleteAlert(interaction.user.id);
-    return interaction.update({ content: '✅ Your alert has been fully removed.', embeds: [], components: [] });
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({ content: '✅ Your alert has been fully removed.', embeds: [], components: [backRow] });
   }
   if(customId === 'mac_browse:cancel'){
-    return interaction.update({ content: 'No changes made.', embeds: [], components: [] });
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.update({ content: 'No changes made.', embeds: [], components: [backRow] });
   }
   if(customId.startsWith('mac_browse:trait:')){
     const traitKey = customId.slice('mac_browse:trait:'.length);
