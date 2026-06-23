@@ -82,6 +82,27 @@ function resolveCollectionFromServerCfg(serverCfg, collectionInput){
   ) || primary;
 }
 
+function getServerCollectionsForWalletSync(config){
+  const items = [];
+  const add = c => {
+    if(!c) return;
+    const contract = String(c.contract || '').trim().toLowerCase();
+    const slug = String(c.slug || c.collectionSlug || '').trim();
+    if(!contract && !slug) return;
+    items.push({ contract, slug: slug || contract, name: c.name || c.contractName || slug || contract });
+  };
+  add({ contract: config?.contract, slug: config?.collectionSlug || config?.slug, name: config?.contractName || config?.collectionSlug || config?.slug });
+  for(const c of config?.collections || []) add(c);
+  add({ contract: '0x078be86f3104a32313a47815792230a3808642cc', slug: 'on-chain-all-stars', name: 'On-Chain All Stars' });
+  const seen = new Set();
+  return items.filter(c => {
+    const key = c.slug ? `slug:${c.slug.toLowerCase()}` : `contract:${c.contract}`;
+    if(seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 async function handleMarketCommand(commandName, ctx){
   const {
     interaction, guildId, config,
@@ -1731,6 +1752,8 @@ async function handleMeInteraction(interaction, ctx){
   if(customId === 'me_browse:wallet:sync'){
     const guildId = interaction.guildId;
     const userId = interaction.user.id;
+    if(!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(()=>{});
+    const editWalletSync = payload => interaction.editReply(payload).catch(()=>{});
 
     // Check if verified first
     const reg = await pgPool.query(
@@ -1740,7 +1763,7 @@ async function handleMeInteraction(interaction, ctx){
     const wallet = reg?.rows[0]?.wallet;
 
     if(!wallet){
-      return interaction.update({
+      return editWalletSync({
         embeds: [new EmbedBuilder().setTitle('💼 Wallet').setColor(0xED4245).setDescription('❌ No verified wallet found. Verify your wallet first.')],
         components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary))],
       });
@@ -1748,10 +1771,7 @@ async function handleMeInteraction(interaction, ctx){
 
     // Build collection list to show in progress
     const config = getConfig(guildId) || {};
-    const syncCols = [];
-    if(config.contract) syncCols.push(config.contractName || config.collectionSlug || config.slug || 'OCAS');
-    for(const c of config.collections || []) { if(c.slug) syncCols.push(c.name || c.slug); }
-    if(!syncCols.find(n => n.toLowerCase().includes('all-stars') || n.toLowerCase() === 'ocas')) syncCols.push('On-Chain All Stars');
+    const syncCols = getServerCollectionsForWalletSync(config).map(c => c.name || c.slug);
 
     // Fire-and-forget — don't await
     const { syncWalletForUser } = ctx;
@@ -1767,7 +1787,7 @@ async function handleMeInteraction(interaction, ctx){
       new ButtonBuilder().setCustomId('me_browse:wallet:progress').setLabel('🔃 Check Progress').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     );
-    return interaction.update({
+    return editWalletSync({
       embeds: [new EmbedBuilder()
         .setTitle('💼 Wallet — Syncing')
         .setColor(0x5865F2)
@@ -1786,6 +1806,8 @@ async function handleMeInteraction(interaction, ctx){
   if(customId === 'me_browse:wallet:progress'){
     const userId = interaction.user.id;
     const { getSyncStatus } = ctx;
+    if(!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(()=>{});
+    const editWalletProgress = payload => interaction.editReply(payload).catch(()=>{});
     let statusRows = [];
     try {
       if(getSyncStatus) statusRows = await getSyncStatus(userId, pgPool);
@@ -1797,7 +1819,7 @@ async function handleMeInteraction(interaction, ctx){
         new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync Wallet').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
       );
-      return interaction.update({
+      return editWalletProgress({
         embeds: [new EmbedBuilder().setTitle('💼 Wallet').setColor(0x5865F2)
           .setDescription('No sync data found yet. Tap **🔄 Sync Wallet** to start.')],
         components: [row],
@@ -1845,7 +1867,7 @@ async function handleMeInteraction(interaction, ctx){
       new ButtonBuilder().setCustomId('me_browse:wallet:progress').setLabel('🔃 Check Progress').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     );
-    return interaction.update({
+    return editWalletProgress({
       embeds: [new EmbedBuilder()
         .setTitle(`💼 Wallet — Syncing (${done}/${total})`)
         .setColor(0x5865F2)

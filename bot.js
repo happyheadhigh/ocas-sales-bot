@@ -176,6 +176,10 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     formatBurnLotteryWindow, isSvg, isDiscordOk, matchesFilters,
     // Rank sync
     rankSyncQueue, queueRankSync,
+     // Wallet sync
+     backfillWallet,
+     getSyncStatus,
+     syncWalletForUser: _syncWalletForUser,
     // Components
     ActionRowBuilder, ButtonBuilder, ButtonStyle,
     EmbedBuilder, AttachmentBuilder, MessageFlags, PermissionFlagsBits,
