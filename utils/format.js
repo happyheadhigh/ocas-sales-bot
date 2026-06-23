@@ -105,7 +105,7 @@ function matchesFilters(traits, filters){
   for(const t of (traits || [])) lookup[t.trait_type?.toLowerCase()] = String(t.value).toLowerCase();
   for(const [k, v] of Object.entries(filters)){
     const allowed = Array.isArray(v) ? v : [v];
-    if(allowed.includes(lookup[k])) return true;
+    if(allowed.map(a => String(a).toLowerCase()).includes(lookup[k])) return true;
   }
   return false;
 }

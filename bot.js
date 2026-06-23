@@ -95,7 +95,8 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction }   = require('./commands/market');
+const { backfillWallet } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
@@ -636,6 +637,9 @@ client.on('interactionCreate', async (interaction)=>{
       [discordId, guildId, primaryWallet]
     ).catch(e => console.error('[SVModal] reg insert:', e.message));
 
+    // Trigger wallet backfill (fire-and-forget)
+    backfillWallet(primaryWallet, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+
     // Assign roles
     try{
       const panelR = await pgPool.query(
@@ -723,6 +727,80 @@ client.on('interactionCreate', async (interaction)=>{
   if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('ma_browse:')){
     const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert };
     return handleMyAlertInteraction(interaction, maCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('mac_browse:')){
+    const macCtx = { getAlert, setAlert, deleteAlert };
+    return handleMaClearInteraction(interaction, macCtx);
+  }
+  if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
+    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson };
+    return handleMeInteraction(interaction, meCtx);
+  }
+
+  // Modal submissions for price/floor alerts
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('me_modal:')){
+    const parts = interaction.customId.split(':');
+    const alertType = parts[1];
+    const slug = parts.slice(2).join(':');
+
+    if(alertType === 'pricealert'){
+      const tokenId = parseInt(interaction.fields.getTextInputValue('token_id').trim());
+      const threshold = parseFloat(interaction.fields.getTextInputValue('threshold').trim());
+      const onceVal = (interaction.fields.getTextInputValue('once').trim() || 'once').toLowerCase();
+      const alertOnce = onceVal !== 'repeat';
+      const repeatAlert = !alertOnce;
+      if(isNaN(tokenId) || isNaN(threshold) || threshold <= 0){
+        return interaction.reply({ content: '❌ Invalid token ID or threshold. Token ID must be a number, threshold must be ETH like 0.05.', flags: MessageFlags.Ephemeral });
+      }
+      await pgPool.query(
+        `INSERT INTO user_price_alerts (discord_id, slug, token_id, threshold_eth, alert_once, repeat_alert)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [interaction.user.id, slug, tokenId, threshold, alertOnce, repeatAlert]
+      ).catch(()=>{});
+      // Reply then show price alerts section
+      const { ActionRowBuilder: AR2, ButtonBuilder: BB2, ButtonStyle: BS2 } = require('discord.js');
+      await interaction.reply({
+        content: `✅ Price alert set! I'll DM you when **#${tokenId}** (${slug}) is listed below **Ξ ${threshold.toFixed(4)}** (${alertOnce ? 'once' : 'repeating'}).`,
+        components: [new AR2().addComponents(new BB2().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(BS2.Secondary))],
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    if(alertType === 'flooralert'){
+      const threshold = parseFloat(interaction.fields.getTextInputValue('threshold').trim());
+      const cooldownStr = interaction.fields.getTextInputValue('cooldown').trim() || '1h';
+      // Parse cooldown — supports 30m, 2h, 1d, or plain number (minutes)
+      const cooldownMinutes = (() => {
+        const s = cooldownStr.toLowerCase();
+        const m = s.match(/^([\d.]+)\s*([mhd]?)$/);
+        if(!m) return 60;
+        const val = parseFloat(m[1]);
+        const unit = m[2] || 'm';
+        if(unit === 'd') return Math.round(val * 24 * 60);
+        if(unit === 'h') return Math.round(val * 60);
+        return Math.round(val);
+      })();
+      if(isNaN(threshold) || threshold <= 0){
+        return interaction.reply({ content: '❌ Invalid threshold. Enter an ETH amount like 0.05.', flags: MessageFlags.Ephemeral });
+      }
+      await pgPool.query(
+        `INSERT INTO user_floor_alerts (discord_id, slug, threshold_eth, cooldown_minutes)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (discord_id, slug) DO UPDATE SET threshold_eth=$3, cooldown_minutes=$4`,
+        [interaction.user.id, slug, threshold, cooldownMinutes]
+      ).catch(()=>{});
+      const cdDisplay = cooldownMinutes >= 1440 ? `${(cooldownMinutes/1440).toFixed(1).replace(/\.0$/,'')}d`
+        : cooldownMinutes >= 60 ? `${(cooldownMinutes/60).toFixed(1).replace(/\.0$/,'')}h`
+        : `${cooldownMinutes}m`;
+      const { ActionRowBuilder: AR3, ButtonBuilder: BB3, ButtonStyle: BS3 } = require('discord.js');
+      await interaction.reply({
+        content: `✅ Floor alert set! I'll DM you when the **${slug}** floor drops below **Ξ ${threshold.toFixed(4)}** (cooldown: ${cdDisplay}).`,
+        components: [new AR3().addComponents(new BB3().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(BS3.Secondary))],
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
   }
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
      (interaction.customId.startsWith('cfg_chsel:') || interaction.customId.startsWith('cfg_rolesel:'))){
@@ -1111,6 +1189,8 @@ client.on('interactionCreate', async (interaction)=>{
       [discordId, gid, wallet]
     ).catch(e=>console.error('[SVDone] upsertReg failed guild='+gid+':', e.message));
     await upsertReg(svGuild);
+    // Trigger wallet backfill (fire-and-forget)
+    backfillWallet(wallet, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
     // Global cross-server record — DELETE existing global row for this wallet/discord_id then re-insert
     console.log('[SVDone] saving global row for discord_id:', discordId, 'wallet:', wallet.slice(0,8));
     try {
