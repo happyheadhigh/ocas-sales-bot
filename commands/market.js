@@ -415,11 +415,9 @@ async function handleMarketCommand(commandName, ctx){
       setAlert(interaction.user.id,{...alert,traitFilters:filters});
       const remaining=Object.keys(filters).length===0?'none':Object.entries(filters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
       await interaction.reply({content:`Removed filter. Remaining: ${remaining}`, flags: MessageFlags.Ephemeral});
-    } else {
-      deleteAlert(interaction.user.id);
-      await interaction.reply({content:'Your personal alert has been fully removed.', flags: MessageFlags.Ephemeral});
+      return;
     }
-    return;
+    return showMaClearWizard(interaction, { getAlert, deleteAlert, setAlert });
   }
 
   // /myalertstatus
@@ -1143,4 +1141,88 @@ async function handleMyAlertInteraction(interaction, ctx){
 }
 
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker };
+// ── /myalertclear wizard ─────────────────────────────────────────────────────
+async function showMaClearWizard(interaction, ctx){
+  const { getAlert } = ctx;
+  const alert = getAlert(interaction.user.id);
+  if(!alert || (!Object.keys(alert.traitFilters||{}).length && !alert.slug)){
+    return interaction.reply({ content: 'You have no alert set. Use `/myalert` to create one.', flags: MessageFlags.Ephemeral });
+  }
+  const filters = alert.traitFilters || {};
+  const fmtF = f => Object.keys(f).length===0 ? 'none (all tokens)' :
+    Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+  const embed = new EmbedBuilder()
+    .setTitle('🔔 My Alert')
+    .setColor(0x5865F2)
+    .setDescription([
+      `**Collection:** ${alert.slug||'any'}`,
+      `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
+      `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+      `**Filters:**`,
+      fmtF(filters),
+    ].join('\n'));
+  const rows = [];
+  const traitKeys = Object.keys(filters);
+  if(traitKeys.length){
+    const traitBtns = traitKeys.slice(0, 8).map(k =>
+      new ButtonBuilder().setCustomId(`mac_browse:trait:${k}`).setLabel(`Remove: ${k}`).setStyle(ButtonStyle.Danger)
+    );
+    for(let i = 0; i < traitBtns.length; i += 4){
+      rows.push(new ActionRowBuilder().addComponents(traitBtns.slice(i, i+4)));
+    }
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  ));
+  return interaction.reply({ embeds: [embed], components: rows, flags: MessageFlags.Ephemeral });
+}
+
+async function handleMaClearInteraction(interaction, ctx){
+  const { getAlert, setAlert, deleteAlert } = ctx;
+  const customId = interaction.customId;
+  if(customId === 'mac_browse:all'){
+    deleteAlert(interaction.user.id);
+    return interaction.update({ content: '✅ Your alert has been fully removed.', embeds: [], components: [] });
+  }
+  if(customId === 'mac_browse:cancel'){
+    return interaction.update({ content: 'No changes made.', embeds: [], components: [] });
+  }
+  if(customId.startsWith('mac_browse:trait:')){
+    const traitKey = customId.slice('mac_browse:trait:'.length);
+    const alert = getAlert(interaction.user.id);
+    if(!alert) return interaction.update({ content: 'No alert found.', embeds: [], components: [] });
+    const filters = { ...(alert.traitFilters||{}) };
+    delete filters[traitKey];
+    setAlert(interaction.user.id, { ...alert, traitFilters: filters });
+    const fmtF = f => Object.keys(f).length===0 ? 'none (all tokens)' :
+      Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+    const embed = new EmbedBuilder()
+      .setTitle('🔔 My Alert')
+      .setColor(0x5865F2)
+      .setDescription([
+        `**Collection:** ${alert.slug||'any'}`,
+        `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
+        `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+        `**Filters:**`,
+        fmtF(filters),
+      ].join('\n'));
+    const rows = [];
+    const traitKeys = Object.keys(filters);
+    if(traitKeys.length){
+      const traitBtns = traitKeys.slice(0, 8).map(k =>
+        new ButtonBuilder().setCustomId(`mac_browse:trait:${k}`).setLabel(`Remove: ${k}`).setStyle(ButtonStyle.Danger)
+      );
+      for(let i = 0; i < traitBtns.length; i += 4){
+        rows.push(new ActionRowBuilder().addComponents(traitBtns.slice(i, i+4)));
+      }
+    }
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Done').setStyle(ButtonStyle.Secondary),
+    ));
+    return interaction.update({ embeds: [embed], components: rows });
+  }
+}
+
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction };
