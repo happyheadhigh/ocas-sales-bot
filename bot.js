@@ -2105,6 +2105,11 @@ async function migrateMarketCollectionsToServerConfigs(){
       console.log('[Migration] guild=' + guildId + ' added ' + toAdd.length + ' collections from market_collections_v1');
     }
     console.log('[Migration] market_collections_v1 -> server_configs: ' + migrated + ' collections migrated');
+    // Clear source data so deleted collections never get restored on restart
+    if(migrated > 0){
+      await pgPool.query(`DELETE FROM bot_state WHERE key='market_collections_v1'`).catch(()=>{});
+      console.log('[Migration] market_collections_v1 source data cleared — collections will no longer be restored on restart');
+    }
   }catch(e){
     console.error('[Migration] market_collections_v1 failed:', e.message);
   }
