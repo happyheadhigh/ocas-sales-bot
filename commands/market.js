@@ -1170,11 +1170,21 @@ async function showMaClearWizard(interaction, ctx){
   const rows = [];
   const traitKeys = Object.keys(filters);
   if(traitKeys.length){
-    const traitBtns = traitKeys.slice(0, 8).map(k =>
-      new ButtonBuilder().setCustomId(`mac_browse:trait:${k}`).setLabel(`Remove: ${k}`).setStyle(ButtonStyle.Danger)
-    );
-    for(let i = 0; i < traitBtns.length; i += 4){
-      rows.push(new ActionRowBuilder().addComponents(traitBtns.slice(i, i+4)));
+    // Build one button per value, not per trait
+    const valueBtns = [];
+    for(const [trait, val] of Object.entries(filters)){
+      const vals = Array.isArray(val) ? val : [val];
+      for(const v of vals){
+        valueBtns.push(
+          new ButtonBuilder()
+            .setCustomId(`mac_browse:val:${trait}:${v}`)
+            .setLabel(`✕ ${trait}: ${v}`.slice(0, 80))
+            .setStyle(ButtonStyle.Danger)
+        );
+      }
+    }
+    for(let i = 0; i < Math.min(valueBtns.length, 16); i += 4){
+      rows.push(new ActionRowBuilder().addComponents(valueBtns.slice(i, i+4)));
     }
   }
   rows.push(new ActionRowBuilder().addComponents(
@@ -1200,12 +1210,24 @@ async function handleMaClearInteraction(interaction, ctx){
     );
     return interaction.update({ content: 'No changes made.', embeds: [], components: [backRow] });
   }
-  if(customId.startsWith('mac_browse:trait:')){
-    const traitKey = customId.slice('mac_browse:trait:'.length);
+  if(customId.startsWith('mac_browse:val:')){
+    // Format: mac_browse:val:traitName:traitValue
+    const rest = customId.slice('mac_browse:val:'.length);
+    const colonIdx = rest.indexOf(':');
+    const traitKey = rest.slice(0, colonIdx);
+    const traitVal = rest.slice(colonIdx + 1);
     const alert = getAlert(interaction.user.id);
     if(!alert) return interaction.update({ content: 'No alert found.', embeds: [], components: [] });
     const filters = { ...(alert.traitFilters||{}) };
-    delete filters[traitKey];
+    const current = filters[traitKey];
+    if(Array.isArray(current)){
+      const updated = current.filter(v => v !== traitVal);
+      if(updated.length === 0) delete filters[traitKey];
+      else if(updated.length === 1) filters[traitKey] = updated[0];
+      else filters[traitKey] = updated;
+    } else {
+      delete filters[traitKey];
+    }
     setAlert(interaction.user.id, { ...alert, traitFilters: filters });
     const fmtF = f => Object.keys(f).length===0 ? 'none (all tokens)' :
       Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
@@ -1220,14 +1242,21 @@ async function handleMaClearInteraction(interaction, ctx){
         fmtF(filters),
       ].join('\n'));
     const rows = [];
-    const traitKeys = Object.keys(filters);
-    if(traitKeys.length){
-      const traitBtns = traitKeys.slice(0, 8).map(k =>
-        new ButtonBuilder().setCustomId(`mac_browse:trait:${k}`).setLabel(`Remove: ${k}`).setStyle(ButtonStyle.Danger)
-      );
-      for(let i = 0; i < traitBtns.length; i += 4){
-        rows.push(new ActionRowBuilder().addComponents(traitBtns.slice(i, i+4)));
+    const rows = [];
+    const valueBtns2 = [];
+    for(const [trait, val] of Object.entries(filters)){
+      const vals = Array.isArray(val) ? val : [val];
+      for(const v of vals){
+        valueBtns2.push(
+          new ButtonBuilder()
+            .setCustomId(`mac_browse:val:${trait}:${v}`)
+            .setLabel(`✕ ${trait}: ${v}`.slice(0, 80))
+            .setStyle(ButtonStyle.Danger)
+        );
       }
+    }
+    for(let i = 0; i < Math.min(valueBtns2.length, 16); i += 4){
+      rows.push(new ActionRowBuilder().addComponents(valueBtns2.slice(i, i+4)));
     }
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
@@ -1260,9 +1289,46 @@ function formatCooldown(minutes){
 
 // ── /me hub — main entry ──────────────────────────────────────────────────────
 async function showMeHub(interaction, ctx){
+  const { getAlert, pgPool } = ctx;
+  const userId = interaction.user.id;
+  const fmtF = f => !f || Object.keys(f).length===0 ? 'none' :
+    Object.entries(f).map(([k,v]) => `${k}: ${Array.isArray(v)?v.join(', '):v}`).join(' · ');
+
+  // Build summary lines
+  const summaryLines = [];
+
+  // Trait alert
+  const alert = getAlert(userId);
+  if(alert){
+    summaryLines.push(`📣 **Trait Alert** — ${alert.slug||'any'} · Sales: ${alert.alertSales?'✅':'❌'} · Listings: ${alert.alertListings?'✅':'❌'}`);
+    summaryLines.push(`  Filters: ${fmtF(alert.traitFilters)}`);
+  } else {
+    summaryLines.push('📣 **Trait Alert** — not set');
+  }
+
+  // Price alerts
+  if(pgPool){
+    const pa = await pgPool.query(
+      `SELECT COUNT(*) AS cnt FROM user_price_alerts WHERE discord_id=$1`, [userId]
+    ).catch(()=>null);
+    const paCnt = parseInt(pa?.rows[0]?.cnt||0);
+    summaryLines.push(`🏷️ **Price Alerts** — ${paCnt > 0 ? `${paCnt} active` : 'none set'}`);
+
+    const fa = await pgPool.query(
+      `SELECT slug, threshold_eth FROM user_floor_alerts WHERE discord_id=$1`, [userId]
+    ).catch(()=>null);
+    if(fa?.rows.length){
+      summaryLines.push(`📉 **Floor Alerts** — ${fa.rows.map(r=>`${r.slug} < Ξ${parseFloat(r.threshold_eth).toFixed(3)}`).join(', ')}`);
+    } else {
+      summaryLines.push('📉 **Floor Alerts** — none set');
+    }
+  }
+
+  summaryLines.push('💼 **Wallet** — verification coming soon');
+
   const nav = new StringSelectMenuBuilder()
     .setCustomId('me_browse:nav')
-    .setPlaceholder('What would you like to manage?')
+    .setPlaceholder('Select a section to manage...')
     .addOptions([
       new StringSelectMenuOptionBuilder().setLabel('📣 Trait Alert').setDescription('Sales & listing DMs by trait').setValue('trait_alert'),
       new StringSelectMenuOptionBuilder().setLabel('🏷️ Price Alerts').setDescription('DM when a token drops below a price').setValue('price_alerts'),
@@ -1273,7 +1339,8 @@ async function showMeHub(interaction, ctx){
   const embed = new EmbedBuilder()
     .setTitle('👤 My Settings')
     .setColor(0x5865F2)
-    .setDescription('Select a section to manage your personal settings.')
+    .setDescription(summaryLines.join('
+'))
     .setFooter({ text: 'Your settings are private — only you can see this' });
 
   const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
@@ -1305,7 +1372,7 @@ async function showMeTraitAlert(interaction, ctx){
     .setDescription(desc);
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('me_browse:alert:set').setLabel(alert ? 'Edit Alert' : 'Set Alert').setStyle(alert ? ButtonStyle.Primary : ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('me_browse:alert:set').setLabel('Add Alert').setStyle(ButtonStyle.Success),
   );
   if(alert) row.addComponents(
     new ButtonBuilder().setCustomId('me_browse:alert:clear').setLabel('Manage / Clear').setStyle(ButtonStyle.Danger),
