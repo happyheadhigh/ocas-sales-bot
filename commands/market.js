@@ -1338,8 +1338,7 @@ async function showMeHub(interaction, ctx){
   const embed = new EmbedBuilder()
     .setTitle('👤 My Settings')
     .setColor(0x5865F2)
-    .setDescription(summaryLines.join('
-'))
+    .setDescription(summaryLines.join('\n'))
     .setFooter({ text: 'Your settings are private — only you can see this' });
 
   const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
