@@ -729,8 +729,54 @@ client.on('interactionCreate', async (interaction)=>{
     return handleMaClearInteraction(interaction, macCtx);
   }
   if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
-    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex };
+    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool };
     return handleMeInteraction(interaction, meCtx);
+  }
+
+  // Modal submissions for price/floor alerts
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('me_modal:')){
+    const parts = interaction.customId.split(':');
+    const alertType = parts[1]; // pricealert or flooralert
+    const slug = parts.slice(2).join(':');
+
+    if(alertType === 'pricealert'){
+      const tokenId = parseInt(interaction.fields.getTextInputValue('token_id').trim());
+      const threshold = parseFloat(interaction.fields.getTextInputValue('threshold').trim());
+      const onceVal = (interaction.fields.getTextInputValue('once').trim() || 'once').toLowerCase();
+      const alertOnce = onceVal !== 'repeat';
+      const repeatAlert = !alertOnce;
+      if(isNaN(tokenId) || isNaN(threshold) || threshold <= 0){
+        return interaction.reply({ content: '❌ Invalid token ID or threshold. Token ID must be a number, threshold must be ETH amount like 0.05.', flags: MessageFlags.Ephemeral });
+      }
+      await pgPool.query(
+        `INSERT INTO user_price_alerts (discord_id, slug, token_id, threshold_eth, alert_once, repeat_alert)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT DO NOTHING`,
+        [interaction.user.id, slug, tokenId, threshold, alertOnce, repeatAlert]
+      ).catch(()=>{});
+      return interaction.reply({
+        content: `✅ Price alert set! I'll DM you when **#${tokenId}** (${slug}) is listed below **Ξ ${threshold.toFixed(4)}** (${alertOnce ? 'once' : 'repeating'}).`,
+        flags: MessageFlags.Ephemeral
+      });
+    }
+
+    if(alertType === 'flooralert'){
+      const threshold = parseFloat(interaction.fields.getTextInputValue('threshold').trim());
+      const cooldown = parseInt(interaction.fields.getTextInputValue('cooldown').trim() || '1') || 1;
+      if(isNaN(threshold) || threshold <= 0){
+        return interaction.reply({ content: '❌ Invalid threshold. Enter an ETH amount like 0.05.', flags: MessageFlags.Ephemeral });
+      }
+      await pgPool.query(
+        `INSERT INTO user_floor_alerts (discord_id, slug, threshold_eth, cooldown_hours)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (discord_id, slug) DO UPDATE SET threshold_eth=$3, cooldown_hours=$4`,
+        [interaction.user.id, slug, threshold, cooldown]
+      ).catch(()=>{});
+      return interaction.reply({
+        content: `✅ Floor alert set! I'll DM you when the **${slug}** floor drops below **Ξ ${threshold.toFixed(4)}** (cooldown: ${cooldown}h).`,
+        flags: MessageFlags.Ephemeral
+      });
+    }
   }
   if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
      (interaction.customId.startsWith('cfg_chsel:') || interaction.customId.startsWith('cfg_rolesel:'))){
