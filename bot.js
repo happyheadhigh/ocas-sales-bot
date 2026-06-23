@@ -96,7 +96,7 @@ const {
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
 const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction }   = require('./commands/market');
-const { backfillWallet } = require('./lib/wallet-backfill');
+const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
@@ -733,7 +733,7 @@ client.on('interactionCreate', async (interaction)=>{
     return handleMaClearInteraction(interaction, macCtx);
   }
   if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
-    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson };
+    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser };
     return handleMeInteraction(interaction, meCtx);
   }
 

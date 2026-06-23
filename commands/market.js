@@ -1627,7 +1627,7 @@ async function showMeWallet(interaction, ctx){
 
 // ── /me interaction handler ───────────────────────────────────────────────────
 async function handleMeInteraction(interaction, ctx){
-  const { getAlert, setAlert, deleteAlert, getConfig, pgPool } = ctx;
+  const { getAlert, setAlert, deleteAlert, getConfig, pgPool, getSyncStatus, syncWalletForUser } = ctx;
   const customId = interaction.customId;
 
   // Nav dropdown
@@ -1729,7 +1729,6 @@ async function handleMeInteraction(interaction, ctx){
 
   // ── Wallet sync ─────────────────────────────────────────────────────────────
   if(customId === 'me_browse:wallet:sync'){
-    const { pgPool, getConfig } = ctx;
     const guildId = interaction.guildId;
     const userId = interaction.user.id;
 
@@ -1755,10 +1754,12 @@ async function handleMeInteraction(interaction, ctx){
     if(!syncCols.find(n => n.toLowerCase().includes('all-stars') || n.toLowerCase() === 'ocas')) syncCols.push('On-Chain All Stars');
 
     // Fire-and-forget — don't await
-    const { syncWalletForUser } = require('../lib/wallet-backfill');
-    syncWalletForUser(userId, guildId, pgPool, process.env.ALCHEMY_API_KEY, getConfig).catch(e => {
-      console.warn('[WalletSync]', e.message);
-    });
+    const { syncWalletForUser } = ctx;
+    if(syncWalletForUser){
+      syncWalletForUser(userId, guildId, pgPool, process.env.ALCHEMY_API_KEY, getConfig).catch(e => {
+        console.warn('[WalletSync]', e.message);
+      });
+    }
 
     // Show initial progress screen
     const progressLines = syncCols.map(n => `⏳ ${n}`);
@@ -1783,10 +1784,12 @@ async function handleMeInteraction(interaction, ctx){
 
   // Check sync progress
   if(customId === 'me_browse:wallet:progress'){
-    const { pgPool, getConfig } = ctx;
     const userId = interaction.user.id;
-    const { getSyncStatus } = require('../lib/wallet-backfill');
-    const statusRows = await getSyncStatus(userId, pgPool);
+    const { getSyncStatus } = ctx;
+    let statusRows = [];
+    try {
+      if(getSyncStatus) statusRows = await getSyncStatus(userId, pgPool);
+    } catch(e) { console.warn('[WalletProgress]', e.message); }
 
     if(!statusRows.length){
       return showMeWallet(interaction, ctx);
