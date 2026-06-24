@@ -1633,39 +1633,36 @@ async function showMeWallet(interaction, ctx){
       ? ` (${c.unrealizedPnl >= 0 ? '+' : ''}${((c.unrealizedPnl / (c.avgCost * c.held)) * 100).toFixed(0)}%)`
       : '';
 
+    // Collection name bold
     lines.push(`**${c.name}**`);
 
-    // Line 1: holdings + floor + est value
-    const l1parts = [`${c.held} held`];
-    if(c.floor) l1parts.push(`floor Ξ${fmtE(c.floor)}`);
-    if(c.estValue) l1parts.push(`est. Ξ${fmtE(c.estValue)}`);
-    lines.push(l1parts.join(' · '));
+    // Holdings line — bold count + floor + est value
+    lines.push(`Holdings: **${c.held}** token${c.held === 1 ? '' : 's'}`);
+    if(c.floor) lines.push(`Floor: **Ξ ${fmtE(c.floor)}** · Est. value: **Ξ ${fmtE(c.estValue)}**`);
 
-    // Line 2: cost basis + unrealized P&L
+    // Avg cost + unrealized P&L (only if cost basis is known)
     if(c.avgCost > 0){
-      const l2parts = [`avg cost Ξ${fmtE(c.avgCost)}`];
-      if(c.unrealizedPnl !== null) l2parts.push(`unrealized ${pnl(c.unrealizedPnl)}${unrealPct}`);
-      lines.push(l2parts.join(' · '));
+      lines.push(`Avg. cost: **Ξ ${fmtE(c.avgCost)}** · Unrealized: **${pnl(c.unrealizedPnl)}${unrealPct}**`);
     }
 
-    // Line 3: realized P&L (only if they've sold)
-    if(c.sold > 0 && c.realizedPnl !== 0){
-      lines.push(`${c.sold} sold · realized ${pnl(c.realizedPnl)}`);
+    // Realized P&L (only if they've sold)
+    if(c.sold > 0){
+      lines.push(`Sold: **${c.sold}** · Realized P&L: **${pnl(c.realizedPnl)}**`);
     }
 
     lines.push('');
   }
 
-  // Totals
+  // Totals row
   if(cols.length > 1){
     const totalEst = cols.reduce((a, c) => a + (c.estValue || 0), 0);
-    const totalUnreal = cols.filter(c => c.unrealizedPnl !== null).reduce((a, c) => a + c.unrealizedPnl, 0);
+    const totalUnreal = cols.filter(c => c.unrealizedPnl !== null && c.avgCost > 0).reduce((a, c) => a + c.unrealizedPnl, 0);
     const totalReal = cols.reduce((a, c) => a + c.realizedPnl, 0);
-    const totalHeld = cols.reduce((a, c) => a + c.held, 0);
 
     lines.push('─────────────────');
-    lines.push(`**${totalHeld} tokens · Ξ${fmtE(totalEst)} total**`);
-    if(totalUnreal !== 0) lines.push(`Unrealized ${pnl(totalUnreal)} · Realized ${pnl(totalReal)}`);
+    lines.push(`Total Est. Value: **Ξ ${fmtE(totalEst)}**`);
+    const hasUnreal = cols.some(c => c.avgCost > 0);
+    if(hasUnreal) lines.push(`Unrealized: **${pnl(totalUnreal)}** · Realized: **${pnl(totalReal)}**`);
     lines.push('');
   }
 
