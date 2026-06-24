@@ -1504,7 +1504,7 @@ async function showMeFloorAlerts(interaction, ctx){
 }
 
 async function showMeWallet(interaction, ctx){
-  const { pgPool, getConfig, getRailwayApiUrl, fetchBotApiJson } = ctx;
+  const { pgPool, getConfig } = ctx;
   const userId = interaction.user.id;
   const guildId = interaction.guildId;
 
@@ -1516,8 +1516,6 @@ async function showMeWallet(interaction, ctx){
       [userId, guildId]
     ).catch(()=>null);
     wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
-
-    // Also check global row if no guild-specific
     if(!wallet){
       const globalReg = await pgPool.query(
         `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
@@ -1527,127 +1525,164 @@ async function showMeWallet(interaction, ctx){
     }
   }
 
+  const updateFn = interaction.deferred || interaction.replied
+    ? 'editReply'
+    : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
+
   // ── Unverified ──────────────────────────────────────────────────────────────
   if(!wallet){
     const embed = new EmbedBuilder()
-      .setTitle('💼 Wallet — Not Verified')
+      .setTitle('💼 Wallet')
       .setColor(0x5865F2)
       .setDescription([
         'Link your wallet to unlock portfolio analytics, P&L tracking, and leaderboards.',
         '',
-        'To verify, find the **Verify Wallet** button in your server\'s verification channel.',
+        'Find the **Verify Wallet** button in your server\'s verification channel to get started.',
       ].join('\n'));
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
-    );
-    const updateFn = interaction.deferred || interaction.replied
-      ? 'editReply'
-      : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
-    return interaction[updateFn]({ embeds: [embed], components: [row] });
+    return interaction[updateFn]({
+      embeds: [embed],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      )],
+    });
   }
 
-  // ── Verified — fetch wallet data ────────────────────────────────────────────
-  const RAILWAY_URL = getRailwayApiUrl();
-  const API_SECRET = process.env.API_SECRET;
+  // ── Fetch per-collection analytics ──────────────────────────────────────────
   const shortWallet = wallet.slice(0,6) + '...' + wallet.slice(-4);
+  let cols = [];
 
-  let collectionBreakdowns = [];
-
-  // Per-collection breakdown from wallet_token_intervals
   if(pgPool){
     const config = getConfig(guildId) || {};
-    const cols = [];
-    if(config.collectionSlug || config.slug) cols.push({ slug: config.collectionSlug || config.slug, name: config.contractName || config.collectionSlug || config.slug });
-    for(const c of config.collections || []) { if(c.slug) cols.push({ slug: c.slug, name: c.name || c.slug }); }
-    if(!cols.find(c => c.slug === 'on-chain-all-stars')) cols.push({ slug: 'on-chain-all-stars', name: 'On-Chain All Stars' });
+    const rawCols = [];
+    if(config.collectionSlug || config.slug) rawCols.push({ slug: config.collectionSlug || config.slug, name: config.contractName || config.collectionSlug || config.slug });
+    for(const c of config.collections || []) { if(c.slug) rawCols.push({ slug: c.slug, name: c.name || c.slug }); }
+    if(!rawCols.find(c => c.slug === 'on-chain-all-stars')) rawCols.push({ slug: 'on-chain-all-stars', name: 'On-Chain All Stars' });
 
-    for(const col of cols){
+    for(const col of rawCols){
       try {
-        const held = await pgPool.query(
-          `SELECT COUNT(*) AS cnt FROM wallet_token_intervals WHERE wallet_address=$1 AND collection_slug=$2 AND disposed_at IS NULL`,
-          [wallet, col.slug]
-        );
-        const heldCount = parseInt(held.rows[0]?.cnt || 0);
-        if(heldCount === 0) continue;
-
-        const floor = await pgPool.query(
-          `SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug=$1`,
-          [col.slug]
-        );
-        const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
-
-        // P&L
-        const pnl = await pgPool.query(
+        const stats = await pgPool.query(
           `SELECT
-            COALESCE(SUM(CASE WHEN disposed_at IS NOT NULL THEN sale_eth - cost_eth END), 0) AS realized,
-            COALESCE(AVG(CASE WHEN disposed_at IS NULL THEN cost_eth END), 0) AS avg_cost
+            COUNT(*) FILTER (WHERE disposed_at IS NULL) AS held,
+            COUNT(*) FILTER (WHERE disposed_at IS NOT NULL) AS sold,
+            COALESCE(AVG(cost_eth) FILTER (WHERE disposed_at IS NULL), 0) AS avg_cost,
+            COALESCE(SUM(sale_eth - cost_eth) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL), 0) AS realized_pnl
            FROM wallet_token_intervals
            WHERE wallet_address=$1 AND collection_slug=$2`,
           [wallet, col.slug]
         );
+        const held = parseInt(stats.rows[0]?.held || 0);
+        if(held === 0) continue;
 
-        collectionBreakdowns.push({
-          name: col.name,
-          slug: col.slug,
-          held: heldCount,
-          floorEth,
-          estimatedValue: floorEth ? heldCount * floorEth : null,
-          realizedPnl: parseFloat(pnl.rows[0]?.realized || 0),
-          avgCost: parseFloat(pnl.rows[0]?.avg_cost || 0),
-        });
-      } catch(e){ console.warn('[WalletTab] breakdown:', e.message); }
+        const floorRow = await pgPool.query(
+          `SELECT MIN(price_eth) AS floor FROM listings WHERE collection_slug=$1`,
+          [col.slug]
+        );
+        const floor = floorRow.rows[0]?.floor ? parseFloat(floorRow.rows[0].floor) : null;
+        const estValue = floor ? held * floor : null;
+        const avgCost = parseFloat(stats.rows[0]?.avg_cost || 0);
+        const unrealizedPnl = (floor && avgCost > 0) ? (floor - avgCost) * held : null;
+        const realizedPnl = parseFloat(stats.rows[0]?.realized_pnl || 0);
+        const sold = parseInt(stats.rows[0]?.sold || 0);
+
+        cols.push({ name: col.name, slug: col.slug, held, sold, floor, estValue, avgCost, unrealizedPnl, realizedPnl });
+      } catch(e){ console.warn('[WalletTab]', col.slug, e.message); }
     }
   }
 
-  // ── Build embed ─────────────────────────────────────────────────────────────
-  const fmt = n => n >= 1 ? n.toFixed(3) : n.toFixed(4);
-  const pnlStr = n => n >= 0 ? `+Ξ ${fmt(n)}` : `-Ξ ${fmt(Math.abs(n))}`;
+  // ── Format helpers ───────────────────────────────────────────────────────────
+  const fmtE = n => {
+    if(!n && n !== 0) return '—';
+    const abs = Math.abs(n);
+    return (abs >= 1 ? abs.toFixed(3) : abs.toFixed(4));
+  };
+  const pnl = (n, showSign = true) => {
+    if(!n && n !== 0) return '—';
+    const sign = n >= 0 ? (showSign ? '+' : '') : '-';
+    return `${sign}Ξ${fmtE(n)}`;
+  };
+  const pct = (gain, cost) => {
+    if(!cost || cost === 0) return '';
+    const p = (gain / (cost * Math.abs(gain / gain || 1))) * 100;
+    const pp = ((gain / (cost * cols.find(c=>c.unrealizedPnl===gain)?.held || 1)) / (cost) * 100);
+    return '';
+  };
 
-  const descLines = [
-    `🔗 **Wallet:** \`${shortWallet}\``,
-    '',
-  ];
+  // ── Build embed ──────────────────────────────────────────────────────────────
+  if(!cols.length){
+    const embed = new EmbedBuilder()
+      .setTitle('💼 Wallet')
+      .setColor(0x5865F2)
+      .setDescription([
+        `\`${shortWallet}\``,
+        '',
+        '_No holdings found. Tap **🔄 Sync Wallet** to load your portfolio._',
+      ].join('\n'));
+    return interaction[updateFn]({
+      embeds: [embed],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync Wallet').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      )],
+    });
+  }
 
-  if(collectionBreakdowns.length){
-    for(const col of collectionBreakdowns){
-      descLines.push(`**${col.name}**`);
-      descLines.push(`  Holdings: **${col.held}** token${col.held===1?'':'s'}`);
-      if(col.floorEth) descLines.push(`  Floor: **Ξ ${fmt(col.floorEth)}** · Est. value: **Ξ ${fmt(col.estimatedValue)}**`);
-      if(col.realizedPnl !== 0) descLines.push(`  Realized P&L: **${pnlStr(col.realizedPnl)}**`);
-      if(col.avgCost > 0) descLines.push(`  Avg. cost basis: **Ξ ${fmt(col.avgCost)}**`);
-      descLines.push('');
+  const lines = [`\`${shortWallet}\``, ''];
+
+  for(const c of cols){
+    const unrealPct = (c.unrealizedPnl !== null && c.avgCost > 0)
+      ? ` (${c.unrealizedPnl >= 0 ? '+' : ''}${((c.unrealizedPnl / (c.avgCost * c.held)) * 100).toFixed(0)}%)`
+      : '';
+
+    lines.push(`**${c.name}**`);
+
+    // Line 1: holdings + floor + est value
+    const l1parts = [`${c.held} held`];
+    if(c.floor) l1parts.push(`floor Ξ${fmtE(c.floor)}`);
+    if(c.estValue) l1parts.push(`est. Ξ${fmtE(c.estValue)}`);
+    lines.push(l1parts.join(' · '));
+
+    // Line 2: cost basis + unrealized P&L
+    if(c.avgCost > 0){
+      const l2parts = [`avg cost Ξ${fmtE(c.avgCost)}`];
+      if(c.unrealizedPnl !== null) l2parts.push(`unrealized ${pnl(c.unrealizedPnl)}${unrealPct}`);
+      lines.push(l2parts.join(' · '));
     }
-  } else {
-    descLines.push('_No holdings data found yet._');
-    descLines.push('_Click **🔄 Sync Wallet** to load your portfolio data._');
+
+    // Line 3: realized P&L (only if they've sold)
+    if(c.sold > 0 && c.realizedPnl !== 0){
+      lines.push(`${c.sold} sold · realized ${pnl(c.realizedPnl)}`);
+    }
+
+    lines.push('');
   }
 
-  // Totals across collections
-  if(collectionBreakdowns.length > 1){
-    const totalEst = collectionBreakdowns.reduce((a, c) => a + (c.estimatedValue || 0), 0);
-    const totalRealized = collectionBreakdowns.reduce((a, c) => a + c.realizedPnl, 0);
-    if(totalEst > 0) descLines.push(`**Total Est. Value: Ξ ${fmt(totalEst)}**`);
-    if(totalRealized !== 0) descLines.push(`**Total Realized P&L: ${pnlStr(totalRealized)}**`);
-    descLines.push('');
+  // Totals
+  if(cols.length > 1){
+    const totalEst = cols.reduce((a, c) => a + (c.estValue || 0), 0);
+    const totalUnreal = cols.filter(c => c.unrealizedPnl !== null).reduce((a, c) => a + c.unrealizedPnl, 0);
+    const totalReal = cols.reduce((a, c) => a + c.realizedPnl, 0);
+    const totalHeld = cols.reduce((a, c) => a + c.held, 0);
+
+    lines.push('─────────────────');
+    lines.push(`**${totalHeld} tokens · Ξ${fmtE(totalEst)} total**`);
+    if(totalUnreal !== 0) lines.push(`Unrealized ${pnl(totalUnreal)} · Realized ${pnl(totalReal)}`);
+    lines.push('');
   }
 
-  descLines.push(`📊 [View full analytics on TraitView](https://traitview.com/wallet/${wallet})`);
+  lines.push(`[📊 Full analytics on TraitView](https://traitview.com/wallet/${wallet})`);
 
   const embed = new EmbedBuilder()
-    .setTitle('💼 Wallet')
-    .setColor(0x57F287)
-    .setDescription(descLines.join('\n'));
+    .setTitle('💼 Portfolio')
+    .setColor(cols.some(c => c.unrealizedPnl > 0) ? 0x57F287 : 0x5865F2)
+    .setDescription(lines.join('\n'));
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync Wallet').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
-  );
-
-  const updateFn = interaction.deferred || interaction.replied
-    ? 'editReply'
-    : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
-  return interaction[updateFn]({ embeds: [embed], components: [row] });
+  return interaction[updateFn]({
+    embeds: [embed],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    )],
+  });
 }
 
 // ── /me interaction handler ───────────────────────────────────────────────────
