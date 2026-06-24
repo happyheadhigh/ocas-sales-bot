@@ -1571,6 +1571,14 @@ async function showMeWallet(interaction, ctx){
            WHERE wallet_address=$1 AND collection_slug=$2`,
           [wallet, col.slug]
         );
+        // Count distinct burn events for this wallet+collection
+        const burnEvents = await pgPool.query(
+          `SELECT COUNT(DISTINCT be.id) AS event_count
+           FROM burn_events be
+           WHERE LOWER(be.burner_wallet) = $1`,
+          [wallet]
+        ).catch(() => ({ rows: [{ event_count: 0 }] }));
+        const burnEventCount = parseInt(burnEvents.rows[0]?.event_count || 0);
         const held = parseInt(stats.rows[0]?.held || 0);
         const sold = parseInt(stats.rows[0]?.sold || 0);
         const burned = parseInt(stats.rows[0]?.burned || 0);
@@ -1586,7 +1594,7 @@ async function showMeWallet(interaction, ctx){
         const unrealizedPnl = (floor && avgCost > 0) ? (floor - avgCost) * held : null;
         const realizedPnl = parseFloat(stats.rows[0]?.realized_pnl || 0);
 
-        cols.push({ name: col.name, slug: col.slug, held, sold, burned, floor, estValue, avgCost, unrealizedPnl, realizedPnl });
+        cols.push({ name: col.name, slug: col.slug, held, sold, burned, burnEventCount, floor, estValue, avgCost, unrealizedPnl, realizedPnl });
       } catch(e){ console.warn('[WalletTab]', col.slug, e.message); }
     }
   }
@@ -1653,7 +1661,8 @@ async function showMeWallet(interaction, ctx){
     }
     // Burned (shown separately, no P&L)
     if(c.burned > 0){
-      lines.push(`Burned: **${c.burned}**`);
+      const evStr = c.burnEventCount > 0 ? ` (${c.burnEventCount} event${c.burnEventCount === 1 ? '' : 's'})` : '';
+      lines.push(`Burned: **${c.burned}** tokens${evStr}`);
     }
 
     lines.push('');
