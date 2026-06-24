@@ -1541,7 +1541,9 @@ async function showMeWallet(interaction, ctx){
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     );
-    const updateFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply';
+    const updateFn = interaction.deferred || interaction.replied
+      ? 'editReply'
+      : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
     return interaction[updateFn]({ embeds: [embed], components: [row] });
   }
 
@@ -1642,7 +1644,9 @@ async function showMeWallet(interaction, ctx){
     new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
   );
 
-  const updateFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply';
+  const updateFn = interaction.deferred || interaction.replied
+    ? 'editReply'
+    : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
   return interaction[updateFn]({ embeds: [embed], components: [row] });
 }
 
@@ -1847,7 +1851,7 @@ async function handleMeInteraction(interaction, ctx){
         new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Re-sync').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
       );
-      return interaction.update({
+      return editWalletProgress({
         embeds: [new EmbedBuilder()
           .setTitle('💼 Wallet — Sync Complete')
           .setColor(0x5865F2)
