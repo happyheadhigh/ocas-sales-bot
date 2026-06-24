@@ -1563,28 +1563,30 @@ async function showMeWallet(interaction, ctx){
         const stats = await pgPool.query(
           `SELECT
             COUNT(*) FILTER (WHERE disposed_at IS NULL) AS held,
-            COUNT(*) FILTER (WHERE disposed_at IS NOT NULL) AS sold,
+            COUNT(*) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0) AS sold,
+            COUNT(*) FILTER (WHERE disposed_at IS NOT NULL AND (sale_eth IS NULL OR sale_eth = 0)) AS burned,
             COALESCE(AVG(cost_eth) FILTER (WHERE disposed_at IS NULL), 0) AS avg_cost,
-            COALESCE(SUM(sale_eth - cost_eth) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL), 0) AS realized_pnl
+            COALESCE(SUM(sale_eth - cost_eth) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS realized_pnl
            FROM wallet_token_intervals
            WHERE wallet_address=$1 AND collection_slug=$2`,
           [wallet, col.slug]
         );
         const held = parseInt(stats.rows[0]?.held || 0);
-        if(held === 0) continue;
+        const sold = parseInt(stats.rows[0]?.sold || 0);
+        const burned = parseInt(stats.rows[0]?.burned || 0);
+        if(held === 0 && sold === 0 && burned === 0) continue;
 
         const floorRow = await pgPool.query(
           `SELECT MIN(price_eth) AS floor FROM listings WHERE collection_slug=$1`,
           [col.slug]
         );
         const floor = floorRow.rows[0]?.floor ? parseFloat(floorRow.rows[0].floor) : null;
-        const estValue = floor ? held * floor : null;
+        const estValue = floor && held ? held * floor : null;
         const avgCost = parseFloat(stats.rows[0]?.avg_cost || 0);
         const unrealizedPnl = (floor && avgCost > 0) ? (floor - avgCost) * held : null;
         const realizedPnl = parseFloat(stats.rows[0]?.realized_pnl || 0);
-        const sold = parseInt(stats.rows[0]?.sold || 0);
 
-        cols.push({ name: col.name, slug: col.slug, held, sold, floor, estValue, avgCost, unrealizedPnl, realizedPnl });
+        cols.push({ name: col.name, slug: col.slug, held, sold, burned, floor, estValue, avgCost, unrealizedPnl, realizedPnl });
       } catch(e){ console.warn('[WalletTab]', col.slug, e.message); }
     }
   }
@@ -1645,9 +1647,13 @@ async function showMeWallet(interaction, ctx){
       lines.push(`Avg. cost: **Ξ ${fmtE(c.avgCost)}** · Unrealized: **${pnl(c.unrealizedPnl)}${unrealPct}**`);
     }
 
-    // Realized P&L (only if they've sold)
+    // Sold + realized P&L (only if they've sold on secondary)
     if(c.sold > 0){
       lines.push(`Sold: **${c.sold}** · Realized P&L: **${pnl(c.realizedPnl)}**`);
+    }
+    // Burned (shown separately, no P&L)
+    if(c.burned > 0){
+      lines.push(`Burned: **${c.burned}**`);
     }
 
     lines.push('');
