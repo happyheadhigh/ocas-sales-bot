@@ -91,6 +91,8 @@ function auth(req, res, next) {
   next();
 }
 
+app.use(express.json());
+
 // ── CORS — allow Cloudflare Worker and traitview.com ─────────────────────────
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
