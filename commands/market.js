@@ -1619,16 +1619,14 @@ async function handleTVGenerateCode(interaction, ctx) {
       `Your verification code is:`,
       `# \`${code}\``,
       '',
-      '1. Go to **[traitview.com](https://traitview.com)**',
-      '2. Click **Connect Discord** ',
-      '3. Enter this code',
-      '',
+      `Click the button below to open TraitView and enter your code.`,
       `⏱️ Expires in **5 minutes**`,
     ].join('\n'));
 
   return interaction.editReply({
     embeds: [embed],
     components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setURL('https://traitview.com?verify=true').setLabel('Verify on TraitView').setStyle(ButtonStyle.Link),
       new ButtonBuilder().setCustomId('me_browse:traitview').setLabel('← Back').setStyle(ButtonStyle.Secondary)
     )],
   });
