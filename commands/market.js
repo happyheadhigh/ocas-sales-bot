@@ -1891,31 +1891,43 @@ async function showMeWallet(interaction, ctx){
         // Bought = everything else acquired (secondary purchases)
         // Total ETH spent on buys = SUM(cost_eth) for non-minted acquired intervals
         // Burn contract address — survivors minted by this are NOT user mints
-        const BURN_CONTRACT = '0x1095c73c337cc5e03f9e1d426c524cc3e32a50f6';
+        // True mint = first transfer from zero address AND token is not a burn survivor.
+        // Burn survivors are minted from zero address to the user's wallet by the burn
+        // contract — they look identical to real mints without the burn_events check.
         const acquisitionRes = await pgPool.query(
           `SELECT
              COUNT(DISTINCT CASE
                WHEN first_tx.from_address = '0x0000000000000000000000000000000000000000'
-                AND LOWER(first_tx.to_address) != $3
+                AND wti.token_id NOT IN (
+                  SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL
+                )
                THEN wti.token_id END) AS minted,
              COUNT(DISTINCT CASE
-               WHEN NOT (first_tx.from_address = '0x0000000000000000000000000000000000000000'
-                         AND LOWER(first_tx.to_address) != $3)
+               WHEN NOT (
+                 first_tx.from_address = '0x0000000000000000000000000000000000000000'
+                 AND wti.token_id NOT IN (
+                   SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL
+                 )
+               )
                THEN wti.id END)       AS bought_intervals,
              COALESCE(SUM(CASE
-               WHEN NOT (first_tx.from_address = '0x0000000000000000000000000000000000000000'
-                         AND LOWER(first_tx.to_address) != $3)
+               WHEN NOT (
+                 first_tx.from_address = '0x0000000000000000000000000000000000000000'
+                 AND wti.token_id NOT IN (
+                   SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL
+                 )
+               )
                THEN wti.cost_eth END), 0) AS total_buy_eth
            FROM wallet_token_intervals wti
            JOIN (
-             SELECT DISTINCT ON (token_id) token_id, from_address, to_address
+             SELECT DISTINCT ON (token_id) token_id, from_address
              FROM nft_transfers
              WHERE collection_slug = $2
              ORDER BY token_id, block_number ASC, id ASC
            ) first_tx ON first_tx.token_id = wti.token_id
            WHERE wti.wallet_address = $1
              AND wti.collection_slug = $2`,
-          [wallet, col.slug, BURN_CONTRACT]
+          [wallet, col.slug]
         ).catch(() => ({ rows: [{ minted: 0, bought_intervals: 0, total_buy_eth: 0 }] }));
 
         const minted       = parseInt(acquisitionRes.rows[0]?.minted          || 0);
