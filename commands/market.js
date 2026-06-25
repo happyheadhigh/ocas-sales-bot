@@ -1899,14 +1899,14 @@ async function showMeWallet(interaction, ctx){
              COUNT(DISTINCT CASE
                WHEN first_tx.from_address = '0x0000000000000000000000000000000000000000'
                 AND wti.token_id NOT IN (
-                  SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL
+                  SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
                 )
                THEN wti.token_id END) AS minted,
              COUNT(DISTINCT CASE
                WHEN NOT (
                  first_tx.from_address = '0x0000000000000000000000000000000000000000'
                  AND wti.token_id NOT IN (
-                   SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL
+                   SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
                  )
                )
                THEN wti.id END)       AS bought_intervals,
@@ -1914,7 +1914,7 @@ async function showMeWallet(interaction, ctx){
                WHEN NOT (
                  first_tx.from_address = '0x0000000000000000000000000000000000000000'
                  AND wti.token_id NOT IN (
-                   SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL
+                   SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
                  )
                )
                THEN wti.cost_eth END), 0) AS total_buy_eth
@@ -1922,7 +1922,6 @@ async function showMeWallet(interaction, ctx){
            JOIN (
              SELECT DISTINCT ON (token_id) token_id, from_address
              FROM nft_transfers
-             WHERE collection_slug = $2
              ORDER BY token_id, block_number ASC, id ASC
            ) first_tx ON first_tx.token_id = wti.token_id
            WHERE wti.wallet_address = $1
