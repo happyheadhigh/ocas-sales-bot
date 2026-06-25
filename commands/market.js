@@ -1480,14 +1480,16 @@ async function showMeFloorAlerts(interaction, ctx){
 
   if(pgPool){
     const res = await pgPool.query(
-      `SELECT id, slug, threshold_eth, cooldown_minutes, last_alerted_at FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
+      `SELECT id, slug, threshold_eth, cooldown_minutes, direction, last_alerted_at FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
       [userId]
     ).catch(()=>null);
     if(res?.rows.length){
       hasAlerts = true;
-      desc = res.rows.map(r =>
-        `**${r.slug}** — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)} (cooldown: ${formatCooldown(r.cooldown_minutes||60)}${r.last_alerted_at?' · last alerted '+new Date(r.last_alerted_at).toLocaleDateString():''})`
-      ).join('\n');
+      desc = res.rows.map(r => {
+        const dir = r.direction || 'below';
+        const arrow = dir === 'above' ? '📈' : dir === 'either' ? '↕️' : '📉';
+        return `${arrow} **${r.slug}** — ${dir} Ξ ${parseFloat(r.threshold_eth).toFixed(4)} · repeats after ${formatCooldown(r.cooldown_minutes||60)}${r.last_alerted_at?' · last alerted '+new Date(r.last_alerted_at).toLocaleDateString():''}`;
+      }).join('\n');
       const btns = res.rows.map(r =>
         new ButtonBuilder().setCustomId(`me_browse:flooralert:remove:${r.id}`)
           .setLabel(`Remove ${r.slug}`).setStyle(ButtonStyle.Danger)
@@ -2151,8 +2153,9 @@ async function showFloorAlertModal(interaction, slug){
   const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
   const modal = new ModalBuilder().setCustomId(`me_modal:flooralert:${slug}`).setTitle(`Floor Alert — ${slug}`);
   modal.addComponents(
-    new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Alert when floor drops below (ETH)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('0.05')),
-    new AR().addComponents(new TextInputBuilder().setCustomId('cooldown').setLabel('Cooldown (e.g. 30m, 2h, 1d)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('1h')),
+    new AR().addComponents(new TextInputBuilder().setCustomId('threshold').setLabel('Floor threshold (ETH)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('0.05')),
+    new AR().addComponents(new TextInputBuilder().setCustomId('direction').setLabel('Direction: below, above, or either').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('below')),
+    new AR().addComponents(new TextInputBuilder().setCustomId('cooldown').setLabel('Min. repeat interval (e.g. 30m, 2h, 1d)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('1h')),
   );
   return interaction.showModal(modal);
 }

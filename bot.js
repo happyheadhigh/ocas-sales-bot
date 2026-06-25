@@ -773,8 +773,10 @@ client.on('interactionCreate', async (interaction)=>{
 
     if(alertType === 'flooralert'){
       const threshold = parseFloat(interaction.fields.getTextInputValue('threshold').trim());
+      const directionRaw = (interaction.fields.getTextInputValue('direction').trim() || 'below').toLowerCase();
+      const direction = ['above','either'].includes(directionRaw) ? directionRaw : 'below';
       const cooldownStr = interaction.fields.getTextInputValue('cooldown').trim() || '1h';
-      // Parse cooldown — supports 30m, 2h, 1d, or plain number (minutes)
+      // Parse repeat interval — supports 30m, 2h, 1d, or plain number (minutes)
       const cooldownMinutes = (() => {
         const s = cooldownStr.toLowerCase();
         const m = s.match(/^([\d.]+)\s*([mhd]?)$/);
@@ -789,17 +791,18 @@ client.on('interactionCreate', async (interaction)=>{
         return interaction.reply({ content: '❌ Invalid threshold. Enter an ETH amount like 0.05.', flags: MessageFlags.Ephemeral });
       }
       await pgPool.query(
-        `INSERT INTO user_floor_alerts (discord_id, slug, threshold_eth, cooldown_minutes)
-         VALUES ($1,$2,$3,$4)
-         ON CONFLICT (discord_id, slug) DO UPDATE SET threshold_eth=$3, cooldown_minutes=$4`,
-        [interaction.user.id, slug, threshold, cooldownMinutes]
+        `INSERT INTO user_floor_alerts (discord_id, slug, threshold_eth, cooldown_minutes, direction)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (discord_id, slug) DO UPDATE SET threshold_eth=$3, cooldown_minutes=$4, direction=$5`,
+        [interaction.user.id, slug, threshold, cooldownMinutes, direction]
       ).catch(()=>{});
       const cdDisplay = cooldownMinutes >= 1440 ? `${(cooldownMinutes/1440).toFixed(1).replace(/\.0$/,'')}d`
         : cooldownMinutes >= 60 ? `${(cooldownMinutes/60).toFixed(1).replace(/\.0$/,'')}h`
         : `${cooldownMinutes}m`;
+      const dirLabel = direction === 'above' ? 'rises above' : direction === 'either' ? 'crosses' : 'drops below';
       const { ActionRowBuilder: AR3, ButtonBuilder: BB3, ButtonStyle: BS3 } = require('discord.js');
       await interaction.reply({
-        content: `✅ Floor alert set! I'll DM you when the **${slug}** floor drops below **Ξ ${threshold.toFixed(4)}** (cooldown: ${cdDisplay}).`,
+        content: `✅ Floor alert set! I'll DM you when the **${slug}** floor ${dirLabel} **Ξ ${threshold.toFixed(4)}** (repeats after: ${cdDisplay}).`,
         components: [new AR3().addComponents(new BB3().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(BS3.Secondary))],
         flags: MessageFlags.Ephemeral
       });
