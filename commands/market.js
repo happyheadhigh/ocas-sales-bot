@@ -1710,17 +1710,21 @@ async function showMeWallet(interaction, ctx){
 
     for(const col of rawCols){
       try {
+        // ── Core interval stats ───────────────────────────────────────────────
         const stats = await pgPool.query(
           `SELECT
-            COUNT(*) FILTER (WHERE disposed_at IS NULL) AS held,
-            COUNT(*) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0) AS sold,
-            COUNT(*) FILTER (WHERE disposed_at IS NOT NULL AND (sale_eth IS NULL OR sale_eth = 0)) AS burned,
-            COALESCE(AVG(cost_eth) FILTER (WHERE disposed_at IS NULL), 0) AS avg_cost,
+            COUNT(*) FILTER (WHERE disposed_at IS NULL)                                                        AS held,
+            COUNT(*) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0)          AS sold,
+            COUNT(*) FILTER (WHERE disposed_at IS NOT NULL AND (sale_eth IS NULL OR sale_eth = 0))             AS burned,
+            COALESCE(AVG(cost_eth)  FILTER (WHERE disposed_at IS NULL), 0)                                     AS avg_cost,
+            COALESCE(SUM(cost_eth)  FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS total_spent_sold,
+            COALESCE(SUM(sale_eth)  FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS total_earned,
             COALESCE(SUM(sale_eth - cost_eth) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS realized_pnl
            FROM wallet_token_intervals
            WHERE wallet_address=$1 AND collection_slug=$2`,
           [wallet, col.slug]
         );
+
         // Count distinct burn events for this wallet+collection
         const burnEvents = await pgPool.query(
           `SELECT COUNT(DISTINCT be.id) AS event_count
@@ -1728,23 +1732,184 @@ async function showMeWallet(interaction, ctx){
            WHERE LOWER(be.burner_wallet) = $1`,
           [wallet]
         ).catch(() => ({ rows: [{ event_count: 0 }] }));
+
         const burnEventCount = parseInt(burnEvents.rows[0]?.event_count || 0);
-        const held = parseInt(stats.rows[0]?.held || 0);
-        const sold = parseInt(stats.rows[0]?.sold || 0);
+        const held   = parseInt(stats.rows[0]?.held   || 0);
+        const sold   = parseInt(stats.rows[0]?.sold   || 0);
         const burned = parseInt(stats.rows[0]?.burned || 0);
         if(held === 0 && sold === 0 && burned === 0) continue;
 
-        const floorRow = await pgPool.query(
+        const totalEarned     = parseFloat(stats.rows[0]?.total_earned     || 0);
+        const realizedPnl     = parseFloat(stats.rows[0]?.realized_pnl     || 0);
+        const avgCost         = parseFloat(stats.rows[0]?.avg_cost         || 0);
+
+        // ── Sweep-depth est. value ────────────────────────────────────────────
+        // Est. value = sum of the cheapest `held` listings in the collection.
+        // This models what it would actually cost to acquire an equivalent position —
+        // floor rises as each cheaper token gets picked off, which is more realistic
+        // than (held × floor price).
+        //
+        // Trait layer: if trait data exists for this collection, group held tokens
+        // by their most-listed trait value and find the cheapest K listings per group,
+        // where K = how many of that trait the wallet holds. This gives per-trait
+        // sweep depth. Falls back to collection sweep if no trait data.
+
+        let estValue = null;
+        let estMethod = 'sweep'; // 'sweep' | 'trait-sweep' | 'floor'
+
+        if(held > 0){
+          // Collection sweep depth — cheapest `held` listings
+          const sweepRes = await pgPool.query(
+            `SELECT COALESCE(SUM(price_eth), 0) AS sweep_value, COUNT(*) AS count
+             FROM (
+               SELECT price_eth
+               FROM listings
+               WHERE collection_slug = $1
+               ORDER BY price_eth ASC
+               LIMIT $2
+             ) sub`,
+            [col.slug, held]
+          ).catch(() => ({ rows: [] }));
+
+          const sweepCount = parseInt(sweepRes.rows[0]?.count || 0);
+          const sweepValue = sweepCount > 0 ? parseFloat(sweepRes.rows[0]?.sweep_value || 0) : null;
+
+          // Trait sweep depth — only attempt if collection has trait data
+          const hasTraits = await pgPool.query(
+            `SELECT 1 FROM token_traits WHERE (collection_slug=$1 OR collection_slug IS NULL) LIMIT 1`,
+            [col.slug]
+          ).catch(() => ({ rows: [] }));
+
+          if(hasTraits.rows.length > 0 && held > 0){
+            // For each held token, find cheapest listing among tokens sharing its rarest trait
+            // (rarest = trait shared by fewest tokens in collection → most price-differentiating)
+            const traitSweepRes = await pgPool.query(
+              `WITH held_tokens AS (
+                 SELECT token_id FROM wallet_token_intervals
+                 WHERE wallet_address=$1 AND collection_slug=$2 AND disposed_at IS NULL
+               ),
+               token_rarest_trait AS (
+                 -- For each held token pick its rarest trait (fewest tokens share it)
+                 SELECT DISTINCT ON (tt.token_id)
+                   tt.token_id,
+                   tt.trait_name,
+                   tt.trait_value,
+                   COUNT(*) OVER (PARTITION BY tt.trait_name, tt.trait_value) AS trait_count
+                 FROM token_traits tt
+                 JOIN held_tokens ht ON ht.token_id = tt.token_id
+                 WHERE (tt.collection_slug=$2 OR tt.collection_slug IS NULL)
+                 ORDER BY tt.token_id, trait_count ASC
+               ),
+               trait_groups AS (
+                 -- Count how many held tokens share each trait group
+                 SELECT trait_name, trait_value, COUNT(*) AS held_count
+                 FROM token_rarest_trait
+                 GROUP BY trait_name, trait_value
+               ),
+               trait_sweep AS (
+                 -- For each trait group, sum cheapest K listings where K = held_count
+                 SELECT
+                   tg.trait_name,
+                   tg.trait_value,
+                   tg.held_count,
+                   (SELECT COALESCE(SUM(price_eth), 0)
+                    FROM (
+                      SELECT l.price_eth
+                      FROM listings l
+                      JOIN token_traits tt2 ON tt2.token_id = l.token_id
+                        AND tt2.trait_name  = tg.trait_name
+                        AND tt2.trait_value = tg.trait_value
+                        AND (tt2.collection_slug=$2 OR tt2.collection_slug IS NULL)
+                      WHERE l.collection_slug = $2
+                      ORDER BY l.price_eth ASC
+                      LIMIT tg.held_count
+                    ) sub
+                   ) AS group_sweep_value,
+                   (SELECT COUNT(*)
+                    FROM listings l
+                    JOIN token_traits tt2 ON tt2.token_id = l.token_id
+                      AND tt2.trait_name  = tg.trait_name
+                      AND tt2.trait_value = tg.trait_value
+                      AND (tt2.collection_slug=$2 OR tt2.collection_slug IS NULL)
+                    WHERE l.collection_slug = $2
+                   ) AS listings_available
+                 FROM trait_groups tg
+               )
+               SELECT
+                 SUM(group_sweep_value) AS total_trait_sweep,
+                 SUM(held_count) AS tokens_covered,
+                 SUM(CASE WHEN listings_available >= held_count THEN held_count ELSE listings_available END) AS fully_covered
+               FROM trait_sweep`,
+              [wallet, col.slug]
+            ).catch(() => ({ rows: [] }));
+
+            const traitSweepVal = traitSweepRes.rows[0]?.total_trait_sweep
+              ? parseFloat(traitSweepRes.rows[0].total_trait_sweep) : null;
+            const covered = parseInt(traitSweepRes.rows[0]?.tokens_covered || 0);
+
+            if(traitSweepVal !== null && covered === held){
+              // Full trait coverage — use trait sweep
+              estValue  = traitSweepVal;
+              estMethod = 'trait-sweep';
+            } else if(traitSweepVal !== null && sweepValue !== null){
+              // Partial — blend: trait sweep for covered tokens, collection sweep for rest
+              const uncovered = held - covered;
+              const partialCollSweep = await pgPool.query(
+                `SELECT COALESCE(SUM(price_eth),0) AS v FROM (
+                   SELECT price_eth FROM listings WHERE collection_slug=$1
+                   ORDER BY price_eth ASC LIMIT $2
+                 ) sub`,
+                [col.slug, uncovered]
+              ).catch(() => ({ rows: [{ v: 0 }] }));
+              estValue  = traitSweepVal + parseFloat(partialCollSweep.rows[0]?.v || 0);
+              estMethod = 'trait-sweep';
+            } else if(sweepValue !== null){
+              estValue  = sweepValue;
+              estMethod = 'sweep';
+            }
+          } else if(sweepValue !== null){
+            estValue  = sweepValue;
+            estMethod = 'sweep';
+          }
+        }
+
+        // Collection floor (for display reference)
+        const collFloorRow = await pgPool.query(
           `SELECT MIN(price_eth) AS floor FROM listings WHERE collection_slug=$1`,
           [col.slug]
-        );
-        const floor = floorRow.rows[0]?.floor ? parseFloat(floorRow.rows[0].floor) : null;
-        const estValue = floor && held ? held * floor : null;
-        const avgCost = parseFloat(stats.rows[0]?.avg_cost || 0);
-        const unrealizedPnl = (floor && avgCost > 0) ? (floor - avgCost) * held : null;
-        const realizedPnl = parseFloat(stats.rows[0]?.realized_pnl || 0);
+        ).catch(() => ({ rows: [] }));
+        const floor = collFloorRow.rows[0]?.floor ? parseFloat(collFloorRow.rows[0].floor) : null;
 
-        cols.push({ name: col.name, slug: col.slug, held, sold, burned, burnEventCount, floor, estValue, avgCost, unrealizedPnl, realizedPnl });
+        const unrealizedPnl = (estValue !== null && avgCost > 0) ? (estValue - avgCost * held) : null;
+
+        // ── Minted / Bought breakdown ─────────────────────────────────────────
+        // Minted = token's very first on-chain transfer ever was from zero address
+        // Bought = everything else acquired (secondary purchases)
+        // Total ETH spent on buys = SUM(cost_eth) for non-minted acquired intervals
+        const acquisitionRes = await pgPool.query(
+          `SELECT
+             COUNT(DISTINCT CASE WHEN first_tx.from_address = '0x0000000000000000000000000000000000000000' THEN wti.token_id END) AS minted,
+             COUNT(DISTINCT CASE WHEN first_tx.from_address != '0x0000000000000000000000000000000000000000' THEN wti.id END)       AS bought_intervals,
+             COALESCE(SUM(CASE WHEN first_tx.from_address != '0x0000000000000000000000000000000000000000' THEN wti.cost_eth END), 0) AS total_buy_eth
+           FROM wallet_token_intervals wti
+           JOIN (
+             SELECT DISTINCT ON (token_id) token_id, from_address
+             FROM nft_transfers
+             WHERE collection_slug = $2
+             ORDER BY token_id, block_number ASC, id ASC
+           ) first_tx ON first_tx.token_id = wti.token_id
+           WHERE wti.wallet_address = $1
+             AND wti.collection_slug = $2`,
+          [wallet, col.slug]
+        ).catch(() => ({ rows: [{ minted: 0, bought_intervals: 0, total_buy_eth: 0 }] }));
+
+        const minted       = parseInt(acquisitionRes.rows[0]?.minted          || 0);
+        const boughtCount  = parseInt(acquisitionRes.rows[0]?.bought_intervals || 0);
+        const totalBuyEth  = parseFloat(acquisitionRes.rows[0]?.total_buy_eth  || 0);
+
+        cols.push({ name: col.name, slug: col.slug, held, sold, burned, burnEventCount,
+                    floor, estValue, estMethod, avgCost, unrealizedPnl, realizedPnl,
+                    totalEarned, minted, boughtCount, totalBuyEth });
       } catch(e){ console.warn('[WalletTab]', col.slug, e.message); }
     }
   }
@@ -1793,23 +1958,31 @@ async function showMeWallet(interaction, ctx){
       ? ` (${c.unrealizedPnl >= 0 ? '+' : ''}${((c.unrealizedPnl / (c.avgCost * c.held)) * 100).toFixed(0)}%)`
       : '';
 
-    // Collection name bold
     lines.push(`**${c.name}**`);
 
-    // Holdings line — bold count + floor + est value
+    // Holdings + est value
     lines.push(`Holdings: **${c.held}** token${c.held === 1 ? '' : 's'}`);
-    if(c.floor) lines.push(`Floor: **Ξ ${fmtE(c.floor)}** · Est. value: **Ξ ${fmtE(c.estValue)}**`);
+    if(c.floor){
+      const estLabel = c.estMethod === 'trait-sweep' ? 'Trait est.' : 'Est. value';
+      lines.push(`Floor: **Ξ ${fmtE(c.floor)}** · ${estLabel}: **Ξ ${fmtE(c.estValue)}**`);
+    }
 
-    // Avg cost + unrealized P&L (only if cost basis is known)
+    // Minted / Bought / Sold — full history from wallet backfill
+    if(c.minted > 0)      lines.push(`Minted: **${c.minted}**`);
+    if(c.boughtCount > 0) lines.push(`Bought: **${c.boughtCount}** · Spent: **Ξ ${fmtE(c.totalBuyEth)}**`);
+    if(c.sold > 0)        lines.push(`Sold: **${c.sold}** · Earned: **Ξ ${fmtE(c.totalEarned)}**`);
+
+    // Avg cost + unrealized P&L
     if(c.avgCost > 0){
       lines.push(`Avg. cost: **Ξ ${fmtE(c.avgCost)}** · Unrealized: **${pnl(c.unrealizedPnl)}${unrealPct}**`);
     }
 
-    // Sold + realized P&L (only if they've sold on secondary)
+    // Realized P&L
     if(c.sold > 0){
-      lines.push(`Sold: **${c.sold}** · Realized P&L: **${pnl(c.realizedPnl)}**`);
+      lines.push(`Realized P&L: **${pnl(c.realizedPnl)}**`);
     }
-    // Burned (shown separately, no P&L)
+
+    // Burned (no P&L)
     if(c.burned > 0){
       const evStr = c.burnEventCount > 0 ? ` (${c.burnEventCount} event${c.burnEventCount === 1 ? '' : 's'})` : '';
       lines.push(`Burned: **${c.burned}** tokens${evStr}`);
