@@ -1359,8 +1359,17 @@ async function showMeHub(interaction, ctx){
     const w = walletReg?.rows[0]?.wallet;
     if(w) summaryLines.push(`💼 **Wallet** — \`${w.slice(0,6)}...${w.slice(-4)}\` verified ✅`);
     else summaryLines.push('💼 **Wallet** — not verified');
+
+    // TraitView link status
+    const tvLink = await pgPool.query(
+      `SELECT wallet, linked_at FROM traitview_links WHERE discord_id=$1 AND guild_id=$2`,
+      [userId, interaction.guildId]
+    ).catch(()=>null);
+    if(tvLink?.rows[0]) summaryLines.push(`📊 **TraitView** — linked ✅`);
+    else summaryLines.push('📊 **TraitView** — not linked');
   } else {
     summaryLines.push('💼 **Wallet** — not verified');
+    summaryLines.push('📊 **TraitView** — not linked');
   }
 
   const nav = new StringSelectMenuBuilder()
@@ -1371,6 +1380,7 @@ async function showMeHub(interaction, ctx){
       new StringSelectMenuOptionBuilder().setLabel('🏷️ Price Alerts').setDescription('DM when a token drops below a price').setValue('price_alerts'),
       new StringSelectMenuOptionBuilder().setLabel('📉 Floor Alerts').setDescription('DM when a collection floor drops').setValue('floor_alerts'),
       new StringSelectMenuOptionBuilder().setLabel('💼 Wallet').setDescription('Verification & wallet analytics').setValue('wallet'),
+      new StringSelectMenuOptionBuilder().setLabel('📊 TraitView').setDescription('Link your TraitView account').setValue('traitview'),
     ]);
 
   const embed = new EmbedBuilder()
@@ -1501,6 +1511,146 @@ async function showMeFloorAlerts(interaction, ctx){
 
   const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
   return interaction[updateFn]({ embeds: [embed], components: rows });
+}
+
+
+// ── TraitView↔Discord verification ───────────────────────────────────────────
+function generateTVCode() {
+  // 6-char alphanumeric code, uppercase, no ambiguous chars (0/O, 1/I/L)
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for(let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+async function showMeTraitView(interaction, ctx) {
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+  const guildId = interaction.guildId;
+
+  const updateFn = interaction.deferred || interaction.replied ? 'editReply'
+    : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
+
+  // Check if already linked
+  let linked = null;
+  if(pgPool) {
+    const row = await pgPool.query(
+      `SELECT wallet, linked_at FROM traitview_links WHERE discord_id=$1 AND guild_id=$2`,
+      [userId, guildId]
+    ).catch(()=>null);
+    linked = row?.rows[0] || null;
+  }
+
+  const lines = [];
+  if(linked) {
+    lines.push(`✅ **TraitView is linked!**`);
+    lines.push(`Wallet: \`${linked.wallet.slice(0,6)}...${linked.wallet.slice(-4)}\``);
+    lines.push(`Linked: <t:${Math.floor(new Date(linked.linked_at).getTime()/1000)}:R>`);
+    lines.push('');
+    lines.push('Your wallet data is now available on TraitView. You can re-link anytime.');
+  } else {
+    lines.push('Connect your Discord account to TraitView to unlock:');
+    lines.push('• Verified holder badge on TraitView');
+    lines.push('• Personal portfolio analytics on TraitView');
+    lines.push('• Your burn history and community leaderboards');
+    lines.push('');
+    lines.push('**How to link:**');
+    lines.push('**Option A** — Generate a code here and enter it on TraitView');
+    lines.push('**Option B** — Get a code from TraitView and enter it here');
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('📊 TraitView')
+    .setColor(linked ? 0x57F287 : 0x5865F2)
+    .setDescription(lines.join('\n'));
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:tv:generate').setLabel('🔑 Generate Code').setStyle(linked ? ButtonStyle.Secondary : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('me_browse:tv:enter').setLabel('✏️ Enter Code').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
+}
+
+async function handleTVGenerateCode(interaction, ctx) {
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+  const guildId = interaction.guildId;
+
+  if(!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(()=>{});
+
+  // Must have a verified wallet
+  const walletRow = await pgPool.query(
+    `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+    [userId]
+  ).catch(()=>null);
+  const wallet = walletRow?.rows[0]?.wallet;
+
+  if(!wallet) {
+    return interaction.editReply({
+      embeds: [new EmbedBuilder().setTitle('📊 TraitView').setColor(0xED4245)
+        .setDescription('❌ You need to verify your wallet first before linking TraitView.')],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary)
+      )],
+    });
+  }
+
+  // Generate code, invalidate any existing ones for this user, insert new
+  const code = generateTVCode();
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+  await pgPool.query(
+    `DELETE FROM tv_verify_codes WHERE discord_id=$1 AND guild_id=$2`,
+    [userId, guildId]
+  ).catch(()=>{});
+
+  await pgPool.query(
+    `INSERT INTO tv_verify_codes (code, discord_id, guild_id, wallet, direction, expires_at)
+     VALUES ($1,$2,$3,$4,'discord',$5)`,
+    [code, userId, guildId, wallet, expiresAt]
+  ).catch(()=>{});
+
+  const embed = new EmbedBuilder()
+    .setTitle('📊 TraitView — Your Code')
+    .setColor(0x5865F2)
+    .setDescription([
+      `Your verification code is:`,
+      `# \`${code}\``,
+      '',
+      '1. Go to **[traitview.com](https://traitview.com)**',
+      '2. Click **Connect Discord** ',
+      '3. Enter this code',
+      '',
+      `⏱️ Expires in **5 minutes**`,
+    ].join('\n'));
+
+  return interaction.editReply({
+    embeds: [embed],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:traitview').setLabel('← Back').setStyle(ButtonStyle.Secondary)
+    )],
+  });
+}
+
+async function handleTVEnterCode(interaction, ctx) {
+  // Show a modal for the user to type in the code from TraitView
+  const modal = new ModalBuilder()
+    .setCustomId('me_modal:tv:enter_code')
+    .setTitle('Enter TraitView Code');
+
+  const codeInput = new TextInputBuilder()
+    .setCustomId('tv_code')
+    .setLabel('Code from TraitView')
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder('e.g. ABC123')
+    .setMinLength(6)
+    .setMaxLength(6)
+    .setRequired(true);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(codeInput));
+  return interaction.showModal(modal);
 }
 
 async function showMeWallet(interaction, ctx){
@@ -1709,10 +1859,14 @@ async function handleMeInteraction(interaction, ctx){
     if(section === 'price_alerts') return showMePriceAlerts(interaction, ctx);
     if(section === 'floor_alerts') return showMeFloorAlerts(interaction, ctx);
     if(section === 'wallet') return showMeWallet(interaction, ctx);
+    if(section === 'traitview') return showMeTraitView(interaction, ctx);
   }
 
   // Back to hub
   if(customId === 'me_browse:back') return showMeHub(interaction, ctx);
+  if(customId === 'me_browse:traitview') return showMeTraitView(interaction, ctx);
+  if(customId === 'me_browse:tv:generate') return handleTVGenerateCode(interaction, ctx);
+  if(customId === 'me_browse:tv:enter') return handleTVEnterCode(interaction, ctx);
 
   // ── Trait alert ──────────────────────────────────────────────────────────────
   if(customId === 'me_browse:alert:set'){
@@ -1800,6 +1954,50 @@ async function handleMeInteraction(interaction, ctx){
   }
 
   // ── Wallet sync ─────────────────────────────────────────────────────────────
+  if(customId === 'me_modal:tv:enter_code'){
+    // User entered a code from TraitView
+    const code = (interaction.fields?.getTextInputValue('tv_code') || '').trim().toUpperCase();
+    const userId = interaction.user.id;
+    const guildId = interaction.guildId;
+    await interaction.deferReply({ ephemeral: true }).catch(()=>{});
+
+    const row = await pgPool.query(
+      `SELECT discord_id, wallet, guild_id, expires_at, claimed_at, direction
+       FROM tv_verify_codes WHERE code=$1`,
+      [code]
+    ).catch(()=>null);
+
+    const entry = row?.rows[0];
+    const errEmbed = (msg) => new EmbedBuilder().setTitle('📊 TraitView').setColor(0xED4245).setDescription(msg);
+
+    if(!entry) return interaction.editReply({ embeds: [errEmbed('❌ Invalid code. Check the code on TraitView and try again.')] });
+    if(entry.claimed_at) return interaction.editReply({ embeds: [errEmbed('❌ This code has already been used.')] });
+    if(new Date(entry.expires_at) < new Date()) return interaction.editReply({ embeds: [errEmbed('❌ This code has expired. Generate a new one on TraitView.')] });
+
+    // Claim it
+    await pgPool.query(`UPDATE tv_verify_codes SET claimed_at=NOW() WHERE code=$1`, [code]).catch(()=>{});
+
+    // Get wallet from user_registrations (the person entering the code must be verified)
+    const walletRow = await pgPool.query(
+      `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+      [userId]
+    ).catch(()=>null);
+    const wallet = walletRow?.rows[0]?.wallet;
+    if(!wallet) return interaction.editReply({ embeds: [errEmbed('❌ You need to verify your wallet first.')] });
+
+    await pgPool.query(
+      `INSERT INTO traitview_links (discord_id, guild_id, wallet, linked_at)
+       VALUES ($1,$2,$3,NOW())
+       ON CONFLICT (discord_id, guild_id) DO UPDATE SET wallet=$3, linked_at=NOW()`,
+      [userId, guildId, wallet]
+    ).catch(()=>{});
+
+    return interaction.editReply({
+      embeds: [new EmbedBuilder().setTitle('📊 TraitView').setColor(0x57F287)
+        .setDescription(`✅ **TraitView linked successfully!**\n\nWallet: \`${wallet.slice(0,6)}...${wallet.slice(-4)}\`\nYour portfolio data is now available on TraitView.`)],
+    });
+  }
+
   if(customId === 'me_browse:wallet:sync'){
     const guildId = interaction.guildId;
     const userId = interaction.user.id;
