@@ -1549,7 +1549,7 @@ app.post('/tv/claim-code', auth, async (req, res) => {
   if (!code) return res.status(400).json({ error: 'code required' });
 
   try {
-    const row = await pgPool.query(
+    const row = await pool.query(
       `SELECT discord_id, wallet, guild_id, expires_at, claimed_at
        FROM tv_verify_codes WHERE code=$1`,
       [code.trim().toUpperCase()]
@@ -1560,13 +1560,13 @@ app.post('/tv/claim-code', auth, async (req, res) => {
     if (new Date(entry.expires_at) < new Date()) return res.status(410).json({ error: 'code_expired' });
 
     // Claim it atomically
-    await pgPool.query(
+    await pool.query(
       `UPDATE tv_verify_codes SET claimed_at=NOW() WHERE code=$1`,
       [code.trim().toUpperCase()]
     );
 
     // Upsert traitview_links
-    await pgPool.query(
+    await pool.query(
       `INSERT INTO traitview_links (discord_id, guild_id, wallet, linked_at)
        VALUES ($1,$2,$3,NOW())
        ON CONFLICT (discord_id, guild_id) DO UPDATE SET wallet=$3, linked_at=NOW()`,
@@ -1587,7 +1587,7 @@ app.get('/tv/link-status', auth, async (req, res) => {
   if (!discord_id) return res.status(400).json({ error: 'discord_id required' });
 
   try {
-    const row = await pgPool.query(
+    const row = await pool.query(
       `SELECT wallet, linked_at FROM traitview_links
        WHERE discord_id=$1 AND guild_id=$2`,
       [discord_id, guild_id || 'global']
