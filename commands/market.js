@@ -1880,27 +1880,42 @@ async function showMeWallet(interaction, ctx){
         ).catch(() => ({ rows: [] }));
         const floor = collFloorRow.rows[0]?.floor ? parseFloat(collFloorRow.rows[0].floor) : null;
 
-        const unrealizedPnl = (estValue !== null && avgCost > 0) ? (estValue - avgCost * held) : null;
+        // Collection floor est. = held × floor (simple baseline always shown)
+        const collFloorEst = (floor && held) ? held * floor : null;
+        // Best est. = trait sweep if available, otherwise collection sweep, otherwise floor est.
+        const bestEst = estValue ?? collFloorEst;
+        const unrealizedPnl = (bestEst !== null && avgCost > 0) ? (bestEst - avgCost * held) : null;
 
         // ── Minted / Bought breakdown ─────────────────────────────────────────
         // Minted = token's very first on-chain transfer ever was from zero address
         // Bought = everything else acquired (secondary purchases)
         // Total ETH spent on buys = SUM(cost_eth) for non-minted acquired intervals
+        // Burn contract address — survivors minted by this are NOT user mints
+        const BURN_CONTRACT = '0x1095c73c337cc5e03f9e1d426c524cc3e32a50f6';
         const acquisitionRes = await pgPool.query(
           `SELECT
-             COUNT(DISTINCT CASE WHEN first_tx.from_address = '0x0000000000000000000000000000000000000000' THEN wti.token_id END) AS minted,
-             COUNT(DISTINCT CASE WHEN first_tx.from_address != '0x0000000000000000000000000000000000000000' THEN wti.id END)       AS bought_intervals,
-             COALESCE(SUM(CASE WHEN first_tx.from_address != '0x0000000000000000000000000000000000000000' THEN wti.cost_eth END), 0) AS total_buy_eth
+             COUNT(DISTINCT CASE
+               WHEN first_tx.from_address = '0x0000000000000000000000000000000000000000'
+                AND LOWER(first_tx.to_address) != $3
+               THEN wti.token_id END) AS minted,
+             COUNT(DISTINCT CASE
+               WHEN NOT (first_tx.from_address = '0x0000000000000000000000000000000000000000'
+                         AND LOWER(first_tx.to_address) != $3)
+               THEN wti.id END)       AS bought_intervals,
+             COALESCE(SUM(CASE
+               WHEN NOT (first_tx.from_address = '0x0000000000000000000000000000000000000000'
+                         AND LOWER(first_tx.to_address) != $3)
+               THEN wti.cost_eth END), 0) AS total_buy_eth
            FROM wallet_token_intervals wti
            JOIN (
-             SELECT DISTINCT ON (token_id) token_id, from_address
+             SELECT DISTINCT ON (token_id) token_id, from_address, to_address
              FROM nft_transfers
              WHERE collection_slug = $2
              ORDER BY token_id, block_number ASC, id ASC
            ) first_tx ON first_tx.token_id = wti.token_id
            WHERE wti.wallet_address = $1
              AND wti.collection_slug = $2`,
-          [wallet, col.slug]
+          [wallet, col.slug, BURN_CONTRACT]
         ).catch(() => ({ rows: [{ minted: 0, bought_intervals: 0, total_buy_eth: 0 }] }));
 
         const minted       = parseInt(acquisitionRes.rows[0]?.minted          || 0);
@@ -1908,8 +1923,8 @@ async function showMeWallet(interaction, ctx){
         const totalBuyEth  = parseFloat(acquisitionRes.rows[0]?.total_buy_eth  || 0);
 
         cols.push({ name: col.name, slug: col.slug, held, sold, burned, burnEventCount,
-                    floor, estValue, estMethod, avgCost, unrealizedPnl, realizedPnl,
-                    totalEarned, minted, boughtCount, totalBuyEth });
+                    floor, collFloorEst, estValue, bestEst, estMethod, avgCost,
+                    unrealizedPnl, realizedPnl, totalEarned, minted, boughtCount, totalBuyEth });
       } catch(e){ console.warn('[WalletTab]', col.slug, e.message); }
     }
   }
@@ -1954,7 +1969,7 @@ async function showMeWallet(interaction, ctx){
   const lines = [`\`${shortWallet}\``, ''];
 
   for(const c of cols){
-    const unrealPct = (c.unrealizedPnl !== null && c.avgCost > 0)
+    const unrealPct = (c.unrealizedPnl !== null && c.avgCost > 0 && c.bestEst !== null)
       ? ` (${c.unrealizedPnl >= 0 ? '+' : ''}${((c.unrealizedPnl / (c.avgCost * c.held)) * 100).toFixed(0)}%)`
       : '';
 
@@ -1963,8 +1978,13 @@ async function showMeWallet(interaction, ctx){
     // Holdings + est value
     lines.push(`Holdings: **${c.held}** token${c.held === 1 ? '' : 's'}`);
     if(c.floor){
-      const estLabel = c.estMethod === 'trait-sweep' ? 'Trait est.' : 'Est. value';
-      lines.push(`Floor: **Ξ ${fmtE(c.floor)}** · ${estLabel}: **Ξ ${fmtE(c.estValue)}**`);
+      // Always show floor line with collection floor est.
+      // If trait est. is available and different, show it on same line
+      if(c.estMethod === 'trait-sweep' && c.estValue !== null){
+        lines.push(`Floor: **Ξ ${fmtE(c.floor)}** · Floor est.: **Ξ ${fmtE(c.collFloorEst)}** · Trait est.: **Ξ ${fmtE(c.estValue)}**`);
+      } else {
+        lines.push(`Floor: **Ξ ${fmtE(c.floor)}** · Est. value: **Ξ ${fmtE(c.bestEst)}**`);
+      }
     }
 
     // Minted / Bought / Sold — full history from wallet backfill
@@ -1991,11 +2011,11 @@ async function showMeWallet(interaction, ctx){
     lines.push('');
   }
 
-  // Totals row
+  // Totals row — use bestEst (trait sweep if available, else collection sweep/floor)
   if(cols.length > 1){
-    const totalEst = cols.reduce((a, c) => a + (c.estValue || 0), 0);
+    const totalEst   = cols.reduce((a, c) => a + (c.bestEst || 0), 0);
     const totalUnreal = cols.filter(c => c.unrealizedPnl !== null && c.avgCost > 0).reduce((a, c) => a + c.unrealizedPnl, 0);
-    const totalReal = cols.reduce((a, c) => a + c.realizedPnl, 0);
+    const totalReal  = cols.reduce((a, c) => a + c.realizedPnl, 0);
 
     lines.push('─────────────────');
     lines.push(`Total Est. Value: **Ξ ${fmtE(totalEst)}**`);
