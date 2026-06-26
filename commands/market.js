@@ -1721,7 +1721,7 @@ async function showMeWallet(interaction, ctx){
             COALESCE(SUM(sale_eth)  FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS total_earned,
             COALESCE(SUM(sale_eth - cost_eth) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS realized_pnl
            FROM wallet_token_intervals
-           WHERE wallet_address=$1 AND collection_slug=$2`,
+           WHERE LOWER(wallet_address)=$1 AND collection_slug=$2`,
           [wallet, col.slug]
         );
 
@@ -1786,7 +1786,7 @@ async function showMeWallet(interaction, ctx){
             const traitSweepRes = await pgPool.query(
               `WITH held_tokens AS (
                  SELECT token_id FROM wallet_token_intervals
-                 WHERE wallet_address=$1 AND collection_slug=$2 AND disposed_at IS NULL
+                 WHERE LOWER(wallet_address)=$1 AND collection_slug=$2 AND disposed_at IS NULL
                ),
                token_rarest_trait AS (
                  -- For each held token pick its rarest trait (fewest tokens share it)
@@ -1924,7 +1924,7 @@ async function showMeWallet(interaction, ctx){
              FROM nft_transfers
              ORDER BY token_id, block_number ASC, id ASC
            ) first_tx ON first_tx.token_id = wti.token_id
-           WHERE wti.wallet_address = $1
+           WHERE LOWER(wti.wallet_address) = $1
              AND wti.collection_slug = $2`,
           [wallet, col.slug]
         ).catch(() => ({ rows: [{ minted: 0, bought_intervals: 0, total_buy_eth: 0 }] }));
