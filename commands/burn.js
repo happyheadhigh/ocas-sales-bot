@@ -308,69 +308,31 @@ const totalTokensBurned = burns.reduce((s,r)=>{
       const tokensStr_base = tokenTypes.replace(/^\d+/, String(consumedIds.length));
 
         // Get seed type (token's type at time of this burn) for parenthetical display
-        // Uses the same fallback chain as buildBurnEmbed's survivorPreBurnType lookup
         let seedType = null;
         try {
           const sid = parseInt(tokenInput);
-          // 1. burn-start-input snapshot
-          const s1 = await pgPool.query(
-            `SELECT traits_json FROM token_image_snapshots
-             WHERE token_id=$1 AND source='burn-start-input'
-             AND id <= (SELECT COALESCE(MAX(id),999999999) FROM token_image_snapshots WHERE token_id=$1 AND source='burn-start-input' AND created_at <= $2)
-             ORDER BY id DESC LIMIT 1`,
-            [sid, b.burned_at || new Date().toISOString()]
+          // Try burn_state_snapshots first (most accurate for multi-burn tokens)
+          const bss = await pgPool.query(
+            `SELECT traits_json FROM burn_state_snapshots
+             WHERE token_id=$1 AND burn_event_id < $2
+             ORDER BY burn_event_id DESC LIMIT 1`,
+            [sid, b.id]
           ).catch(()=>({rows:[]}));
-          if(s1.rows[0]?.traits_json){
-            const tj = typeof s1.rows[0].traits_json==='string' ? JSON.parse(s1.rows[0].traits_json) : s1.rows[0].traits_json;
+          if(bss.rows[0]?.traits_json){
+            const tj = typeof bss.rows[0].traits_json==='string' ? JSON.parse(bss.rows[0].traits_json) : bss.rows[0].traits_json;
             seedType = normalizeOcasType(tj?.Type || tj?.type || null);
           }
-          console.log('[SeedType s1]', s1.rows[0]?.traits_json ? 'hit' : 'miss');
-          // 2. burn_state_snapshots — state from before this burn event
+          // Fall back to original mint snapshot
           if(!seedType){
-            const s2 = await pgPool.query(
-              `SELECT traits_json FROM burn_state_snapshots
-               WHERE token_id=$1 AND burn_event_id < $2
-               ORDER BY burn_event_id DESC LIMIT 1`,
-              [sid, b.id]
-            ).catch(()=>({rows:[]}));
-            if(s2.rows[0]?.traits_json){
-              const tj = typeof s2.rows[0].traits_json==='string' ? JSON.parse(s2.rows[0].traits_json) : s2.rows[0].traits_json;
-              seedType = normalizeOcasType(tj?.Type || tj?.type || null);
-            }
-          }
-          console.log('[SeedType s2]', s2.rows[0]?.traits_json ? 'hit' : 'miss', 'seedType now:', seedType);
-          // 3. token_original_snapshots
-          if(!seedType){
-            const s3 = await pgPool.query(
+            const tos = await pgPool.query(
               `SELECT traits_json FROM token_original_snapshots WHERE token_id=$1`, [sid]
             ).catch(()=>({rows:[]}));
-            if(s3.rows[0]?.traits_json){
-              const tj = typeof s3.rows[0].traits_json==='string' ? JSON.parse(s3.rows[0].traits_json) : s3.rows[0].traits_json;
+            if(tos.rows[0]?.traits_json){
+              const tj = typeof tos.rows[0].traits_json==='string' ? JSON.parse(tos.rows[0].traits_json) : tos.rows[0].traits_json;
               seedType = normalizeOcasType(tj?.Type || tj?.type || null);
             }
           }
-          console.log('[SeedType s3]', s3.rows[0]?.traits_json ? 'hit' : 'miss', 'seedType now:', seedType);
-          // 4. backfill-chunks snapshot
-          if(!seedType){
-            const s4 = await pgPool.query(
-              `SELECT traits_json FROM token_image_snapshots
-               WHERE token_id=$1 AND source='backfill-chunks'
-               ORDER BY id DESC LIMIT 1`, [sid]
-            ).catch(()=>({rows:[]}));
-            if(s4.rows[0]?.traits_json){
-              const tj = typeof s4.rows[0].traits_json==='string' ? JSON.parse(s4.rows[0].traits_json) : s4.rows[0].traits_json;
-              seedType = normalizeOcasType(tj?.Type || tj?.type || null);
-            }
-          }
-          // 5. token_traits — last resort
-          if(!seedType){
-            const s5 = await pgPool.query(
-              `SELECT trait_value FROM token_traits WHERE token_id=$1 AND LOWER(trait_name)='type' LIMIT 1`, [sid]
-            ).catch(()=>({rows:[]}));
-            if(s5.rows[0]?.trait_value) seedType = normalizeOcasType(s5.rows[0].trait_value);
-          }
-        } catch(seedErr){ console.warn('[SeedType] error:', seedErr.message); }
-        console.log('[SeedType] burn', burnNum, 'token', tokenInput, '=> seedType:', seedType);
+        } catch(_){}
 
         const tokensStr = seedType ? `${tokensStr_base} (+ 1x ${seedType})` : tokensStr_base;
         const fieldVal = [
