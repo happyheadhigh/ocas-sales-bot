@@ -324,6 +324,7 @@ const totalTokensBurned = burns.reduce((s,r)=>{
             const tj = typeof s1.rows[0].traits_json==='string' ? JSON.parse(s1.rows[0].traits_json) : s1.rows[0].traits_json;
             seedType = normalizeOcasType(tj?.Type || tj?.type || null);
           }
+          console.log('[SeedType s1]', s1.rows[0]?.traits_json ? 'hit' : 'miss');
           // 2. burn_state_snapshots — state from before this burn event
           if(!seedType){
             const s2 = await pgPool.query(
@@ -337,6 +338,7 @@ const totalTokensBurned = burns.reduce((s,r)=>{
               seedType = normalizeOcasType(tj?.Type || tj?.type || null);
             }
           }
+          console.log('[SeedType s2]', s2.rows[0]?.traits_json ? 'hit' : 'miss', 'seedType now:', seedType);
           // 3. token_original_snapshots
           if(!seedType){
             const s3 = await pgPool.query(
@@ -347,6 +349,7 @@ const totalTokensBurned = burns.reduce((s,r)=>{
               seedType = normalizeOcasType(tj?.Type || tj?.type || null);
             }
           }
+          console.log('[SeedType s3]', s3.rows[0]?.traits_json ? 'hit' : 'miss', 'seedType now:', seedType);
           // 4. backfill-chunks snapshot
           if(!seedType){
             const s4 = await pgPool.query(
