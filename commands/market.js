@@ -1891,29 +1891,21 @@ async function showMeWallet(interaction, ctx){
         // Bought = everything else acquired (secondary purchases)
         // Total ETH spent on buys = SUM(cost_eth) for non-minted acquired intervals
         // Burn contract address — survivors minted by this are NOT user mints
-        // True mint = wallet was the FIRST EVER recipient of that token (not just from zero address).
+        // True mint = wallet was the FIRST EVER recipient of that token.
         // For OCAS, every token transfer comes from zero address (including secondary sales),
         // so we detect mints by checking if the wallet received the token before anyone else ever did.
-        // Burn survivors are excluded separately via burn_events.
+        // We do NOT exclude burn survivors here — a token you originally minted that later
+        // became a survivor still counts as a mint.
         const acquisitionRes = await pgPool.query(
           `SELECT
              COUNT(DISTINCT CASE
                WHEN is_first_recipient.token_id IS NOT NULL
-                AND wti.token_id NOT IN (
-                  SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
-                )
                THEN wti.token_id END) AS minted,
              COUNT(DISTINCT CASE
                WHEN is_first_recipient.token_id IS NULL
-                OR wti.token_id IN (
-                  SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
-                )
                THEN wti.id END)       AS bought_intervals,
              COALESCE(SUM(CASE
                WHEN is_first_recipient.token_id IS NULL
-                OR wti.token_id IN (
-                  SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
-                )
                THEN wti.cost_eth END), 0) AS total_buy_eth
            FROM wallet_token_intervals wti
            -- Check if wallet was the first-ever recipient of each token,
