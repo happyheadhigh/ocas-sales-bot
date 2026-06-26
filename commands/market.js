@@ -1920,9 +1920,13 @@ async function showMeWallet(interaction, ctx){
                THEN wti.cost_eth END), 0) AS total_buy_eth
            FROM wallet_token_intervals wti
            JOIN (
-             SELECT DISTINCT ON (token_id) token_id, from_address
-             FROM nft_transfers
-             ORDER BY token_id, block_number ASC, id ASC
+             SELECT DISTINCT ON (nt.token_id) nt.token_id, nt.from_address
+             FROM nft_transfers nt
+             JOIN wallet_token_intervals w2
+               ON w2.token_id = nt.token_id
+              AND w2.collection_slug = $2
+              AND LOWER(w2.wallet_address) = $1
+             ORDER BY nt.token_id, nt.block_number ASC, nt.id ASC
            ) first_tx ON first_tx.token_id = wti.token_id
            WHERE LOWER(wti.wallet_address) = $1
              AND wti.collection_slug = $2`,
