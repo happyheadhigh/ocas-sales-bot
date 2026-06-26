@@ -1891,43 +1891,43 @@ async function showMeWallet(interaction, ctx){
         // Bought = everything else acquired (secondary purchases)
         // Total ETH spent on buys = SUM(cost_eth) for non-minted acquired intervals
         // Burn contract address — survivors minted by this are NOT user mints
-        // True mint = first transfer from zero address AND token is not a burn survivor.
-        // Burn survivors are minted from zero address to the user's wallet by the burn
-        // contract — they look identical to real mints without the burn_events check.
+        // True mint = wallet was the FIRST EVER recipient of that token (not just from zero address).
+        // For OCAS, every token transfer comes from zero address (including secondary sales),
+        // so we detect mints by checking if the wallet received the token before anyone else ever did.
+        // Burn survivors are excluded separately via burn_events.
         const acquisitionRes = await pgPool.query(
           `SELECT
              COUNT(DISTINCT CASE
-               WHEN first_tx.from_address = '0x0000000000000000000000000000000000000000'
+               WHEN is_first_recipient.token_id IS NOT NULL
                 AND wti.token_id NOT IN (
                   SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
                 )
                THEN wti.token_id END) AS minted,
              COUNT(DISTINCT CASE
-               WHEN NOT (
-                 first_tx.from_address = '0x0000000000000000000000000000000000000000'
-                 AND wti.token_id NOT IN (
-                   SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
-                 )
-               )
+               WHEN is_first_recipient.token_id IS NULL
+                OR wti.token_id IN (
+                  SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
+                )
                THEN wti.id END)       AS bought_intervals,
              COALESCE(SUM(CASE
-               WHEN NOT (
-                 first_tx.from_address = '0x0000000000000000000000000000000000000000'
-                 AND wti.token_id NOT IN (
-                   SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
-                 )
-               )
+               WHEN is_first_recipient.token_id IS NULL
+                OR wti.token_id IN (
+                  SELECT survivor_token_id FROM burn_events WHERE survivor_token_id IS NOT NULL AND LOWER(burner_wallet) = $1
+                )
                THEN wti.cost_eth END), 0) AS total_buy_eth
            FROM wallet_token_intervals wti
-           JOIN (
-             SELECT DISTINCT ON (nt.token_id) nt.token_id, nt.from_address
+           -- Check if wallet was the first-ever recipient of each token
+           LEFT JOIN (
+             SELECT DISTINCT nt.token_id
              FROM nft_transfers nt
-             JOIN wallet_token_intervals w2
-               ON w2.token_id = nt.token_id
-              AND w2.collection_slug = $2
-              AND LOWER(w2.wallet_address) = $1
-             ORDER BY nt.token_id, nt.block_number ASC, nt.id ASC
-           ) first_tx ON first_tx.token_id = wti.token_id
+             WHERE LOWER(nt.to_address) = $1
+             AND NOT EXISTS (
+               SELECT 1 FROM nft_transfers nt2
+               WHERE nt2.token_id = nt.token_id
+               AND (nt2.block_number < nt.block_number
+                 OR (nt2.block_number = nt.block_number AND nt2.id < nt.id))
+             )
+           ) is_first_recipient ON is_first_recipient.token_id = wti.token_id
            WHERE LOWER(wti.wallet_address) = $1
              AND wti.collection_slug = $2`,
           [wallet, col.slug]
