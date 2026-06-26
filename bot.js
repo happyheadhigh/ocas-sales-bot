@@ -132,7 +132,7 @@ function buildCtx(interaction, guildId, config, isAdmin){
 COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTERY_TIMEZONE,
     // Helpers
     osHeaders, getRailwayApiUrl, getRankTierColor, fetchBotApiJson, resolveDiscordChannel,
-    checkCommandCooldown, normalizeOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji,
+    checkCommandCooldown, normalizeOcasType, resolveOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji,
     API_SECRET, sendErrorWebhook,
     // DB
     pgPool, dbLoad, dbSave, getConfig, setConfig,
