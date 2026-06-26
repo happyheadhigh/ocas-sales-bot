@@ -291,6 +291,7 @@ const totalTokensBurned = burns.reduce((s,r)=>{
 
       // Oldest first (Burn 1 → Burn N), up to 10 most recent
       const displayBurns = burns.length > 10 ? burns.slice(burns.length - 10) : [...burns];
+      console.log('[DEBUG] displayBurns count:', displayBurns.length, 'burns[0].id:', burns[0]?.id);
 
       for(let i = 0; i < displayBurns.length; i++){
         const b = displayBurns[i];
