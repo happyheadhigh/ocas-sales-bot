@@ -12,7 +12,7 @@ async function handleBurnCommand(commandName, ctx){
     COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, DEFAULT_LOTTERY_TIMEZONE,
     slideshowSessions, burnRpc, burnRpcUrl,
     triggerOsMetadataRefresh, buildBurnEmbed, upsertTokenTraitRows,
-    normalizeOcasType, E1_TYPE_NAMES,
+    normalizeOcasType, resolveOcasType, E1_TYPE_NAMES,
     buildBurnLotteryEmbed, buildActiveBurnLotteryComponents,
     getBurnLotteryEntries, drawAndPostBurnLottery,
     processDueBurnLotteries, buildBurnLotteryComponents,
@@ -320,7 +320,7 @@ const totalTokensBurned = burns.reduce((s,r)=>{
           ).catch(()=>({rows:[]}));
           if(bss.rows[0]?.traits_json){
             const tj = typeof bss.rows[0].traits_json==='string' ? JSON.parse(bss.rows[0].traits_json) : bss.rows[0].traits_json;
-            seedType = normalizeOcasType(tj?.Type || tj?.type || null);
+            seedType = resolveOcasType(tj?.Type || tj?.type || null);
           }
           // Fall back to original mint snapshot
           if(!seedType){
@@ -329,7 +329,7 @@ const totalTokensBurned = burns.reduce((s,r)=>{
             ).catch(()=>({rows:[]}));
             if(tos.rows[0]?.traits_json){
               const tj = typeof tos.rows[0].traits_json==='string' ? JSON.parse(tos.rows[0].traits_json) : tos.rows[0].traits_json;
-              seedType = normalizeOcasType(tj?.Type || tj?.type || null);
+              seedType = resolveOcasType(tj?.Type || tj?.type || null);
             }
           }
         } catch(_){}
