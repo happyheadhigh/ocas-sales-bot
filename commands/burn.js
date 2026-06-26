@@ -311,14 +311,18 @@ const totalTokensBurned = burns.reduce((s,r)=>{
         try {
           if(burnNum === 1){
             const snapRow = await pgPool.query(
-              `SELECT traits_json->'Type' as type FROM token_original_snapshots WHERE token_id=$1`,
+              `SELECT traits_json->>'Type' as type FROM token_original_snapshots WHERE token_id=$1`,
               [tokenInput]
             );
             if(snapRow.rows[0]?.type){
-              const raw = typeof snapRow.rows[0].type === 'string'
-                ? snapRow.rows[0].type.replace(/^"|"$/g,'')
-                : String(snapRow.rows[0].type);
-              seedType = normalizeOcasType(raw);
+              const raw = snapRow.rows[0].type;
+              // May be a numeric body type index or a string name
+              const numericType = parseInt(raw);
+              if(!isNaN(numericType) && E1_TYPE_NAMES?.[numericType]){
+                seedType = normalizeOcasType(E1_TYPE_NAMES[numericType]);
+              } else {
+                seedType = normalizeOcasType(raw);
+              }
             }
           } else {
             const prevBurn = burns[burns.indexOf(b) - 1];
@@ -340,7 +344,7 @@ const totalTokensBurned = burns.reduce((s,r)=>{
         const tokensStr = seedType ? `${tokensStr_base} (+ 1x ${seedType})` : tokensStr_base;
         const fieldVal = [
           `**Burner:** [${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`,
-          `**Tokens:** ${tokensStr}`,
+          `**Tokens Burned:** ${tokensStr}`,
           `**Points:** ${b.points_used||0}`,
         ].join('\n');
         embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:true });
