@@ -365,7 +365,8 @@ const totalTokensBurned = burns.reduce((s,r)=>{
             ).catch(()=>({rows:[]}));
             if(s5.rows[0]?.trait_value) seedType = normalizeOcasType(s5.rows[0].trait_value);
           }
-        } catch(_){}
+        } catch(seedErr){ console.warn('[SeedType] error:', seedErr.message); }
+        console.log('[SeedType] burn', burnNum, 'token', tokenInput, '=> seedType:', seedType);
 
         const tokensStr = seedType ? `${tokensStr_base} (+ 1x ${seedType})` : tokensStr_base;
         const fieldVal = [
