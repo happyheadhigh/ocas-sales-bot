@@ -304,31 +304,44 @@ const totalTokensBurned = burns.reduce((s,r)=>{
         
         
       const tokenTypes = await burnTypeBreakdown(consumedIds, b.id).catch(()=>String(consumedIds.length || '?'));
-      const tokensStr = tokenTypes.replace(/^\d+/, String(consumedIds.length));
-        // For burn 1 in the full chain, show original mint type
-        let preBurnNote = '';
-        if(burnNum === 1){
-          try{
+      const tokensStr_base = tokenTypes.replace(/^\d+/, String(consumedIds.length));
+
+        // Get seed type (token's type at time of this burn) for parenthetical display
+        let seedType = null;
+        try {
+          if(burnNum === 1){
             const snapRow = await pgPool.query(
-              `SELECT traits_json->'Type' as type FROM token_original_snapshots
-               WHERE token_id=$1`,
+              `SELECT traits_json->'Type' as type FROM token_original_snapshots WHERE token_id=$1`,
               [tokenInput]
             );
             if(snapRow.rows[0]?.type){
               const raw = typeof snapRow.rows[0].type === 'string'
                 ? snapRow.rows[0].type.replace(/^"|"$/g,'')
                 : String(snapRow.rows[0].type);
-          const normalizedType = normalizeOcasType(raw);
-            preBurnNote = normalizedType && !/nan/i.test(String(normalizedType))
-            ? ` · was ${normalizedType}`
-            : '';
+              seedType = normalizeOcasType(raw);
             }
-          }catch(_){}
-        }
+          } else {
+            const prevBurn = burns[burns.indexOf(b) - 1];
+            if(prevBurn?.id){
+              const snapRow = await pgPool.query(
+                `SELECT traits_json FROM burn_state_snapshots
+                 WHERE token_id=$1 AND burn_event_id=$2`,
+                [tokenInput, prevBurn.id]
+              );
+              if(snapRow.rows[0]?.traits_json){
+                const tj = typeof snapRow.rows[0].traits_json === 'string'
+                  ? JSON.parse(snapRow.rows[0].traits_json) : snapRow.rows[0].traits_json;
+                seedType = normalizeOcasType(tj?.Type || tj?.type || null);
+              }
+            }
+          }
+        } catch(_){}
+
+        const tokensStr = seedType ? `${tokensStr_base} (+ 1x ${seedType})` : tokensStr_base;
         const fieldVal = [
           `**Burner:** [${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`,
           `**Tokens:** ${tokensStr}`,
-          `**Points:** ${b.points_used||0}${preBurnNote}`,
+          `**Points:** ${b.points_used||0}`,
         ].join('\n');
         embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:true });
       }
