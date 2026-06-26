@@ -315,14 +315,7 @@ const totalTokensBurned = burns.reduce((s,r)=>{
               [tokenInput]
             );
             if(snapRow.rows[0]?.type){
-              const raw = snapRow.rows[0].type;
-              // May be a numeric body type index or a string name
-              const numericType = parseInt(raw);
-              if(!isNaN(numericType) && E1_TYPE_NAMES?.[numericType]){
-                seedType = normalizeOcasType(E1_TYPE_NAMES[numericType]);
-              } else {
-                seedType = normalizeOcasType(raw);
-              }
+              seedType = normalizeOcasType(snapRow.rows[0].type);
             }
           } else {
             const prevBurn = burns[burns.indexOf(b) - 1];
