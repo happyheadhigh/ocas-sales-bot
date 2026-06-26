@@ -1916,13 +1916,21 @@ async function showMeWallet(interaction, ctx){
                 )
                THEN wti.cost_eth END), 0) AS total_buy_eth
            FROM wallet_token_intervals wti
-           -- Check if wallet was the first-ever recipient of each token
+           -- Check if wallet was the first-ever recipient of each token,
+           -- scoped to this collection via wti join to avoid cross-collection token ID collisions
            LEFT JOIN (
              SELECT DISTINCT nt.token_id
              FROM nft_transfers nt
+             JOIN wallet_token_intervals w2
+               ON w2.token_id = nt.token_id
+              AND w2.collection_slug = $2
+              AND LOWER(w2.wallet_address) = $1
              WHERE LOWER(nt.to_address) = $1
              AND NOT EXISTS (
                SELECT 1 FROM nft_transfers nt2
+               JOIN wallet_token_intervals w3
+                 ON w3.token_id = nt2.token_id
+                AND w3.collection_slug = $2
                WHERE nt2.token_id = nt.token_id
                AND (nt2.block_number < nt.block_number
                  OR (nt2.block_number = nt.block_number AND nt2.id < nt.id))
