@@ -2213,24 +2213,31 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     : '';
 
   // Get token image from snapshots — handle SVG (OCAS on-chain) and HTTP URLs
+  // Try tokens table image_url first (stored during backfill for all collections)
+  const tokenImgRes = await pgPool.query(
+    `SELECT image_url FROM tokens WHERE id=$1 AND (collection_slug=$2 OR collection_slug IS NULL)`,
+    [tokenId, slug]
+  ).catch(()=>({ rows: [] }));
+  const tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
+
+  // Fall back to token_image_snapshots (OCAS on-chain SVG)
   const imgRes = await pgPool.query(
-    `SELECT image_data, source FROM token_image_snapshots WHERE token_id=$1
-     ORDER BY burn_event_id DESC NULLS LAST LIMIT 1`,
+    `SELECT image_data FROM token_image_snapshots WHERE token_id=$1 LIMIT 1`,
     [tokenId]
-  ).catch(e => { console.warn('[TokenDetail imgQuery]', e.message); return { rows: [] }; });
-  console.log('[TokenDetail imgQuery] rows:', imgRes.rows.length, 'source:', imgRes.rows[0]?.source, 'has_data:', !!imgRes.rows[0]?.image_data);
+  ).catch(()=>({ rows: [] }));
   const imgData = imgRes.rows[0]?.image_data || null;
+
   let imageResult = null;
-  if(imgData){
+  if(tokenImgUrl && isDiscordOk(tokenImgUrl)){
+    imageResult = { type: 'url', url: tokenImgUrl };
+  } else if(imgData){
     if(imgData.startsWith('http') && isDiscordOk(imgData)){
       imageResult = { type: 'url', url: imgData };
     } else if(imgData.startsWith('<svg') || imgData.startsWith('data:image/svg') || imgData.toLowerCase().includes('image/svg')){
-      const buf = await extractPngFromSvg(imgData).catch(e => { console.warn('[TokenDetail image]', e.message); return null; });
-      console.log('[TokenDetail image] buf:', buf ? 'got buffer' : 'null', 'imgData starts:', imgData.slice(0,30));
+      const buf = await extractPngFromSvg(imgData).catch(()=>null);
       if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
     }
   }
-  console.log('[TokenDetail image] imageResult type:', imageResult?.type || 'none');
 
   // Top trait floor — find the rarest trait and its cheapest listing
   const topTraitRes = await pgPool.query(
