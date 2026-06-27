@@ -2164,8 +2164,12 @@ async function showMeTokens(interaction, ctx, slug, page = 0){
 async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const { pgPool, getRailwayApiUrl } = ctx;
   const userId = interaction.user.id;
-  const updateFn = interaction.deferred || interaction.replied ? 'editReply'
-    : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
+
+  // Defer immediately — SVG→PNG rendering can exceed Discord's 3s window
+  if(!interaction.deferred && !interaction.replied){
+    await interaction.deferUpdate().catch(()=>interaction.deferReply({ ephemeral: true }).catch(()=>{}));
+  }
+  const updateFn = 'editReply';
 
   const reg = await pgPool.query(
     `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
