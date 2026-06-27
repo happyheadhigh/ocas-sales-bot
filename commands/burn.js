@@ -334,7 +334,14 @@ const totalTokensBurned = burns.reduce((s,r)=>{
           }
         } catch(_){}
 
-        const tokensStr = seedType ? `${tokensStr_base} (+ 1x ${seedType})` : tokensStr_base;
+        // Only show parenthetical when seed type differs from the burned token types
+        const tokensStr = (() => {
+          if(!seedType) return tokensStr_base;
+          const burnedTypes = tokensStr_base.toLowerCase();
+          const seedLower = seedType.toLowerCase();
+          const sameType = burnedTypes.includes(seedLower) && !burnedTypes.includes(',');
+          return sameType ? tokensStr_base : `${tokensStr_base} (+ 1x ${seedType})`;
+        })();
         const fieldVal = [
           `**Burner:** [${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`,
           `**Tokens Burned:** ${tokensStr}`,
