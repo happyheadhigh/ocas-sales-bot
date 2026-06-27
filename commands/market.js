@@ -2037,12 +2037,281 @@ async function showMeWallet(interaction, ctx){
     .setColor(cols.some(c => c.unrealizedPnl > 0) ? 0x57F287 : 0x5865F2)
     .setDescription(lines.join('\n'));
 
-  return interaction[updateFn]({
-    embeds: [embed],
-    components: [new ActionRowBuilder().addComponents(
+  // Build collection token buttons (one per collection, up to 4)
+  const tokenBtns = cols.slice(0, 4).map(c =>
+    new ButtonBuilder()
+      .setCustomId(`me_browse:wallet:tokens:${c.slug}:0`)
+      .setLabel(`${c.name} tokens`)
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  const rows = [
+    new ActionRowBuilder().addComponents(...tokenBtns),
+    new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
-    )],
+    ),
+  ];
+
+  return interaction[updateFn]({ embeds: [embed], components: rows });
+}
+
+// ── showMeTokens — token dropdown for a collection ────────────────────────────
+async function showMeTokens(interaction, ctx, slug, page = 0){
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+  const updateFn = interaction.deferred || interaction.replied ? 'editReply'
+    : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
+
+  // Get wallet
+  const reg = await pgPool.query(
+    `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+    [userId]
+  ).catch(()=>null);
+  const wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
+  if(!wallet) return interaction[updateFn]({ content: '❌ No wallet linked.', components: [] });
+
+  // Get collection name
+  const cfgRow = await pgPool.query(
+    `SELECT name FROM server_configs WHERE guild_id=$1`,
+    [interaction.guildId]
+  ).catch(()=>null);
+
+  // Fetch all held tokens for this collection with P&L data
+  const tokensRes = await pgPool.query(
+    `SELECT wti.token_id, wti.cost_eth, wti.acquired_at,
+            tt.trait_value AS type_trait
+     FROM wallet_token_intervals wti
+     LEFT JOIN token_traits tt ON tt.token_id = wti.token_id
+       AND (tt.collection_slug = $2 OR tt.collection_slug IS NULL)
+       AND LOWER(tt.trait_name) = 'type'
+     WHERE LOWER(wti.wallet_address) = $1
+       AND wti.collection_slug = $2
+       AND wti.disposed_at IS NULL
+     ORDER BY wti.token_id ASC`,
+    [wallet, slug]
+  ).catch(()=>({ rows: [] }));
+
+  if(!tokensRes.rows.length){
+    return interaction[updateFn]({ content: `No held tokens found for **${slug}**.`, components: [] });
+  }
+
+  // Get listings for est value per token (trait sweep)
+  const tokenIds = tokensRes.rows.map(r => r.token_id);
+  const listingsRes = await pgPool.query(
+    `SELECT token_id, price_eth FROM listings WHERE collection_slug=$1 AND token_id = ANY($2)`,
+    [slug, tokenIds]
+  ).catch(()=>({ rows: [] }));
+  const listingMap = {};
+  for(const r of listingsRes.rows) listingMap[r.token_id] = parseFloat(r.price_eth);
+
+  // Build token list with P&L, sorted by unrealized P&L desc
+  const tokens = tokensRes.rows.map(r => {
+    const cost = parseFloat(r.cost_eth || 0);
+    const estVal = listingMap[r.token_id] || null;
+    const unrealized = (estVal && cost > 0) ? estVal - cost : null;
+    const pct = (unrealized !== null && cost > 0) ? ((unrealized / cost) * 100).toFixed(0) : null;
+    return { tokenId: r.token_id, cost, estVal, unrealized, pct, typeLabel: r.type_trait || '' };
+  }).sort((a, b) => (b.unrealized || 0) - (a.unrealized || 0));
+
+  // Paginate — 25 per page
+  const PAGE_SIZE = 25;
+  const totalPages = Math.ceil(tokens.length / PAGE_SIZE);
+  const pageTokens = tokens.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  // Build dropdown options
+  const options = pageTokens.map(t => {
+    const pctStr = t.pct !== null ? ` · ${t.unrealized >= 0 ? '+' : ''}${t.pct}%` : '';
+    const typeStr = t.typeLabel ? ` · ${t.typeLabel}` : '';
+    const label = `#${t.tokenId}${typeStr}${pctStr}`.slice(0, 100);
+    return { label, value: `${t.tokenId}` };
+  });
+
+  const pageLabel = totalPages > 1 ? ` (${page * PAGE_SIZE + 1}–${Math.min((page + 1) * PAGE_SIZE, tokens.length)} of ${tokens.length})` : ` (${tokens.length} tokens)`;
+
+  const { StringSelectMenuBuilder } = require('discord.js');
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`me_browse:wallet:token_select:${slug}:${page}`)
+    .setPlaceholder(`Select a token...${pageLabel}`)
+    .addOptions(options);
+
+  const navBtns = [
+    new ButtonBuilder().setCustomId('me_browse:wallet').setLabel('← Portfolio').setStyle(ButtonStyle.Secondary),
+  ];
+  if(page > 0) navBtns.unshift(
+    new ButtonBuilder().setCustomId(`me_browse:wallet:tokens:${slug}:${page - 1}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary)
+  );
+  if(page < totalPages - 1) navBtns.push(
+    new ButtonBuilder().setCustomId(`me_browse:wallet:tokens:${slug}:${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary)
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🗂️ ${slug} — Your Tokens`)
+    .setColor(0x5865F2)
+    .setDescription(`Sorted by unrealized P&L. Select a token to view details.`);
+
+  return interaction[updateFn]({
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder().addComponents(select),
+      new ActionRowBuilder().addComponents(...navBtns),
+    ],
+  });
+}
+
+// ── showMeTokenDetail — full detail for a single held token ───────────────────
+async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
+  const { pgPool, getRailwayApiUrl } = ctx;
+  const userId = interaction.user.id;
+  const updateFn = interaction.deferred || interaction.replied ? 'editReply'
+    : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
+
+  const reg = await pgPool.query(
+    `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+    [userId]
+  ).catch(()=>null);
+  const wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
+  if(!wallet) return interaction[updateFn]({ content: '❌ No wallet linked.', components: [] });
+
+  // Get interval data for this token
+  const wtiRes = await pgPool.query(
+    `SELECT wti.token_id, wti.cost_eth, wti.acquired_at,
+            tt.trait_value AS type_trait
+     FROM wallet_token_intervals wti
+     LEFT JOIN token_traits tt ON tt.token_id = wti.token_id
+       AND (tt.collection_slug = $3 OR tt.collection_slug IS NULL)
+       AND LOWER(tt.trait_name) = 'type'
+     WHERE LOWER(wti.wallet_address) = $1
+       AND wti.collection_slug = $3
+       AND wti.token_id = $2
+       AND wti.disposed_at IS NULL`,
+    [wallet, tokenId, slug]
+  ).catch(()=>({ rows: [] }));
+
+  if(!wtiRes.rows.length){
+    return interaction[updateFn]({ content: `Token #${tokenId} not found in your holdings.`, components: [] });
+  }
+
+  const t = wtiRes.rows[0];
+  const cost = parseFloat(t.cost_eth || 0);
+
+  // Get listing price for this token
+  const listingRes = await pgPool.query(
+    `SELECT price_eth FROM listings WHERE collection_slug=$1 AND token_id=$2`,
+    [slug, tokenId]
+  ).catch(()=>({ rows: [] }));
+  const estVal = listingRes.rows[0]?.price_eth ? parseFloat(listingRes.rows[0].price_eth) : null;
+
+  const unrealized = (estVal && cost > 0) ? estVal - cost : null;
+  const pct = (unrealized !== null && cost > 0)
+    ? ` (${unrealized >= 0 ? '+' : ''}${((unrealized / cost) * 100).toFixed(0)}%)`
+    : '';
+
+  // Check if minted
+  const mintRes = await pgPool.query(
+    `SELECT COUNT(*) AS cnt FROM nft_transfers
+     WHERE token_id=$1
+       AND from_address='0x0000000000000000000000000000000000000000'
+       AND LOWER(to_address)=$2`,
+    [tokenId, wallet]
+  ).catch(()=>({ rows: [{ cnt: 0 }] }));
+  const isMinted = parseInt(mintRes.rows[0]?.cnt || 0) > 0;
+
+  // OCAS burn history
+  let burnLine = '';
+  if(slug === 'on-chain-all-stars'){
+    const burnRes = await pgPool.query(
+      `SELECT COUNT(*) AS cnt, SUM(points_used) AS pts
+       FROM burn_events WHERE survivor_token_id=$1`, [tokenId]
+    ).catch(()=>({ rows: [] }));
+    const burnCount = parseInt(burnRes.rows[0]?.cnt || 0);
+    const burnPts = parseInt(burnRes.rows[0]?.pts || 0);
+    if(burnCount > 0) burnLine = `🔥 Burn survivor · ${burnCount}x burned · ${burnPts} pts`;
+  }
+
+  // Get all held tokens for nav (same sorted list)
+  const allTokensRes = await pgPool.query(
+    `SELECT wti.token_id, wti.cost_eth,
+            l.price_eth
+     FROM wallet_token_intervals wti
+     LEFT JOIN listings l ON l.token_id = wti.token_id AND l.collection_slug = $2
+     WHERE LOWER(wti.wallet_address) = $1
+       AND wti.collection_slug = $2
+       AND wti.disposed_at IS NULL
+     ORDER BY wti.token_id ASC`,
+    [wallet, slug]
+  ).catch(()=>({ rows: [] }));
+
+  const sortedTokens = allTokensRes.rows.map(r => {
+    const c = parseFloat(r.cost_eth || 0);
+    const e = r.price_eth ? parseFloat(r.price_eth) : null;
+    return { tokenId: r.token_id, unrealized: (e && c > 0) ? e - c : null };
+  }).sort((a, b) => (b.unrealized || 0) - (a.unrealized || 0));
+
+  const currentIdx = sortedTokens.findIndex(r => r.tokenId == tokenId);
+  const prevToken = currentIdx > 0 ? sortedTokens[currentIdx - 1].tokenId : null;
+  const nextToken = currentIdx < sortedTokens.length - 1 ? sortedTokens[currentIdx + 1].tokenId : null;
+
+  // Rebuild dropdown for current page
+  const PAGE_SIZE = 25;
+  const totalPages = Math.ceil(sortedTokens.length / PAGE_SIZE);
+  const pageForToken = Math.floor(currentIdx / PAGE_SIZE);
+  const pageTokens = sortedTokens.slice(pageForToken * PAGE_SIZE, (pageForToken + 1) * PAGE_SIZE);
+
+  const { StringSelectMenuBuilder } = require('discord.js');
+  const options = pageTokens.map(r => ({
+    label: `#${r.tokenId}${r.unrealized !== null ? ` · ${r.unrealized >= 0 ? '+' : ''}${((r.unrealized / (parseFloat(allTokensRes.rows.find(x=>x.token_id==r.tokenId)?.cost_eth)||1))*100).toFixed(0)}%` : ''}`.slice(0,100),
+    value: `${r.tokenId}`,
+    default: r.tokenId == tokenId,
+  }));
+
+  const pageLabel = totalPages > 1 ? ` (${pageForToken * PAGE_SIZE + 1}–${Math.min((pageForToken+1)*PAGE_SIZE, sortedTokens.length)} of ${sortedTokens.length})` : ` (${sortedTokens.length} tokens)`;
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`me_browse:wallet:token_select:${slug}:${pageForToken}`)
+    .setPlaceholder(`Select a token...${pageLabel}`)
+    .addOptions(options);
+
+  // Nav buttons
+  const navBtns = [
+    new ButtonBuilder().setCustomId(`me_browse:wallet:tokens:${slug}:${pageForToken}`).setLabel('← Tokens').setStyle(ButtonStyle.Secondary),
+  ];
+  if(prevToken !== null) navBtns.push(
+    new ButtonBuilder().setCustomId(`me_browse:wallet:token_detail:${slug}:${prevToken}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary)
+  );
+  if(nextToken !== null) navBtns.push(
+    new ButtonBuilder().setCustomId(`me_browse:wallet:token_detail:${slug}:${nextToken}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary)
+  );
+
+  const typeLabel = t.type_trait ? `${t.type_trait} · ` : '';
+  const descLines = [
+    `**#${tokenId}** · ${typeLabel}${slug}`,
+    '',
+    `Cost: **Ξ ${cost > 0 ? cost.toFixed(4) : '—'}**`,
+    estVal ? `Est. Value: **Ξ ${estVal.toFixed(4)}**` : 'Est. Value: —',
+    unrealized !== null ? `Unrealized: **${unrealized >= 0 ? '+' : ''}Ξ ${Math.abs(unrealized).toFixed(4)}${pct}**` : '',
+    '',
+    isMinted ? '✨ Minted' : '🛒 Bought',
+    burnLine,
+  ].filter(Boolean).join('
+');
+
+  // Token image
+  const tvUrl = `https://traitview.com/token/${slug}/${tokenId}`;
+  const osUrl = `https://opensea.io/assets/ethereum/${slug}/${tokenId}`;
+  const embed = new EmbedBuilder()
+    .setTitle(`🔍 Token #${tokenId}`)
+    .setColor(unrealized !== null && unrealized >= 0 ? 0x57F287 : 0xED4245)
+    .setDescription(descLines)
+    .setURL(tvUrl)
+    .setThumbnail(`https://successful-healing-production-2f7e.up.railway.app/token-image/${slug}/${tokenId}`)
+    .setFooter({ text: `${currentIdx + 1} of ${sortedTokens.length} held tokens` });
+
+  return interaction[updateFn]({
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder().addComponents(select),
+      new ActionRowBuilder().addComponents(...navBtns),
+    ],
   });
 }
 
@@ -2333,6 +2602,31 @@ async function handleMeInteraction(interaction, ctx){
   // Direct wallet tab refresh
   if(customId === 'me_browse:wallet'){
     return showMeWallet(interaction, ctx);
+  }
+
+  // Token list dropdown for a collection
+  if(customId.startsWith('me_browse:wallet:tokens:')){
+    const parts = customId.split(':');
+    const slug = parts[4];
+    const page = parseInt(parts[5] || '0');
+    return showMeTokens(interaction, ctx, slug, page);
+  }
+
+  // Token selected from dropdown
+  if(customId.startsWith('me_browse:wallet:token_select:')){
+    const parts = customId.split(':');
+    const slug = parts[4];
+    const page = parseInt(parts[5] || '0');
+    const tokenId = parseInt(interaction.values[0]);
+    return showMeTokenDetail(interaction, ctx, slug, tokenId, page);
+  }
+
+  // Token detail via prev/next nav
+  if(customId.startsWith('me_browse:wallet:token_detail:')){
+    const parts = customId.split(':');
+    const slug = parts[4];
+    const tokenId = parseInt(parts[5]);
+    return showMeTokenDetail(interaction, ctx, slug, tokenId);
   }
 }
 
