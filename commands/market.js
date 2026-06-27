@@ -2606,16 +2606,16 @@ async function handleMeInteraction(interaction, ctx){
   // Token list dropdown for a collection
   if(customId.startsWith('me_browse:wallet:tokens:')){
     const parts = customId.split(':');
-    const slug = parts[4];
-    const page = parseInt(parts[5] || '0');
+    const slug = parts[3];
+    const page = parseInt(parts[4] || '0');
     return showMeTokens(interaction, ctx, slug, page);
   }
 
   // Token selected from dropdown
   if(customId.startsWith('me_browse:wallet:token_select:')){
     const parts = customId.split(':');
-    const slug = parts[4];
-    const page = parseInt(parts[5] || '0');
+    const slug = parts[3];
+    const page = parseInt(parts[4] || '0');
     const tokenId = parseInt(interaction.values[0]);
     return showMeTokenDetail(interaction, ctx, slug, tokenId, page);
   }
@@ -2623,8 +2623,8 @@ async function handleMeInteraction(interaction, ctx){
   // Token detail via prev/next nav
   if(customId.startsWith('me_browse:wallet:token_detail:')){
     const parts = customId.split(':');
-    const slug = parts[4];
-    const tokenId = parseInt(parts[5]);
+    const slug = parts[3];
+    const tokenId = parseInt(parts[4]);
     return showMeTokenDetail(interaction, ctx, slug, tokenId);
   }
 }
