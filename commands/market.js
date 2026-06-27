@@ -2224,10 +2224,12 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     if(imgData.startsWith('http') && isDiscordOk(imgData)){
       imageResult = { type: 'url', url: imgData };
     } else if(imgData.startsWith('<svg') || imgData.startsWith('data:image/svg') || imgData.toLowerCase().includes('image/svg')){
-      const buf = await extractPngFromSvg(imgData).catch(()=>null);
+      const buf = await extractPngFromSvg(imgData).catch(e => { console.warn('[TokenDetail image]', e.message); return null; });
+      console.log('[TokenDetail image] buf:', buf ? 'got buffer' : 'null', 'imgData starts:', imgData.slice(0,30));
       if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
     }
   }
+  console.log('[TokenDetail image] imageResult type:', imageResult?.type || 'none');
 
   // Top trait floor — find the rarest trait and its cheapest listing
   const topTraitRes = await pgPool.query(
