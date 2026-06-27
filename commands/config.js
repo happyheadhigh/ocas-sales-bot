@@ -1189,9 +1189,9 @@ async function handleConfigButton(interaction, ctx){
 
     await interaction.editReply({ content:`🔄 Re-backfilling **${col.name||col.slug}**... This may take a minute.`, embeds:[], components:[] });
 
-    // Run backfill fire-and-forget
-    const { maybeStartBackfill } = require('../lib/auto-backfill');
-    maybeStartBackfill(pgPool, { contract: col.contract, slug: col.slug })
+    // Run backfill directly — bypasses the "already backfilled" guard in maybeStartBackfill
+    const { backfillCollectionTraits } = require('../lib/collection-backfill');
+    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug })
       .then(stats => {
         interaction.followUp({ content:`✅ Re-backfill complete for **${col.name||col.slug}** — ${stats?.written||0} tokens updated.`, ephemeral: true }).catch(()=>{});
       })
