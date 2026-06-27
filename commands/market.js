@@ -3,6 +3,7 @@
 const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
 const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
+const { extractPngFromSvg } = require('../lib/images');
 
 /**
  * Handle market/NFT lookup commands.
@@ -2207,14 +2208,50 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     ? ` (${unrealized >= 0 ? '+' : ''}${((unrealized / cost) * 100).toFixed(0)}%)`
     : '';
 
-  // Get token image from snapshots
+  // Get token image from snapshots — handle SVG (OCAS on-chain) and HTTP URLs
   const imgRes = await pgPool.query(
     `SELECT image_data FROM token_image_snapshots WHERE token_id=$1
      ORDER BY burn_event_id DESC NULLS LAST LIMIT 1`,
     [tokenId]
   ).catch(()=>({ rows: [] }));
   const imgData = imgRes.rows[0]?.image_data || null;
-  const thumbnailUrl = (imgData && imgData.startsWith('http')) ? imgData : null;
+  let imageResult = null;
+  if(imgData){
+    if(imgData.startsWith('http') && isDiscordOk(imgData)){
+      imageResult = { type: 'url', url: imgData };
+    } else if(imgData.startsWith('<svg') || imgData.startsWith('data:image/svg') || imgData.toLowerCase().includes('image/svg')){
+      const buf = await extractPngFromSvg(imgData).catch(()=>null);
+      if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+    }
+  }
+
+  // Top trait floor — find the rarest trait and its cheapest listing
+  const topTraitRes = await pgPool.query(
+    `SELECT tt.trait_name, tt.trait_value,
+            MIN(l.price_eth) AS trait_floor,
+            COUNT(tt2.token_id) AS trait_count
+     FROM token_traits tt
+     JOIN token_traits tt2 ON tt2.trait_name = tt.trait_name
+       AND tt2.trait_value = tt.trait_value
+       AND (tt2.collection_slug = $2 OR tt2.collection_slug IS NULL)
+     JOIN listings l ON l.token_id = tt2.token_id AND l.collection_slug = $2
+     WHERE tt.token_id = $1
+       AND (tt.collection_slug = $2 OR tt.collection_slug IS NULL)
+       AND LOWER(tt.trait_name) NOT IN ('type','num tattoos','num jewellery','num clothes')
+     GROUP BY tt.trait_name, tt.trait_value
+     ORDER BY trait_count ASC, trait_floor ASC
+     LIMIT 1`,
+    [tokenId, slug]
+  ).catch(()=>({ rows: [] }));
+  const topTrait = topTraitRes.rows[0] || null;
+
+  // Collection floor as fallback for est value
+  const collFloorRes = await pgPool.query(
+    `SELECT MIN(price_eth) AS floor FROM listings WHERE collection_slug=$1`, [slug]
+  ).catch(()=>({ rows: [] }));
+  const collFloor = collFloorRes.rows[0]?.floor ? parseFloat(collFloorRes.rows[0].floor) : null;
+  const displayEst = estVal || collFloor;
+  const estLabel = estVal ? 'Est. Value' : 'Floor est.';
 
   // Check if minted
   const mintRes = await pgPool.query(
@@ -2292,12 +2329,18 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   );
 
   const typeLabel = t.type_trait ? `${t.type_trait} · ` : '';
+  const unrealizedDisplay = displayEst && cost > 0 ? displayEst - cost : null;
+  const pctDisplay = (unrealizedDisplay !== null && cost > 0)
+    ? ` (${unrealizedDisplay >= 0 ? '+' : ''}${((unrealizedDisplay / cost) * 100).toFixed(0)}%)`
+    : '';
+
   const descLines = [
     `**#${tokenId}** · ${typeLabel}${slug}`,
     '',
     `Cost: **Ξ ${cost > 0 ? cost.toFixed(4) : '—'}**`,
-    estVal ? `Est. Value: **Ξ ${estVal.toFixed(4)}**` : 'Est. Value: —',
-    unrealized !== null ? `Unrealized: **${unrealized >= 0 ? '+' : ''}Ξ ${Math.abs(unrealized).toFixed(4)}${pct}**` : '',
+    displayEst ? `${estLabel}: **Ξ ${displayEst.toFixed(4)}**` : 'Est. Value: —',
+    topTrait ? `Top trait: **${topTrait.trait_value}** · Ξ ${parseFloat(topTrait.trait_floor).toFixed(4)} floor` : '',
+    unrealizedDisplay !== null ? `Unrealized: **${unrealizedDisplay >= 0 ? '+' : ''}Ξ ${Math.abs(unrealizedDisplay).toFixed(4)}${pctDisplay}**` : '',
     '',
     isMinted ? '✨ Minted' : '🛒 Bought',
     burnLine,
@@ -2308,19 +2351,24 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const osUrl = `https://opensea.io/assets/ethereum/${slug}/${tokenId}`;
   const embed = new EmbedBuilder()
     .setTitle(`🔍 Token #${tokenId}`)
-    .setColor(unrealized !== null && unrealized >= 0 ? 0x57F287 : 0xED4245)
+    .setColor(unrealizedDisplay !== null && unrealizedDisplay >= 0 ? 0x57F287 : 0xED4245)
     .setDescription(descLines)
     .setURL(tvUrl)
     .setFooter({ text: `${currentIdx + 1} of ${sortedTokens.length} held tokens` });
-  if(thumbnailUrl) embed.setThumbnail(thumbnailUrl);
 
-  return interaction[updateFn]({
-    embeds: [embed],
-    components: [
-      new ActionRowBuilder().addComponents(select),
-      new ActionRowBuilder().addComponents(...navBtns),
-    ],
-  });
+  const components = [
+    new ActionRowBuilder().addComponents(select),
+    new ActionRowBuilder().addComponents(...navBtns),
+  ];
+
+  if(imageResult?.type === 'buffer'){
+    const att = new AttachmentBuilder(imageResult.buffer, { name: imageResult.filename });
+    embed.setThumbnail(`attachment://${imageResult.filename}`);
+    return interaction[updateFn]({ embeds: [embed], components, files: [att] });
+  } else {
+    if(imageResult?.type === 'url') embed.setThumbnail(imageResult.url);
+    return interaction[updateFn]({ embeds: [embed], components, files: [] });
+  }
 }
 
 // ── /me interaction handler ───────────────────────────────────────────────────
