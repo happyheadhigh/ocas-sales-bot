@@ -2086,7 +2086,7 @@ async function showMeTokens(interaction, ctx, slug, page = 0){
        AND (tt.collection_slug = $2 OR tt.collection_slug IS NULL)
        AND LOWER(tt.trait_name) = 'type'
      WHERE LOWER(wti.wallet_address) = $1
-       AND wti.collection_slug = $2
+       AND (wti.collection_slug = $2 OR wti.collection_slug IS NULL)
        AND wti.disposed_at IS NULL
      ORDER BY wti.token_id ASC`,
     [wallet, slug]
@@ -2173,7 +2173,7 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
   if(!wallet) return interaction[updateFn]({ content: '❌ No wallet linked.', components: [] });
 
-  // Get interval data for this token
+  // Get interval data for this token — use OR for collection_slug to handle NULL rows
   const wtiRes = await pgPool.query(
     `SELECT wti.token_id, wti.cost_eth, wti.acquired_at,
             tt.trait_value AS type_trait
@@ -2182,7 +2182,7 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
        AND (tt.collection_slug = $3 OR tt.collection_slug IS NULL)
        AND LOWER(tt.trait_name) = 'type'
      WHERE LOWER(wti.wallet_address) = $1
-       AND wti.collection_slug = $3
+       AND (wti.collection_slug = $3 OR wti.collection_slug IS NULL)
        AND wti.token_id = $2
        AND wti.disposed_at IS NULL`,
     [wallet, tokenId, slug]
@@ -2206,6 +2206,15 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const pct = (unrealized !== null && cost > 0)
     ? ` (${unrealized >= 0 ? '+' : ''}${((unrealized / cost) * 100).toFixed(0)}%)`
     : '';
+
+  // Get token image from snapshots
+  const imgRes = await pgPool.query(
+    `SELECT image_data FROM token_image_snapshots WHERE token_id=$1
+     ORDER BY id DESC LIMIT 1`,
+    [tokenId]
+  ).catch(()=>({ rows: [] }));
+  const imgData = imgRes.rows[0]?.image_data || null;
+  const thumbnailUrl = (imgData && imgData.startsWith('http')) ? imgData : null;
 
   // Check if minted
   const mintRes = await pgPool.query(
@@ -2236,7 +2245,7 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
      FROM wallet_token_intervals wti
      LEFT JOIN listings l ON l.token_id = wti.token_id AND l.collection_slug = $2
      WHERE LOWER(wti.wallet_address) = $1
-       AND wti.collection_slug = $2
+       AND (wti.collection_slug = $2 OR wti.collection_slug IS NULL)
        AND wti.disposed_at IS NULL
      ORDER BY wti.token_id ASC`,
     [wallet, slug]
@@ -2302,8 +2311,8 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     .setColor(unrealized !== null && unrealized >= 0 ? 0x57F287 : 0xED4245)
     .setDescription(descLines)
     .setURL(tvUrl)
-    .setThumbnail(`https://successful-healing-production-2f7e.up.railway.app/token-image/${slug}/${tokenId}`)
     .setFooter({ text: `${currentIdx + 1} of ${sortedTokens.length} held tokens` });
+  if(thumbnailUrl) embed.setThumbnail(thumbnailUrl);
 
   return interaction[updateFn]({
     embeds: [embed],
