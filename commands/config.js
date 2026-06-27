@@ -9,6 +9,7 @@ const {
 } = require('discord.js');
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
+const { OWNER_DISCORD_IDS } = require('../lib/constants');
 const { isPaidFeature } = require('./market');
 
 // ── Access control ────────────────────────────────────────────────────────────
@@ -233,6 +234,7 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
     new StringSelectMenuOptionBuilder().setLabel('Rank Alert').setEmoji('🏆').setValue('rankalert').setDescription(isOcas ? 'Alert when a rank range gets listed' : '🔒 Paid tier required'),
     new StringSelectMenuOptionBuilder().setLabel('Trait Roles').setEmoji('🎭').setValue('traitroles').setDescription('Auto-assign roles by trait'),
     new StringSelectMenuOptionBuilder().setLabel('Pause / Resume').setEmoji('⏸️').setValue('pause').setDescription('Toggle auto-posting'),
+    new StringSelectMenuOptionBuilder().setLabel('Re-backfill Traits').setEmoji('🔄').setValue('rebackfill').setDescription('Refresh trait & image data (paid · 24h cooldown)'),
   ];
   if(isOcas){
     options.push(new StringSelectMenuOptionBuilder().setLabel('Burn Alerts Channel').setEmoji('🔥').setValue('burnchan').setDescription('Where burn alerts post'));
@@ -659,6 +661,7 @@ async function handleConfigButton(interaction, ctx){
       rankalert:     `cfg:col:rankalert:${colId}`,
       traitroles:    `cfg:col:traitroles:${colId}`,
       pause:         `cfg:col:pause:${colId}`,
+      rebackfill:    `cfg:col:rebackfill:${colId}`,
     };
     if(section === 'rankalert'){
       const preCfg = getConfig(guildId) || {};
@@ -1137,6 +1140,66 @@ async function handleConfigButton(interaction, ctx){
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     const status = col.paused ? '⏸️ Paused' : '▶️ Resumed';
     return interaction.editReply({ content:`${status} for ${col.name||col.slug}.`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+  }
+
+  // ── Re-backfill traits (admin only, paid tier, 24h cooldown) ────────────────
+  if(customId.startsWith('cfg:col:rebackfill:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName }
+      : (cfg.collections||[])[parseInt(colId)];
+    if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
+
+    // Admin only
+    const member = await interaction.guild?.members.fetch(interaction.user.id).catch(()=>null);
+    const isAdmin = OWNER_DISCORD_IDS.includes(interaction.user.id)
+      || member?.permissions?.has('Administrator')
+      || member?.permissions?.has('ManageGuild');
+    if(!isAdmin){
+      return interaction.editReply({ content:'🔒 Re-backfill requires Administrator or Manage Server permission.', embeds:[], components:[] });
+    }
+
+    // Paid tier check (OCAS always free)
+    const isOcasCol = col.contract?.toLowerCase() === OCAS_CONTRACT;
+    if(!isOcasCol && isPaidFeature(col, 'rebackfill', interaction.user.id)){
+      return interaction.editReply({ content:'🔒 Re-backfill is a paid tier feature for non-OCAS collections.', embeds:[], components:[] });
+    }
+
+    // 24h cooldown — stored in collection config
+    const now = Date.now();
+    const COOLDOWN_MS = 24 * 60 * 60 * 1000;
+    const lastRun = col.last_backfilled_at ? new Date(col.last_backfilled_at).getTime() : 0;
+    if(now - lastRun < COOLDOWN_MS){
+      const nextRun = new Date(lastRun + COOLDOWN_MS);
+      const hrs = Math.ceil((nextRun - now) / 3600000);
+      return interaction.editReply({ content:`⏳ Re-backfill is on cooldown. Available again in **${hrs}h**.`, embeds:[], components:[] });
+    }
+
+    // Store timestamp before running
+    if(isPrimary){
+      cfg.last_backfilled_at = new Date().toISOString();
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]) cols[idx].last_backfilled_at = new Date().toISOString();
+      cfg.collections = cols;
+    }
+    await setConfig(guildId, cfg);
+
+    await interaction.editReply({ content:`🔄 Re-backfilling **${col.name||col.slug}**... This may take a minute.`, embeds:[], components:[] });
+
+    // Run backfill fire-and-forget
+    const { maybeStartBackfill } = require('../lib/auto-backfill');
+    maybeStartBackfill(pgPool, { contract: col.contract, slug: col.slug })
+      .then(stats => {
+        interaction.followUp({ content:`✅ Re-backfill complete for **${col.name||col.slug}** — ${stats?.written||0} tokens updated.`, ephemeral: true }).catch(()=>{});
+      })
+      .catch(e => {
+        console.error('[Config rebackfill]', e.message);
+        interaction.followUp({ content:`❌ Re-backfill failed: ${e.message}`, ephemeral: true }).catch(()=>{});
+      });
+    return;
   }
 
   if(customId.startsWith('cfg:col:remove:')){
