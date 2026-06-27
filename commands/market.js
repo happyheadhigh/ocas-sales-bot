@@ -2292,8 +2292,7 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     '',
     isMinted ? '✨ Minted' : '🛒 Bought',
     burnLine,
-  ].filter(Boolean).join('
-');
+  ].filter(Boolean).join('\n');
 
   // Token image
   const tvUrl = `https://traitview.com/token/${slug}/${tokenId}`;
