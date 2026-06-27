@@ -4,6 +4,7 @@ const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, Button
 const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
 const { extractPngFromSvg } = require('../lib/images');
+const { isDiscordOk } = require('../utils/format');
 
 /**
  * Handle market/NFT lookup commands.
