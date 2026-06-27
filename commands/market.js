@@ -2210,7 +2210,7 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   // Get token image from snapshots
   const imgRes = await pgPool.query(
     `SELECT image_data FROM token_image_snapshots WHERE token_id=$1
-     ORDER BY id DESC LIMIT 1`,
+     ORDER BY burn_event_id DESC NULLS LAST LIMIT 1`,
     [tokenId]
   ).catch(()=>({ rows: [] }));
   const imgData = imgRes.rows[0]?.image_data || null;
