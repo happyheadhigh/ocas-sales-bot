@@ -2214,10 +2214,11 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
 
   // Get token image from snapshots — handle SVG (OCAS on-chain) and HTTP URLs
   const imgRes = await pgPool.query(
-    `SELECT image_data FROM token_image_snapshots WHERE token_id=$1
+    `SELECT image_data, source FROM token_image_snapshots WHERE token_id=$1
      ORDER BY burn_event_id DESC NULLS LAST LIMIT 1`,
     [tokenId]
-  ).catch(()=>({ rows: [] }));
+  ).catch(e => { console.warn('[TokenDetail imgQuery]', e.message); return { rows: [] }; });
+  console.log('[TokenDetail imgQuery] rows:', imgRes.rows.length, 'source:', imgRes.rows[0]?.source, 'has_data:', !!imgRes.rows[0]?.image_data);
   const imgData = imgRes.rows[0]?.image_data || null;
   let imageResult = null;
   if(imgData){
