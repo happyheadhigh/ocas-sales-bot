@@ -1153,7 +1153,7 @@ async function handleConfigButton(interaction, ctx){
 
     // Admin only
     const member = await interaction.guild?.members.fetch(interaction.user.id).catch(()=>null);
-    const isAdmin = OWNER_DISCORD_IDS.includes(interaction.user.id)
+    const isAdmin = OWNER_DISCORD_IDS.has(String(interaction.user.id))
       || member?.permissions?.has('Administrator')
       || member?.permissions?.has('ManageGuild');
     if(!isAdmin){
