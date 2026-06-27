@@ -1166,14 +1166,17 @@ async function handleConfigButton(interaction, ctx){
       return interaction.editReply({ content:'🔒 Re-backfill is a paid tier feature for non-OCAS collections.', embeds:[], components:[] });
     }
 
-    // 24h cooldown — stored in collection config
-    const now = Date.now();
-    const COOLDOWN_MS = 24 * 60 * 60 * 1000;
-    const lastRun = col.last_backfilled_at ? new Date(col.last_backfilled_at).getTime() : 0;
-    if(now - lastRun < COOLDOWN_MS){
-      const nextRun = new Date(lastRun + COOLDOWN_MS);
-      const hrs = Math.ceil((nextRun - now) / 3600000);
-      return interaction.editReply({ content:`⏳ Re-backfill is on cooldown. Available again in **${hrs}h**.`, embeds:[], components:[] });
+    // 24h cooldown — stored in collection config (bypassed for bot owner)
+    const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+    if(!isOwner){
+      const now = Date.now();
+      const COOLDOWN_MS = 24 * 60 * 60 * 1000;
+      const lastRun = col.last_backfilled_at ? new Date(col.last_backfilled_at).getTime() : 0;
+      if(now - lastRun < COOLDOWN_MS){
+        const nextRun = new Date(lastRun + COOLDOWN_MS);
+        const hrs = Math.ceil((nextRun - now) / 3600000);
+        return interaction.editReply({ content:`⏳ Re-backfill is on cooldown. Available again in **${hrs}h**.`, embeds:[], components:[] });
+      }
     }
 
     // Store timestamp before running
