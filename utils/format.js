@@ -89,13 +89,24 @@ function burnLotteryWindowStatusLine(row){
 function isSvg(url){
   if(!url) return false;
   const s = String(url).trim();
-  return s.startsWith('<svg') || s.startsWith('data:image/svg') || s.includes('image/svg');
+  // Detects SVG content or SVG URLs — used for rendering decisions
+  return s.startsWith('<svg') || s.startsWith('data:image/svg') || s.toLowerCase().endsWith('.svg') || s.includes('image/svg');
 }
 
 function isDiscordOk(url){
-  if(!url || isSvg(url)) return false;
+  if(!url) return false;
   const s = url.toLowerCase();
-  return (s.startsWith('http://') || s.startsWith('https://')) && !s.startsWith('data:');
+  if(!s.startsWith('http://') && !s.startsWith('https://')) return false;
+  if(s.startsWith('data:')) return false;
+  // Block raw SVG markup but allow HTTPS .svg URLs from known CDNs that Discord can render
+  if(s.startsWith('<svg') || s.includes('data:image/svg') || s.includes('image/svg')) return false;
+  // Block raw .svg URLs that OpenSea serves (Discord cannot render them) but allow
+  // Alchemy CDN and seadn which serve pre-rendered images even if URL ends in .svg
+  if(s.endsWith('.svg')){
+    if(s.includes('nft2-cdn.alchemy.com') || s.includes('nft3-cdn.alchemy.com')) return true;
+    return false;
+  }
+  return true;
 }
 
 // ── Trait filter matching ─────────────────────────────────────────────────────
