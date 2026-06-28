@@ -324,7 +324,7 @@ async function handleMarketCommand(commandName, ctx){
 
   // /debuglisting
   if(commandName==='debuglisting'){
-    if(!isAdmin) return interaction.reply({content:'❌ Admin only.', flags: MessageFlags.Ephemeral});
+    if(!OWNER_DISCORD_IDS.has(String(interaction.user.id))) return interaction.reply({content:'❌ Owner only.', flags: MessageFlags.Ephemeral});
     const slug=interaction.options.getString('collection')||config.slug;
     if(!slug) return interaction.reply({content:'Provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply({ephemeral:true});
