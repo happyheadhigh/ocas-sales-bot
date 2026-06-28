@@ -10,7 +10,9 @@ const PAGE  = 5; // rows per page
 // Cancel controls only show for Manage Server admins or the guild's configured
 // Bot Manager role — same gate used by /config and /setup.
 const { PermissionFlagsBits } = require('discord.js');
+const { OWNER_DISCORD_IDS } = require('../lib/constants');
 function hasLotteryAdminAccess(interaction, cfg){
+  if(OWNER_DISCORD_IDS.has(String(interaction.user.id))) return true;
   if(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return true;
   const managerRoleId = cfg?.botManagerRoleId;
   if(managerRoleId && interaction.member?.roles?.cache?.has(managerRoleId)) return true;
