@@ -1160,8 +1160,12 @@ async function handleConfigButton(interaction, ctx){
     const col = isPrimary
       ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, animated: cfg.animated }
       : (cfg.collections||[])[parseInt(colId)];
-    const status = col?.animated ? '🎞️ Animated ON' : '🖼️ Static';
-    return interaction.editReply({ content:`${status} for **${col?.name||col?.slug}**. Token thumbnails will use ${col?.animated ? 'animated (OpenSea)' : 'static (cached)'} images.`, embeds:[], components:[] });
+    const isOcasCol = col?.contract?.toLowerCase() === OCAS_CONTRACT;
+    return interaction.editReply({
+      content: `${col?.animated ? '🎞️ Animated ON' : '🖼️ Static'} for **${col?.name||col?.slug}**.`,
+      embeds: [buildCollectionEditEmbed(col, isPrimary, isOcasCol)],
+      components: collectionEditRow(colId, isPrimary, isOcasCol)
+    });
   }
 
   // ── Re-backfill traits (admin only, paid tier, 24h cooldown) ────────────────
