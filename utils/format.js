@@ -89,7 +89,7 @@ function burnLotteryWindowStatusLine(row){
 function isSvg(url){
   if(!url) return false;
   const s = String(url).trim();
-  return s.startsWith('<svg') || s.startsWith('data:image/svg') || s.toLowerCase().endsWith('.svg') || s.includes('image/svg');
+  return s.startsWith('<svg') || s.startsWith('data:image/svg') || s.includes('image/svg');
 }
 
 function isDiscordOk(url){
