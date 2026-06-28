@@ -7,12 +7,13 @@ const {
   ModalBuilder, TextInputBuilder, TextInputStyle,
   MessageFlags, PermissionFlagsBits,
 } = require('discord.js');
-const { ALCHEMY_KEY } = require('../lib/constants');
+const { ALCHEMY_KEY, OWNER_DISCORD_IDS } = require('../lib/constants');
 
 // ── Access control ────────────────────────────────────────────────────────────
 // Same gate as /config, /setup: Manage Server permission, or the guild's
 // configured Bot Manager role.
 function hasGiveawayAccess(interaction, cfg){
+  if(OWNER_DISCORD_IDS.has(String(interaction.user.id))) return true;
   if(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return true;
   const managerRoleId = cfg?.botManagerRoleId;
   if(managerRoleId && interaction.member?.roles?.cache?.has(managerRoleId)) return true;
