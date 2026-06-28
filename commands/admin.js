@@ -48,6 +48,7 @@ async function handleAdminCommand(commandName, ctx){
   }
 
   if(commandName === 'status'){
+    if(!isAdmin) return interaction.reply({ content: 'Need Manage Server permission.', flags: MessageFlags.Ephemeral });
     const fmtFilter = f => Object.keys(f || {}).length === 0
       ? 'none'
       : Object.entries(f).map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(' OR ') : v}`).join(', ');
