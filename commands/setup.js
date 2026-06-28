@@ -120,17 +120,18 @@ function buildWelcomeEmbed(){
 function buildCollectionEmbed(state){
   const cfg = state.config;
   const hasC = !!cfg.contract;
+  const slugLine = cfg.collectionSlug ? `🔗 **Slug:** \`${cfg.collectionSlug}\`\n` : '⚠️ **Slug:** Not set — trait search & token thumbnails won\'t work\n';
   return new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle('📦 Collection')
     .setDescription(
       stepBar(2, 6) + '\n' + SEP + '\n\n' +
-      'Enter your NFT contract address so the bot knows which collection to track.\n\n' +
+      'Enter your NFT contract address and OpenSea collection slug.\n\n' +
       (hasC
         ? `✅ **Contract:** \`${cfg.contract}\`\n` +
-          (cfg.isOcas ? '🔥 **OCAS detected** — full feature set unlocked!\n' : `📁 **Name:** ${cfg.contractName || 'Custom collection'}\n`)
+          (cfg.isOcas ? '🔥 **OCAS detected** — full feature set unlocked!\n' : `📁 **Name:** ${cfg.contractName || 'Custom collection'}\n` + slugLine)
         : '❌ No contract set yet.\n') +
-      '\n*Tip: Your contract address starts with `0x` and is 42 characters long.*'
+      '\n*Find the slug in your OpenSea collection URL: opensea.io/collection/**your-slug***'
     )
     .setFooter({ text: 'Only visible to you' });
 }
@@ -417,13 +418,21 @@ async function handleSetupButton(interaction, ctx){
 
   // ── contract modal ─────────────────────────────────────────────────────────
   if(customId === 'setup:contract'){
-    const modal = new ModalBuilder().setCustomId('setup_modal:contract').setTitle('Enter Contract Address');
-    modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId('contract_input').setLabel('NFT Contract Address (0x...)')
-        .setStyle(TextInputStyle.Short).setPlaceholder('0x078be86f3104a32313a47815792230a3808642cc')
-        .setRequired(true).setMinLength(42).setMaxLength(42)
-    ));
+    const modal = new ModalBuilder().setCustomId('setup_modal:contract').setTitle('Collection Details');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('contract_input').setLabel('NFT Contract Address (0x...)')
+          .setStyle(TextInputStyle.Short).setPlaceholder('0xdce7bfe9ad997c1676cae8c5b5468272e878e5ad')
+          .setRequired(true).setMinLength(42).setMaxLength(42)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('slug_input').setLabel('OpenSea Collection Slug')
+          .setStyle(TextInputStyle.Short).setPlaceholder('fluxeto')
+          .setRequired(false).setMaxLength(100)
+      ),
+    );
     return interaction.showModal(modal);
   }
 
@@ -642,6 +651,7 @@ async function handleSetupModal(interaction, ctx){
     const contract = interaction.fields.getTextInputValue('contract_input').trim().toLowerCase();
     if(!/^0x[0-9a-f]{40}$/i.test(contract))
       return interaction.editReply({ content:'❌ Invalid contract address. Must be 0x followed by 40 hex characters.' });
+    const slugRaw = interaction.fields.getTextInputValue('slug_input').trim().toLowerCase().replace(/\s+/g, '-');
     state.config.contract = contract;
     const isOcas = contract === OCAS_CONTRACT;
     if(isOcas){
@@ -649,6 +659,15 @@ async function handleSetupModal(interaction, ctx){
       state.config.collectionSlug = OCAS_SLUG;
       state.config.isOcas         = true;
       fetchAndStoreCollectionTraits(OCAS_SLUG, pgPool).catch(()=>{});
+    } else if(slugRaw){
+      state.config.collectionSlug = slugRaw;
+      state.config.slug           = slugRaw;
+      // Fire-and-forget: cache OS trait counts + kick off token trait backfill
+      fetchAndStoreCollectionTraits(slugRaw, pgPool).catch(()=>{});
+      try{
+        const { maybeStartBackfill } = require('../lib/auto-backfill');
+        maybeStartBackfill(pgPool, { contract, slug: slugRaw }).catch(()=>{});
+      }catch(_){}
     }
     await saveState(guildId, state, pgPool);
     return interaction.editReply({ content:'', embeds:[buildCollectionEmbed(state)], components:[collectionRow(true)] });
