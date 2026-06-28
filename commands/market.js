@@ -2255,6 +2255,19 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     }
   }
 
+  // Non-OCAS SVG fallback — render SVG→PNG from token_svg_cache
+  if(!imageResult && slug !== 'on-chain-all-stars'){
+    const svgRes = await pgPool.query(
+      `SELECT image_data FROM token_svg_cache WHERE token_id=$1 AND collection_slug=$2 LIMIT 1`,
+      [tokenId, slug]
+    ).catch(()=>({ rows: [] }));
+    const svgData = svgRes.rows[0]?.image_data || null;
+    if(svgData){
+      const buf = await extractPngFromSvg(svgData).catch(()=>null);
+      if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+    }
+  }
+
   // OCAS fallback — SVG → PNG from token_image_snapshots (OCAS-only table)
   // Only attempt this when the collection being viewed is actually OCAS —
   // never fall through to OCAS snapshots for Fluxeto or any other collection
