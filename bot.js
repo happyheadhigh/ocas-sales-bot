@@ -20,6 +20,7 @@ const {
   POLL_MS, RANK_SYNC_INTERVAL, BOT_ENV,
   osHeaders, getRailwayApiUrl, getRankTierColor,
   PENDING_DRAW_SEED_PREFIX, DEFAULT_LOTTERY_TIMEZONE,
+  OWNER_DISCORD_IDS,
   } = require('./lib/constants');
 
 const {
@@ -1868,7 +1869,8 @@ client.on('interactionCreate', async (interaction)=>{
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
   const config=getConfig(guildId);
-  const isAdmin=interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+  const isAdmin=interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
+    || OWNER_DISCORD_IDS.has(String(interaction.user.id));
 
   // /setup
 
