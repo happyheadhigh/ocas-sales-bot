@@ -324,6 +324,7 @@ async function handleMarketCommand(commandName, ctx){
 
   // /debuglisting
   if(commandName==='debuglisting'){
+    if(!isAdmin) return interaction.reply({content:'❌ Admin only.', flags: MessageFlags.Ephemeral});
     const slug=interaction.options.getString('collection')||config.slug;
     if(!slug) return interaction.reply({content:'Provide a collection.', flags: MessageFlags.Ephemeral});
     await interaction.deferReply({ephemeral:true});
