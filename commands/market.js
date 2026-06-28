@@ -126,6 +126,8 @@ async function handleMarketCommand(commandName, ctx){
     const slug = resolved?.slug || config.slug;
     const activeConfig = resolved ? {...config, ...resolved} : config;
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
+    const _lsCool = checkCommandCooldown(interaction.user.id, 'lastsale');
+    if(_lsCool) return interaction.reply({content:`⏳ Please wait **${_lsCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=sale&limit=1`,{headers:osHeaders()});
@@ -145,6 +147,8 @@ async function handleMarketCommand(commandName, ctx){
     const slug=interaction.options.getString('collection')||config.slug;
     const count=Math.min(interaction.options.getInteger('count')||5,20);
     if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
+    const _rsCool = checkCommandCooldown(interaction.user.id, 'recentsales');
+    if(_rsCool) return interaction.reply({content:`⏳ Please wait **${_rsCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=sale&limit=${count}`,{headers:osHeaders()});
@@ -152,8 +156,9 @@ async function handleMarketCommand(commandName, ctx){
       const sales=(await r.json()).asset_events||[];
       if(!sales.length){await interaction.editReply('No sales found.');return;}
       const cfg={...config,slug};
-      const embeds=await Promise.all(sales.reverse().map(s=>buildSaleEmbed(s,cfg).catch(()=>null)));
-      await postEmbeds(interaction, embeds.filter(Boolean), `Last ${sales.length} sales for **${slug}**:`);
+      const embeds=[];
+      for(const s of sales.reverse()){ const e=await buildSaleEmbed(s,cfg).catch(()=>null); if(e) embeds.push(e); }
+      await postEmbeds(interaction, embeds, `Last ${sales.length} sales for **${slug}**:`);
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
   }
@@ -309,6 +314,8 @@ async function handleMarketCommand(commandName, ctx){
     const colSlug = resolved2?.slug || config.slug;
     const count=Math.min(interaction.options.getInteger('count')||5,20);
     if(!colSlug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
+    const _liCool = checkCommandCooldown(interaction.user.id, 'listings');
+    if(_liCool) return interaction.reply({content:`⏳ Please wait **${_liCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     await interaction.deferReply();
     try{
       const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(colSlug)}?event_type=listing&limit=${count}`,{headers:osHeaders()});
@@ -552,6 +559,8 @@ async function handleMarketCommand(commandName, ctx){
     const sweepConfig = sweepResolved ? {...config, ...sweepResolved} : config;
     if(isPaidFeature(sweepConfig, 'sweep', interaction.user.id))
       return interaction.reply({content:'🧹 Sweep commands require a paid tier for non-OCAS collections. Visit traitview.com to upgrade.', flags: MessageFlags.Ephemeral});
+    const _swCool = checkCommandCooldown(interaction.user.id, 'sweep');
+    if(_swCool) return interaction.reply({content:`⏳ Please wait **${_swCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const RAILWAY_URL = getRailwayApiUrl();
     const API_SECRET  = process.env.API_SECRET;
     const rawSearch   = (interaction.options.getString('search')||'').trim();
