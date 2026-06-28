@@ -20,6 +20,7 @@ const { isPaidFeature } = require('./market');
 // loosen a bot's default command permissions via Integrations settings without
 // the bot owner knowing, so the registration-level permission alone isn't safe.
 function hasConfigAccess(interaction, cfg){
+  if(OWNER_DISCORD_IDS.has(String(interaction.user.id))) return true;
   if(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return true;
   const managerRoleId = cfg?.botManagerRoleId;
   if(managerRoleId && interaction.member?.roles?.cache?.has(managerRoleId)) return true;
