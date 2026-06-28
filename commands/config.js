@@ -235,6 +235,7 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
     new StringSelectMenuOptionBuilder().setLabel('Trait Roles').setEmoji('🎭').setValue('traitroles').setDescription('Auto-assign roles by trait'),
     new StringSelectMenuOptionBuilder().setLabel('Pause / Resume').setEmoji('⏸️').setValue('pause').setDescription('Toggle auto-posting'),
     new StringSelectMenuOptionBuilder().setLabel('Re-backfill Traits').setEmoji('🔄').setValue('rebackfill').setDescription('Refresh trait & image data (paid · 24h cooldown)'),
+    new StringSelectMenuOptionBuilder().setLabel('Animated Images').setEmoji('🎞️').setValue('animated').setDescription('Toggle animated thumbnails (auto-detected on backfill)'),
   ];
   if(isOcas){
     options.push(new StringSelectMenuOptionBuilder().setLabel('Burn Alerts Channel').setEmoji('🔥').setValue('burnchan').setDescription('Where burn alerts post'));
@@ -662,6 +663,7 @@ async function handleConfigButton(interaction, ctx){
       traitroles:    `cfg:col:traitroles:${colId}`,
       pause:         `cfg:col:pause:${colId}`,
       rebackfill:    `cfg:col:rebackfill:${colId}`,
+      animated:      `cfg:col:animated:${colId}`,
     };
     if(section === 'rankalert'){
       const preCfg = getConfig(guildId) || {};
@@ -1142,6 +1144,26 @@ async function handleConfigButton(interaction, ctx){
     return interaction.editReply({ content:`${status} for ${col.name||col.slug}.`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
 
+  // ── Animated toggle ──────────────────────────────────────────────────────────
+  if(customId.startsWith('cfg:col:animated:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      cfg.animated = !cfg.animated;
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]) cols[idx].animated = !cols[idx].animated;
+      cfg.collections = cols;
+    }
+    await setConfig(guildId, cfg);
+    const col = isPrimary
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, animated: cfg.animated }
+      : (cfg.collections||[])[parseInt(colId)];
+    const status = col?.animated ? '🎞️ Animated ON' : '🖼️ Static';
+    return interaction.editReply({ content:`${status} for **${col?.name||col?.slug}**. Token thumbnails will use ${col?.animated ? 'animated (OpenSea)' : 'static (cached)'} images.`, embeds:[], components:[] });
+  }
+
   // ── Re-backfill traits (admin only, paid tier, 24h cooldown) ────────────────
   if(customId.startsWith('cfg:col:rebackfill:')){
     const colId = customId.split(':')[3];
@@ -1195,8 +1217,22 @@ async function handleConfigButton(interaction, ctx){
     // Run backfill directly — bypasses the "already backfilled" guard in maybeStartBackfill
     const { backfillCollectionTraits } = require('../lib/collection-backfill');
     backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug })
-      .then(stats => {
-        interaction.followUp({ content:`✅ Re-backfill complete for **${col.name||col.slug}** — ${stats?.written||0} tokens updated.`, ephemeral: true }).catch(()=>{});
+      .then(async stats => {
+        // Store animated detection result in collection config
+        if(typeof stats?.animated === 'boolean'){
+          const freshCfg = getConfig(guildId) || {};
+          if(isPrimary){
+            freshCfg.animated = stats.animated;
+          } else {
+            const cols = freshCfg.collections || [];
+            const idx = parseInt(colId);
+            if(cols[idx]) cols[idx].animated = stats.animated;
+            freshCfg.collections = cols;
+          }
+          await setConfig(guildId, freshCfg).catch(()=>{});
+        }
+        const animatedNote = stats?.animated ? ' · 🎞️ Animated detected' : '';
+        interaction.followUp({ content:`✅ Re-backfill complete for **${col.name||col.slug}** — ${stats?.written||0} tokens updated${animatedNote}.`, ephemeral: true }).catch(()=>{});
       })
       .catch(e => {
         console.error('[Config rebackfill]', e.message);

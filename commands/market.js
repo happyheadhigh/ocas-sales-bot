@@ -3,7 +3,7 @@
 const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
 const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
-const { extractPngFromSvg } = require('../lib/images');
+const { extractPngFromSvg, resolveImage } = require('../lib/images');
 const { isDiscordOk } = require('../utils/format');
 
 /**
@@ -2213,30 +2213,49 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     ? ` (${unrealized >= 0 ? '+' : ''}${((unrealized / cost) * 100).toFixed(0)}%)`
     : '';
 
-  // Get token image from snapshots — handle SVG (OCAS on-chain) and HTTP URLs
-  // Try tokens table image_url first (stored during backfill for all collections)
-  const tokenImgRes = await pgPool.query(
-    `SELECT image_url FROM tokens WHERE id=$1 AND (collection_slug=$2 OR collection_slug IS NULL)`,
-    [tokenId, slug]
-  ).catch(()=>({ rows: [] }));
-  const tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
-
-  // Fall back to token_image_snapshots (OCAS on-chain SVG)
-  const imgRes = await pgPool.query(
-    `SELECT image_data FROM token_image_snapshots WHERE token_id=$1 LIMIT 1`,
-    [tokenId]
-  ).catch(()=>({ rows: [] }));
-  const imgData = imgRes.rows[0]?.image_data || null;
+  // Get collection config — contract + animated flag
+  const serverCfg = ctx.getConfig ? ctx.getConfig(interaction.guildId) : null;
+  const allCols = serverCfg ? [
+    ...(serverCfg.contract ? [{ slug: serverCfg.collectionSlug || serverCfg.slug, contract: serverCfg.contract, animated: serverCfg.animated }] : []),
+    ...(serverCfg.collections || [])
+  ] : [];
+  const colCfg = allCols.find(c => c.slug === slug);
+  const colContract = colCfg?.contract || null;
+  const isAnimated = colCfg?.animated === true;
 
   let imageResult = null;
-  if(tokenImgUrl && isDiscordOk(tokenImgUrl)){
-    imageResult = { type: 'url', url: tokenImgUrl };
-  } else if(imgData){
-    if(imgData.startsWith('http') && isDiscordOk(imgData)){
-      imageResult = { type: 'url', url: imgData };
-    } else if(imgData.startsWith('<svg') || imgData.startsWith('data:image/svg') || imgData.toLowerCase().includes('image/svg')){
-      const buf = await extractPngFromSvg(imgData).catch(()=>null);
-      if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+
+  // Animated collection — call OpenSea for display_image_url (cached 2 min)
+  if(isAnimated && colContract){
+    imageResult = await resolveImage({ identifier: tokenId, token_id: tokenId }, colContract, 'ethereum').catch(()=>null);
+  }
+
+  // Static — use stored image_url from backfill (no API call)
+  if(!imageResult){
+    const tokenImgRes = await pgPool.query(
+      `SELECT image_url FROM tokens WHERE id=$1 AND (collection_slug=$2 OR collection_slug IS NULL)`,
+      [tokenId, slug]
+    ).catch(()=>({ rows: [] }));
+    const tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
+    if(tokenImgUrl && isDiscordOk(tokenImgUrl)){
+      imageResult = { type: 'url', url: tokenImgUrl };
+    }
+  }
+
+  // OCAS fallback — SVG → PNG from token_image_snapshots
+  if(!imageResult){
+    const imgRes = await pgPool.query(
+      `SELECT image_data FROM token_image_snapshots WHERE token_id=$1 LIMIT 1`,
+      [tokenId]
+    ).catch(()=>({ rows: [] }));
+    const imgData = imgRes.rows[0]?.image_data || null;
+    if(imgData){
+      if(imgData.startsWith('http') && isDiscordOk(imgData)){
+        imageResult = { type: 'url', url: imgData };
+      } else if(imgData.startsWith('<svg') || imgData.startsWith('data:image/svg') || imgData.toLowerCase().includes('image/svg')){
+        const buf = await extractPngFromSvg(imgData).catch(()=>null);
+        if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+      }
     }
   }
 
