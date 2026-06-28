@@ -26,38 +26,8 @@ function hasSetupAccess(interaction, cfg){
 const SETUP_NO_ACCESS_MSG = '🔒 You need **Manage Server** permission or the designated Bot Manager role to use this.';
 const OCAS_SLUG     = 'on-chain-all-stars';
 
-// Re-use trait cache helper from config (inline here to avoid circular require)
-async function fetchAndStoreCollectionTraits(slug, pgPool){
-  if(!slug) return;
-  try{
-    const { osHeaders } = require('../lib/constants');
-    const fetch = require('node-fetch');
-    const res = await fetch(
-      `https://api.opensea.io/api/v2/traits/${slug}`,
-      { headers: osHeaders() }
-    );
-    if(!res.ok){ console.warn('[TraitCache] OS traits fetch failed:', res.status, slug); return; }
-    const data = await res.json();
-    // OS v2 traits response: { categories: { "Type": "string" }, counts: { "Type": { "Zombie": 123 } } }
-    const counts = data.counts || {};
-    let count = 0;
-    for(const [traitName, valueCounts] of Object.entries(counts)){
-      if(typeof valueCounts !== 'object' || Array.isArray(valueCounts)) continue;
-      for(const [val, cnt] of Object.entries(valueCounts)){
-        await pgPool.query(
-          `INSERT INTO collection_traits (slug, trait_name, trait_value, token_count)
-           VALUES ($1,$2,$3,$4)
-           ON CONFLICT (slug, trait_name, trait_value) DO UPDATE SET token_count=$4`,
-          [slug, traitName, val, cnt]
-        ).catch(()=>{});
-        count++;
-      }
-    }
-    console.log(`[TraitCache] Stored ${count} trait values for ${slug}`);
-  }catch(e){
-    console.warn('[TraitCache] Error fetching traits for', slug, ':', e.message);
-  }
-}
+// Trait cache — canonical implementation in lib/db.js (includes dedup check).
+const { fetchAndStoreCollectionTraits } = require('../lib/db');
 
 // ── Wizard state ──────────────────────────────────────────────────────────────
 // In-memory cache; backed by server_configs JSONB (wizard_state key) for persistence
