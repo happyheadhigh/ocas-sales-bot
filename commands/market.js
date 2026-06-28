@@ -2231,9 +2231,10 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   }
 
   // Static — use stored image_url from backfill (no API call)
+  // Strict collection_slug match only — never fall back to other collections
   if(!imageResult){
     const tokenImgRes = await pgPool.query(
-      `SELECT image_url FROM tokens WHERE id=$1 AND (collection_slug=$2 OR collection_slug IS NULL)`,
+      `SELECT image_url FROM tokens WHERE id=$1 AND collection_slug=$2`,
       [tokenId, slug]
     ).catch(()=>({ rows: [] }));
     const tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
