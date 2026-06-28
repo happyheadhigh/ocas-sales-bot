@@ -2253,8 +2253,11 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     }
   }
 
-  // OCAS fallback — SVG → PNG from token_image_snapshots
-  if(!imageResult){
+  // OCAS fallback — SVG → PNG from token_image_snapshots (OCAS-only table)
+  // Only attempt this when the collection being viewed is actually OCAS —
+  // never fall through to OCAS snapshots for Fluxeto or any other collection
+  // that shares token IDs with OCAS.
+  if(!imageResult && slug === 'on-chain-all-stars'){
     const imgRes = await pgPool.query(
       `SELECT image_data FROM token_image_snapshots WHERE token_id=$1 LIMIT 1`,
       [tokenId]
