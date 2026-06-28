@@ -7,6 +7,8 @@ const {
   StringSelectMenuOptionBuilder, ChannelType, MessageFlags,
 } = require('discord.js');
 
+const { OWNER_DISCORD_IDS } = require('../lib/constants');
+
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 
 // ── Access control ────────────────────────────────────────────────────────────
@@ -15,6 +17,7 @@ const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 // slash-command registration, since registration-level permissions can be
 // loosened by server admins via Discord's own Integrations settings.
 function hasSetupAccess(interaction, cfg){
+  if(OWNER_DISCORD_IDS.has(String(interaction.user.id))) return true;
   if(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return true;
   const managerRoleId = cfg?.botManagerRoleId;
   if(managerRoleId && interaction.member?.roles?.cache?.has(managerRoleId)) return true;
