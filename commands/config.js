@@ -30,37 +30,8 @@ function hasConfigAccess(interaction, cfg){
 const NO_ACCESS_MSG = '🔒 You need **Manage Server** permission or the designated Bot Manager role to use this.';
 
 // ── Fetch & cache traits from OpenSea for a collection slug ──────────────────
-async function fetchAndStoreCollectionTraits(slug, pgPool){
-  if(!slug) return;
-  try{
-    const { OPENSEA_KEY, osHeaders } = require('../lib/constants');
-    const fetch = require('node-fetch');
-    const res = await fetch(
-      `https://api.opensea.io/api/v2/traits/${slug}`,
-      { headers: osHeaders() }
-    );
-    if(!res.ok){ console.warn('[TraitCache] OS traits fetch failed:', res.status, slug); return; }
-    const data = await res.json();
-    // OS v2 traits response: { categories: { "Type": "string" }, counts: { "Type": { "Zombie": 123 } } }
-    const counts = data.counts || {};
-    let count = 0;
-    for(const [traitName, valueCounts] of Object.entries(counts)){
-      if(typeof valueCounts !== 'object' || Array.isArray(valueCounts)) continue;
-      for(const [val, cnt] of Object.entries(valueCounts)){
-        await pgPool.query(
-          `INSERT INTO collection_traits (slug, trait_name, trait_value, token_count)
-           VALUES ($1,$2,$3,$4)
-           ON CONFLICT (slug, trait_name, trait_value) DO UPDATE SET token_count=$4`,
-          [slug, traitName, val, cnt]
-        ).catch(()=>{});
-        count++;
-      }
-    }
-    console.log(`[TraitCache] Stored ${count} trait values for ${slug}`);
-  }catch(e){
-    console.warn('[TraitCache] Error fetching traits for', slug, ':', e.message);
-  }
-}
+// Canonical implementation lives in lib/db.js (includes dedup check).
+const { fetchAndStoreCollectionTraits } = require('../lib/db');
 
 const OCAS_SLUG     = 'on-chain-all-stars';
 const SEP           = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
