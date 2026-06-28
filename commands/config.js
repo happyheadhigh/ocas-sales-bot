@@ -217,6 +217,7 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
       `**Sales Filters:** ${Object.keys(col.salesFilters||{}).length} active\n` +
       `**Rank Alert:** ${raLabel}${!isOcas ? ' 🔒' : ''}\n` +
       `**Status:** ${col.paused ? '⏸️ Paused' : '▶️ Active'}\n` +
+      (!isOcas ? `**Animated:** ${col.animated ? '🎞️ ON' : '🖼️ OFF (static)'}\n` : '') +
       (isOcas ? '\n🔥 **OCAS** — full feature set active.\n' : '\n🔒 *Rank Alert requires a paid tier for non-OCAS collections.*\n') +
       '\n*Use the dropdown below to edit a section.*'
     )
