@@ -651,13 +651,15 @@ async function handleMarketCommand(commandName, ctx){
       let allFetched = [];
       if(!matchedGroups.length && traitCount === null){
         console.log('[/sweep] plain sweep from DB, mode:', sweepMode);
+        const sweepSlug = sweepConfig.slug || sweepConfig.collectionSlug || 'on-chain-all-stars';
         const dbRes = await pgPool.query(
           `SELECT l.token_id, l.price_eth, l.url, t.os_rank, t.obs_rank, t.trait_count
            FROM listings l
-           LEFT JOIN tokens t ON t.id = l.token_id
+           LEFT JOIN tokens t ON t.id = l.token_id AND t.collection_slug = $2
+           WHERE l.collection_slug = $2
            ORDER BY l.price_eth ASC
            LIMIT $1`,
-          [fetchLimit]
+          [fetchLimit, sweepSlug]
         );
         allFetched = dbRes.rows.map(r => ({
           token_id: parseInt(r.token_id),
