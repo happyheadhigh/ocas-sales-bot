@@ -1599,6 +1599,88 @@ app.get('/tv/link-status', auth, async (req, res) => {
   }
 });
 
+
+// ── GET /db/traits-fast ───────────────────────────────────────────────────────
+// Serves traits_fast.json structure computed live from DB, excluding burned tokens.
+// Cached in memory for 5 minutes.
+// Returns: { ok, rank: [[id, score], ...], domain: {trait: [values]},
+//            buckets: {count: [ids]}, freq: {trait: {value: count}}, survivorCount }
+let _traitsFastCache = null;
+let _traitsFastCacheTs = 0;
+const TRAITS_FAST_TTL = 5 * 60 * 1000;
+
+app.get('/db/traits-fast', auth, async (req, res) => {
+  try {
+    const now = Date.now();
+    if (_traitsFastCache && (now - _traitsFastCacheTs) < TRAITS_FAST_TTL) {
+      return res.json(_traitsFastCache);
+    }
+
+    const BURNED_EXCL = `NOT EXISTS (
+      SELECT 1 FROM burn_event_inputs bei
+      JOIN burn_events be ON be.id = bei.burn_event_id
+      WHERE bei.burned_token_id = t.id
+      AND bei.burned_token_id != be.survivor_token_id
+    )`;
+
+    const BURNED_EXCL_TT = `NOT EXISTS (
+      SELECT 1 FROM burn_event_inputs bei
+      JOIN burn_events be ON be.id = bei.burn_event_id
+      WHERE bei.burned_token_id = tt.token_id
+      AND bei.burned_token_id != be.survivor_token_id
+    )`;
+
+    // 1. Surviving tokens sorted by rarity_score DESC (for OBS rank)
+    const [rankRes, traitRes] = await Promise.all([
+      pool.query(`
+        SELECT t.id, t.rarity_score, t.trait_count
+        FROM tokens t
+        WHERE t.rarity_score IS NOT NULL
+        AND ${BURNED_EXCL}
+        ORDER BY t.rarity_score DESC
+      `),
+      // 2. Trait frequencies for surviving tokens
+      pool.query(`
+        SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS freq
+        FROM token_traits tt
+        JOIN tokens t ON t.id = tt.token_id
+        WHERE ${BURNED_EXCL_TT}
+        GROUP BY tt.trait_name, tt.trait_value
+        ORDER BY tt.trait_name, tt.trait_value
+      `)
+    ]);
+
+    // rank array: [[id, score], ...]
+    const rank = rankRes.rows.map(r => [parseInt(r.id), parseFloat(r.rarity_score)]);
+
+    // freq: { "Type": { "Human 1": 450, ... }, ... }
+    // domain: { "Type": ["Human 1", ...], ... }
+    const freq = {};
+    const domain = {};
+    for (const { trait_name: k, trait_value: v, freq: count } of traitRes.rows) {
+      if (!freq[k]) freq[k] = {};
+      freq[k][v] = count;
+      if (!domain[k]) domain[k] = [];
+      domain[k].push(v);
+    }
+
+    // buckets: { "1": [id, ...], "4": [...] }
+    const buckets = {};
+    for (const { id, trait_count: tc } of rankRes.rows) {
+      const key = String(tc ?? 0);
+      if (!buckets[key]) buckets[key] = [];
+      buckets[key].push(parseInt(id));
+    }
+
+    _traitsFastCache = { ok: true, rank, domain, freq, buckets, survivorCount: rankRes.rows.length };
+    _traitsFastCacheTs = now;
+    res.json(_traitsFastCache);
+  } catch (e) {
+    console.error('[/db/traits-fast]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
