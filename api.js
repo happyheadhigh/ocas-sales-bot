@@ -295,8 +295,11 @@ app.get('/db/listings/sync', auth, async (req, res) => {
 // ── GET /db/listings — all current listings from DB ───────────────────────────
 app.get('/db/listings', auth, async (req, res) => {
   try {
+    // Default to OCAS slug for TraitView; pass ?slug= to override
+    const slug = req.query.slug || 'on-chain-all-stars';
     const result = await pool.query(
-      `SELECT token_id, price_eth, url FROM listings ORDER BY price_eth ASC`
+      `SELECT token_id, price_eth, url FROM listings WHERE collection_slug = $1 ORDER BY price_eth ASC`,
+      [slug]
     );
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
     res.json({
@@ -1630,14 +1633,14 @@ app.get('/db/traits-fast', auth, async (req, res) => {
       AND bei.burned_token_id != be.survivor_token_id
     )`;
 
-    // 1. Surviving tokens sorted by rarity_score DESC (for OBS rank)
+    // 1. Surviving tokens sorted by obs_rank ASC (pre-computed rank in DB)
+    // Falls back to id order if obs_rank not available
     const [rankRes, traitRes] = await Promise.all([
       pool.query(`
-        SELECT t.id, t.rarity_score, t.trait_count
+        SELECT t.id, t.obs_rank, t.trait_count
         FROM tokens t
-        WHERE t.rarity_score IS NOT NULL
-        AND ${BURNED_EXCL}
-        ORDER BY t.rarity_score DESC
+        WHERE ${BURNED_EXCL}
+        ORDER BY t.obs_rank ASC NULLS LAST, t.id ASC
       `),
       // 2. Trait frequencies for surviving tokens
       pool.query(`
@@ -1650,8 +1653,9 @@ app.get('/db/traits-fast', auth, async (req, res) => {
       `)
     ]);
 
-    // rank array: [[id, score], ...]
-    const rank = rankRes.rows.map(r => [parseInt(r.id), parseFloat(r.rarity_score)]);
+    // rank array: [[id, obsRank], ...] sorted by obs_rank ASC
+    // TraitView uses index position for OBS rank so order matters
+    const rank = rankRes.rows.map(r => [parseInt(r.id), r.obs_rank ? parseInt(r.obs_rank) : 9999]);
 
     // freq: { "Type": { "Human 1": 450, ... }, ... }
     // domain: { "Type": ["Human 1", ...], ... }
@@ -1665,9 +1669,15 @@ app.get('/db/traits-fast', auth, async (req, res) => {
     }
 
     // buckets: { "1": [id, ...], "4": [...] }
+    // trait_count may not exist on older schema — fall back to counting from traitRes
+    const traitCountMap = {};
+    for (const { token_id, trait_name } of traitRes.rows) {
+      traitCountMap[token_id] = (traitCountMap[token_id] || 0) + 1;
+    }
     const buckets = {};
     for (const { id, trait_count: tc } of rankRes.rows) {
-      const key = String(tc ?? 0);
+      const count = tc != null ? tc : (traitCountMap[parseInt(id)] || 0);
+      const key = String(count);
       if (!buckets[key]) buckets[key] = [];
       buckets[key].push(parseInt(id));
     }
