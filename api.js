@@ -1681,6 +1681,72 @@ app.get('/db/traits-fast', auth, async (req, res) => {
   }
 });
 
+
+// ── GET /db/all-traits ────────────────────────────────────────────────────────
+// Returns all surviving tokens' traits in chunk-compatible format.
+// Used by TraitView to replace static chunk files with live DB data.
+// Server-side cache: 5 minutes. One DB query per 5 min regardless of visitors.
+// Returns: { ok, tokens: { "1": { traits: {...} }, ... }, survivorCount }
+let _allTraitsCache = null;
+let _allTraitsCacheTs = 0;
+const ALL_TRAITS_TTL = 5 * 60 * 1000;
+
+app.get('/db/all-traits', auth, async (req, res) => {
+  try {
+    const now = Date.now();
+    if (_allTraitsCache && (now - _allTraitsCacheTs) < ALL_TRAITS_TTL) {
+      return res.json(_allTraitsCache);
+    }
+
+    // Get all surviving token IDs
+    const survivorsRes = await pool.query(`
+      SELECT t.id
+      FROM tokens t
+      WHERE NOT EXISTS (
+        SELECT 1 FROM burn_event_inputs bei
+        JOIN burn_events be ON be.id = bei.burn_event_id
+        WHERE bei.burned_token_id = t.id
+        AND bei.burned_token_id != be.survivor_token_id
+      )
+      ORDER BY t.id
+    `);
+
+    const survivorIds = new Set(survivorsRes.rows.map(r => parseInt(r.id)));
+
+    // Get all traits for surviving tokens in one query
+    const traitsRes = await pool.query(`
+      SELECT tt.token_id, tt.trait_name, tt.trait_value
+      FROM token_traits tt
+      WHERE tt.token_id = ANY($1::int[])
+      ORDER BY tt.token_id, COALESCE(tt.trait_index, 0), tt.trait_name
+    `, [[...survivorIds]]);
+
+    // Build tokens object: { "1": { traits: { "Type": "Human 6", ... } }, ... }
+    const tokens = {};
+
+    // Initialize all survivors with empty traits
+    for (const id of survivorIds) {
+      tokens[String(id)] = { traits: {} };
+    }
+
+    // Populate traits
+    for (const { token_id, trait_name, trait_value } of traitsRes.rows) {
+      const key = String(token_id);
+      if (tokens[key]) {
+        tokens[key].traits[trait_name] = trait_value;
+      }
+    }
+
+    _allTraitsCache = { ok: true, tokens, survivorCount: survivorIds.size };
+    _allTraitsCacheTs = now;
+
+    res.json(_allTraitsCache);
+  } catch (e) {
+    console.error('[/db/all-traits]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
