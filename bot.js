@@ -2041,12 +2041,12 @@ client.once('clientReady', async ()=>{
     console.log(`[Memory] heapUsed=${_mb(m.heapUsed)}MB heapTotal=${_mb(m.heapTotal)}MB rss=${_mb(m.rss)}MB external=${_mb(m.external)}MB`);
   }, 60_000);
 
-  // ── DIAGNOSTIC: listing poller temporarily disabled to isolate OOM cause ──
-  // Re-enable by uncommenting the lines below once memory cause is confirmed
+  // Listing poller re-enabled with fix: caps fetch at 50 listings to prevent
+  // loading 500-listing bursts into memory on restart (confirmed OOM cause).
   pollSales();
-  // pollListings();  // DISABLED FOR DIAGNOSIS
+  pollListings();
   setInterval(pollSales, POLL_MS);
-  // setInterval(pollListings, POLL_MS);  // DISABLED FOR DIAGNOSIS
+  setInterval(pollListings, POLL_MS);
   // Persist cursors every 60s so restarts lose at most 1 min of cursor progress
   setInterval(saveSaleCursors, 60_000);
   setInterval(saveListingCursors, 60_000);
