@@ -2034,10 +2034,19 @@ client.once('clientReady', async ()=>{
   await loadAllAlerts();
   await loadSaleCursors();
   await loadListingCursors();
+  // ── Memory logging — diagnostic only, remove after crash cause confirmed ──
+  const _mb = v => Math.round(v / 1024 / 1024);
+  setInterval(() => {
+    const m = process.memoryUsage();
+    console.log(`[Memory] heapUsed=${_mb(m.heapUsed)}MB heapTotal=${_mb(m.heapTotal)}MB rss=${_mb(m.rss)}MB external=${_mb(m.external)}MB`);
+  }, 60_000);
+
+  // ── DIAGNOSTIC: listing poller temporarily disabled to isolate OOM cause ──
+  // Re-enable by uncommenting the lines below once memory cause is confirmed
   pollSales();
-  pollListings();
+  // pollListings();  // DISABLED FOR DIAGNOSIS
   setInterval(pollSales, POLL_MS);
-  setInterval(pollListings, POLL_MS);
+  // setInterval(pollListings, POLL_MS);  // DISABLED FOR DIAGNOSIS
   // Persist cursors every 60s so restarts lose at most 1 min of cursor progress
   setInterval(saveSaleCursors, 60_000);
   setInterval(saveListingCursors, 60_000);
