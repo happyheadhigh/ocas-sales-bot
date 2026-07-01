@@ -1508,7 +1508,8 @@ async function showMeHub(interaction, ctx){
   // Trait alert
   const alert = getAlert(userId);
   if(alert){
-    summaryLines.push(`📣 **Trait Alert** — ${alert.slug||'any'} · Sales: ${alert.alertSales?'✅':'❌'} · Listings: ${alert.alertListings?'✅':'❌'}`);
+    const pausedTag = alert.paused ? ' ⏸️ paused' : '';
+    summaryLines.push(`📣 **Trait Alert** — ${alert.slug||'any'} · Sales: ${alert.alertSales?'✅':'❌'} · Listings: ${alert.alertListings?'✅':'❌'}${pausedTag}`);
     summaryLines.push(`  Filters: ${fmtF(alert.traitFilters)}`);
   } else {
     summaryLines.push('📣 **Trait Alert** — not set');
@@ -1517,16 +1518,18 @@ async function showMeHub(interaction, ctx){
   // Price alerts
   if(pgPool){
     const pa = await pgPool.query(
-      `SELECT COUNT(*) AS cnt FROM user_price_alerts WHERE discord_id=$1`, [userId]
+      `SELECT COUNT(*) FILTER (WHERE is_active) AS active_cnt, COUNT(*) FILTER (WHERE NOT is_active) AS paused_cnt FROM user_price_alerts WHERE discord_id=$1`, [userId]
     ).catch(()=>null);
-    const paCnt = parseInt(pa?.rows[0]?.cnt||0);
-    summaryLines.push(`🏷️ **Price Alerts** — ${paCnt > 0 ? `${paCnt} active` : 'none set'}`);
+    const activeCnt = parseInt(pa?.rows[0]?.active_cnt||0);
+    const pausedCnt = parseInt(pa?.rows[0]?.paused_cnt||0);
+    const paSummary = (activeCnt+pausedCnt) === 0 ? 'none set' : `${activeCnt} active${pausedCnt ? `, ${pausedCnt} ⏸️ paused` : ''}`;
+    summaryLines.push(`🏷️ **Price Alerts** — ${paSummary}`);
 
     const fa = await pgPool.query(
-      `SELECT slug, threshold_eth FROM user_floor_alerts WHERE discord_id=$1`, [userId]
+      `SELECT slug, threshold_eth, is_active FROM user_floor_alerts WHERE discord_id=$1`, [userId]
     ).catch(()=>null);
     if(fa?.rows.length){
-      summaryLines.push(`📉 **Floor Alerts** — ${fa.rows.map(r=>`${r.slug} < Ξ${parseFloat(r.threshold_eth).toFixed(3)}`).join(', ')}`);
+      summaryLines.push(`📉 **Floor Alerts** — ${fa.rows.map(r=>`${r.slug} < Ξ${parseFloat(r.threshold_eth).toFixed(3)}${r.is_active===false?' ⏸️':''}`).join(', ')}`);
     } else {
       summaryLines.push('📉 **Floor Alerts** — none set');
     }
@@ -1639,9 +1642,9 @@ async function showMePriceAlerts(interaction, ctx){
       }).join('\n');
       for(const r of res.rows){
         const toggleBtn = r.is_active === false
-          ? new ButtonBuilder().setCustomId(`me_browse:pricealert:resume:${r.id}`).setLabel(`▶️ Resume #${r.token_id}`).setStyle(ButtonStyle.Success)
-          : new ButtonBuilder().setCustomId(`me_browse:pricealert:pause:${r.id}`).setLabel(`⏸️ Pause #${r.token_id}`).setStyle(ButtonStyle.Secondary);
-        const removeBtn = new ButtonBuilder().setCustomId(`me_browse:pricealert:remove:${r.id}`).setLabel(`🗑️ Remove #${r.token_id}`).setStyle(ButtonStyle.Danger);
+          ? new ButtonBuilder().setCustomId(`me_browse:pricealert:resume:${r.id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success)
+          : new ButtonBuilder().setCustomId(`me_browse:pricealert:pause:${r.id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary);
+        const removeBtn = new ButtonBuilder().setCustomId(`me_browse:pricealert:remove:${r.id}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger);
         rows.push(new ActionRowBuilder().addComponents(toggleBtn, removeBtn));
       }
     }
@@ -1686,9 +1689,9 @@ async function showMeFloorAlerts(interaction, ctx){
       }).join('\n');
       for(const r of res.rows){
         const toggleBtn = r.is_active === false
-          ? new ButtonBuilder().setCustomId(`me_browse:flooralert:resume:${r.id}`).setLabel(`▶️ Resume ${r.slug}`).setStyle(ButtonStyle.Success)
-          : new ButtonBuilder().setCustomId(`me_browse:flooralert:pause:${r.id}`).setLabel(`⏸️ Pause ${r.slug}`).setStyle(ButtonStyle.Secondary);
-        const removeBtn = new ButtonBuilder().setCustomId(`me_browse:flooralert:remove:${r.id}`).setLabel(`🗑️ Remove ${r.slug}`).setStyle(ButtonStyle.Danger);
+          ? new ButtonBuilder().setCustomId(`me_browse:flooralert:resume:${r.id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success)
+          : new ButtonBuilder().setCustomId(`me_browse:flooralert:pause:${r.id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary);
+        const removeBtn = new ButtonBuilder().setCustomId(`me_browse:flooralert:remove:${r.id}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger);
         rows.push(new ActionRowBuilder().addComponents(toggleBtn, removeBtn));
       }
     }
