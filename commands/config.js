@@ -693,18 +693,32 @@ async function handleConfigButton(interaction, ctx){
     });
   }
 
+  function resolveColFromId(cfg, colId){
+    const isPrimary = colId === 'primary';
+    const col = isPrimary
+      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
+      : (cfg.collections||[])[parseInt(colId)];
+    return { col, isPrimary };
+  }
+
   // ── Category navigation ────────────────────────────────────────────────────
   if(customId === 'cfg:cat:collection'){
+    const extras = cfg.collections || [];
+    const allCols = [];
+    if(cfg.contract) allCols.push('primary');
+    extras.forEach((_, i) => allCols.push(String(i)));
+    if(allCols.length === 1){
+      // Only one collection configured — skip the picker, go straight to editing it.
+      const { col, isPrimary } = resolveColFromId(cfg, allCols[0]);
+      if(col) return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(allCols[0], isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    }
     return interaction.editReply({ content:'', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
 
   // Select a collection to edit
   if(customId === 'cfg_col:select'){
     const colId = interaction.values[0];
-    const isPrimary = colId === 'primary';
-    const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
-      : (cfg.collections||[])[parseInt(colId)];
+    const { col, isPrimary } = resolveColFromId(cfg, colId);
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
