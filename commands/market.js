@@ -812,6 +812,14 @@ async function showTfTraitPicker(interaction, ctx, slug, page = 0){
   const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET = process.env.API_SECRET;
+  // Component interactions (select-menu clicks) are always fresh interaction
+  // objects — interaction.replied/deferred on them is always false even
+  // though the message they're attached to already exists. Using reply()
+  // here would create a brand new ephemeral message every step instead of
+  // editing the existing one. update() edits the message the component
+  // lives on, which is what we want for every step after the initial
+  // slash-command response.
+  const isComponent = typeof interaction.isMessageComponent === 'function' && interaction.isMessageComponent();
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
   const allTraitNames = sortTraitNamesTypeFirst([...new Set(traitIndex.map(t => t.trait_name))]);
@@ -821,7 +829,7 @@ async function showTfTraitPicker(interaction, ctx, slug, page = 0){
   const pageNames = allTraitNames.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
   const hasNextPage = safePage < totalPages - 1;
   if(!pageNames.length){
-    const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
+    const replyFn = isComponent ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
     return interaction[replyFn]({ content: `No trait data found for **${slug}** yet. Make sure the collection is added via \`/config\`.`, flags: MessageFlags.Ephemeral });
   }
   const traitValueCounts = {};
@@ -846,7 +854,7 @@ async function showTfTraitPicker(interaction, ctx, slug, page = 0){
     .setPlaceholder('Pick a trait category...')
     .addOptions(options);
   const pageNote = totalPages > 1 ? ` (page ${safePage + 1} of ${totalPages})` : '';
-  const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
+  const replyFn = isComponent ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
   return interaction[replyFn]({
     content: `**🔍 Trait Find — ${slug}**\n\nPick a trait category${pageNote}:`,
     components: [new ActionRowBuilder().addComponents(menu)],
