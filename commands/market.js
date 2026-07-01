@@ -1588,9 +1588,10 @@ async function showMeTraitAlert(interaction, ctx){
     `**Collection:** ${alert.slug||'any'}`,
     `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
     `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+    alert.paused ? '**Status:** ⏸️ paused' : '',
     `**Filters:**`,
     fmtF(alert.traitFilters),
-  ].join('\n') : 'No trait alert set.';
+  ].filter(Boolean).join('\n') : 'No trait alert set.';
 
   const embed = new EmbedBuilder()
     .setTitle('📣 Trait Alert')
@@ -1600,9 +1601,16 @@ async function showMeTraitAlert(interaction, ctx){
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('me_browse:alert:set').setLabel('Add Alert').setStyle(ButtonStyle.Success),
   );
-  if(alert) row.addComponents(
-    new ButtonBuilder().setCustomId('me_browse:alert:clear').setLabel('Manage / Clear').setStyle(ButtonStyle.Danger),
-  );
+  if(alert){
+    if(alert.paused){
+      row.addComponents(new ButtonBuilder().setCustomId('me_browse:alert:resume').setLabel('▶️ Resume').setStyle(ButtonStyle.Success));
+    } else {
+      row.addComponents(new ButtonBuilder().setCustomId('me_browse:alert:pause').setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary));
+    }
+    row.addComponents(
+      new ButtonBuilder().setCustomId('me_browse:alert:clear').setLabel('Manage / Clear').setStyle(ButtonStyle.Danger),
+    );
+  }
   row.addComponents(
     new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
   );
@@ -1620,19 +1628,22 @@ async function showMePriceAlerts(interaction, ctx){
 
   if(pgPool){
     const res = await pgPool.query(
-      `SELECT id, token_id, slug, threshold_eth, alert_once, repeat_alert, triggered_at FROM user_price_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
+      `SELECT id, token_id, slug, threshold_eth, alert_once, repeat_alert, triggered_at, is_active FROM user_price_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 4`,
       [userId]
     ).catch(()=>null);
     if(res?.rows.length){
       hasAlerts = true;
-      desc = res.rows.map(r =>
-        `**#${r.token_id}** (${r.slug}) — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)} ${r.triggered_at?'✅ triggered':r.repeat_alert?'🔁 repeat':'1x'}`
-      ).join('\n');
-      const btns = res.rows.map(r =>
-        new ButtonBuilder().setCustomId(`me_browse:pricealert:remove:${r.id}`)
-          .setLabel(`Remove #${r.token_id}`).setStyle(ButtonStyle.Danger)
-      );
-      for(let i=0;i<btns.length;i+=4) rows.push(new ActionRowBuilder().addComponents(btns.slice(i,i+4)));
+      desc = res.rows.map(r => {
+        const pausedTag = r.is_active === false ? ' ⏸️ *paused*' : '';
+        return `**#${r.token_id}** (${r.slug}) — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)} ${r.triggered_at?'✅ triggered':r.repeat_alert?'🔁 repeat':'1x'}${pausedTag}`;
+      }).join('\n');
+      for(const r of res.rows){
+        const toggleBtn = r.is_active === false
+          ? new ButtonBuilder().setCustomId(`me_browse:pricealert:resume:${r.id}`).setLabel(`▶️ Resume #${r.token_id}`).setStyle(ButtonStyle.Success)
+          : new ButtonBuilder().setCustomId(`me_browse:pricealert:pause:${r.id}`).setLabel(`⏸️ Pause #${r.token_id}`).setStyle(ButtonStyle.Secondary);
+        const removeBtn = new ButtonBuilder().setCustomId(`me_browse:pricealert:remove:${r.id}`).setLabel(`🗑️ Remove #${r.token_id}`).setStyle(ButtonStyle.Danger);
+        rows.push(new ActionRowBuilder().addComponents(toggleBtn, removeBtn));
+      }
     }
   }
 
@@ -1662,7 +1673,7 @@ async function showMeFloorAlerts(interaction, ctx){
 
   if(pgPool){
     const res = await pgPool.query(
-      `SELECT id, slug, threshold_eth, cooldown_minutes, direction, last_alerted_at FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 8`,
+      `SELECT id, slug, threshold_eth, cooldown_minutes, direction, last_alerted_at, is_active FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 4`,
       [userId]
     ).catch(()=>null);
     if(res?.rows.length){
@@ -1670,13 +1681,16 @@ async function showMeFloorAlerts(interaction, ctx){
       desc = res.rows.map(r => {
         const dir = r.direction || 'below';
         const arrow = dir === 'above' ? '📈' : dir === 'either' ? '↕️' : '📉';
-        return `${arrow} **${r.slug}** — ${dir} Ξ ${parseFloat(r.threshold_eth).toFixed(4)} · repeats after ${formatCooldown(r.cooldown_minutes||60)}${r.last_alerted_at?' · last alerted '+new Date(r.last_alerted_at).toLocaleDateString():''}`;
+        const pausedTag = r.is_active === false ? ' ⏸️ *paused*' : '';
+        return `${arrow} **${r.slug}** — ${dir} Ξ ${parseFloat(r.threshold_eth).toFixed(4)} · repeats after ${formatCooldown(r.cooldown_minutes||60)}${r.last_alerted_at?' · last alerted '+new Date(r.last_alerted_at).toLocaleDateString():''}${pausedTag}`;
       }).join('\n');
-      const btns = res.rows.map(r =>
-        new ButtonBuilder().setCustomId(`me_browse:flooralert:remove:${r.id}`)
-          .setLabel(`Remove ${r.slug}`).setStyle(ButtonStyle.Danger)
-      );
-      for(let i=0;i<btns.length;i+=4) rows.push(new ActionRowBuilder().addComponents(btns.slice(i,i+4)));
+      for(const r of res.rows){
+        const toggleBtn = r.is_active === false
+          ? new ButtonBuilder().setCustomId(`me_browse:flooralert:resume:${r.id}`).setLabel(`▶️ Resume ${r.slug}`).setStyle(ButtonStyle.Success)
+          : new ButtonBuilder().setCustomId(`me_browse:flooralert:pause:${r.id}`).setLabel(`⏸️ Pause ${r.slug}`).setStyle(ButtonStyle.Secondary);
+        const removeBtn = new ButtonBuilder().setCustomId(`me_browse:flooralert:remove:${r.id}`).setLabel(`🗑️ Remove ${r.slug}`).setStyle(ButtonStyle.Danger);
+        rows.push(new ActionRowBuilder().addComponents(toggleBtn, removeBtn));
+      }
     }
   }
 
@@ -2644,6 +2658,16 @@ async function handleMeInteraction(interaction, ctx){
     return showMaClearWizard(interaction, { getAlert, deleteAlert, setAlert });
   }
 
+  if(customId === 'me_browse:alert:pause'){
+    setAlert(interaction.user.id, { paused: true });
+    return showMeTraitAlert(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:alert:resume'){
+    setAlert(interaction.user.id, { paused: false });
+    return showMeTraitAlert(interaction, ctx);
+  }
+
   // ── Price alerts ─────────────────────────────────────────────────────────────
   if(customId === 'me_browse:pricealert:set'){
     const guildId = interaction.guildId;
@@ -2668,6 +2692,18 @@ async function handleMeInteraction(interaction, ctx){
   if(customId.startsWith('me_browse:pricealert:remove:')){
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`DELETE FROM user_price_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return showMePriceAlerts(interaction, ctx);
+  }
+
+  if(customId.startsWith('me_browse:pricealert:pause:')){
+    const id = parseInt(customId.split(':').pop());
+    await pgPool.query(`UPDATE user_price_alerts SET is_active=false WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return showMePriceAlerts(interaction, ctx);
+  }
+
+  if(customId.startsWith('me_browse:pricealert:resume:')){
+    const id = parseInt(customId.split(':').pop());
+    await pgPool.query(`UPDATE user_price_alerts SET is_active=true WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
     return showMePriceAlerts(interaction, ctx);
   }
 
@@ -2700,6 +2736,18 @@ async function handleMeInteraction(interaction, ctx){
   if(customId.startsWith('me_browse:flooralert:remove:')){
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`DELETE FROM user_floor_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return showMeFloorAlerts(interaction, ctx);
+  }
+
+  if(customId.startsWith('me_browse:flooralert:pause:')){
+    const id = parseInt(customId.split(':').pop());
+    await pgPool.query(`UPDATE user_floor_alerts SET is_active=false WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return showMeFloorAlerts(interaction, ctx);
+  }
+
+  if(customId.startsWith('me_browse:flooralert:resume:')){
+    const id = parseInt(customId.split(':').pop());
+    await pgPool.query(`UPDATE user_floor_alerts SET is_active=true WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
     return showMeFloorAlerts(interaction, ctx);
   }
 

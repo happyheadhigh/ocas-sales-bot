@@ -1411,6 +1411,49 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // ── Sweep pagination buttons ─────────────────────────────────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('pa_pause:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`UPDATE user_price_alerts SET is_active=false WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`pa_resume:${id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`pa_stop:${id}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('pa_resume:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`UPDATE user_price_alerts SET is_active=true WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`pa_pause:${id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`pa_stop:${id}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('pa_stop:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`DELETE FROM user_price_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return interaction.update({ content: '🗑️ Price alert deleted.', embeds: [], components: [] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId === 'ta_pause'){
+    setAlert(interaction.user.id, { paused: true });
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('ta_resume').setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('ta_stop').setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId === 'ta_resume'){
+    setAlert(interaction.user.id, { paused: false });
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('ta_pause').setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('ta_stop').setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId === 'ta_stop'){
+    deleteAlert(interaction.user.id);
+    return interaction.update({ content: '🗑️ Trait alert deleted.', embeds: [], components: [] }).catch(()=>{});
+  }
   if(interaction.isButton() && interaction.customId.startsWith('fa_pause:')){
     const id = parseInt(interaction.customId.split(':')[1], 10);
     await pgPool.query(`UPDATE user_floor_alerts SET is_active=false WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
