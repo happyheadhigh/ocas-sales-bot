@@ -301,32 +301,61 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
   return { buffer, meta };
 }
 
-async function handleDownloadCommand(interaction, forced={}){
-  // forced may contain ctx fields like getConfig; extract them
-  const ctx = forced.getConfig ? forced : {};
-  if(forced.getConfig) forced = {};
-  const cfgForParse = await loadMarketConfig();
-  const guildCfgForParse = getGuildMarket(cfgForParse, interaction.guildId || 'dm');
-  const searchText = interaction.options?.getString?.('search') || '';
-  const parsed = parseDownloadSearch(searchText, guildCfgForParse);
+// Collections available for this guild's guided /download flow. Always
+// returns at least one entry (OCAS) so the picker step can be skipped when
+// there's nothing to choose between, same as /traitfind's collection picker.
+function buildDownloadCollectionOptions(serverCfg){
+  const allCols = [];
+  const primarySlug = serverCfg?.collectionSlug || serverCfg?.slug;
+  if(primarySlug) allCols.push({ slug: primarySlug, name: serverCfg.contractName || primarySlug });
+  for(const c of serverCfg?.collections || []){ if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+  if(!allCols.length) allCols.push({ slug: DEFAULT_SLUG, name: 'OCAS' });
+  return allCols;
+}
 
-  const tokenId = forced.tokenId || interaction.options?.getInteger?.('token') || parsed.tokenId;
-  const sizeRaw = forced.size || interaction.options?.getInteger?.('size') || parsed.size || 2048;
-  const size = Math.max(512, Math.min(sizeRaw, 4096));
-  const transparent = forced.transparent ?? interaction.options?.getBoolean?.('transparent') ?? parsed.transparent ?? false;
-  const collection = interaction.options?.getString?.('collection') || parsed.alias || 'ocas';
-  if(!tokenId) return interaction.reply({ content:'Provide a token ID. Example: `/download search:ocas #337 2048 no bg`', flags:MessageFlags.Ephemeral });
+function showDlTokenModal(interaction, collectionSlug){
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const modal = new ModalBuilder()
+    .setCustomId(`dl_modal:token:${collectionSlug || ''}`)
+    .setTitle('Download — Token Details');
+  modal.addComponents(
+    new AR().addComponents(new TextInputBuilder().setCustomId('token_id').setLabel('Token ID').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('337')),
+    new AR().addComponents(new TextInputBuilder().setCustomId('size').setLabel('Size in pixels (512-4096)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('2048')),
+    new AR().addComponents(new TextInputBuilder().setCustomId('transparent').setLabel('Transparent background? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('no')),
+  );
+  return interaction.showModal(modal);
+}
 
-  const cooldownMessage = forced.skipCooldown ? null : checkDownloadCooldown(interaction);
+async function handleDownloadColPick(interaction, ctx){
+  const slug = interaction.values[0];
+  return showDlTokenModal(interaction, slug);
+}
+
+async function handleDownloadModalSubmit(interaction, ctx){
+  const parts = interaction.customId.split(':');
+  const collection = parts.slice(2).join(':') || 'ocas';
+  const tokenId = parseInt((interaction.fields.getTextInputValue('token_id')||'').trim(), 10);
+  if(!tokenId || tokenId < 1){
+    return interaction.reply({ content:'❌ Invalid token ID. Please enter a positive number.', flags:MessageFlags.Ephemeral });
+  }
+  const sizeInput = (interaction.fields.getTextInputValue('size')||'').trim();
+  const sizeRaw = sizeInput ? parseInt(sizeInput, 10) : 2048;
+  if(sizeInput && (isNaN(sizeRaw) || sizeRaw < 512 || sizeRaw > 4096)){
+    return interaction.reply({ content:'❌ Invalid size. Must be a number between 512 and 4096.', flags:MessageFlags.Ephemeral });
+  }
+  const size = Math.max(512, Math.min(sizeRaw || 2048, 4096));
+  const transparentInput = (interaction.fields.getTextInputValue('transparent')||'').trim().toLowerCase();
+  const transparent = transparentInput === 'yes' || transparentInput === 'y' || transparentInput === 'true';
+
+  const cooldownMessage = checkDownloadCooldown(interaction);
   if(cooldownMessage){
     return interaction.reply({ content:cooldownMessage, flags:MessageFlags.Ephemeral }).catch(()=>{});
   }
+  await interaction.deferReply();
+  return runDownload(interaction, ctx, { tokenId, size, transparent, collection });
+}
 
-  if(!interaction.deferred && !interaction.replied){
-    if(forced.ephemeral) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    else await interaction.deferReply();
-  }
-
+async function runDownload(interaction, ctx, { tokenId, size, transparent, collection, alias: forcedAlias }){
   try{
     let contract = OCAS_CONTRACT, slug = DEFAULT_SLUG, chain = DEFAULT_CHAIN, alias = 'ocas';
     if(collection && collection !== 'ocas'){
@@ -389,6 +418,59 @@ async function handleDownloadCommand(interaction, forced={}){
   }
 }
 
+async function handleDownloadCommand(interaction, forced={}){
+  // forced may contain ctx fields like getConfig; extract them
+  const ctx = forced.getConfig ? forced : {};
+  if(forced.getConfig) forced = {};
+  const cfgForParse = await loadMarketConfig();
+  const guildCfgForParse = getGuildMarket(cfgForParse, interaction.guildId || 'dm');
+  const searchText = interaction.options?.getString?.('search') || '';
+  const parsed = parseDownloadSearch(searchText, guildCfgForParse);
+
+  const tokenId = forced.tokenId || interaction.options?.getInteger?.('token') || parsed.tokenId;
+  const sizeRaw = forced.size || interaction.options?.getInteger?.('size') || parsed.size || 2048;
+  const size = Math.max(512, Math.min(sizeRaw, 4096));
+  const transparent = forced.transparent ?? interaction.options?.getBoolean?.('transparent') ?? parsed.transparent ?? false;
+  const collection = interaction.options?.getString?.('collection') || parsed.alias || 'ocas';
+
+  // Nothing given at all — launch the guided flow. Collection picker only
+  // appears if this guild actually has more than one collection configured;
+  // otherwise it's skipped and falls straight to that one collection's modal.
+  if(!tokenId && !searchText.trim()){
+    const serverCfg = ctx.getConfig ? ctx.getConfig(interaction.guildId) : null;
+    const allCols = buildDownloadCollectionOptions(serverCfg);
+    if(allCols.length === 1){
+      return showDlTokenModal(interaction, allCols[0].slug);
+    }
+    const { StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ActionRowBuilder: AR } = require('discord.js');
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('dl_browse:col')
+      .setPlaceholder('Pick a collection...')
+      .addOptions(allCols.slice(0, 25).map(c =>
+        new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)
+      ));
+    return interaction.reply({
+      content: '**📥 Download** — Pick a collection:',
+      components: [new AR().addComponents(menu)],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  if(!tokenId) return interaction.reply({ content:'Provide a token ID. Example: `/download search:ocas #337 2048 no bg`', flags:MessageFlags.Ephemeral });
+
+  const cooldownMessage = forced.skipCooldown ? null : checkDownloadCooldown(interaction);
+  if(cooldownMessage){
+    return interaction.reply({ content:cooldownMessage, flags:MessageFlags.Ephemeral }).catch(()=>{});
+  }
+
+  if(!interaction.deferred && !interaction.replied){
+    if(forced.ephemeral) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    else await interaction.deferReply();
+  }
+
+  return runDownload(interaction, ctx, { tokenId, size, transparent, collection });
+}
+
 const DOWNLOAD_COMMANDS = new Set(['download']);
 
-module.exports = { handleDownloadCommand, DOWNLOAD_COMMANDS };
+module.exports = { handleDownloadCommand, handleDownloadColPick, handleDownloadModalSubmit, DOWNLOAD_COMMANDS };

@@ -28,7 +28,7 @@ const commands = [
 
 
   new SlashCommandBuilder().setName('download')
-  .setDescription('Download a high-res PNG for OCAS or another configured collection')
+  .setDescription('Download a high-res PNG for OCAS or another configured collection — leave blank for a guided menu')
   .addStringOption(o=>o.setName('search').setDescription('Example: ocas #337 2048 no bg').setRequired(false))
   .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(false).setMinValue(1))
   .addStringOption(o=>o.setName('collection').setDescription('Collection slug or alias. Defaults to OCAS').setRequired(false).setAutocomplete(true))

@@ -103,7 +103,7 @@ const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
 const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
 const { handleGiveawayCommand, handleGiveawayInteraction, GIVEAWAY_COMMANDS } = require('./commands/giveaway');
 const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
-const { handleDownloadCommand, DOWNLOAD_COMMANDS } = require('./commands/download');
+const { handleDownloadCommand, handleDownloadColPick, handleDownloadModalSubmit, DOWNLOAD_COMMANDS } = require('./commands/download');
 const { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS } = require('./commands/setup');
 const { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS } = require('./commands/config');
 const { handleLotteriesCommand, handleLotteriesButton, LOTTERIES_COMMANDS } = require('./commands/lotteries');
@@ -552,6 +552,9 @@ client.on('interactionCreate', async (interaction)=>{
   // ── Wallet verification button ────────────────────────────────────────────
 
   // ── start_verification wallet modal submit ────────────────────────────────────
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('dl_modal:token:')){
+    return handleDownloadModalSubmit(interaction, { getConfig, osHeaders });
+  }
   if(interaction.isModalSubmit() && interaction.customId.startsWith('rf_modal:range:')){
     return handleRankFindModalSubmit(interaction, {});
   }
@@ -731,6 +734,9 @@ client.on('interactionCreate', async (interaction)=>{
       buildTokenSearchEmbed, fetchTokenMetaFromDb, traitObjectToArray,
     };
     return handleTraitBrowseInteraction(interaction, tfCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId === 'dl_browse:col'){
+    return handleDownloadColPick(interaction, { getConfig });
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('rf_browse:mode:')){
     const rfCtx = {
