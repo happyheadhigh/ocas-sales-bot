@@ -1758,6 +1758,67 @@ app.get('/db/all-traits', auth, async (req, res) => {
 });
 
 // ── Start server ──────────────────────────────────────────────────────────────
+
+// ── GET /render/svg-token ─────────────────────────────────────────────────────
+// Renders an on-chain SVG token to PNG using Sharp. Moved here from the bot
+// process because Sharp's native libvips memory was not being released in
+// the long-running Discord bot process, causing OOM crashes after several
+// hours. This service is stateless and can be restarted independently.
+// Query params: svgUrl (or svgData for data: URIs)
+// Returns: image/png binary
+const sharp = require('sharp');
+sharp.cache(false);
+sharp.concurrency(2);
+
+app.get('/render/svg-token', auth, async (req, res) => {
+  try {
+    const svgSource = req.query.svgUrl || req.query.svgData;
+    if (!svgSource) return res.status(400).json({ ok: false, error: 'missing svgUrl or svgData' });
+
+    let svgText;
+    if (svgSource.startsWith('data:image/svg')) {
+      const b64 = svgSource.split(',')[1];
+      if (!b64) return res.status(400).json({ ok: false, error: 'empty svg data' });
+      svgText = Buffer.from(b64, 'base64').toString('utf-8');
+    } else {
+      const r = await fetch(svgSource);
+      if (!r.ok) return res.status(502).json({ ok: false, error: `SVG fetch ${r.status}` });
+      svgText = await r.text();
+    }
+
+    const SIZE = 500;
+    let bgBuf;
+    try {
+      bgBuf = await sharp(Buffer.from(svgText))
+        .resize(SIZE, SIZE, { kernel: 'nearest', fit: 'fill' })
+        .png()
+        .toBuffer();
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'SVG render failed: ' + e.message });
+    }
+
+    // Extract embedded character PNG and composite, same as original extractPngFromSvg
+    const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
+    let finalBuf = bgBuf;
+    if (pngMatch) {
+      try {
+        const rawPng = Buffer.from(pngMatch[1].replace(/\s/g, ''), 'base64');
+        const charBuf = await sharp(rawPng).resize(SIZE, SIZE, { kernel: 'nearest' }).png().toBuffer();
+        finalBuf = await sharp(bgBuf).composite([{ input: charBuf, blend: 'over' }]).png().toBuffer();
+      } catch (e) {
+        console.warn('[/render/svg-token] char composite failed, using full SVG render:', e.message);
+      }
+    }
+
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=3600'); // browser/CDN cache 1hr
+    res.send(finalBuf);
+  } catch (e) {
+    console.error('[/render/svg-token]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`TraitView API running on port ${PORT}`);
   console.log(`Auth: ${API_SECRET ? 'enabled' : (REQUIRE_API_AUTH ? 'REQUIRED BUT MISSING' : 'DISABLED (dev only; set API_SECRET to enable)')}`);
