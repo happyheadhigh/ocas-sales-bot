@@ -1625,93 +1625,154 @@ async function showMeTraitAlert(interaction, ctx){
 async function showMePriceAlerts(interaction, ctx){
   const { pgPool } = ctx;
   const userId = interaction.user.id;
-  let desc = 'No price alerts set.';
-  let hasAlerts = false;
-  const rows = [];
 
   if(pgPool){
     const res = await pgPool.query(
-      `SELECT id, token_id, slug, threshold_eth, alert_once, repeat_alert, triggered_at, is_active FROM user_price_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 4`,
+      `SELECT id, token_id, slug, threshold_eth, alert_once, repeat_alert, triggered_at, is_active FROM user_price_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 20`,
       [userId]
     ).catch(()=>null);
-    if(res?.rows.length){
-      hasAlerts = true;
-      desc = res.rows.map(r => {
+    if(res?.rows.length === 1){
+      return showPriceAlertDetail(interaction, ctx, res.rows[0].id, res.rows[0]);
+    }
+    if(res?.rows.length > 1){
+      const desc = res.rows.map(r => {
         const pausedTag = r.is_active === false ? ' ⏸️ *paused*' : '';
         return `**#${r.token_id}** (${r.slug}) — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)} ${r.triggered_at?'✅ triggered':r.repeat_alert?'🔁 repeat':'1x'}${pausedTag}`;
       }).join('\n');
-      for(const r of res.rows){
-        const toggleBtn = r.is_active === false
-          ? new ButtonBuilder().setCustomId(`me_browse:pricealert:resume:${r.id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success)
-          : new ButtonBuilder().setCustomId(`me_browse:pricealert:pause:${r.id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary);
-        const removeBtn = new ButtonBuilder().setCustomId(`me_browse:pricealert:remove:${r.id}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger);
-        rows.push(new ActionRowBuilder().addComponents(toggleBtn, removeBtn));
-      }
+      const embed = new EmbedBuilder().setTitle('🏷️ Price Alerts').setColor(0x5865F2).setDescription(desc);
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('me_browse:pricealert:pick')
+        .setPlaceholder('Pick an alert to manage...')
+        .addOptions(res.rows.slice(0,25).map(r =>
+          new StringSelectMenuOptionBuilder()
+            .setLabel(`#${r.token_id} (${r.slug}) — Ξ ${parseFloat(r.threshold_eth).toFixed(4)}`)
+            .setDescription(r.is_active === false ? 'Paused' : 'Active')
+            .setValue(String(r.id))
+        ));
+      const actionRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('me_browse:pricealert:set').setLabel('Add Price Alert').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('me_browse:pricealert:clearall').setLabel('Remove All').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      );
+      const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+      return interaction[updateFn]({ embeds: [embed], components: [new ActionRowBuilder().addComponents(menu), actionRow] });
     }
   }
 
-  const embed = new EmbedBuilder().setTitle('🏷️ Price Alerts').setColor(0x5865F2).setDescription(desc);
-
+  const embed = new EmbedBuilder().setTitle('🏷️ Price Alerts').setColor(0x5865F2).setDescription('No price alerts set.');
   const actionRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('me_browse:pricealert:set').setLabel('Add Price Alert').setStyle(ButtonStyle.Success),
-  );
-  if(hasAlerts) actionRow.addComponents(
-    new ButtonBuilder().setCustomId('me_browse:pricealert:clearall').setLabel('Remove All').setStyle(ButtonStyle.Danger),
-  );
-  actionRow.addComponents(
     new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
   );
-  rows.push(actionRow);
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: [actionRow] });
+}
+
+async function showPriceAlertDetail(interaction, ctx, alertId, preloaded){
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+  let r = preloaded;
+  if(!r){
+    const res = await pgPool.query(
+      `SELECT id, token_id, slug, threshold_eth, alert_once, repeat_alert, triggered_at, is_active FROM user_price_alerts WHERE id=$1 AND discord_id=$2`,
+      [alertId, userId]
+    ).catch(()=>null);
+    r = res?.rows[0];
+  }
+  if(!r) return showMePriceAlerts(interaction, ctx);
+
+  const pausedTag = r.is_active === false ? '\n⏸️ *Paused*' : '';
+  const desc = `**#${r.token_id}** (${r.slug}) — below Ξ ${parseFloat(r.threshold_eth).toFixed(4)}\n${r.triggered_at?'✅ Already triggered':r.repeat_alert?'🔁 Repeats':'Fires once'}${pausedTag}`;
+
+  const embed = new EmbedBuilder().setTitle('🏷️ Price Alert').setColor(0x5865F2).setDescription(desc);
+  const toggleBtn = r.is_active === false
+    ? new ButtonBuilder().setCustomId(`me_browse:pricealert:resume:${r.id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success)
+    : new ButtonBuilder().setCustomId(`me_browse:pricealert:pause:${r.id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary);
+  const removeBtn = new ButtonBuilder().setCustomId(`me_browse:pricealert:remove:${r.id}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId('me_browse:pricealert:list').setLabel('← Back to list').setStyle(ButtonStyle.Secondary);
+  const row = new ActionRowBuilder().addComponents(toggleBtn, removeBtn, backBtn);
 
   const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
-  return interaction[updateFn]({ embeds: [embed], components: rows });
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
 }
 
 async function showMeFloorAlerts(interaction, ctx){
   const { pgPool } = ctx;
   const userId = interaction.user.id;
-  let desc = 'No floor alerts set.';
-  let hasAlerts = false;
-  const rows = [];
 
   if(pgPool){
     const res = await pgPool.query(
-      `SELECT id, slug, threshold_eth, cooldown_minutes, direction, last_alerted_at, is_active FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 4`,
+      `SELECT id, slug, threshold_eth, cooldown_minutes, direction, last_alerted_at, is_active FROM user_floor_alerts WHERE discord_id=$1 ORDER BY created_at DESC LIMIT 20`,
       [userId]
     ).catch(()=>null);
-    if(res?.rows.length){
-      hasAlerts = true;
-      desc = res.rows.map(r => {
+    if(res?.rows.length === 1){
+      // Only one alert — no need to make the user pick, go straight to it.
+      return showFloorAlertDetail(interaction, ctx, res.rows[0].id, res.rows[0]);
+    }
+    if(res?.rows.length > 1){
+      const desc = res.rows.map(r => {
         const dir = r.direction || 'below';
         const arrow = dir === 'above' ? '📈' : dir === 'either' ? '↕️' : '📉';
         const pausedTag = r.is_active === false ? ' ⏸️ *paused*' : '';
-        return `${arrow} **${r.slug}** — ${dir} Ξ ${parseFloat(r.threshold_eth).toFixed(4)} · repeats after ${formatCooldown(r.cooldown_minutes||60)}${r.last_alerted_at?' · last alerted '+new Date(r.last_alerted_at).toLocaleDateString():''}${pausedTag}`;
+        return `${arrow} **${r.slug}** — ${dir} Ξ ${parseFloat(r.threshold_eth).toFixed(4)}${pausedTag}`;
       }).join('\n');
-      for(const r of res.rows){
-        const toggleBtn = r.is_active === false
-          ? new ButtonBuilder().setCustomId(`me_browse:flooralert:resume:${r.id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success)
-          : new ButtonBuilder().setCustomId(`me_browse:flooralert:pause:${r.id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary);
-        const removeBtn = new ButtonBuilder().setCustomId(`me_browse:flooralert:remove:${r.id}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger);
-        rows.push(new ActionRowBuilder().addComponents(toggleBtn, removeBtn));
-      }
+      const embed = new EmbedBuilder().setTitle('📉 Floor Alerts').setColor(0x5865F2).setDescription(desc);
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('me_browse:flooralert:pick')
+        .setPlaceholder('Pick an alert to manage...')
+        .addOptions(res.rows.slice(0,25).map(r =>
+          new StringSelectMenuOptionBuilder()
+            .setLabel(`${r.slug} — ${(r.direction||'below')} Ξ ${parseFloat(r.threshold_eth).toFixed(4)}`)
+            .setDescription(r.is_active === false ? 'Paused' : 'Active')
+            .setValue(String(r.id))
+        ));
+      const actionRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('me_browse:flooralert:set').setLabel('Add Floor Alert').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('me_browse:flooralert:clearall').setLabel('Remove All').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+      );
+      const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+      return interaction[updateFn]({ embeds: [embed], components: [new ActionRowBuilder().addComponents(menu), actionRow] });
     }
   }
 
-  const embed = new EmbedBuilder().setTitle('📉 Floor Alerts').setColor(0x5865F2).setDescription(desc);
-
+  const embed = new EmbedBuilder().setTitle('📉 Floor Alerts').setColor(0x5865F2).setDescription('No floor alerts set.');
   const actionRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('me_browse:flooralert:set').setLabel('Add Floor Alert').setStyle(ButtonStyle.Success),
-  );
-  if(hasAlerts) actionRow.addComponents(
-    new ButtonBuilder().setCustomId('me_browse:flooralert:clearall').setLabel('Remove All').setStyle(ButtonStyle.Danger),
-  );
-  actionRow.addComponents(
     new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
   );
-  rows.push(actionRow);
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: [actionRow] });
+}
+
+async function showFloorAlertDetail(interaction, ctx, alertId, preloaded){
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+  let r = preloaded;
+  if(!r){
+    const res = await pgPool.query(
+      `SELECT id, slug, threshold_eth, cooldown_minutes, direction, last_alerted_at, is_active FROM user_floor_alerts WHERE id=$1 AND discord_id=$2`,
+      [alertId, userId]
+    ).catch(()=>null);
+    r = res?.rows[0];
+  }
+  if(!r) return showMeFloorAlerts(interaction, ctx);
+
+  const dir = r.direction || 'below';
+  const arrow = dir === 'above' ? '📈' : dir === 'either' ? '↕️' : '📉';
+  const pausedTag = r.is_active === false ? '\n⏸️ *Paused*' : '';
+  const desc = `${arrow} **${r.slug}** — ${dir} Ξ ${parseFloat(r.threshold_eth).toFixed(4)}\nRepeats after ${formatCooldown(r.cooldown_minutes||60)}${r.last_alerted_at?'\nLast alerted '+new Date(r.last_alerted_at).toLocaleDateString():''}${pausedTag}`;
+
+  const embed = new EmbedBuilder().setTitle('📉 Floor Alert').setColor(0x5865F2).setDescription(desc);
+  const toggleBtn = r.is_active === false
+    ? new ButtonBuilder().setCustomId(`me_browse:flooralert:resume:${r.id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success)
+    : new ButtonBuilder().setCustomId(`me_browse:flooralert:pause:${r.id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary);
+  const removeBtn = new ButtonBuilder().setCustomId(`me_browse:flooralert:remove:${r.id}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId('me_browse:flooralert:list').setLabel('← Back to list').setStyle(ButtonStyle.Secondary);
+  const row = new ActionRowBuilder().addComponents(toggleBtn, removeBtn, backBtn);
 
   const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
-  return interaction[updateFn]({ embeds: [embed], components: rows });
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
 }
 
 
@@ -2692,6 +2753,14 @@ async function handleMeInteraction(interaction, ctx){
     return showPriceAlertModal(interaction, interaction.values[0]);
   }
 
+  if(customId === 'me_browse:pricealert:pick'){
+    return showPriceAlertDetail(interaction, ctx, parseInt(interaction.values[0]));
+  }
+
+  if(customId === 'me_browse:pricealert:list'){
+    return showMePriceAlerts(interaction, ctx);
+  }
+
   if(customId.startsWith('me_browse:pricealert:remove:')){
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`DELETE FROM user_price_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
@@ -2701,13 +2770,13 @@ async function handleMeInteraction(interaction, ctx){
   if(customId.startsWith('me_browse:pricealert:pause:')){
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`UPDATE user_price_alerts SET is_active=false WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
-    return showMePriceAlerts(interaction, ctx);
+    return showPriceAlertDetail(interaction, ctx, id);
   }
 
   if(customId.startsWith('me_browse:pricealert:resume:')){
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`UPDATE user_price_alerts SET is_active=true WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
-    return showMePriceAlerts(interaction, ctx);
+    return showPriceAlertDetail(interaction, ctx, id);
   }
 
   if(customId === 'me_browse:pricealert:clearall'){
@@ -2736,6 +2805,14 @@ async function handleMeInteraction(interaction, ctx){
     return showFloorAlertModal(interaction, interaction.values[0]);
   }
 
+  if(customId === 'me_browse:flooralert:pick'){
+    return showFloorAlertDetail(interaction, ctx, parseInt(interaction.values[0]));
+  }
+
+  if(customId === 'me_browse:flooralert:list'){
+    return showMeFloorAlerts(interaction, ctx);
+  }
+
   if(customId.startsWith('me_browse:flooralert:remove:')){
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`DELETE FROM user_floor_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
@@ -2745,13 +2822,13 @@ async function handleMeInteraction(interaction, ctx){
   if(customId.startsWith('me_browse:flooralert:pause:')){
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`UPDATE user_floor_alerts SET is_active=false WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
-    return showMeFloorAlerts(interaction, ctx);
+    return showFloorAlertDetail(interaction, ctx, id);
   }
 
   if(customId.startsWith('me_browse:flooralert:resume:')){
     const id = parseInt(customId.split(':').pop());
     await pgPool.query(`UPDATE user_floor_alerts SET is_active=true WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
-    return showMeFloorAlerts(interaction, ctx);
+    return showFloorAlertDetail(interaction, ctx, id);
   }
 
   if(customId === 'me_browse:flooralert:clearall'){
