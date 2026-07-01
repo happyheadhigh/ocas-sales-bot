@@ -96,7 +96,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction }   = require('./commands/market');
 const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
@@ -552,6 +552,9 @@ client.on('interactionCreate', async (interaction)=>{
   // ── Wallet verification button ────────────────────────────────────────────
 
   // ── start_verification wallet modal submit ────────────────────────────────────
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('rf_modal:range:')){
+    return handleRankFindModalSubmit(interaction, {});
+  }
   if(interaction.isModalSubmit() && interaction.customId.startsWith('sv_modal:username:')){
     await interaction.deferReply({flags:64});
     const discordId  = interaction.user.id;
@@ -728,6 +731,14 @@ client.on('interactionCreate', async (interaction)=>{
       buildTokenSearchEmbed, fetchTokenMetaFromDb, traitObjectToArray,
     };
     return handleTraitBrowseInteraction(interaction, tfCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('rf_browse:mode:')){
+    const rfCtx = {
+      getConfig, getRailwayApiUrl, fetchBotApiJson, buildSaleEmbed, postEmbeds,
+      traitObjectToArray, fetchTokenMetaFromDb, getRankTierColor, COLORS,
+      resolveImage, traitDisplayLines,
+    };
+    return handleRankFindBrowseInteraction(interaction, rfCtx);
   }
   if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('ma_browse:')){
     const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert };

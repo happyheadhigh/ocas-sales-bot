@@ -473,84 +473,29 @@ async function handleMarketCommand(commandName, ctx){
     const _rfCool = checkCommandCooldown(interaction.user.id, 'rankfind');
     if(_rfCool) return interaction.reply({content:`⏳ Please wait **${_rfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
     const RAILWAY_URL = getRailwayApiUrl();
-    const API_SECRET  = process.env.API_SECRET;
+    if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured.', flags: MessageFlags.Ephemeral });
+
+    const _rfColInput  = interaction.options.getString('collection') || null;
+
+    // No rank range given at all — launch the guided flow (modal for
+    // min/max rank, then a follow-up menu for mode + sort) instead of
+    // silently running with the 1-100 defaults.
+    const noRankArgsGiven = interaction.options.getInteger('min_rank') == null && interaction.options.getInteger('max_rank') == null;
+    if(noRankArgsGiven){
+      return showRfRankModal(interaction, _rfColInput);
+    }
+
     const rankMin  = interaction.options.getInteger('min_rank') || 1;
     const rankMax  = interaction.options.getInteger('max_rank') || 100;
     const modeRf   = interaction.options.getString('mode') || 'listings';
     const sortBy   = interaction.options.getString('sort') || 'price';
-    const wantSales    = modeRf === 'sales';
-    const wantListings = !wantSales;
-    const _rfColInput  = interaction.options.getString('collection') || null;
     const _rfResolved  = resolveCollectionFromServerCfg(config, _rfColInput);
     const rfSlug       = _rfResolved?.slug || config.collectionSlug || config.slug;
 
-    if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured.', flags: MessageFlags.Ephemeral });
     if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. min_rank must be ≤ max_rank and within 1–10000.', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
-    const contract = (_rfResolved?.contract || config.contract || '');
-    try{
-      if(wantSales){
-        const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, limit: '20', sort: 'desc' });
-        if(API_SECRET) qs.set('key', API_SECRET);
-        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/rank-sales?${qs}`, '/db/rank-sales API');
-        const sales = j.sales || [];
-        if(!sales.length){ await interaction.editReply(`No sales found for OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
-        const cfg = _rfResolved ? {...config, ..._rfResolved} : {...config, slug: rfSlug};
-        const saleEmbeds = await Promise.all(sales.map(async sale => {
-          const tokenTraits = sale.traits && typeof sale.traits==='object' ? traitObjectToArray(sale.traits) : [];
-          const isWethSale = (sale.currency||'ETH').toUpperCase() === 'WETH';
-          const syntheticSale = {
-            nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits, os_rank: sale.os_rank },
-            buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
-            payment: { symbol: (sale.currency||'ETH'), token_address: isWethSale?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
-            event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
-          };
-          return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
-        }));
-        await postEmbeds(interaction, saleEmbeds.filter(Boolean),
-          `📊 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${sales.length} recent sale${sales.length===1?'':'s'}:`);
-        return;
-      }
-
-      const qs = new URLSearchParams({ listed: '1', rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
-      if(API_SECRET) qs.set('key', API_SECRET);
-      const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, '/db/multi-trait-tokens rank listings API');
-      let listings = j.tokens || [];
-      if(!listings.length){ await interaction.editReply(`No listings found with OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
-      if(sortBy === 'rank') listings.sort((a,b) => (a.os_rank??9999) - (b.os_rank??9999));
-      const rankEmbeds = await Promise.all(listings.map(async l => {
-        const tokenId = l.token_id ?? l.id ?? l.identifier;
-        const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-        const tokenTraits = dbMeta?.traits
-          ? traitObjectToArray(dbMeta.traits)
-          : (l.traits && typeof l.traits==='object' ? traitObjectToArray(l.traits) : []);
-        const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
-        const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
-        const listingUrl = l.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
-        const tvUrl = `https://traitview.com/?jump=${tokenId}`;
-        const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
-        const embed = new EmbedBuilder()
-          .setColor(rankColor)
-          .setTitle(`${priceStr} ETH • #${tokenId}${rankBadge} • Listed`)
-          .setURL(listingUrl)
-          .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
-          .setTimestamp();
-        const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
-        if(tokenTraits.length){
-          embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
-        } else { embed.setDescription('**Links**\n' + tvLink); }
-        try{ embed._imageResult = await resolveImage({ identifier: String(tokenId) }, contract, 'ethereum'); }catch(e){}
-        return embed;
-      }));
-      const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
-      await postEmbeds(interaction, rankEmbeds.filter(Boolean),
-        `🏆 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${listings.length} listing${listings.length===1?'':'s'} (${sortLabel}):`);
-    }catch(e){
-      console.warn('[rankfind]', e.message);
-      await interaction.editReply(`I could not load rank results from the TraitView API. ${e.message}`);
-    }
-    return;
+    return runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, modeRf, sortBy, rfSlug, _rfResolved });
   }
 
   if(commandName==='sweep'){
@@ -808,6 +753,133 @@ function sortTraitNamesTypeFirst(names){
   copy.unshift(type);
   return copy;
 }
+// ── /rankfind guided flow ──────────────────────────────────────────────────
+// Launched when /rankfind is run with no min_rank/max_rank given at all.
+// Shows a modal (two plain-text fields, easier for the community to fill in
+// correctly than a single "1-100" free-text field) then a follow-up menu
+// for mode + sort, then runs the same search logic the direct-args path uses.
+function showRfRankModal(interaction, collectionInput){
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const modal = new ModalBuilder()
+    .setCustomId(`rf_modal:range:${collectionInput || ''}`)
+    .setTitle('Rank Find — Choose a Range');
+  modal.addComponents(
+    new AR().addComponents(new TextInputBuilder().setCustomId('min_rank').setLabel('Minimum Rank').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('1')),
+    new AR().addComponents(new TextInputBuilder().setCustomId('max_rank').setLabel('Maximum Rank').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('100')),
+  );
+  return interaction.showModal(modal);
+}
+
+async function handleRankFindModalSubmit(interaction, ctx){
+  const parts = interaction.customId.split(':');
+  const collectionInput = parts.slice(2).join(':') || null;
+  const rankMin = parseInt(interaction.fields.getTextInputValue('min_rank').trim(), 10);
+  const rankMax = parseInt(interaction.fields.getTextInputValue('max_rank').trim(), 10);
+  if(isNaN(rankMin) || isNaN(rankMax) || rankMin < 1 || rankMax > 10000 || rankMin > rankMax){
+    return interaction.reply({ content: '❌ Invalid rank range. Minimum and maximum must be numbers between 1–10000, with minimum ≤ maximum.', flags: MessageFlags.Ephemeral });
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`rf_browse:mode:${collectionInput || ''}:${rankMin}:${rankMax}`)
+    .setPlaceholder('What do you want to see?')
+    .addOptions([
+      new StringSelectMenuOptionBuilder().setLabel('Listings — cheapest first').setValue('listings:price'),
+      new StringSelectMenuOptionBuilder().setLabel('Listings — best rank first').setValue('listings:rank'),
+      new StringSelectMenuOptionBuilder().setLabel('Sales').setValue('sales:price'),
+    ]);
+  return interaction.reply({
+    content: `**🏆 Rank Find — ⬥ #${rankMin}–#${rankMax}**\n\nWhat would you like to see?`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleRankFindBrowseInteraction(interaction, ctx){
+  const { getConfig } = ctx;
+  const parts = interaction.customId.slice('rf_browse:mode:'.length).split(':');
+  const collectionInput = parts[0] || null;
+  const rankMin = parseInt(parts[1], 10);
+  const rankMax = parseInt(parts[2], 10);
+  const [modeRf, sortBy] = interaction.values[0].split(':');
+
+  const guildId = interaction.guildId;
+  const config = getConfig(guildId) || {};
+  const _rfResolved = resolveCollectionFromServerCfg(config, collectionInput);
+  const rfSlug = _rfResolved?.slug || config.collectionSlug || config.slug;
+
+  await interaction.update({ content: `🔍 Searching **⬥ #${rankMin}–#${rankMax}**...`, components: [] });
+  return runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, modeRf, sortBy, rfSlug, _rfResolved });
+}
+
+async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, modeRf, sortBy, rfSlug, _rfResolved }){
+  const { getRailwayApiUrl, fetchBotApiJson, buildSaleEmbed, postEmbeds, traitObjectToArray,
+          fetchTokenMetaFromDb, getRankTierColor, COLORS, resolveImage, traitDisplayLines } = ctx;
+  const RAILWAY_URL = getRailwayApiUrl();
+  const API_SECRET  = process.env.API_SECRET;
+  const wantSales = modeRf === 'sales';
+  const contract = (_rfResolved?.contract || config.contract || '');
+  try{
+    if(wantSales){
+      const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, limit: '20', sort: 'desc' });
+      if(API_SECRET) qs.set('key', API_SECRET);
+      const j = await fetchBotApiJson(`${RAILWAY_URL}/db/rank-sales?${qs}`, '/db/rank-sales API');
+      const sales = j.sales || [];
+      if(!sales.length){ await interaction.editReply(`No sales found for OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
+      const cfg = _rfResolved ? {...config, ..._rfResolved} : {...config, slug: rfSlug};
+      const saleEmbeds = await Promise.all(sales.map(async sale => {
+        const tokenTraits = sale.traits && typeof sale.traits==='object' ? traitObjectToArray(sale.traits) : [];
+        const isWethSale = (sale.currency||'ETH').toUpperCase() === 'WETH';
+        const syntheticSale = {
+          nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits, os_rank: sale.os_rank },
+          buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
+          payment: { symbol: (sale.currency||'ETH'), token_address: isWethSale?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
+          event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
+        };
+        return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+      }));
+      await postEmbeds(interaction, saleEmbeds.filter(Boolean),
+        `📊 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${sales.length} recent sale${sales.length===1?'':'s'}:`);
+      return;
+    }
+
+    const qs = new URLSearchParams({ listed: '1', rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
+    if(API_SECRET) qs.set('key', API_SECRET);
+    const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, '/db/multi-trait-tokens rank listings API');
+    let listings = j.tokens || [];
+    if(!listings.length){ await interaction.editReply(`No listings found with OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
+    if(sortBy === 'rank') listings.sort((a,b) => (a.os_rank??9999) - (b.os_rank??9999));
+    const rankEmbeds = await Promise.all(listings.map(async l => {
+      const tokenId = l.token_id ?? l.id ?? l.identifier;
+      const dbMeta = await fetchTokenMetaFromDb(tokenId, rfSlug).catch(()=>null);
+      const tokenTraits = dbMeta?.traits
+        ? traitObjectToArray(dbMeta.traits)
+        : (l.traits && typeof l.traits==='object' ? traitObjectToArray(l.traits) : []);
+      const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
+      const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
+      const listingUrl = l.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+      const tvUrl = `https://traitview.com/?jump=${tokenId}`;
+      const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
+      const embed = new EmbedBuilder()
+        .setColor(rankColor)
+        .setTitle(`${priceStr} ETH • #${tokenId}${rankBadge} • Listed`)
+        .setURL(listingUrl)
+        .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
+        .setTimestamp();
+      const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
+      if(tokenTraits.length){
+        embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
+      } else { embed.setDescription('**Links**\n' + tvLink); }
+      try{ embed._imageResult = await resolveImage({ identifier: String(tokenId) }, contract, 'ethereum'); }catch(e){}
+      return embed;
+    }));
+    const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
+    await postEmbeds(interaction, rankEmbeds.filter(Boolean),
+      `🏆 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${listings.length} listing${listings.length===1?'':'s'} (${sortLabel}):`);
+  }catch(e){
+    console.warn('[rankfind]', e.message);
+    await interaction.editReply(`I could not load rank results from the TraitView API. ${e.message}`);
+  }
+}
+
 async function showTfTraitPicker(interaction, ctx, slug, page = 0){
   const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
   const RAILWAY_URL = getRailwayApiUrl();
@@ -2841,4 +2913,4 @@ async function showFloorAlertModal(interaction, slug){
   return interaction.showModal(modal);
 }
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction };
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction };
