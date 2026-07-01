@@ -808,16 +808,19 @@ function sortTraitNamesTypeFirst(names){
   copy.unshift(type);
   return copy;
 }
-async function showTfTraitPicker(interaction, ctx, slug){
+async function showTfTraitPicker(interaction, ctx, slug, page = 0){
   const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
   const allTraitNames = sortTraitNamesTypeFirst([...new Set(traitIndex.map(t => t.trait_name))]);
-  const traitNames = allTraitNames.slice(0, 25);
-  const hasMoreTraitCategories = allTraitNames.length > 25;
-  if(!traitNames.length){
+  const PAGE_SIZE = 24; // leave room for a "More categories" option as the 25th slot
+  const totalPages = Math.max(1, Math.ceil(allTraitNames.length / PAGE_SIZE));
+  const safePage = Math.min(Math.max(page, 0), totalPages - 1);
+  const pageNames = allTraitNames.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
+  const hasNextPage = safePage < totalPages - 1;
+  if(!pageNames.length){
     const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
     return interaction[replyFn]({ content: `No trait data found for **${slug}** yet. Make sure the collection is added via \`/config\`.`, flags: MessageFlags.Ephemeral });
   }
@@ -826,17 +829,26 @@ async function showTfTraitPicker(interaction, ctx, slug){
     if(!traitValueCounts[t.trait_name]) traitValueCounts[t.trait_name] = 0;
     traitValueCounts[t.trait_name]++;
   }
+  const options = pageNames.map(n => new StringSelectMenuOptionBuilder()
+    .setLabel(n)
+    .setValue(n)
+    .setDescription(`${traitValueCounts[n] || 0} value${traitValueCounts[n]===1?'':'s'}`)
+  );
+  if(hasNextPage){
+    options.push(new StringSelectMenuOptionBuilder()
+      .setLabel(`→ More categories (page ${safePage + 2} of ${totalPages})`)
+      .setValue(`__next_page__:${safePage + 1}`)
+      .setDescription('See remaining trait categories')
+    );
+  }
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`tf_browse:trait:${slug}`)
     .setPlaceholder('Pick a trait category...')
-    .addOptions(traitNames.map(n => new StringSelectMenuOptionBuilder()
-      .setLabel(n)
-      .setValue(n)
-      .setDescription(`${traitValueCounts[n] || 0} value${traitValueCounts[n]===1?'':'s'}`)
-    ));
+    .addOptions(options);
+  const pageNote = totalPages > 1 ? ` (page ${safePage + 1} of ${totalPages})` : '';
   const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
   return interaction[replyFn]({
-    content: `**🔍 Trait Find — ${slug}**\n\nPick a trait category:`,
+    content: `**🔍 Trait Find — ${slug}**\n\nPick a trait category${pageNote}:`,
     components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
@@ -922,8 +934,12 @@ async function handleTraitBrowseInteraction(interaction, ctx){
 
   if(customId.startsWith('tf_browse:trait:')){
     const slug = customId.slice('tf_browse:trait:'.length);
-    const traitName = interaction.values[0];
-    return showTfValuePicker(interaction, ctx, slug, traitName);
+    const selected = interaction.values[0];
+    if(selected.startsWith('__next_page__:')){
+      const nextPage = parseInt(selected.split(':')[1], 10) || 0;
+      return showTfTraitPicker(interaction, ctx, slug, nextPage);
+    }
+    return showTfValuePicker(interaction, ctx, slug, selected);
   }
 
   if(customId.startsWith('tf_browse:val:')){
@@ -1014,31 +1030,43 @@ async function handleTraitBrowseInteraction(interaction, ctx){
 }
 
 // ── /myalert guided flow helpers ─────────────────────────────────────────────
-async function showMaTraitPicker(interaction, ctx, slug){
+async function showMaTraitPicker(interaction, ctx, slug, page = 0){
   const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
   const allTraitNames = sortTraitNamesTypeFirst([...new Set(traitIndex.map(t => t.trait_name))]);
-  const traitNames = allTraitNames.slice(0, 25);
-  const hasMoreTraitCategories = allTraitNames.length > 25;
-  if(!traitNames.length){
+  const PAGE_SIZE = 24;
+  const totalPages = Math.max(1, Math.ceil(allTraitNames.length / PAGE_SIZE));
+  const safePage = Math.min(Math.max(page, 0), totalPages - 1);
+  const pageNames = allTraitNames.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
+  const hasNextPage = safePage < totalPages - 1;
+  if(!pageNames.length){
     const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
     return interaction[replyFn]({ content: `No trait data found for **${slug}** yet.`, ...(replyFn !== 'update' ? { flags: MessageFlags.Ephemeral } : {}) });
   }
   const traitValueCounts = {};
   for(const t of traitIndex){ if(!traitValueCounts[t.trait_name]) traitValueCounts[t.trait_name]=0; traitValueCounts[t.trait_name]++; }
+  const options = pageNames.map(n => new StringSelectMenuOptionBuilder()
+    .setLabel(n).setValue(n)
+    .setDescription(`${traitValueCounts[n]||0} value${traitValueCounts[n]===1?'':'s'}`)
+  );
+  if(hasNextPage){
+    options.push(new StringSelectMenuOptionBuilder()
+      .setLabel(`→ More categories (page ${safePage + 2} of ${totalPages})`)
+      .setValue(`__next_page__:${safePage + 1}`)
+      .setDescription('See remaining trait categories')
+    );
+  }
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`ma_browse:trait:${slug}`)
     .setPlaceholder('Pick a trait to filter by...')
-    .addOptions(traitNames.map(n => new StringSelectMenuOptionBuilder()
-      .setLabel(n).setValue(n)
-      .setDescription(`${traitValueCounts[n]||0} value${traitValueCounts[n]===1?'':'s'}`)
-    ));
+    .addOptions(options);
+  const pageNote = totalPages > 1 ? ` (page ${safePage + 1} of ${totalPages})` : '';
   const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
   const replyOpts = {
-    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by:`,
+    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by${pageNote}:`,
     components: [new ActionRowBuilder().addComponents(menu)],
     embeds: [],
   };
@@ -1142,8 +1170,12 @@ async function handleMyAlertInteraction(interaction, ctx){
   }
   if(customId.startsWith('ma_browse:trait:')){
     const slug = customId.slice('ma_browse:trait:'.length);
-    const traitName = interaction.values[0];
-    return showMaValuePicker(interaction, ctx, slug, traitName);
+    const selected = interaction.values[0];
+    if(selected.startsWith('__next_page__:')){
+      const nextPage = parseInt(selected.split(':')[1], 10) || 0;
+      return showMaTraitPicker(interaction, ctx, slug, nextPage);
+    }
+    return showMaValuePicker(interaction, ctx, slug, selected);
   }
   if(customId.startsWith('ma_browse:skiptr:')){
     const slug = customId.slice('ma_browse:skiptr:'.length);
