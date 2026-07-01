@@ -158,7 +158,7 @@ async function handleTokenCommand(commandName, ctx){
       const contextLine = descParts.length ? `${descParts.join(' · ')}\n` : '';
 
       // Fetch OS rank for title badge + rank-tier sidebar color
-      const dbMeta  = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+      const dbMeta  = await fetchTokenMetaFromDb(tokenId, activeCol.slug).catch(()=>null);
       const osRank  = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
       const rankBadge = osRank ? ` ⬥${osRank.toLocaleString()}` : '';
       const ocasColor = getRankTierColor(osRank) ?? COLORS.OCAS_BG;

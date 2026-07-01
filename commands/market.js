@@ -245,7 +245,7 @@ async function handleMarketCommand(commandName, ctx){
         if(!sales.length){ await interaction.editReply(`No sales found for **${matchLabel}**.`); return; }
         const toShow = sales.slice(0, want);
         const saleEmbeds = await Promise.all(toShow.map(async sale => {
-          const dbMeta = await fetchTokenMetaFromDb(sale.token_id).catch(()=>null);
+          const dbMeta = await fetchTokenMetaFromDb(sale.token_id, slug).catch(()=>null);
           const tokenTraits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
           const syntheticSale = {
             nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
@@ -290,7 +290,7 @@ async function handleMarketCommand(commandName, ctx){
           };
           return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
         }
-        const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+        const dbMeta = await fetchTokenMetaFromDb(tokenId, slug).catch(()=>null);
         return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
       }));
       await postEmbeds(interaction, embeds.filter(Boolean),
@@ -982,7 +982,7 @@ async function handleTraitBrowseInteraction(interaction, ctx){
         const sales = j.sales || [];
         if(!sales.length){ await interaction.editReply({ content: `No sales found for **${matchLabel}**.`, components:[] }); return; }
         const saleEmbeds = await Promise.all(sales.slice(0,want).map(async sale => {
-          const dbMeta = await fetchTokenMetaFromDb(sale.token_id).catch(()=>null);
+          const dbMeta = await fetchTokenMetaFromDb(sale.token_id, slug).catch(()=>null);
           const tokenTraits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
           const syntheticSale = {
             nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
@@ -1016,7 +1016,7 @@ async function handleTraitBrowseInteraction(interaction, ctx){
           };
           return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
         }
-        const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+        const dbMeta = await fetchTokenMetaFromDb(tokenId, slug).catch(()=>null);
         return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
       }));
       await postEmbeds(interaction, embeds.filter(Boolean),

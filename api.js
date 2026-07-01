@@ -11,6 +11,7 @@
 
 const express = require('express');
 const { Pool } = require('pg');
+const { OCAS_SLUG } = require('./lib/constants');
 
 // Loaded at module level (not lazily inside a route handler) specifically
 // so its setInterval-driven sync loops actually start the moment this
@@ -171,10 +172,17 @@ app.get('/db/token/:id', auth, async (req, res) => {
     if (!tokenId || tokenId < 1 || tokenId > 10000) {
       return res.status(400).json({ ok: false, error: 'invalid token id' });
     }
+    // Defaults to OCAS when no slug is provided so any caller not yet updated
+    // to pass one keeps its exact current behavior. Without this scoping,
+    // token_id collisions across collections (e.g. cryptopunks #9228 and
+    // on-chain-all-stars #9228 both existing in these tables) get merged
+    // together into one result — confirmed root cause of the 2026-07-01
+    // /traitfind garbled-trait bug.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
 
     const [tokenRes, traitsRes] = await Promise.all([
-      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count FROM tokens WHERE id = $1`, [tokenId]),
-      pool.query(`SELECT trait_name, trait_value, COALESCE(trait_index,0) AS trait_index FROM token_traits WHERE token_id = $1 ORDER BY COALESCE(trait_index,0), trait_name`, [tokenId])
+      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count FROM tokens WHERE id = $1 AND collection_slug = $2`, [tokenId, slug]),
+      pool.query(`SELECT trait_name, trait_value, COALESCE(trait_index,0) AS trait_index FROM token_traits WHERE token_id = $1 AND collection_slug = $2 ORDER BY COALESCE(trait_index,0), trait_name`, [tokenId, slug])
     ]);
 
     if (!tokenRes.rows.length) return res.status(404).json({ ok: false, error: 'not found' });
