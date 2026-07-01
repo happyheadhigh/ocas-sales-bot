@@ -798,13 +798,25 @@ const MARKET_COMMANDS = new Set([
 ]);
 
 // ── /traitfind guided flow helpers ───────────────────────────────────────────
+// Sorts trait category names with "Type" always first (most commonly searched),
+// rest kept in original order. Used by both the trait-find and mispriced-alert pickers.
+function sortTraitNamesTypeFirst(names){
+  const idx = names.findIndex(n => n.toLowerCase() === 'type');
+  if(idx <= 0) return names; // already first, or not present
+  const copy = [...names];
+  const [type] = copy.splice(idx, 1);
+  copy.unshift(type);
+  return copy;
+}
 async function showTfTraitPicker(interaction, ctx, slug){
   const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
-  const traitNames = [...new Set(traitIndex.map(t => t.trait_name))].slice(0, 25);
+  const allTraitNames = sortTraitNamesTypeFirst([...new Set(traitIndex.map(t => t.trait_name))]);
+  const traitNames = allTraitNames.slice(0, 25);
+  const hasMoreTraitCategories = allTraitNames.length > 25;
   if(!traitNames.length){
     const replyFn = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
     return interaction[replyFn]({ content: `No trait data found for **${slug}** yet. Make sure the collection is added via \`/config\`.`, flags: MessageFlags.Ephemeral });
@@ -843,45 +855,55 @@ async function showTfValuePicker(interaction, ctx, slug, traitName){
   }
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`tf_browse:val:${slug}:${traitName}`)
-    .setPlaceholder(`Pick a ${traitName} value...`)
+    .setPlaceholder(`Pick 1-${valueRows.length} ${traitName} value(s)...`)
+    .setMinValues(1)
+    .setMaxValues(valueRows.length)
     .addOptions(valueRows.map(r => new StringSelectMenuOptionBuilder()
       .setLabel(r.trait_value)
       .setValue(r.trait_value)
       .setDescription(`${r.token_count} token${r.token_count===1?'':'s'}`)
     ));
   return interaction.update({
-    content: `**🔍 Trait Find — ${slug} › ${traitName}**\n\nPick a value:`,
+    content: `**🔍 Trait Find — ${slug} › ${traitName}**\n\nPick one or more values (matches ANY selected):`,
     components: [new ActionRowBuilder().addComponents(menu)],
   });
 }
 
-async function showTfModePicker(interaction, ctx, slug, traitName, traitValue){
+async function showTfModePicker(interaction, ctx, slug, traitName, traitValues){
   const { getRailwayApiUrl, fetchBotApiJson } = ctx;
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET = process.env.API_SECRET;
+  const valuesArr = Array.isArray(traitValues) ? traitValues : [traitValues];
+  const valueLabel = valuesArr.join(' or ');
+  // Group is one OR-set: [{trait_name, trait_value}, {trait_name, trait_value}, ...]
+  // matches ANY of the selected values for this trait category.
+  const group = valuesArr.map(v => ({ trait_name: traitName, trait_value: v }));
   let tokenCount = '?', listingCount = '?', salesCount = '?';
   try {
     const qs = new URLSearchParams({ slug, key: API_SECRET||'' });
-    qs.set('groups', JSON.stringify([[{ trait_name: traitName, trait_value: traitValue }]]));
+    qs.set('groups', JSON.stringify([group]));
+    const salesQs = new URLSearchParams({ trait: traitName, value: valuesArr[0], limit:'1', key: API_SECRET||'' });
     const [tokRes, lstRes, salRes] = await Promise.all([
       fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, 'mode-count-tokens').catch(()=>null),
       fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}&listed=1`, 'mode-count-listed').catch(()=>null),
-      fetchBotApiJson(`${RAILWAY_URL}/db/trait-sales?${new URLSearchParams({ trait: traitName, value: traitValue, limit:'1', key: API_SECRET||'' })}`, 'mode-count-sales').catch(()=>null),
+      fetchBotApiJson(`${RAILWAY_URL}/db/trait-sales?${salesQs}`, 'mode-count-sales').catch(()=>null),
     ]);
     if(tokRes?.tokens) tokenCount = tokRes.tokens.length >= 20 ? '20+' : String(tokRes.tokens.length);
     if(lstRes?.tokens) listingCount = String(lstRes.tokens.length);
     if(salRes?.count != null) salesCount = String(salRes.count);
   } catch(e) {}
+  // Encode multiple values with | separator (safe — trait values don't contain |)
+  const encodedValues = valuesArr.map(v => encodeURIComponent(v)).join('|');
   const menu = new StringSelectMenuBuilder()
-    .setCustomId(`tf_browse:mode:${slug}:${traitName}:${traitValue}`)
+    .setCustomId(`tf_browse:mode:${slug}:${traitName}:${encodedValues}`)
     .setPlaceholder('What do you want to see?')
     .addOptions([
       new StringSelectMenuOptionBuilder().setLabel('Tokens').setDescription(`${tokenCount} token${tokenCount==='1'?'':'s'} with this trait`).setValue('tokens'),
       new StringSelectMenuOptionBuilder().setLabel('Listings').setDescription(`${listingCount} listed — cheapest first`).setValue('listings'),
-      new StringSelectMenuOptionBuilder().setLabel('Sales').setDescription(`${salesCount} sale${salesCount==='1'?'':'s'} in history`).setValue('sales'),
+      new StringSelectMenuOptionBuilder().setLabel('Sales').setDescription(`${salesCount} sale${salesCount==='1'?'':'s'} in history (first value only)`).setValue('sales'),
     ]);
   return interaction.update({
-    content: `**🔍 Trait Find — ${slug} › ${traitName}: ${traitValue}**\n\nWhat would you like to see?`,
+    content: `**🔍 Trait Find — ${slug} › ${traitName}: ${valueLabel}**\n\nWhat would you like to see?`,
     components: [new ActionRowBuilder().addComponents(menu)],
   });
 }
@@ -908,18 +930,23 @@ async function handleTraitBrowseInteraction(interaction, ctx){
     const parts = customId.slice('tf_browse:val:'.length).split(':');
     const slug = parts[0];
     const traitName = parts.slice(1).join(':');
-    const traitValue = interaction.values[0];
-    return showTfModePicker(interaction, ctx, slug, traitName, traitValue);
+    const traitValues = interaction.values; // array — one or more selected
+    return showTfModePicker(interaction, ctx, slug, traitName, traitValues);
   }
 
   if(customId.startsWith('tf_browse:mode:')){
     const parts = customId.slice('tf_browse:mode:'.length).split(':');
     const slug = parts[0];
     const traitName = parts[1];
-    const traitValue = parts.slice(2).join(':');
+    const encodedValues = parts.slice(2).join(':');
+    const traitValuesArr = encodedValues.split('|').map(v => decodeURIComponent(v));
+    const traitValue = traitValuesArr[0]; // used for sales mode (single-value only) and labels
     const mode = interaction.values[0];
+    const matchLabel = traitValuesArr.length > 1
+      ? `${traitName}: ${traitValuesArr.join(' or ')}`
+      : `${traitName}: ${traitValue}`;
 
-    await interaction.update({ content: `🔍 Searching **${traitName}: ${traitValue}** in **${slug}** (${mode})...`, components: [] });
+    await interaction.update({ content: `🔍 Searching **${matchLabel}** in **${slug}** (${mode})...`, components: [] });
 
     const guildId = interaction.guildId;
     const config = getConfig(guildId) || {};
@@ -928,8 +955,8 @@ async function handleTraitBrowseInteraction(interaction, ctx){
     const _resolved = resolveCollectionFromServerCfg(config, slug);
     const cfg = _resolved ? { ...config, ..._resolved } : { ...config, slug };
     const want = 20;
-    const groups = [[{ trait_name: traitName, trait_value: traitValue }]];
-    const matchLabel = `${traitName}: ${traitValue}`;
+    // One OR-group: matches ANY of the selected values for this trait
+    const groups = [traitValuesArr.map(v => ({ trait_name: traitName, trait_value: v }))];
 
     try {
       if(mode === 'sales'){
@@ -993,7 +1020,9 @@ async function showMaTraitPicker(interaction, ctx, slug){
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
-  const traitNames = [...new Set(traitIndex.map(t => t.trait_name))].slice(0, 25);
+  const allTraitNames = sortTraitNamesTypeFirst([...new Set(traitIndex.map(t => t.trait_name))]);
+  const traitNames = allTraitNames.slice(0, 25);
+  const hasMoreTraitCategories = allTraitNames.length > 25;
   if(!traitNames.length){
     const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
     return interaction[replyFn]({ content: `No trait data found for **${slug}** yet.`, ...(replyFn !== 'update' ? { flags: MessageFlags.Ephemeral } : {}) });
