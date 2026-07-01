@@ -96,7 +96,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick }   = require('./commands/market');
 const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
@@ -737,6 +737,9 @@ client.on('interactionCreate', async (interaction)=>{
   }
   if(interaction.isStringSelectMenu() && interaction.customId === 'dl_browse:col'){
     return handleDownloadColPick(interaction, { getConfig });
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId === 'rf_browse:col'){
+    return handleRfColPick(interaction, {});
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('rf_browse:mode:')){
     const rfCtx = {

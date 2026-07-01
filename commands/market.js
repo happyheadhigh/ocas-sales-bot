@@ -477,12 +477,34 @@ async function handleMarketCommand(commandName, ctx){
 
     const _rfColInput  = interaction.options.getString('collection') || null;
 
-    // No rank range given at all — launch the guided flow (modal for
-    // min/max rank, then a follow-up menu for mode + sort) instead of
-    // silently running with the 1-100 defaults.
+    // No rank range given at all — launch the guided flow: collection
+    // picker first (only if the server has more than one configured and
+    // none was explicitly given), then a modal for min/max rank, then a
+    // follow-up menu for mode + sort.
     const noRankArgsGiven = interaction.options.getInteger('min_rank') == null && interaction.options.getInteger('max_rank') == null;
     if(noRankArgsGiven){
-      return showRfRankModal(interaction, _rfColInput);
+      if(_rfColInput){
+        return showRfRankModal(interaction, _rfColInput);
+      }
+      const allCols = [];
+      const primarySlug = config.collectionSlug || config.slug;
+      if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
+      for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+      if(!allCols.length) allCols.push({ slug: 'on-chain-all-stars', name: 'OCAS' });
+      if(allCols.length === 1){
+        return showRfRankModal(interaction, allCols[0].slug);
+      }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('rf_browse:col')
+        .setPlaceholder('Pick a collection...')
+        .addOptions(allCols.slice(0, 25).map(c =>
+          new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)
+        ));
+      return interaction.reply({
+        content: '**🏆 Rank Find** — Pick a collection:',
+        components: [new ActionRowBuilder().addComponents(menu)],
+        flags: MessageFlags.Ephemeral,
+      });
     }
 
     const rankMin  = interaction.options.getInteger('min_rank') || 1;
@@ -758,6 +780,11 @@ function sortTraitNamesTypeFirst(names){
 // Shows a modal (two plain-text fields, easier for the community to fill in
 // correctly than a single "1-100" free-text field) then a follow-up menu
 // for mode + sort, then runs the same search logic the direct-args path uses.
+async function handleRfColPick(interaction, ctx){
+  const slug = interaction.values[0];
+  return showRfRankModal(interaction, slug);
+}
+
 function showRfRankModal(interaction, collectionInput){
   const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
   const modal = new ModalBuilder()
@@ -2913,4 +2940,4 @@ async function showFloorAlertModal(interaction, slug){
   return interaction.showModal(modal);
 }
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction };
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick };
