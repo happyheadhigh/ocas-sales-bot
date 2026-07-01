@@ -1411,6 +1411,29 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // ── Sweep pagination buttons ─────────────────────────────────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('fa_pause:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`UPDATE user_floor_alerts SET is_active=false WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`fa_resume:${id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`fa_stop:${id}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('fa_resume:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`UPDATE user_floor_alerts SET is_active=true WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`fa_pause:${id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`fa_stop:${id}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('fa_stop:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`DELETE FROM user_floor_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return interaction.update({ content: '🗑️ Floor alert deleted.', embeds: [], components: [] }).catch(()=>{});
+  }
   if(interaction.isButton() && interaction.customId.startsWith('sweep:')){
     const parts = interaction.customId.split(':');
     const action = parts[1];
