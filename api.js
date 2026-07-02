@@ -1102,6 +1102,7 @@ function burnEventJson(row) {
     created_token_id: burnNum(row.survivor_token_id || row.created_token_id),
     input_token_ids: inputTokenIds,
     input_count: burnNum(row.input_count) ?? inputTokenIds.length,
+    snapshot_image: row.snapshot_image || null,
   };
 }
 function burnEndpointError(res, route, e, fallback = {}) {
@@ -1367,7 +1368,7 @@ app.get('/db/burn-latest', auth, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT be.tx_hash, be.log_index, be.block_number, be.burner_wallet,
-             be.survivor_token_id, be.burned_at,
+             be.survivor_token_id, be.burned_at, bs.image_data AS snapshot_image,
              COALESCE(
                array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
                  FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id),
@@ -1377,7 +1378,8 @@ app.get('/db/burn-latest', auth, async (req, res) => {
                FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id))::int AS input_count
       FROM burn_events be
       LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-      GROUP BY be.id
+      LEFT JOIN burn_state_snapshots bs ON bs.burn_event_id = be.id AND bs.token_id = be.survivor_token_id
+      GROUP BY be.id, bs.image_data
       ORDER BY be.burned_at DESC NULLS LAST, be.block_number DESC NULLS LAST, be.log_index DESC NULLS LAST
       LIMIT $1
     `, [limit]);
