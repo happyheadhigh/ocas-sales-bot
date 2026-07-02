@@ -45,11 +45,15 @@ async function handleMiscCommand(commandName, ctx){
       '`/lotteries` — View and manage burn lotteries & giveaways',
       '`/status` — Show server config',
     ].join('\n');
+    const accountCmds=[
+      '`/me` — Your wallet portfolio, DM alert settings, and wallet verification',
+    ].join('\n');
     await interaction.reply({embeds:[new EmbedBuilder()
       .setTitle('Bot Commands')
       .setColor(COLORS.OCAS_GREEN)
       .setDescription('Search tokens, track sales, sweep floors, monitor burns, verify holders, and manage your server.')  
       .addFields(
+        {name:'👤 Your Account',             value:accountCmds, inline:false},
         {name:'🔍 Market & Search',         value:marketCmds, inline:false},
         {name:'📈 Sales & Listings',         value:salesCmds,  inline:false},
         {name:'🔥 Burn Machine',             value:burnCmds,   inline:false},
@@ -69,12 +73,12 @@ if(commandName==='myregistration'){
       [interaction.user.id]
     );
     if(!row.rows.length)
-      return interaction.editReply({content:'No registration found. Run `/register` to get started.'});
+      return interaction.editReply({content:'No registration found. Run `/me` → 💼 Wallet to verify.'});
     const {wallet, verified, verified_at} = row.rows[0];
     return interaction.editReply({content:[
       `**Your Registration**`,
       `🔗 Wallet: \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``,
-      `✅ Verified: ${verified ? `Yes (${new Date(verified_at).toLocaleDateString()})` : 'No — run `/register` to complete'}`,
+      `✅ Verified: ${verified ? `Yes (${new Date(verified_at).toLocaleDateString()})` : 'No — run `/me` → 💼 Wallet to complete verification'}`,
     ].join('\n')});
   }catch(e){
     return interaction.editReply({content:'❌ Could not fetch registration.'});

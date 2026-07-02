@@ -271,7 +271,9 @@ function buildVerificationEmbed(cfg){
       `✅ **Verified Role:** ${rol(cfg.verifyRole)} ${ok(cfg.verifyRole)}\n` +
       `🏆 **Holder Role:** ${cfg.holderRole ? rol(cfg.holderRole) + ' ✅' : '`Not set` ⚪'}\n` +
       `🚦 **Panel status:** ${deployed ? '✅ Deployed' : '❌ Not deployed'}\n\n` +
-      '*Any member who verifies gets the Verified role.\nMembers holding ≥1 token also get the Holder role.*'
+      (cfg.verifyChannel && cfg.verifyRole
+        ? '*Any member who verifies gets the Verified role.\nMembers holding ≥1 token also get the Holder role.*'
+        : '*Don\'t need verification? That\'s fine — leave this unconfigured. Your alerts (sales, listings, burns) don\'t depend on it.*')
     )
     .setFooter({ text: 'Only visible to you' });
 }

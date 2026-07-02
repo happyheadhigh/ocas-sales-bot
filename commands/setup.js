@@ -84,7 +84,7 @@ function buildWelcomeEmbed(){
       '**What we\'ll configure:**\n' +
       '→ Your NFT collection\n' +
       '→ Sales & listings channels\n' +
-      '→ Wallet verification & holder roles\n' +
+      '→ Wallet verification & holder roles *(optional)*\n' +
       '→ Trait-based roles (optional)\n\n' +
       '*You can run `/setup` anytime to update settings.*'
     )
@@ -141,7 +141,9 @@ function buildVerificationEmbed(state){
       `📌 **Channel:** ${cfg.verifyChannel ? `<#${cfg.verifyChannel}> ✅` : '❌ Not set'}\n` +
       `✅ **Verified Role:** ${cfg.verifyRole ? `<@&${cfg.verifyRole}> ✅` : '❌ Not set'}\n` +
       `🏆 **Holder Role:** ${cfg.holderRole ? `<@&${cfg.holderRole}> ✅` : '⚪ Optional'}\n\n` +
-      (configured ? '✅ Ready to deploy verification panel.' : '*Set channel and Verified role to continue.*')
+      (configured
+        ? '✅ Ready to deploy verification panel.'
+        : '*Don\'t need verification? No problem — skip this step and click Next. Your alerts (sales, listings, burns) work completely fine without it.*')
     )
     .setFooter({ text: 'Only visible to you' });
 }
