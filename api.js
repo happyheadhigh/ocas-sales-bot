@@ -1136,7 +1136,7 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
     // and the floor query were both unscoped too (token_id collisions +
     // absolute cheapest listing across all collections, not just OCAS).
     const current = await pool.query(`
-      SELECT w.token_id, t.os_rank, t.obs_rank, l.price_eth
+      SELECT w.token_id, t.os_rank, t.obs_rank, l.price_eth, w.cost_eth
       FROM wallet_token_intervals w
       LEFT JOIN tokens t ON t.id = w.token_id AND t.collection_slug = w.collection_slug
       LEFT JOIN listings l ON l.token_id = w.token_id AND l.collection_slug = w.collection_slug
@@ -1152,6 +1152,20 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
     const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
     const estimated = floorEth == null ? null : owned.length * floorEth;
 
+    // P&L: realized (closed positions with an actual sale) and unrealized
+    // (current holdings' cost basis vs current estimated floor value).
+    // Was completely missing from this endpoint before.
+    const realizedRes = await pool.query(`
+      SELECT COALESCE(SUM(sale_eth - cost_eth), 0) AS realized_pnl, COUNT(*)::int AS sold_count
+      FROM wallet_token_intervals
+      WHERE wallet_address = $1 AND collection_slug = $2
+        AND disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0
+    `, [address, OCAS_SLUG]);
+    const realizedPnl = parseFloat(realizedRes.rows[0]?.realized_pnl || 0);
+    const soldCount = parseInt(realizedRes.rows[0]?.sold_count || 0);
+    const totalCostBasis = owned.reduce((s, r) => s + (parseFloat(r.cost_eth) || 0), 0);
+    const unrealizedPnl = (estimated != null && totalCostBasis > 0) ? (estimated - totalCostBasis) : null;
+
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
     res.json({
       ok: true,
@@ -1164,6 +1178,10 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
         listed_count: listed.length,
         estimated_floor_value: estimated,
         floor_eth: floorEth,
+        realized_pnl: realizedPnl,
+        sold_count: soldCount,
+        unrealized_pnl: unrealizedPnl,
+        total_cost_basis: totalCostBasis > 0 ? totalCostBasis : null,
         top_tokens: owned.slice(0, 250).map(r => ({
           token_id: parseInt(r.token_id),
           os_rank: r.os_rank ? parseInt(r.os_rank) : null,
