@@ -11,7 +11,7 @@
 
 const express = require('express');
 const { Pool } = require('pg');
-const { OCAS_SLUG } = require('./lib/constants');
+const { OCAS_SLUG, BURN_CONTRACT } = require('./lib/constants');
 
 // Loaded at module level (not lazily inside a route handler) specifically
 // so its setInterval-driven sync loops actually start the moment this
@@ -1187,12 +1187,15 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
   const offset = intParam(req.query.offset, 0, 10000);
   try {
     const result = await pool.query(`
-      SELECT contract, token_id, from_address, to_address, tx_hash, log_index, block_number, block_ts, event_type
-      FROM nft_transfers
-      WHERE contract = $1 AND (from_address = $2 OR to_address = $2)
-      ORDER BY block_number DESC, log_index DESC
-      LIMIT $3 OFFSET $4
-    `, [OCAS_CONTRACT, address, limit, offset]);
+      SELECT nt.contract, nt.token_id, nt.from_address, nt.to_address, nt.tx_hash, nt.log_index,
+             nt.block_number, nt.block_ts, nt.event_type,
+             s.sale_price, s.buyer, s.seller
+      FROM nft_transfers nt
+      LEFT JOIN sales s ON s.tx_hash = nt.tx_hash AND s.token_id = nt.token_id
+      WHERE nt.contract = $1 AND nt.collection_slug = $2 AND (nt.from_address = $3 OR nt.to_address = $3)
+      ORDER BY nt.block_number DESC, nt.log_index DESC
+      LIMIT $4 OFFSET $5
+    `, [OCAS_CONTRACT, OCAS_SLUG, address, limit, offset]);
     res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
     res.json({
       ok: true,
@@ -1208,7 +1211,14 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
         log_index: parseInt(r.log_index),
         block_number: parseInt(r.block_number),
         block_ts: r.block_ts,
-        event_type: r.event_type,
+        // event_type from nft_transfers is reliable for mint/burn/transfer
+        // (confirmed populated: ~19k transfer, ~10k mint, ~360 burn on
+        // staging). No 'sale' classification exists there though, so a
+        // sales-table match upgrades a plain transfer to a sale with price.
+        event_type: r.sale_price != null ? 'sale' : (r.event_type || 'transfer'),
+        sale_price: r.sale_price != null ? parseFloat(r.sale_price) : null,
+        buyer: r.buyer || null,
+        seller: r.seller || null,
       })),
       count: result.rows.length,
       limit,
