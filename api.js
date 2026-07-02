@@ -1643,22 +1643,29 @@ app.get('/db/traits-fast', auth, async (req, res) => {
 
     // 1. Surviving tokens sorted by obs_rank ASC (pre-computed rank in DB)
     // Falls back to id order if obs_rank not available
+    // NOTE: hardcoded to OCAS_SLUG for now — TraitView itself isn't
+    // multi-collection aware yet (no slug param sent), so without this
+    // filter, other configured collections' tokens/traits merge in here
+    // too (confirmed: Fluxeto traits appearing in TraitView's OCAS filter
+    // panel, same root cause as the /traitfind cross-collection bug fixed
+    // 2026-07-01 — the JOIN below also previously matched on token_id
+    // alone with no collection_slug check on either side).
     const [rankRes, traitRes] = await Promise.all([
       pool.query(`
         SELECT t.id, t.obs_rank, t.trait_count
         FROM tokens t
-        WHERE ${BURNED_EXCL}
+        WHERE t.collection_slug = $1 AND ${BURNED_EXCL}
         ORDER BY t.obs_rank ASC NULLS LAST, t.id ASC
-      `),
+      `, [OCAS_SLUG]),
       // 2. Trait frequencies for surviving tokens
       pool.query(`
         SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS freq
         FROM token_traits tt
-        JOIN tokens t ON t.id = tt.token_id
-        WHERE ${BURNED_EXCL_TT}
+        JOIN tokens t ON t.id = tt.token_id AND t.collection_slug = tt.collection_slug
+        WHERE tt.collection_slug = $1 AND ${BURNED_EXCL_TT}
         GROUP BY tt.trait_name, tt.trait_value
         ORDER BY tt.trait_name, tt.trait_value
-      `)
+      `, [OCAS_SLUG])
     ]);
 
     // rank array: [[id, obsRank], ...] sorted by obs_rank ASC
@@ -1717,17 +1724,18 @@ app.get('/db/all-traits', auth, async (req, res) => {
     }
 
     // Get all surviving token IDs
+    // NOTE: hardcoded to OCAS_SLUG for now — same reasoning as /db/traits-fast above.
     const survivorsRes = await pool.query(`
       SELECT t.id
       FROM tokens t
-      WHERE NOT EXISTS (
+      WHERE t.collection_slug = $1 AND NOT EXISTS (
         SELECT 1 FROM burn_event_inputs bei
         JOIN burn_events be ON be.id = bei.burn_event_id
         WHERE bei.burned_token_id = t.id
         AND bei.burned_token_id != be.survivor_token_id
       )
       ORDER BY t.id
-    `);
+    `, [OCAS_SLUG]);
 
     const survivorIds = new Set(survivorsRes.rows.map(r => parseInt(r.id)));
 
@@ -1735,9 +1743,9 @@ app.get('/db/all-traits', auth, async (req, res) => {
     const traitsRes = await pool.query(`
       SELECT tt.token_id, tt.trait_name, tt.trait_value
       FROM token_traits tt
-      WHERE tt.token_id = ANY($1::int[])
+      WHERE tt.collection_slug = $2 AND tt.token_id = ANY($1::int[])
       ORDER BY tt.token_id, COALESCE(tt.trait_index, 0), tt.trait_name
-    `, [[...survivorIds]]);
+    `, [[...survivorIds], OCAS_SLUG]);
 
     // Build tokens object: { "1": { traits: { "Type": "Human 6", ... } }, ... }
     const tokens = {};
