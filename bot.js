@@ -371,7 +371,7 @@ async function syncTraitRoles(guild, discordId, wallet){
         }
         if(!meetsMin && hasRole){
           const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
-          if(!conflict) await member.roles.remove(tr.role_id).catch(()=>{});
+          if(!conflict) await member.roles.remove(tr.role_id).catch(e=>console.error('[TraitSync] remove role:', e.message));
         }
       }
     }
@@ -385,13 +385,13 @@ async function syncTraitRoles(guild, discordId, wallet){
       const { role_id, holder_role_id } = panel.rows[0];
       // Verified role — any registered wallet
       if(role_id && !member.roles.cache.has(role_id))
-        await member.roles.add(role_id).catch(()=>{});
+        await member.roles.add(role_id).catch(e=>console.error('[TraitSync] add verified role:', e.message));
       // Holder role — must own ≥1 token across any configured collection
       if(holder_role_id){
         if(totalOwnedAcrossCollections >= 1 && !member.roles.cache.has(holder_role_id))
-          await member.roles.add(holder_role_id).catch(()=>{});
+          await member.roles.add(holder_role_id).catch(e=>console.error('[TraitSync] add holder role:', e.message));
         if(totalOwnedAcrossCollections === 0 && member.roles.cache.has(holder_role_id))
-          await member.roles.remove(holder_role_id).catch(()=>{});
+          await member.roles.remove(holder_role_id).catch(e=>console.error('[TraitSync] remove holder role:', e.message));
       }
     }
 
@@ -662,11 +662,11 @@ client.on('interactionCreate', async (interaction)=>{
       if(panelR.rows[0]){
         const { role_id, holder_role_id } = panelR.rows[0];
         const member = await interaction.guild.members.fetch(discordId).catch(()=>null);
-        if(member && role_id) await member.roles.add(role_id).catch(()=>{});
+        if(member && role_id) await member.roles.add(role_id).catch(e=>console.error('[Verify] add verified role:', e.message));
         if(member && holder_role_id && tokenCount >= 1)
-          await member.roles.add(holder_role_id).catch(()=>{});
+          await member.roles.add(holder_role_id).catch(e=>console.error('[Verify] add holder role:', e.message));
       }
-    }catch(_){}
+    }catch(e){ console.error('[Verify] role assignment block failed:', e.message); }
 
     // Clean up code
     await pgPool.query('DELETE FROM verification_codes WHERE discord_id=$1 AND guild_id=$2', [discordId, guildId]).catch(()=>{});
@@ -2018,9 +2018,9 @@ client.on('interactionCreate', async (interaction)=>{
         if(panelR.rows[0]){
           const { role_id, holder_role_id } = panelR.rows[0];
           if(role_id && member.roles.cache.has(role_id))
-            await member.roles.remove(role_id).catch(()=>{});
+            await member.roles.remove(role_id).catch(e=>console.error('[ResetVerify] remove verified role:', e.message));
           if(holder_role_id && member.roles.cache.has(holder_role_id))
-            await member.roles.remove(holder_role_id).catch(()=>{});
+            await member.roles.remove(holder_role_id).catch(e=>console.error('[ResetVerify] remove holder role:', e.message));
         }
         // Remove all trait roles configured for this guild
         const traitR = await pgPool.query(
@@ -2028,7 +2028,7 @@ client.on('interactionCreate', async (interaction)=>{
         ).catch(()=>({rows:[]}));
         for(const row of traitR.rows){
           if(member.roles.cache.has(row.role_id))
-            await member.roles.remove(row.role_id).catch(()=>{});
+            await member.roles.remove(row.role_id).catch(e=>console.error('[ResetVerify] remove trait role:', e.message));
         }
       }
 
