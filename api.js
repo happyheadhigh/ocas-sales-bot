@@ -1129,20 +1129,26 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
       return res.json({ ok: true, address, synced: true, cached: true, updated_at: cache.rows[0].updated_at, summary: cache.rows[0].summary_json });
     }
 
+    // NOTE (2026-07-02): hardcoded to OCAS_SLUG for now, same reasoning as
+    // /db/traits-fast and /db/all-traits earlier today — this wasn't scoped
+    // at all before, so a wallet's holdings/traits/floor across EVERY
+    // configured collection were all merged together. The listings JOIN
+    // and the floor query were both unscoped too (token_id collisions +
+    // absolute cheapest listing across all collections, not just OCAS).
     const current = await pool.query(`
       SELECT w.token_id, t.os_rank, t.obs_rank, l.price_eth
       FROM wallet_token_intervals w
-      LEFT JOIN tokens t ON t.id = w.token_id
-      LEFT JOIN listings l ON l.token_id = w.token_id
-      WHERE w.wallet_address = $1 AND w.disposed_at IS NULL
+      LEFT JOIN tokens t ON t.id = w.token_id AND t.collection_slug = w.collection_slug
+      LEFT JOIN listings l ON l.token_id = w.token_id AND l.collection_slug = w.collection_slug
+      WHERE w.wallet_address = $1 AND w.collection_slug = $2 AND w.disposed_at IS NULL
       ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC
       LIMIT 10000
-    `, [address]);
+    `, [address, OCAS_SLUG]);
 
     const owned = current.rows;
     const ranks = owned.map(r => parseInt(r.os_rank || r.obs_rank)).filter(Number.isFinite);
     const listed = owned.filter(r => r.price_eth != null);
-    const floor = await pool.query('SELECT MIN(price_eth) AS floor_eth FROM listings');
+    const floor = await pool.query('SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug = $1', [OCAS_SLUG]);
     const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
     const estimated = floorEth == null ? null : owned.length * floorEth;
 
@@ -1158,7 +1164,7 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
         listed_count: listed.length,
         estimated_floor_value: estimated,
         floor_eth: floorEth,
-        top_tokens: owned.slice(0, 12).map(r => ({
+        top_tokens: owned.slice(0, 250).map(r => ({
           token_id: parseInt(r.token_id),
           os_rank: r.os_rank ? parseInt(r.os_rank) : null,
           obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
@@ -1260,13 +1266,13 @@ app.get('/db/wallet/:address/traits', auth, async (req, res) => {
       SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS count,
              ARRAY_AGG(w.token_id ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC) AS token_ids
       FROM wallet_token_intervals w
-      JOIN token_traits tt ON tt.token_id = w.token_id
-      LEFT JOIN tokens t ON t.id = w.token_id
-      WHERE w.wallet_address = $1 AND w.disposed_at IS NULL
+      JOIN token_traits tt ON tt.token_id = w.token_id AND tt.collection_slug = w.collection_slug
+      LEFT JOIN tokens t ON t.id = w.token_id AND t.collection_slug = w.collection_slug
+      WHERE w.wallet_address = $1 AND w.collection_slug = $3 AND w.disposed_at IS NULL
       GROUP BY tt.trait_name, tt.trait_value
       ORDER BY count DESC, tt.trait_name ASC, tt.trait_value ASC
       LIMIT $2
-    `, [address, limit]);
+    `, [address, limit, OCAS_SLUG]);
     res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.json({
       ok: true,
