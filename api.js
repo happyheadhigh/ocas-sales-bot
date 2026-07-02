@@ -1627,6 +1627,27 @@ app.get('/tv/link-status', auth, async (req, res) => {
   }
 });
 
+// GET /tv/link-status-by-wallet — reverse lookup, checks live on every wallet
+// connection instead of caching link status client-side. A wallet could be
+// linked in multiple guilds; returns the most recently linked one.
+app.get('/tv/link-status-by-wallet', auth, async (req, res) => {
+  const wallet = cleanAddress(req.query.wallet || '');
+  if (!isEthAddress(wallet)) return res.status(400).json({ error: 'valid wallet address required' });
+
+  try {
+    const row = await pool.query(
+      `SELECT discord_id, guild_id, linked_at FROM traitview_links
+       WHERE LOWER(wallet)=LOWER($1)
+       ORDER BY linked_at DESC LIMIT 1`,
+      [wallet]
+    );
+    if (!row.rows.length) return res.json({ linked: false });
+    res.json({ linked: true, discord_id: row.rows[0].discord_id, guild_id: row.rows[0].guild_id, linked_at: row.rows[0].linked_at });
+  } catch (e) {
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 
 // ── GET /db/traits-fast ───────────────────────────────────────────────────────
 // Serves traits_fast.json structure computed live from DB, excluding burned tokens.
