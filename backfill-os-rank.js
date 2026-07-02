@@ -25,6 +25,21 @@ const fetch     = require('node-fetch');
 const fs        = require('fs');
 const path      = require('path');
 
+// ── Environment selection ────────────────────────────────────────────────────
+// Same convention as register-commands.js: `node backfill-os-rank.js staging`
+// or `node backfill-os-rank.js production` explicitly picks the right DB
+// instead of silently falling back to whatever's in the bare .env file.
+const envArgIdx = process.argv.findIndex(a => a === 'staging' || a === 'production' || a === 'prod');
+const envName = envArgIdx !== -1 ? process.argv[envArgIdx] : '';
+if(envName){
+  const envFile = (envName === 'staging') ? '.env.staging' : '.env.production';
+  require('dotenv').config({ path: path.join(__dirname, envFile), override: true });
+  console.log(`Using environment file: ${envFile}`);
+} else {
+  console.log('No environment specified (staging/production) — using bare .env. Pass one explicitly to avoid ambiguity, e.g.:');
+  console.log('  node backfill-os-rank.js staging --start 1');
+}
+
 const CONTRACT      = '0x078be86f3104a32313a47815792230a3808642cc';
 const TOTAL_TOKENS  = 10000;
 const DELAY_MS      = 500;   // ms between normal requests
