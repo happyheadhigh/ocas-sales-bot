@@ -46,7 +46,8 @@ const DELAY_MS      = 500;   // ms between normal requests
 const CHECKPOINT_FILE = path.join(__dirname, 'backfill-progress.json');
 
 const OPENSEA_KEY   = process.env.OPENSEA_KEY || process.env.OPENSEA_API_KEY;
-const DATABASE_URL  = process.env.DATABASE_URL;
+const dbUrlArgIdx   = process.argv.indexOf('--db-url');
+const DATABASE_URL  = dbUrlArgIdx !== -1 ? process.argv[dbUrlArgIdx + 1] : process.env.DATABASE_URL;
 const DRY_RUN       = process.argv.includes('--dry-run');
 const START_ARG     = process.argv.indexOf('--start');
 const START_FROM    = START_ARG !== -1 ? parseInt(process.argv[START_ARG + 1]) : null;
