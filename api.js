@@ -1201,7 +1201,7 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
 app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
   const address = cleanAddress(req.params.address);
   if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
-  const limit = intParam(req.query.limit, 100, 200);
+  const limit = intParam(req.query.limit, 100, 1000);
   const offset = intParam(req.query.offset, 0, 10000);
   try {
     const result = await pool.query(`
