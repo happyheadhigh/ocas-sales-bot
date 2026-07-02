@@ -1947,11 +1947,12 @@ async function showMeWallet(interaction, ctx){
       .setDescription([
         'Link your wallet to unlock portfolio analytics, P&L tracking, and leaderboards.',
         '',
-        'Find the **Verify Wallet** button in your server\'s verification channel to get started.',
+        'Click **Verify Wallet** below to get started — takes about a minute.',
       ].join('\n'));
     return interaction[updateFn]({
       embeds: [embed],
       components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('start_verification:'+guildId).setLabel('Verify Wallet').setStyle(ButtonStyle.Primary).setEmoji('🔗'),
         new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
       )],
     });
