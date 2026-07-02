@@ -63,32 +63,9 @@ async function handleMiscCommand(commandName, ctx){
     return;
   }
 
-// ── /myregistration ───────────────────────────────────────────────────────────
-if(commandName==='myregistration'){
-  await interaction.deferReply({ephemeral:true});
-  const { pgPool } = require('../lib/db');
-  try{
-    const row = await pgPool.query(
-      `SELECT wallet, verified, verified_at FROM user_registrations WHERE discord_id=$1`,
-      [interaction.user.id]
-    );
-    if(!row.rows.length)
-      return interaction.editReply({content:'No registration found. Run `/me` → 💼 Wallet to verify.'});
-    const {wallet, verified, verified_at} = row.rows[0];
-    return interaction.editReply({content:[
-      `**Your Registration**`,
-      `🔗 Wallet: \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``,
-      `✅ Verified: ${verified ? `Yes (${new Date(verified_at).toLocaleDateString()})` : 'No — run `/me` → 💼 Wallet to complete verification'}`,
-    ].join('\n')});
-  }catch(e){
-    return interaction.editReply({content:'❌ Could not fetch registration.'});
-  }
 }
 
-
-}
-
-const MISC_COMMANDS = new Set(['help','register','myregistration']);
+const MISC_COMMANDS = new Set(['help']);
 
 module.exports = { handleMiscCommand, MISC_COMMANDS };
 

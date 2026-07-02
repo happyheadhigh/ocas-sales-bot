@@ -64,10 +64,6 @@ const commands = [
     .addIntegerOption(o=>o.setName('token').setDescription('Token ID (required for single token mode)').setRequired(false).setMinValue(1).setMaxValue(10000)),
 
 
-  new SlashCommandBuilder().setName('myregistration')
-    .setDescription('Show your current wallet registration status'),
-
-
 
 
 
