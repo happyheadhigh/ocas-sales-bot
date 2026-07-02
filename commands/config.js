@@ -11,6 +11,7 @@ const {
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
 const { isPaidFeature } = require('./market');
+const { buildRolePickerRows, parseRolePagerCustomId } = require('../lib/role-picker');
 
 // ── Access control ────────────────────────────────────────────────────────────
 // /config is gated to: server members with Manage Server permission, OR a
@@ -1382,13 +1383,8 @@ async function handleConfigButton(interaction, ctx){
   }
 
   if(customId === 'cfg:access:set'){
-    const menu = new RoleSelectMenuBuilder().setCustomId('cfg_rolesel:botmanager').setPlaceholder('Pick the Bot Manager role');
-    return interaction.editReply({ content:'**Select the role that should be able to use `/config`** (in addition to Manage Server admins):', embeds:[], components:[
-      new ActionRowBuilder().addComponents(menu),
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
-      ),
-    ]});
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:botmanager', 0, 'cfg:cat:access', 'Pick the Bot Manager role');
+    return interaction.editReply({ content:'**Select the role that should be able to use `/config`** (in addition to Manage Server admins):'+pageLabel, embeds:[], components: rows });
   }
 
   if(customId === 'cfg:access:clear'){
@@ -1549,22 +1545,12 @@ async function handleConfigButton(interaction, ctx){
     ]});
   }
   if(customId === 'cfg:ver:role'){
-    const menu = new RoleSelectMenuBuilder().setCustomId('cfg_rolesel:verify').setPlaceholder('Pick the ✅ Verified Wallet role');
-    return interaction.editReply({ content:'**Select the ✅ Verified Wallet role:**', embeds:[], components:[
-      new ActionRowBuilder().addComponents(menu),
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
-      ),
-    ]});
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:verify', 0, 'cfg:cat:verification', 'Pick the ✅ Verified Wallet role');
+    return interaction.editReply({ content:'**Select the ✅ Verified Wallet role:**'+pageLabel, embeds:[], components: rows });
   }
   if(customId === 'cfg:ver:holder'){
-    const menu = new RoleSelectMenuBuilder().setCustomId('cfg_rolesel:holder').setPlaceholder('Pick the 🏆 Holder role');
-    return interaction.editReply({ content:'**Select the 🏆 Holder role:**', embeds:[], components:[
-      new ActionRowBuilder().addComponents(menu),
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('cfg:cat:verification').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
-      ),
-    ]});
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:holder', 0, 'cfg:cat:verification', 'Pick the 🏆 Holder role');
+    return interaction.editReply({ content:'**Select the 🏆 Holder role:**'+pageLabel, embeds:[], components: rows });
   }
   if(customId === 'cfg:ver:deploy'){
     try{
@@ -1608,20 +1594,21 @@ async function handleConfigButton(interaction, ctx){
   // ── Roles: add ─────────────────────────────────────────────────────────────
   if(customId === 'cfg:role:add' || customId.startsWith('cfg:role:add:')){
     const addColId = customId.startsWith('cfg:role:add:') ? customId.split(':')[3] : '';
-    const roleMenu = new RoleSelectMenuBuilder()
-      .setCustomId(addColId ? `cfg_traitrole:rolesel:${addColId}` : 'cfg_traitrole:rolesel')
-      .setPlaceholder('Pick a role to assign...');
+    const targetId = addColId ? `cfg_traitrole:rolesel:${addColId}` : 'cfg_traitrole:rolesel';
     const cancelId = addColId ? `cfg:col:traitroles:${addColId}` : 'cfg:cat:roles';
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, targetId, 0, cancelId, 'Pick a role to assign...');
     return interaction.editReply({
-      content: '**Step 1 of 3 — Pick the Discord role to assign:**',
+      content: '**Step 1 of 3 — Pick the Discord role to assign:**'+pageLabel,
       embeds: [],
-      components: [
-        new ActionRowBuilder().addComponents(roleMenu),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
-        ),
-      ],
+      components: rows,
     });
+  }
+
+  // ── role picker: page navigation ─────────────────────────────────────────
+  if(customId.startsWith('rolepg:')){
+    const parsed = parseRolePagerCustomId(customId);
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, parsed.targetCustomId, parsed.page, parsed.cancelId, 'Pick a role...');
+    return interaction.editReply({ content:'**Select a role:**'+pageLabel, embeds:[], components: rows });
   }
 
   if(customId.startsWith('cfg_traitrole:manual:')){

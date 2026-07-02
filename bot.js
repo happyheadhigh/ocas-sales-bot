@@ -716,11 +716,28 @@ client.on('interactionCreate', async (interaction)=>{
     const gIsAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
     return handleGiveawayInteraction(interaction, buildCtx(interaction, gGuildId, gConfig, gIsAdmin));
   }
-  // Channel + role select menus from setup wizard
-  if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
-     (interaction.customId.startsWith('setup_chsel:') || interaction.customId.startsWith('setup_rolesel:'))){
+  // Channel select menus from setup wizard (still native Discord component)
+  if(interaction.isChannelSelectMenu() && interaction.customId.startsWith('setup_chsel:')){
     const setupCtx = { pgPool, setConfig };
     return handleSetupButton(interaction, setupCtx);
+  }
+  // Role select menus from setup wizard — now a manually-paginated StringSelectMenu
+  // (see lib/role-picker.js); isRoleSelectMenu() kept as a harmless fallback.
+  if((interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) && interaction.customId.startsWith('setup_rolesel:')){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
+  // Role-picker page navigation buttons (setup or config wizard — routed by prefix)
+  if(interaction.isButton() && interaction.customId.startsWith('rolepg:')){
+    const target = interaction.customId.slice('rolepg:'.length);
+    if(target.startsWith('setup_')){
+      const setupCtx = { pgPool, setConfig };
+      return handleSetupButton(interaction, setupCtx);
+    }
+    if(target.startsWith('cfg_')){
+      const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+      return handleConfigButton(interaction, cfgCtx);
+    }
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_traitrole:')){
     const setupCtx = { pgPool, setConfig };
@@ -833,8 +850,11 @@ client.on('interactionCreate', async (interaction)=>{
       return;
     }
   }
-  if((interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) &&
-     (interaction.customId.startsWith('cfg_chsel:') || interaction.customId.startsWith('cfg_rolesel:'))){
+  if(interaction.isChannelSelectMenu() && interaction.customId.startsWith('cfg_chsel:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if((interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) && interaction.customId.startsWith('cfg_rolesel:')){
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
@@ -871,7 +891,7 @@ client.on('interactionCreate', async (interaction)=>{
     );
     return interaction.showModal(modal);
   }
-  if(interaction.isRoleSelectMenu() && (interaction.customId === 'cfg_traitrole:rolesel' || interaction.customId.startsWith('cfg_traitrole:rolesel:'))){
+  if((interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) && (interaction.customId === 'cfg_traitrole:rolesel' || interaction.customId.startsWith('cfg_traitrole:rolesel:'))){
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }

@@ -8,6 +8,7 @@ const {
 } = require('discord.js');
 
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
+const { buildRolePickerRows, parseRolePagerCustomId } = require('../lib/role-picker');
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 
@@ -428,13 +429,13 @@ async function handleSetupButton(interaction, ctx){
   }
 
   if(customId === 'setup:verify:role'){
-    const menu = new RoleSelectMenuBuilder().setCustomId('setup_rolesel:verify').setPlaceholder('Pick the ✅ Verified Wallet role');
-    return interaction.editReply({ content:'**Select the ✅ Verified Wallet role** (given to anyone who links a wallet):', components:[new ActionRowBuilder().addComponents(menu)], embeds:[] });
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_rolesel:verify', 0, null, 'Pick the ✅ Verified Wallet role');
+    return interaction.editReply({ content:'**Select the ✅ Verified Wallet role** (given to anyone who links a wallet):'+pageLabel, components: rows, embeds:[] });
   }
 
   if(customId === 'setup:verify:holderrole'){
-    const menu = new RoleSelectMenuBuilder().setCustomId('setup_rolesel:holder').setPlaceholder('Pick the 🏆 Holder role');
-    return interaction.editReply({ content:'**Select the 🏆 Holder role** (given to members who hold ≥1 token):', components:[new ActionRowBuilder().addComponents(menu)], embeds:[] });
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_rolesel:holder', 0, null, 'Pick the 🏆 Holder role');
+    return interaction.editReply({ content:'**Select the 🏆 Holder role** (given to members who hold ≥1 token):'+pageLabel, components: rows, embeds:[] });
   }
 
   if(customId === 'setup:verify:deploy'){
@@ -510,19 +511,19 @@ async function handleSetupButton(interaction, ctx){
 
   // ── trait role: add ────────────────────────────────────────────────────────
   if(customId === 'setup:traitrole:add'){
-    const roleMenu = new RoleSelectMenuBuilder()
-      .setCustomId('setup_traitrole:rolesel')
-      .setPlaceholder('Pick a role to assign...');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_traitrole:rolesel', 0, 'setup:step:5', 'Pick a role to assign...');
     return interaction.editReply({
-      content: '**Step 1 of 2 — Pick the Discord role to assign:**',
+      content: '**Step 1 of 2 — Pick the Discord role to assign:**'+pageLabel,
       embeds: [],
-      components: [
-        new ActionRowBuilder().addComponents(roleMenu),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('setup:step:5').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
-        ),
-      ],
+      components: rows,
     });
+  }
+
+  // ── role picker: page navigation ─────────────────────────────────────────
+  if(customId.startsWith('rolepg:')){
+    const parsed = parseRolePagerCustomId(customId);
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, parsed.targetCustomId, parsed.page, parsed.cancelId, 'Pick a role...');
+    return interaction.editReply({ content:'**Select a role:**'+pageLabel, embeds:[], components: rows });
   }
 
   // ── trait role: role selected → open trait fields modal ─────────────────
@@ -535,23 +536,23 @@ async function handleSetupButton(interaction, ctx){
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category  (use "_count" for token count)')
+          .setLabel('Trait Category (optional — e.g. Type)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Type   or   Background   or   _count')
-          .setRequired(true)
+          .setPlaceholder('Leave blank to require a token count instead')
+          .setRequired(false)
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_value')
-          .setLabel('Trait Value  (leave blank if using _count)')
+          .setLabel('Trait Value (optional — e.g. Zombie, Gold)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Zombie   or   Gold   or   Human 4')
+          .setPlaceholder('Leave blank if using token count')
           .setRequired(false)
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_min_count')
-          .setLabel('How many tokens needed?  (default: 1)')
+          .setLabel('Minimum tokens to qualify (default: 1)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('1 = own at least one · 5 = own five or more')
+          .setPlaceholder('e.g. 1, 5, 20')
           .setRequired(false)
       ),
     );
