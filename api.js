@@ -1102,6 +1102,7 @@ function burnEventJson(row) {
     created_token_id: burnNum(row.survivor_token_id || row.created_token_id),
     input_token_ids: inputTokenIds,
     input_count: burnNum(row.input_count) ?? inputTokenIds.length,
+    points_used: burnNum(row.points_used),
     snapshot_image: row.snapshot_image || null,
   };
 }
@@ -1341,16 +1342,23 @@ app.get('/db/burn-stats', auth, async (req, res) => {
     `);
     const tokensBurned = parseInt(result.rows[0]?.tokens_burned || 0, 10);
     const tokensCreated = parseInt(result.rows[0]?.tokens_created || 0, 10);
-    // Mirrors /burnstats distinct burned-token logic and burn repair net-supply math.
-    const supplyReducedBy = tokensBurned - tokensCreated;
+    // NOTE (2026-07-02): previously subtracted tokensCreated too
+    // (10000 - (tokensBurned - tokensCreated)), as if each burn event
+    // minted a brand new token back into supply. It doesn't — the
+    // survivor is one of the existing input tokens transformed in place,
+    // already counted in the original 10000, not a new mint. That extra
+    // subtraction inflated estimated_supply by exactly tokensCreated
+    // (confirmed: showed 8911 instead of the correct 8599 = 10000-1401,
+    // which matches both OpenSea and commands/burn.js's /burnstats,
+    // whose formula (10000 - burned) is what this now matches exactly.
 
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
     res.json({
       ok: true,
       tokens_burned: tokensBurned,
       tokens_created: tokensCreated,
-      supply_reduced_by: supplyReducedBy,
-      estimated_supply: 10000 - supplyReducedBy,
+      supply_reduced_by: tokensBurned,
+      estimated_supply: 10000 - tokensBurned,
     });
   } catch (e) {
     burnEndpointError(res, '/db/burn-stats', e, {
@@ -1368,7 +1376,7 @@ app.get('/db/burn-latest', auth, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT be.tx_hash, be.log_index, be.block_number, be.burner_wallet,
-             be.survivor_token_id, be.burned_at, bs.image_data AS snapshot_image,
+             be.survivor_token_id, be.burned_at, be.points_used, bs.image_data AS snapshot_image,
              COALESCE(
                array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
                  FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id),
