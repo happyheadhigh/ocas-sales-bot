@@ -25,7 +25,7 @@ const {
 
 const {
   pgPool, runMigrations, dbLoad, dbSave,
-  loadAllConfigs, getConfig, setConfig, getAllConfigs,
+  loadAllConfigs, getConfig, setConfig, getAllConfigs, getUserAlerts,
 } = require('./lib/db');
 
 const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
@@ -34,11 +34,11 @@ const {
   getCachedImage, setCachedImage, clearCachedImage,
   getCachedTraits, setCachedTraits, OCAS_TRAITS_CACHE_MAX,
   sweepSessions, slideshowSessions,
-  recentChannelPosts, alertedEventIds,
-  checkCooldown, dedupeChannelPost, ocasTraitsCache,
+  recentChannelPosts, alertedEventIds, commandCooldowns,
+  checkCooldown, dedupeChannelPost, ocasTraitsCache, imageCache,
 } = require('./lib/cache');
 
-const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock, realTraitCount } = require('./lib/rpc');
+const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock, realTraitCount, burnBlockTimestampCache } = require('./lib/rpc');
 const { rollingRankSync, drainRankSyncQueue, queueRankSync, rankSyncQueue } = require('./lib/rank-sync');
 
 const { BURN_COLORS, E1_TYPE_NAMES, normalizeOcasType, resolveOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji } = require('./lib/burn-constants');
@@ -48,12 +48,14 @@ const {
   checkCommandCooldown, fetchBotApiJson,
   buildNavRow, postEmbeds,
   getTraitIndex, chooseTraitGroupsFromQuery, normalizePhrase,
+  cachedFloors,
 } = require('./lib/burn-config');
 
 const {
   pollBurnEvents, processPendingBurnAlerts,
   buildBurnEmbed, triggerOsMetadataRefresh,
   setClient, traitDisplayLines, fetchTokenUriFromContract,
+  pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
 
 const {
@@ -67,9 +69,9 @@ const {
 
 const { fetchTokenMetaFromDb, upsertTokenTraitRows, buildSaleEmbed, buildListingEmbed,
   traitObjectToArray, burnTypeBreakdown, fetchBurnDisplayTraits, fetchSnapshotImageForToken,
-  osRankBadge, titleTokenId,
+  osRankBadge, titleTokenId, tokenMetaCache: embedsTokenMetaCache,
 } = require('./lib/embeds');
-const { resolveImage, sendEmbed, extractPngFromSvg, buildEmbedPayload } = require('./lib/images');
+const { resolveImage, sendEmbed, extractPngFromSvg, buildEmbedPayload, tokenMetaCache: imagesTokenMetaCache } = require('./lib/images');
 
 const {
   pollSales, pollListings,
@@ -78,6 +80,7 @@ const {
   saveSaleCursors, saveListingCursors,
   setClient: setPollClient,
   traitGroupsLabel, buildTokenSearchEmbed,
+  lastSaleIds, lastListingIds,
 } = require('./lib/poll');
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
@@ -2122,9 +2125,40 @@ client.once('clientReady', async ()=>{
   await loadListingCursors();
   // ── Memory logging — diagnostic only, remove after crash cause confirmed ──
   const _mb = v => Math.round(v / 1024 / 1024);
+  const _sz = x => {
+    if(!x) return 0;
+    if(typeof x.size === 'number') return x.size;      // Map/Set
+    if(Array.isArray(x)) return x.length;
+    if(typeof x === 'object') return Object.keys(x).length; // plain object
+    return 0;
+  };
   setInterval(() => {
     const m = process.memoryUsage();
     console.log(`[Memory] heapUsed=${_mb(m.heapUsed)}MB heapTotal=${_mb(m.heapTotal)}MB rss=${_mb(m.rss)}MB external=${_mb(m.external)}MB`);
+    const caches = {
+      imageCache: _sz(imageCache),
+      ocasTraitsCache: _sz(ocasTraitsCache),
+      sweepSessions: _sz(sweepSessions),
+      slideshowSessions: _sz(slideshowSessions),
+      recentChannelPosts: _sz(recentChannelPosts),
+      alertedEventIds: _sz(alertedEventIds),
+      commandCooldowns: _sz(commandCooldowns),
+      cachedFloors: _sz(cachedFloors),
+      pendingBurns: _sz(pendingBurns),
+      pendingBurnAlerts: _sz(pendingBurnAlerts),
+      burnBlockTimestampCache: _sz(burnBlockTimestampCache),
+      rankSyncQueue: _sz(rankSyncQueue),
+      lastSaleIds: _sz(lastSaleIds),
+      lastListingIds: _sz(lastListingIds),
+      tokenMetaCache_embeds: _sz(embedsTokenMetaCache),
+      tokenMetaCache_images: _sz(imagesTokenMetaCache),
+      tokenMetaCache_burnPoller_dead: _sz(burnPollerTokenMetaCache),
+      roleConflictCache: _sz(_roleConflictCache),
+      traitIndexCache: _sz(_traitIndexCache),
+      serverConfigs: getAllConfigs().length,
+      userAlerts: Object.keys(getUserAlerts() || {}).length,
+    };
+    console.log(`[MemoryDetail] ${JSON.stringify(caches)}`);
   }, 60_000);
 
   // Listing poller re-enabled with fix: caps fetch at 50 listings to prevent
