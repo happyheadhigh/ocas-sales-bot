@@ -1726,7 +1726,7 @@ app.get('/db/all-traits', auth, async (req, res) => {
     // Get all surviving token IDs
     // NOTE: hardcoded to OCAS_SLUG for now — same reasoning as /db/traits-fast above.
     const survivorsRes = await pool.query(`
-      SELECT t.id
+      SELECT t.id, t.image_url
       FROM tokens t
       WHERE t.collection_slug = $1 AND NOT EXISTS (
         SELECT 1 FROM burn_event_inputs bei
@@ -1738,6 +1738,7 @@ app.get('/db/all-traits', auth, async (req, res) => {
     `, [OCAS_SLUG]);
 
     const survivorIds = new Set(survivorsRes.rows.map(r => parseInt(r.id)));
+    const imageUrlById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), r.image_url || null]));
 
     // Get all traits for surviving tokens in one query
     const traitsRes = await pool.query(`
@@ -1747,12 +1748,15 @@ app.get('/db/all-traits', auth, async (req, res) => {
       ORDER BY tt.token_id, COALESCE(tt.trait_index, 0), tt.trait_name
     `, [[...survivorIds], OCAS_SLUG]);
 
-    // Build tokens object: { "1": { traits: { "Type": "Human 6", ... } }, ... }
+    // Build tokens object: { "1": { traits: { "Type": "Human 6", ... }, image: "..." }, ... }
     const tokens = {};
 
-    // Initialize all survivors with empty traits
+    // Initialize all survivors with empty traits + whatever image_url is on file
+    // (only populated for tokens that have gone through a burn finalization
+    // since the 2026-07-02 fix — most tokens will have image:null here, which
+    // is fine, TraitView already falls back to its own static image source)
     for (const id of survivorIds) {
-      tokens[String(id)] = { traits: {} };
+      tokens[String(id)] = { traits: {}, image: imageUrlById.get(id) || null };
     }
 
     // Populate traits
