@@ -1206,7 +1206,7 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT nt.contract, nt.token_id, nt.from_address, nt.to_address, nt.tx_hash, nt.log_index,
-             nt.block_number, nt.block_ts, nt.event_type,
+             nt.block_number, COALESCE(nt.block_ts, nt.transferred_at) AS block_ts, nt.event_type,
              s.price_eth AS sale_price, s.buyer, s.seller
       FROM nft_transfers nt
       LEFT JOIN sales s ON s.tx_hash = nt.tx_hash AND s.token_id = nt.token_id
