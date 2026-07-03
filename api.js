@@ -1256,37 +1256,136 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
       ORDER BY nt.block_number DESC, nt.log_index DESC
       LIMIT $4 OFFSET $5
     `, [OCAS_CONTRACT, OCAS_SLUG, address, limit, offset]);
+
+    // Burns live in their own purpose-built tables (burn_events/burn_event_inputs),
+    // separate from nft_transfers entirely -- pull them directly rather than
+    // depend on nft_transfers.event_type, which isn't reliably populated for
+    // every wallet's historical rows.
+    const burnRes = await pool.query(`
+      SELECT be.tx_hash, be.block_number, be.log_index, be.burned_at, be.survivor_token_id,
+             be.points_used, bei.burned_token_id
+      FROM burn_events be
+      JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+      WHERE LOWER(be.burner_wallet) = LOWER($1)
+      ORDER BY be.block_number DESC
+      LIMIT $2
+    `, [address, limit]).catch(() => ({ rows: [] })); // tolerate if burn tables aren't present in some env
+
     res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    const transferRows = result.rows.map(r => ({
+      contract: r.contract,
+      token_id: parseInt(r.token_id),
+      from_address: r.from_address,
+      to_address: r.to_address,
+      tx_hash: r.tx_hash,
+      log_index: parseInt(r.log_index),
+      block_number: parseInt(r.block_number),
+      block_ts: r.block_ts,
+      // Only override with 'sale' when a real sales-table match exists.
+      // Otherwise pass event_type through as-is (including null/blank) --
+      // the frontend already has a from/to zero-address fallback classifier
+      // for mint/burn that a hardcoded 'transfer' default here was silently
+      // preventing from ever running.
+      event_type: r.sale_price != null ? 'sale' : (r.event_type || null),
+      sale_price: r.sale_price != null ? parseFloat(r.sale_price) : null,
+      buyer: r.buyer || null,
+      seller: r.seller || null,
+    }));
+    const burnRows = burnRes.rows.map(r => ({
+      contract: OCAS_CONTRACT,
+      token_id: parseInt(r.burned_token_id),
+      from_address: address,
+      to_address: null,
+      tx_hash: r.tx_hash,
+      log_index: r.log_index != null ? parseInt(r.log_index) : 0,
+      block_number: parseInt(r.block_number),
+      block_ts: r.burned_at,
+      event_type: 'burn',
+      sale_price: null,
+      buyer: null,
+      seller: null,
+      survivor_token_id: r.survivor_token_id != null ? parseInt(r.survivor_token_id) : null,
+      points_used: r.points_used != null ? parseInt(r.points_used) : null,
+    }));
+    const merged = [...transferRows, ...burnRows]
+      .sort((a, b) => new Date(b.block_ts || 0) - new Date(a.block_ts || 0))
+      .slice(0, limit);
+
     res.json({
       ok: true,
       address,
       contract: OCAS_CONTRACT,
       synced: true,
-      transfers: result.rows.map(r => ({
-        contract: r.contract,
-        token_id: parseInt(r.token_id),
-        from_address: r.from_address,
-        to_address: r.to_address,
-        tx_hash: r.tx_hash,
-        log_index: parseInt(r.log_index),
-        block_number: parseInt(r.block_number),
-        block_ts: r.block_ts,
-        // event_type from nft_transfers is reliable for mint/burn/transfer
-        // (confirmed populated: ~19k transfer, ~10k mint, ~360 burn on
-        // staging). No 'sale' classification exists there though, so a
-        // sales-table match upgrades a plain transfer to a sale with price.
-        event_type: r.sale_price != null ? 'sale' : (r.event_type || 'transfer'),
-        sale_price: r.sale_price != null ? parseFloat(r.sale_price) : null,
-        buyer: r.buyer || null,
-        seller: r.seller || null,
-      })),
-      count: result.rows.length,
+      transfers: merged,
+      count: merged.length,
       limit,
       offset,
     });
   } catch (e) {
     if (isMissingWalletAnalyticsTable(e)) return res.json(emptyWalletResponse(address, { transfers: [], count: 0, limit, offset }));
     console.error('/db/wallet/:address/transfers error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/wallet/:address/burn-stats ───────────────────────────────────────
+// Personal burn history/stats for a wallet, from the authoritative burn_events
+// / burn_event_inputs tables (confirmed live schema, not the CREATE TABLE
+// statement in lib/db.js which is missing several real columns).
+app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  try {
+    const eventsRes = await pool.query(`
+      SELECT id, tx_hash, block_number, burned_at, survivor_token_id, points_used,
+             result_is_angel, boost_chance, result_body_type, burn_type
+      FROM burn_events
+      WHERE LOWER(burner_wallet) = LOWER($1)
+      ORDER BY block_number DESC
+    `, [address]);
+    const events = eventsRes.rows;
+    if (!events.length) {
+      return res.json({
+        ok: true, address, burnCount: 0, tokensConsumed: 0,
+        survivorsCreated: 0, totalPoints: 0, angelCount: 0, events: [],
+      });
+    }
+    const eventIds = events.map(e => e.id);
+    const inputsRes = await pool.query(
+      `SELECT burn_event_id, burned_token_id FROM burn_event_inputs WHERE burn_event_id = ANY($1)`,
+      [eventIds]
+    );
+    const inputsByEvent = {};
+    for (const row of inputsRes.rows) {
+      (inputsByEvent[row.burn_event_id] ||= []).push(parseInt(row.burned_token_id));
+    }
+    const totalPoints = events.reduce((s, e) => s + (parseInt(e.points_used) || 0), 0);
+    const angelCount = events.filter(e => e.result_is_angel).length;
+    const survivorsCreated = new Set(events.map(e => e.survivor_token_id).filter(Boolean)).size;
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      address,
+      burnCount: events.length,
+      tokensConsumed: inputsRes.rows.length,
+      survivorsCreated,
+      totalPoints,
+      angelCount,
+      events: events.slice(0, 25).map(e => ({
+        txHash: e.tx_hash,
+        blockNumber: parseInt(e.block_number),
+        burnedAt: e.burned_at,
+        survivorTokenId: e.survivor_token_id != null ? parseInt(e.survivor_token_id) : null,
+        pointsUsed: e.points_used != null ? parseInt(e.points_used) : null,
+        isAngel: !!e.result_is_angel,
+        bodyType: e.result_body_type || null,
+        burnType: e.burn_type || null,
+        burnedTokenIds: inputsByEvent[e.id] || [],
+      })),
+    });
+  } catch (e) {
+    console.error('/db/wallet/:address/burn-stats error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
