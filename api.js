@@ -1114,7 +1114,49 @@ function burnEndpointError(res, route, e, fallback = {}) {
   return res.status(500).json({ ok: false, error: e.message, ...fallback });
 }
 
-// ── GET /db/wallet/:address/summary ──────────────────────────────────────────
+// ── GET /db/wallet/:address/favorites ────────────────────────────────────────
+app.get('/db/wallet/:address/favorites', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const slug = (req.query.slug || OCAS_SLUG).toString();
+  try {
+    const r = await pool.query(
+      `SELECT token_ids FROM wallet_favorites WHERE LOWER(wallet_address)=LOWER($1) AND collection_slug=$2`,
+      [address, slug]
+    );
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, address, slug, tokenIds: r.rows[0]?.token_ids || [] });
+  } catch (e) {
+    console.error('/db/wallet/:address/favorites GET error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PUT /db/wallet/:address/favorites — body: { slug, tokenIds:[1,2,3] } ────
+// Full-array replace, matching the existing localStorage saveFavorites() model
+// exactly (always writes the whole current set, not incremental add/remove).
+app.put('/db/wallet/:address/favorites', auth, async (req, res) => {
+  const address = cleanAddress(req.params.address);
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const slug = (req.body?.slug || OCAS_SLUG).toString();
+  const tokenIds = Array.isArray(req.body?.tokenIds)
+    ? [...new Set(req.body.tokenIds.map(Number).filter(n => Number.isFinite(n) && n > 0))]
+    : [];
+  try {
+    await pool.query(
+      `INSERT INTO wallet_favorites (wallet_address, collection_slug, token_ids, updated_at)
+       VALUES (LOWER($1), $2, $3::jsonb, NOW())
+       ON CONFLICT (wallet_address, collection_slug) DO UPDATE SET token_ids=EXCLUDED.token_ids, updated_at=NOW()`,
+      [address, slug, JSON.stringify(tokenIds)]
+    );
+    res.json({ ok: true, address, slug, count: tokenIds.length });
+  } catch (e) {
+    console.error('/db/wallet/:address/favorites PUT error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 // Current derived wallet summary. Returns empty data if wallet sync has not run.
 app.get('/db/wallet/:address/summary', auth, async (req, res) => {
   const address = cleanAddress(req.params.address);
