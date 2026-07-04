@@ -457,7 +457,7 @@ app.get('/db/trait-sales', auth, async (req, res) => {
 // Returns: { ok, history: [{floor_eth, token_id, recorded_at}], current, ref_24h }
 app.get('/db/floor-history', auth, async (req, res) => {
   try {
-    const hours = Math.min(parseInt(req.query.hours || '48'), 168);
+    const hours = Math.min(parseInt(req.query.hours || '48'), 9600);
     const result = await pool.query(
       `SELECT floor_eth, token_id, recorded_at
        FROM floor_history
