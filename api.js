@@ -1229,6 +1229,7 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
           os_rank: r.os_rank ? parseInt(r.os_rank) : null,
           obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
           price_eth: r.price_eth != null ? parseFloat(r.price_eth) : null,
+          cost_eth: r.cost_eth != null ? parseFloat(r.cost_eth) : null,
         })),
       },
     });
