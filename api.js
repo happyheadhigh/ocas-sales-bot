@@ -10,6 +10,7 @@
 
 const express = require('express');
 const { Pool } = require('pg');
+const { runMigrations } = require('./lib/db');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -1432,7 +1433,20 @@ app.get('/db/burn-activity', auth, async (req, res) => {
 });
 
 // ── Start server ──────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`TraitView API running on port ${PORT}`);
-  console.log(`Auth: ${API_SECRET ? 'enabled' : (REQUIRE_API_AUTH ? 'REQUIRED BUT MISSING' : 'DISABLED (dev only; set API_SECRET to enable)')}`);
+// Runs the same idempotent CREATE TABLE/INDEX IF NOT EXISTS migrations used
+// elsewhere -- ensures a brand-new database gets its full schema automatically
+// on first deploy, and self-heals if any table/index was ever missing,
+// instead of relying on a separate manual step that's easy to forget.
+runMigrations().then(() => {
+  app.listen(PORT, () => {
+    console.log(`TraitView API running on port ${PORT}`);
+    console.log(`Auth: ${API_SECRET ? 'enabled' : (REQUIRE_API_AUTH ? 'REQUIRED BUT MISSING' : 'DISABLED (dev only; set API_SECRET to enable)')}`);
+  });
+}).catch(e => {
+  console.error('[Migrations] Failed to run on startup:', e.message);
+  // Still start the server even if migrations failed -- an existing,
+  // already-correct database shouldn't be taken down by a migration hiccup.
+  app.listen(PORT, () => {
+    console.log(`TraitView API running on port ${PORT} (migrations may be incomplete, check logs above)`);
+  });
 });
