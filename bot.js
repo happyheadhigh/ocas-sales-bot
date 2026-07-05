@@ -681,6 +681,8 @@ client.on('interactionCreate', async (interaction)=>{
       `🪙 **Tokens found:** ${tokenCount} across all wallets`,
       '',
       'You can remove the code from your OpenSea username now.',
+      '',
+      '💡 Try `/me` to see your wallet dashboard, or `/help` to explore everything I can do.',
     ].join('\n')});
   }
   // ── Setup wizard modal + button handlers ───────────────────────────────────
@@ -1042,6 +1044,8 @@ client.on('interactionCreate', async (interaction)=>{
           ...(rolePartsInst.length ? ['', ...rolePartsInst] : []),
           '',
           'Your wallet was recognised from another server — no re-verification needed.',
+          '',
+          '💡 Try `/me` to see your wallet dashboard, or `/help` to explore everything I can do.',
         ].join('\n')});
       }
     }catch(e){
@@ -1308,6 +1312,8 @@ client.on('interactionCreate', async (interaction)=>{
       '',
       'You can remove the code from your OpenSea username now.',
       'Your wallet is saved — future servers will verify you instantly.',
+      '',
+      '💡 Try `/me` to see your wallet dashboard, or `/help` to explore everything I can do.',
     ].join('\n')});
   }
 
