@@ -1555,7 +1555,7 @@ app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
     if (!events.length) {
       return res.json({
         ok: true, address, burnCount: 0, tokensConsumed: 0,
-        survivorsCreated: 0, totalPoints: 0, angelCount: 0, events: [],
+        survivorsCreated: 0, totalPoints: 0, angelCount: 0, events: [], input_snapshots: {},
       });
     }
     const eventIds = events.map(e => e.id);
@@ -1571,6 +1571,23 @@ app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
     const angelCount = events.filter(e => e.result_is_angel).length;
     const survivorsCreated = new Set(events.map(e => e.survivor_token_id).filter(Boolean)).size;
 
+    // Same reasoning as /db/burn-latest and /db/burn-best: the survivor's
+    // thumbnail here needs THIS event's post-burn snapshot (not a current
+    // lookup, since this same survivor may show up in several of the
+    // wallet's own burn rows, each a different point in its history), and
+    // the destroyed input tokens need their pre-burn snapshot since a
+    // "current" lookup is meaningless for a token that no longer exists as
+    // its original self. This endpoint never had either wired in before.
+    const survivorSnapsRes = await pool.query(
+      `SELECT burn_event_id, image_data FROM burn_state_snapshots WHERE burn_event_id = ANY($1::int[])`,
+      [eventIds]
+    );
+    const survivorSnapMap = {};
+    for (const r of survivorSnapsRes.rows) survivorSnapMap[r.burn_event_id] = r.image_data;
+
+    const allInputIds = inputsRes.rows.map(r => r.burned_token_id);
+    const inputSnapshots = await fetchInputSnapshots(allInputIds);
+
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
     res.json({
       ok: true,
@@ -1580,11 +1597,14 @@ app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
       survivorsCreated,
       totalPoints,
       angelCount,
+      input_snapshots: inputSnapshots,
       events: events.slice(0, 25).map(e => ({
+        burnEventId: e.id,
         txHash: e.tx_hash,
         blockNumber: parseInt(e.block_number),
         burnedAt: e.burned_at,
         survivorTokenId: e.survivor_token_id != null ? parseInt(e.survivor_token_id) : null,
+        survivorSnapshotImage: survivorSnapMap[e.id] || null,
         pointsUsed: e.points_used != null ? parseInt(e.points_used) : null,
         isAngel: !!e.result_is_angel,
         bodyType: e.result_body_type || null,
