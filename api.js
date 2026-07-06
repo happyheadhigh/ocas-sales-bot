@@ -1192,7 +1192,120 @@ function burnEndpointError(res, route, e, fallback = {}) {
   return res.status(500).json({ ok: false, error: e.message, ...fallback });
 }
 
-// ── GET /db/wallet/:address/favorites ────────────────────────────────────────
+// ── GET /db/token/:id/burn-history ───────────────────────────────────────────
+// Full lifecycle timeline for a token: original mint state (position 0), then
+// one entry per burn it ever survived (position 1..N, each using the
+// corrected burn_state_snapshots data from the 2026-07-06 repair), plus
+// whether it was later destroyed as fuel in a subsequent burn. Powers the
+// TraitView modal's pre-burn history toggle.
+app.get('/db/token/:id/burn-history', auth, async (req, res) => {
+  const tokenId = parseInt(req.params.id, 10);
+  if (!Number.isFinite(tokenId)) return res.status(400).json({ ok: false, error: 'invalid token id' });
+  try {
+    const survivorEvents = await pool.query(
+      `SELECT id, tx_hash, burned_at FROM burn_events WHERE survivor_token_id=$1 ORDER BY burned_at ASC, id ASC`,
+      [tokenId]
+    );
+
+    const mint = await pool.query(
+      `SELECT image_data, traits_json FROM token_original_snapshots WHERE token_id=$1`,
+      [tokenId]
+    );
+
+    const timeline = [];
+    if (mint.rows.length) {
+      const m = mint.rows[0];
+      timeline.push({
+        position: 0,
+        label: 'Original Mint',
+        burn_event_id: null,
+        tx_hash: null,
+        burned_at: null,
+        traits: typeof m.traits_json === 'string' ? JSON.parse(m.traits_json) : m.traits_json,
+        image: m.image_data || null,
+      });
+    }
+
+    if (survivorEvents.rows.length) {
+      const eventIds = survivorEvents.rows.map(r => r.id);
+      const snaps = await pool.query(
+        `SELECT burn_event_id, image_data, traits_json FROM burn_state_snapshots WHERE token_id=$1 AND burn_event_id = ANY($2::int[])`,
+        [tokenId, eventIds]
+      );
+      const snapMap = {};
+      for (const s of snaps.rows) snapMap[s.burn_event_id] = s;
+
+      survivorEvents.rows.forEach((ev, i) => {
+        const snap = snapMap[ev.id];
+        timeline.push({
+          position: i + 1,
+          label: `After Burn ${i + 1}`,
+          burn_event_id: ev.id,
+          tx_hash: ev.tx_hash,
+          burned_at: ev.burned_at,
+          traits: snap?.traits_json ? (typeof snap.traits_json === 'string' ? JSON.parse(snap.traits_json) : snap.traits_json) : null,
+          image: snap?.image_data || null,
+        });
+      });
+    }
+
+    // Was this token later fed as fuel into a DIFFERENT burn (genuinely
+    // destroyed, not just a survivor of its own history)?
+    const destroyed = await pool.query(`
+      SELECT be.id AS burn_event_id, be.tx_hash, be.burned_at, be.survivor_token_id
+      FROM burn_event_inputs bei
+      JOIN burn_events be ON be.id = bei.burn_event_id
+      WHERE bei.burned_token_id = $1 AND bei.burned_token_id != be.survivor_token_id
+      ORDER BY be.burned_at DESC LIMIT 1
+    `, [tokenId]);
+
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json({
+      ok: true,
+      token_id: tokenId,
+      timeline,
+      survivor_count: survivorEvents.rows.length,
+      destroyed_in: destroyed.rows[0] ? {
+        burn_event_id: destroyed.rows[0].burn_event_id,
+        tx_hash: destroyed.rows[0].tx_hash,
+        burned_at: destroyed.rows[0].burned_at,
+        survivor_token_id: destroyed.rows[0].survivor_token_id,
+      } : null,
+    });
+  } catch (e) {
+    console.error('/db/token/:id/burn-history error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/survivor-counts ───────────────────────────────────────────────────
+// Bulk map of token_id -> number of times it has ever been a burn survivor.
+// Loaded once at page init (like OS ranks) so the grid/modal can show a
+// "Survivor" / "Survivor x2" badge without a per-token API call.
+let _survivorCountsCache = null;
+let _survivorCountsCacheTs = 0;
+const SURVIVOR_COUNTS_TTL = 5 * 60 * 1000;
+app.get('/db/survivor-counts', auth, async (req, res) => {
+  try {
+    const now = Date.now();
+    if (_survivorCountsCache && (now - _survivorCountsCacheTs) < SURVIVOR_COUNTS_TTL) {
+      return res.json(_survivorCountsCache);
+    }
+    const result = await pool.query(
+      `SELECT survivor_token_id, COUNT(*)::int AS c FROM burn_events GROUP BY survivor_token_id`
+    );
+    const counts = {};
+    for (const r of result.rows) counts[r.survivor_token_id] = r.c;
+    _survivorCountsCache = { ok: true, counts };
+    _survivorCountsCacheTs = now;
+    res.json(_survivorCountsCache);
+  } catch (e) {
+    console.error('/db/survivor-counts error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 app.get('/db/wallet/:address/favorites', auth, async (req, res) => {
   const address = cleanAddress(req.params.address);
   if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
