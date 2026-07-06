@@ -1902,13 +1902,17 @@ app.get('/db/burn-best', auth, async (req, res) => {
       }));
 
       const created = await pool.query(`
-        SELECT be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
-               be.survivor_token_id,
-               t.os_rank, t.obs_rank,
-               COALESCE(t.os_rank, t.obs_rank) AS rank
-        FROM burn_events be
-        LEFT JOIN tokens t ON t.id = be.survivor_token_id
-        ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC, be.burned_at DESC NULLS LAST
+        SELECT * FROM (
+          SELECT DISTINCT ON (be.survivor_token_id)
+                 be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
+                 be.survivor_token_id,
+                 t.os_rank, t.obs_rank,
+                 COALESCE(t.os_rank, t.obs_rank) AS rank
+          FROM burn_events be
+          LEFT JOIN tokens t ON t.id = be.survivor_token_id
+          ORDER BY be.survivor_token_id, be.burned_at DESC
+        ) sub
+        ORDER BY COALESCE(rank, 999999) ASC
         LIMIT 25
       `);
       bestCreatedTokens = created.rows.map(r => ({
