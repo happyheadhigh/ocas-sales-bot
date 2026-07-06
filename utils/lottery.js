@@ -187,8 +187,8 @@ function resolveLotteryWindow({ windowText, startText, endText, hours, timezone,
     const end           = new Date(start.getTime() + durationHours * 3600000);
     return { start, end, hours: durationHours, timeZone };
   }
-  const start = parseLotteryDate(startText, null);
-  const end   = parseLotteryDate(endText, null);
+  const start = parseLotteryDate(startText, null, timeZone);
+  const end   = parseLotteryDate(endText, null, timeZone);
   if(start && end)   return { start, end, hours: (end - start) / 3600000, timeZone };
   if(start && !end)  return { start, end: new Date(start.getTime() + fallbackHours * 3600000), hours: fallbackHours, timeZone };
   if(!start && end)  return { start: new Date(end.getTime() - fallbackHours * 3600000), end, hours: fallbackHours, timeZone };
