@@ -1840,7 +1840,7 @@ app.get('/db/burn-best', auth, async (req, res) => {
     let bestCreatedTokens = [];
     try {
       const rarest = await pool.query(`
-        SELECT be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
+        SELECT be.id AS burn_event_id, be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
                bei.burned_token_id,
                t.os_rank, t.obs_rank,
                COALESCE(t.os_rank, t.obs_rank) AS rank,
@@ -1854,6 +1854,7 @@ app.get('/db/burn-best', auth, async (req, res) => {
         LIMIT 25
       `);
       rarestBurnedInputs = rarest.rows.map(r => ({
+        burn_event_id: burnNum(r.burn_event_id),
         tx_hash: r.tx_hash || null,
         block_number: burnNum(r.block_number),
         wallet: r.burner_wallet || null,
