@@ -89,6 +89,28 @@ function arraysEqual(a, b) {
 
 async function main() {
   const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+  // Preflight: burn_started_events/burn_started_inputs have historically only
+  // been created by a one-off manual script (burn-backfill-repair.js), not
+  // the regular migration path (fixed in lib/db.js as of this same session,
+  // but that fix isn't live everywhere yet — e.g. production, pre-merge).
+  // Fail clearly and immediately here instead of a confusing per-survivor
+  // "relation does not exist" error partway through 240 survivors.
+  const tableCheck = await pool.query(`
+    SELECT table_name FROM information_schema.tables
+    WHERE table_name IN ('burn_started_events', 'burn_started_inputs')
+  `);
+  const found = new Set(tableCheck.rows.map(r => r.table_name));
+  if (!found.has('burn_started_events') || !found.has('burn_started_inputs')) {
+    console.error('Required table(s) missing: ' +
+      ['burn_started_events', 'burn_started_inputs'].filter(t => !found.has(t)).join(', '));
+    console.error('This repair depends on burn_started_events/burn_started_inputs holding the true');
+    console.error('fuel-token list per start event. Run the migration (lib/db.js runMigrations(), or');
+    console.error('a fresh bot/API deploy that calls it on startup) before running this script.');
+    await pool.end();
+    process.exit(1);
+  }
+
   const survivorIds = await getSurvivorIds(pool);
 
   console.log(`${WRITE ? 'WRITE MODE' : 'DRY RUN'} — checking ${survivorIds.length} survivor(s)`);
@@ -133,19 +155,33 @@ async function main() {
               [finalize.id, tokenId]
             );
           }
-          // Keep matched_burn_event_id consistent with the live fix so future
-          // runs of this script (or the bot's own fallback logic) don't get
-          // confused about which starts are already accounted for.
-          await client.query(
-            `UPDATE burn_started_events SET matched_burn_event_id=$1 WHERE id=$2`,
-            [finalize.id, starts[i].id]
-          );
           await client.query('COMMIT');
         } catch (e) {
           await client.query('ROLLBACK');
           console.warn(`    DB write failed for burn_event #${finalize.id}:`, e.message);
+          continue;
         } finally {
           client.release();
+        }
+        // Separate from the transaction above and deliberately best-effort:
+        // matched_burn_event_id may not exist yet on a database that hasn't
+        // run lib/db.js's runMigrations() with this fix (e.g. production
+        // before the bot-modular -> main merge/deploy). That's fine — this
+        // bookkeeping only helps FUTURE runs of this script and the live
+        // bot's own start/finalize matching; the actual burn_event_inputs
+        // fix above must never be rolled back just because this column is
+        // missing, so it's outside the transaction and swallows its own error.
+        try {
+          await pool.query(
+            `UPDATE burn_started_events SET matched_burn_event_id=$1 WHERE id=$2`,
+            [finalize.id, starts[i].id]
+          );
+        } catch (e) {
+          if (/matched_burn_event_id/i.test(e.message)) {
+            console.warn(`    (matched_burn_event_id column not present yet — skipped bookkeeping, main fix still applied)`);
+          } else {
+            console.warn(`    matched_burn_event_id update failed:`, e.message);
+          }
         }
       }
     }
