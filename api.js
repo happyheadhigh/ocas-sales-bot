@@ -1202,6 +1202,17 @@ function burnEndpointError(res, route, e, fallback = {}) {
 app.get('/db/token/:id/burn-history', auth, async (req, res) => {
   const tokenId = parseInt(req.params.id, 10);
   if (!Number.isFinite(tokenId)) return res.status(400).json({ ok: false, error: 'invalid token id' });
+  // token_original_snapshots/burn_state_snapshots store the full internal
+  // trait object, which includes __image and __attributes (used elsewhere
+  // for image resolution and preserving raw attribute order). Neither
+  // belongs in what the client displays as "traits" -- image is already
+  // returned as its own top-level field on each timeline entry, and
+  // __attributes is a duplicate array form. Strip both before sending.
+  const cleanTraits = (t) => {
+    if (!t || typeof t !== 'object') return t;
+    const { __image, __attributes, ...rest } = t;
+    return rest;
+  };
   try {
     const survivorEvents = await pool.query(
       `SELECT id, tx_hash, burned_at FROM burn_events WHERE survivor_token_id=$1 ORDER BY burned_at ASC, id ASC`,
@@ -1216,13 +1227,14 @@ app.get('/db/token/:id/burn-history', auth, async (req, res) => {
     const timeline = [];
     if (mint.rows.length) {
       const m = mint.rows[0];
+      const traitsObj = typeof m.traits_json === 'string' ? JSON.parse(m.traits_json) : m.traits_json;
       timeline.push({
         position: 0,
         label: 'Original Mint',
         burn_event_id: null,
         tx_hash: null,
         burned_at: null,
-        traits: typeof m.traits_json === 'string' ? JSON.parse(m.traits_json) : m.traits_json,
+        traits: cleanTraits(traitsObj),
         image: m.image_data || null,
       });
     }
@@ -1238,13 +1250,14 @@ app.get('/db/token/:id/burn-history', auth, async (req, res) => {
 
       survivorEvents.rows.forEach((ev, i) => {
         const snap = snapMap[ev.id];
+        const traitsObj = snap?.traits_json ? (typeof snap.traits_json === 'string' ? JSON.parse(snap.traits_json) : snap.traits_json) : null;
         timeline.push({
           position: i + 1,
           label: `After Burn ${i + 1}`,
           burn_event_id: ev.id,
           tx_hash: ev.tx_hash,
           burned_at: ev.burned_at,
-          traits: snap?.traits_json ? (typeof snap.traits_json === 'string' ? JSON.parse(snap.traits_json) : snap.traits_json) : null,
+          traits: cleanTraits(traitsObj),
           image: snap?.image_data || null,
         });
       });
