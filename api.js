@@ -1156,6 +1156,34 @@ function burnEventJson(row) {
     snapshot_image: row.snapshot_image || null,
   };
 }
+// Batch-fetch pre-burn snapshot images for a set of (likely destroyed) input
+// token IDs, keyed by token_id. Uses token_image_snapshots — the same table
+// the bot's Discord /burnhistory command reads for "what did this token look
+// like right before it was destroyed" (see lib/images.js's
+// fetchSnapshotImageForToken). token_image_snapshots is OCAS-only and
+// priority-protected so a 'burn-start-input' row, once written, is never
+// overwritten by a lower-priority source — so this is safe to treat as a
+// permanent historical record, not something that could silently go stale.
+// NOTE: column names here (image_data, source) match every real read/write
+// site in lib/images.js — lib/db.js's CREATE TABLE stub uses different names
+// (image_url/image_source) and is known-stale; verify with \d token_image_snapshots
+// before relying on this in production.
+async function fetchInputSnapshots(tokenIds) {
+  const ids = burnIdArray(tokenIds);
+  if (!ids.length) return {};
+  try {
+    const result = await pool.query(
+      `SELECT token_id, image_data FROM token_image_snapshots WHERE token_id = ANY($1::int[]) AND image_data IS NOT NULL`,
+      [ids]
+    );
+    const map = {};
+    for (const r of result.rows) map[String(r.token_id)] = r.image_data;
+    return map;
+  } catch (e) {
+    console.warn('[fetchInputSnapshots]', e.message);
+    return {};
+  }
+}
 function burnEndpointError(res, route, e, fallback = {}) {
   console.error(`${route} error:`, e.message);
   if (isMissingBurnTable(e)) {
@@ -1620,10 +1648,17 @@ app.get('/db/burn-latest', auth, async (req, res) => {
       LIMIT $1
     `, [limit]);
 
+    const burns = result.rows.map(burnEventJson);
+    // Pre-burn images for the destroyed input tokens shown in each row's
+    // gallery — these tokens no longer exist as their original selves, so
+    // a "current" image lookup would be wrong/blank. See fetchInputSnapshots.
+    const allInputIds = burns.flatMap(b => b.input_token_ids);
+    const inputSnapshots = await fetchInputSnapshots(allInputIds);
+
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
-    res.json({ ok: true, burns: result.rows.map(burnEventJson), count: result.rows.length });
+    res.json({ ok: true, burns, input_snapshots: inputSnapshots, count: result.rows.length });
   } catch (e) {
-    burnEndpointError(res, '/db/burn-latest', e, { burns: [], count: 0 });
+    burnEndpointError(res, '/db/burn-latest', e, { burns: [], input_snapshots: {}, count: 0 });
   }
 });
 
@@ -1694,10 +1729,12 @@ app.get('/db/burn-best', auth, async (req, res) => {
         SELECT be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
                bei.burned_token_id,
                t.os_rank, t.obs_rank,
-               COALESCE(t.os_rank, t.obs_rank) AS rank
+               COALESCE(t.os_rank, t.obs_rank) AS rank,
+               tis.image_data AS snapshot_image
         FROM burn_event_inputs bei
         JOIN burn_events be ON be.id = bei.burn_event_id
         LEFT JOIN tokens t ON t.id = bei.burned_token_id
+        LEFT JOIN token_image_snapshots tis ON tis.token_id = bei.burned_token_id
         WHERE bei.burned_token_id != be.survivor_token_id
         ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC, be.burned_at DESC NULLS LAST
         LIMIT 25
@@ -1711,6 +1748,9 @@ app.get('/db/burn-best', auth, async (req, res) => {
         os_rank: burnNum(r.os_rank),
         obs_rank: burnNum(r.obs_rank),
         rank: burnNum(r.rank),
+        // This token no longer exists as its original self — show its last
+        // known appearance rather than attempting a "current" image lookup.
+        snapshot_image: r.snapshot_image || null,
       }));
 
       const created = await pool.query(`
@@ -1738,16 +1778,24 @@ app.get('/db/burn-best', auth, async (req, res) => {
       console.warn('/db/burn-best rank data unavailable:', rankError.message);
     }
 
+    const biggestBurns = biggest.rows.map(burnEventJson);
+    // Same reasoning as /db/burn-latest — biggest_burns' input galleries show
+    // destroyed tokens, so they need pre-burn snapshots, not a current lookup.
+    const allInputIds = biggestBurns.flatMap(b => b.input_token_ids);
+    const inputSnapshots = await fetchInputSnapshots(allInputIds);
+
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
     res.json({
       ok: true,
-      biggest_burns: biggest.rows.map(burnEventJson),
+      biggest_burns: biggestBurns,
+      input_snapshots: inputSnapshots,
       rarest_burned_inputs: rarestBurnedInputs,
       best_created_tokens: bestCreatedTokens,
     });
   } catch (e) {
     burnEndpointError(res, '/db/burn-best', e, {
       biggest_burns: [],
+      input_snapshots: {},
       rarest_burned_inputs: [],
       best_created_tokens: [],
     });
