@@ -108,20 +108,23 @@ function tokenImageOf(traits) {
 function traitsEqual(a, b) {
   // Compare ignoring __attributes (array form, order-sensitive by nature)
   // AND ignoring object key insertion order for everything else -- two
-  // logically-identical trait sets built by different code paths (e.g. the
-  // old backfill's own decode vs this script's traitsObjectFromArray) can
-  // have their keys in a different order, which a naive JSON.stringify
+  // logically-identical trait sets built by different code paths can have
+  // their keys in a different order, which a naive JSON.stringify
   // comparison would wrongly flag as "different". Sorting keys before
   // stringifying makes this comparison order-independent.
   if (!a || !b) return false;
   const strip = (t) => {
-    const { __attributes, ...rest } = t || {};
+    const { __attributes, __image, ...rest } = t || {};
     return rest;
   };
   const canonical = (obj) => JSON.stringify(
     Object.keys(obj).sort().reduce((acc, k) => { acc[k] = obj[k]; return acc; }, {})
   );
   return canonical(strip(a)) === canonical(strip(b));
+}
+
+function imagesEqual(a, b) {
+  return (a?.__image || null) === (b?.__image || null);
 }
 
 async function main() {
@@ -136,7 +139,7 @@ async function main() {
   const events = await getBurnEvents(pool);
   console.log(`${WRITE ? 'WRITE MODE' : 'DRY RUN'} — checking ${events.length} burn_event(s) against historical on-chain state`);
 
-  let checked = 0, correct = 0, fixed = 0, rpcFailed = 0;
+  let checked = 0, correct = 0, fixedMissing = 0, fixedTraits = 0, fixedImageOnly = 0, rpcFailed = 0;
 
   for (const ev of events) {
     checked++;
@@ -149,16 +152,39 @@ async function main() {
     const stored = await getStoredSnapshot(pool, ev.id, ev.survivor_token_id);
     const storedTraits = stored?.traits_json ? (typeof stored.traits_json === 'string' ? JSON.parse(stored.traits_json) : stored.traits_json) : null;
 
-    if (traitsEqual(trueTraits, storedTraits)) {
+    const traitsMatch = traitsEqual(trueTraits, storedTraits);
+    const imagesMatch = storedTraits ? imagesEqual(trueTraits, storedTraits) : false;
+
+    if (traitsMatch && imagesMatch) {
       correct++;
       await new Promise(r => setTimeout(r, 300));
       continue;
     }
 
-    fixed++;
-    console.log(`\n  Survivor #${ev.survivor_token_id}, burn_event #${ev.id} (tx ${ev.tx_hash}, block ${ev.block_number}):`);
-    console.log(`    stored: ${storedTraits ? JSON.stringify({ ...storedTraits, __image: storedTraits.__image ? '<image data>' : null }) : '(missing)'}`);
-    console.log(`    true:   ${JSON.stringify({ ...trueTraits, __image: trueTraits.__image ? '<image data>' : null })}`);
+    // Categorize so the summary distinguishes real historical corrections
+    // (missing entirely, or trait VALUES actually differ) from cases where
+    // the traits match but only the image bytes differ -- which could be a
+    // real stale/wrong image, or could just be a harmless re-encode
+    // (different SVG serialization producing the same visual result). Both
+    // get written with the ground-truth value either way, but knowing which
+    // category each fix falls into matters for judging how big a deal this
+    // actually is before committing 80+ writes.
+    let category;
+    if (!storedTraits) category = 'MISSING';
+    else if (!traitsMatch) category = 'TRAITS DIFFER';
+    else category = 'IMAGE ONLY DIFFERS';
+
+    if (category === 'MISSING') fixedMissing++;
+    else if (category === 'TRAITS DIFFER') fixedTraits++;
+    else fixedImageOnly++;
+
+    console.log(`\n  Survivor #${ev.survivor_token_id}, burn_event #${ev.id} (tx ${ev.tx_hash}, block ${ev.block_number}) — ${category}:`);
+    if (category === 'IMAGE ONLY DIFFERS') {
+      console.log(`    (traits match; only the stored image bytes differ from ground truth — not printing the full dump)`);
+    } else {
+      console.log(`    stored: ${storedTraits ? JSON.stringify({ ...storedTraits, __image: storedTraits.__image ? '<image data>' : null }) : '(missing)'}`);
+      console.log(`    true:   ${JSON.stringify({ ...trueTraits, __image: trueTraits.__image ? '<image data>' : null })}`);
+    }
 
     if (WRITE) {
       const client = await pool.connect();
@@ -181,12 +207,16 @@ async function main() {
     await new Promise(r => setTimeout(r, 300));
   }
 
+  const totalFixed = fixedMissing + fixedTraits + fixedImageOnly;
   console.log(`\n=== Summary ===`);
   console.log(`Checked: ${checked}`);
   console.log(`Already correct: ${correct}`);
-  console.log(`${WRITE ? 'Fixed' : 'Would fix'}: ${fixed}`);
+  console.log(`${WRITE ? 'Fixed' : 'Would fix'} (total): ${totalFixed}`);
+  console.log(`  - Missing entirely: ${fixedMissing}`);
+  console.log(`  - Traits genuinely differ (real historical correction): ${fixedTraits}`);
+  console.log(`  - Traits match, image bytes only differ (re-encode or real staleness -- review): ${fixedImageOnly}`);
   console.log(`RPC failures (skipped, not touched): ${rpcFailed}`);
-  if (!WRITE && fixed > 0) console.log(`\nRe-run with WRITE=true to apply these ${fixed} fix(es).`);
+  if (!WRITE && totalFixed > 0) console.log(`\nRe-run with WRITE=true to apply these ${totalFixed} fix(es).`);
 
   await pool.end();
 }
