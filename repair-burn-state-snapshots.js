@@ -106,14 +106,22 @@ function tokenImageOf(traits) {
 }
 
 function traitsEqual(a, b) {
-  // Compare ignoring __attributes (array form, order-sensitive) -- __image
-  // and the named trait keys are what actually matters for display/detection.
+  // Compare ignoring __attributes (array form, order-sensitive by nature)
+  // AND ignoring object key insertion order for everything else -- two
+  // logically-identical trait sets built by different code paths (e.g. the
+  // old backfill's own decode vs this script's traitsObjectFromArray) can
+  // have their keys in a different order, which a naive JSON.stringify
+  // comparison would wrongly flag as "different". Sorting keys before
+  // stringifying makes this comparison order-independent.
   if (!a || !b) return false;
   const strip = (t) => {
     const { __attributes, ...rest } = t || {};
     return rest;
   };
-  return JSON.stringify(strip(a)) === JSON.stringify(strip(b));
+  const canonical = (obj) => JSON.stringify(
+    Object.keys(obj).sort().reduce((acc, k) => { acc[k] = obj[k]; return acc; }, {})
+  );
+  return canonical(strip(a)) === canonical(strip(b));
 }
 
 async function main() {
