@@ -2170,7 +2170,7 @@ client.once('clientReady', async ()=>{
       alertedEventIds: _sz(alertedEventIds),
       commandCooldowns: _sz(commandCooldowns),
       cachedFloors: _sz(cachedFloors),
-      pendingBurns: _sz(pendingBurns),
+      pendingBurns: [...pendingBurns.values()].reduce((sum, q) => sum + (Array.isArray(q) ? q.length : 1), 0),
       pendingBurnAlerts: _sz(pendingBurnAlerts),
       burnBlockTimestampCache: _sz(burnBlockTimestampCache),
       rankSyncQueue: _sz(rankSyncQueue),
