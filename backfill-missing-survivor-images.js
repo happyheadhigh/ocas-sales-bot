@@ -30,6 +30,17 @@
 
 require('dotenv').config();
 const { Pool } = require('pg');
+
+// This script's own on-chain calls have nothing to do with the live bot's
+// catch-up strategy — BURN_RPC_OVERRIDE (Infura, used during catch-up) is a
+// shared setting for the actual burn-poller process, and a burst of 29 calls
+// from this script contending with it is almost certainly why the first dry
+// run saw mostly -32603/-32005 errors from Infura while Alchemy calls (the
+// 2 that succeeded appear to have raced through before rate-limiting kicked
+// in). Clearing it here only affects THIS process's env, not the live bot's.
+delete process.env.BURN_RPC_OVERRIDE;
+delete process.env.ETH_RPC_URL;
+
 const { fetchTokenUriFromContract, getTraitImageSource } = require('./lib/rpc');
 
 const OCAS_SLUG = 'on-chain-all-stars';
@@ -39,14 +50,37 @@ async function getGapIds(pool) {
   if (process.env.IDS) {
     return process.env.IDS.split(',').map(s => parseInt(s.trim(), 10)).filter(Number.isFinite);
   }
+  // Excludes tokens that were later fed as input into a DIFFERENT burn
+  // event (re-burned by their owner down the line) -- those are truly
+  // destroyed now, not just missing an image update. First dry run
+  // confirmed several of the original 29 give "nonexistent token" reverts
+  // from the contract itself, which is what tipped this off.
   const r = await pool.query(`
     SELECT DISTINCT be.survivor_token_id AS token_id
     FROM burn_events be
     LEFT JOIN tokens t ON t.id = be.survivor_token_id AND t.collection_slug = $1
     WHERE t.image_url IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM burn_event_inputs bei2
+        JOIN burn_events be2 ON be2.id = bei2.burn_event_id
+        WHERE bei2.burned_token_id = be.survivor_token_id
+          AND bei2.burned_token_id != be2.survivor_token_id
+      )
     ORDER BY token_id ASC
   `, [OCAS_SLUG]);
   return r.rows.map(row => parseInt(row.token_id, 10));
+}
+
+// One retry with backoff for transient RPC errors only. "Nonexistent token"
+// reverts are permanent (the contract itself is saying it doesn't exist) --
+// no point retrying those, so they're not caught here as retryable.
+async function fetchWithRetry(id, attempts = 2) {
+  for (let i = 0; i < attempts; i++) {
+    const traits = await fetchTokenUriFromContract(id).catch(() => null);
+    if (traits) return traits;
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+  }
+  return null;
 }
 
 async function main() {
@@ -58,7 +92,7 @@ async function main() {
 
   let fetched = 0, wrote = 0, failed = 0;
   for (const id of ids) {
-    const traits = await fetchTokenUriFromContract(id).catch(() => null);
+    const traits = await fetchWithRetry(id);
     const img = traits ? getTraitImageSource(traits) : null;
     if (!img) {
       console.warn(`  #${id}: could not fetch current image from contract — skipped`);
@@ -76,8 +110,9 @@ async function main() {
         failed++;
       }
     }
-    // Light rate limit, same spirit as the burn-lottery/rank-sync scripts
-    await new Promise(r => setTimeout(r, 300));
+    // Longer delay than the first attempt (300ms) -- that pace is likely
+    // what triggered the rate-limit-flavored errors in the first dry run.
+    await new Promise(r => setTimeout(r, 1200));
   }
 
   console.log(`\nDone. fetched=${fetched} wrote=${wrote} failed=${failed}${WRITE ? '' : ' (dry run — nothing written, re-run with WRITE=true)'}`);
