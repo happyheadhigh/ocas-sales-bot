@@ -1144,6 +1144,7 @@ function burnIdArray(value) {
 function burnEventJson(row) {
   const inputTokenIds = burnIdArray(row.input_token_ids);
   return {
+    burn_event_id: burnNum(row.burn_event_id),
     tx_hash: row.tx_hash || null,
     log_index: burnNum(row.log_index),
     block_number: burnNum(row.block_number),
@@ -1744,7 +1745,7 @@ app.get('/db/burn-latest', auth, async (req, res) => {
   const limit = burnLimitParam(req.query.limit, 25, 100);
   try {
     const result = await pool.query(`
-      SELECT be.tx_hash, be.log_index, be.block_number, be.burner_wallet,
+      SELECT be.id AS burn_event_id, be.tx_hash, be.log_index, be.block_number, be.burner_wallet,
              be.survivor_token_id, be.burned_at, be.points_used, bs.image_data AS snapshot_image,
              COALESCE(
                array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
@@ -1818,7 +1819,7 @@ app.get('/db/burn-leaderboard', auth, async (req, res) => {
 app.get('/db/burn-best', auth, async (req, res) => {
   try {
     const biggest = await pool.query(`
-      SELECT be.tx_hash, be.log_index, be.block_number, be.burner_wallet,
+      SELECT be.id AS burn_event_id, be.tx_hash, be.log_index, be.block_number, be.burner_wallet,
              be.survivor_token_id, be.burned_at, be.points_used, bs.image_data AS snapshot_image,
              COALESCE(
                array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
