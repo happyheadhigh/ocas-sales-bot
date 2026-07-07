@@ -2,7 +2,7 @@
 
 const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
 const fetch = require('node-fetch');
-const { OWNER_DISCORD_IDS } = require('../lib/constants');
+const { OWNER_DISCORD_IDS, OCAS_SLUG } = require('../lib/constants');
 const { extractPngFromSvg, resolveImage } = require('../lib/images');
 const { isDiscordOk } = require('../utils/format');
 
@@ -74,6 +74,19 @@ function resolveCollectionFromServerCfg(serverCfg, collectionInput){
   const all = [primary, ...extras].filter(c => c.slug);
 
   if(!collectionInput) {
+    // No explicit collection was given -- and there's currently no slash
+    // command option to provide one anyway. Previously this just returned
+    // whatever "primary" happened to be configured as, with no regard for
+    // whether OCAS was even the primary slot. That's exactly how a server
+    // with OCAS registered as a secondary/"extra" collection (and
+    // something else as primary) silently swept the wrong collection with
+    // no way to override it. Prefer OCAS specifically wherever it's
+    // configured for this server; only fall back to "primary" as a last
+    // resort when OCAS genuinely isn't configured here and there's more
+    // than one other collection to choose between (fully ambiguous case).
+    const ocasMatch = all.find(c => (c.slug||'').toLowerCase() === OCAS_SLUG);
+    if(ocasMatch) return ocasMatch;
+    if(all.length === 1) return all[0];
     return primary.slug ? primary : null;
   }
 
