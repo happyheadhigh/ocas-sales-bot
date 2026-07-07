@@ -1598,7 +1598,7 @@ app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
       totalPoints,
       angelCount,
       input_snapshots: inputSnapshots,
-      events: events.slice(0, 25).map(e => ({
+      events: events.slice(0, 100).map(e => ({
         burnEventId: e.id,
         txHash: e.tx_hash,
         blockNumber: parseInt(e.block_number),
