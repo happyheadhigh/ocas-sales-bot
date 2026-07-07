@@ -1874,6 +1874,7 @@ app.get('/db/burn-best', auth, async (req, res) => {
     try {
       const rarest = await pool.query(`
         SELECT be.id AS burn_event_id, be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
+               be.result_is_angel,
                bei.burned_token_id,
                t.os_rank, t.obs_rank,
                COALESCE(t.os_rank, t.obs_rank) AS rank,
@@ -1901,13 +1902,14 @@ app.get('/db/burn-best', auth, async (req, res) => {
         // known appearance rather than attempting a "current" image lookup.
         snapshot_image: r.snapshot_image || null,
         type_trait: r.type_trait || null,
+        is_angel: !!r.result_is_angel,
       }));
 
       const created = await pool.query(`
         SELECT sub.*, tt.trait_value AS type_trait FROM (
           SELECT DISTINCT ON (be.survivor_token_id)
                  be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
-                 be.survivor_token_id,
+                 be.survivor_token_id, be.result_is_angel,
                  t.os_rank, t.obs_rank,
                  COALESCE(t.os_rank, t.obs_rank) AS rank
           FROM burn_events be
@@ -1928,6 +1930,7 @@ app.get('/db/burn-best', auth, async (req, res) => {
         obs_rank: burnNum(r.obs_rank),
         rank: burnNum(r.rank),
         type_trait: r.type_trait || null,
+        is_angel: !!r.result_is_angel,
       }));
     } catch (rankError) {
       if (!isMissingBurnRankData(rankError)) throw rankError;
