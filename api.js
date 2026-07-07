@@ -1469,7 +1469,7 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
     // depend on nft_transfers.event_type, which isn't reliably populated for
     // every wallet's historical rows.
     const burnRes = await pool.query(`
-      SELECT be.tx_hash, be.block_number, be.log_index, be.burned_at, be.survivor_token_id,
+      SELECT be.id AS burn_event_id, be.tx_hash, be.block_number, be.log_index, be.burned_at, be.survivor_token_id,
              be.points_used, bei.burned_token_id
       FROM burn_events be
       JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
@@ -1477,6 +1477,12 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
       ORDER BY be.block_number DESC
       LIMIT $2
     `, [address, limit]).catch(() => ({ rows: [] })); // tolerate if burn tables aren't present in some env
+
+    // Same reasoning as everywhere else burn rows get displayed: a destroyed
+    // input token no longer represents its original self, so a "current"
+    // image lookup is wrong for it -- use its actual pre-burn snapshot.
+    const burnInputIds = burnRes.rows.map(r => r.burned_token_id).filter(Boolean);
+    const burnInputSnapshots = await fetchInputSnapshots(burnInputIds);
 
     res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
     const transferRows = result.rows.map(r => ({
@@ -1513,6 +1519,8 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
       seller: null,
       survivor_token_id: r.survivor_token_id != null ? parseInt(r.survivor_token_id) : null,
       points_used: r.points_used != null ? parseInt(r.points_used) : null,
+      burn_event_id: burnNum(r.burn_event_id),
+      snapshot_image: burnInputSnapshots[r.burned_token_id] || null,
     }));
     const merged = [...transferRows, ...burnRows]
       .sort((a, b) => new Date(b.block_ts || 0) - new Date(a.block_ts || 0))
