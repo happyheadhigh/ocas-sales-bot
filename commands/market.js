@@ -603,8 +603,10 @@ async function handleMarketCommand(commandName, ctx){
       let matchedGroups = [];
       workingSearch = workingSearch.replace(/[,+]/g,' ').replace(/\b(and|with|plus)\b/gi,' ').replace(/\s+/g,' ').trim();
 
+      const sweepSlug = sweepConfig.slug || sweepConfig.collectionSlug || OCAS_SLUG;
+
       if(workingSearch && RAILWAY_URL){
-        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
+        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET, sweepSlug);
         const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
         matchedGroups = resolved.groups;
         if(resolved.unmatched.length && !matchedGroups.length){
@@ -631,7 +633,6 @@ async function handleMarketCommand(commandName, ctx){
       let allFetched = [];
       if(!matchedGroups.length && traitCount === null){
         console.log('[/sweep] plain sweep from DB, mode:', sweepMode);
-        const sweepSlug = sweepConfig.slug || sweepConfig.collectionSlug || 'on-chain-all-stars';
         const dbRes = await pgPool.query(
           `SELECT l.token_id, l.price_eth, l.url, t.os_rank, t.obs_rank, t.trait_count
            FROM listings l
@@ -652,7 +653,7 @@ async function handleMarketCommand(commandName, ctx){
         console.log('[/sweep] plain sweep tokens returned:', allFetched.length);
       } else {
         if(!RAILWAY_URL) throw new Error('RAILWAY_API_URL is required for trait/count sweeps.');
-        const qs = new URLSearchParams({ listed:'1', limit: String(fetchLimit), key: API_SECRET||'' });
+        const qs = new URLSearchParams({ listed:'1', limit: String(fetchLimit), key: API_SECRET||'', slug: sweepSlug });
         if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
         if(traitCount !== null) qs.set('trait_count', String(traitCount));
         console.log('[/sweep] fetching multi-trait-tokens, mode:', sweepMode, 'groups:', matchedGroups.length, 'traitCount:', traitCount);

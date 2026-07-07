@@ -607,8 +607,8 @@ app.get('/db/floor-before-sweep', auth, async (req, res) => {
 // Returns: { ok, traits: [{trait_name, trait_value, token_count}] }
 app.get('/db/trait-index', auth, async (req, res) => {
   try {
-    const slug = req.query.slug ? String(req.query.slug).trim() : null;
-    const isOcas = !slug || slug.toLowerCase().includes('on-chain-all-stars');
+    const slug = req.query.slug ? String(req.query.slug).trim() : OCAS_SLUG;
+    const isOcas = slug === OCAS_SLUG || slug.toLowerCase().includes('on-chain-all-stars');
 
     if (!isOcas) {
       const result = await pool.query(
@@ -727,13 +727,13 @@ app.get('/db/multi-trait-tokens', auth, async (req, res) => {
     const rankMax = req.query.rank_max ? parseInt(req.query.rank_max) : null;
     const rankType = req.query.rank_type === 'obs' ? 'obs' : 'os';
     const rankCol = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
-    const slug = req.query.slug ? String(req.query.slug).trim() : null;
+    const slug = req.query.slug ? String(req.query.slug).trim() : OCAS_SLUG;
     const limit = Math.min(parseInt(req.query.limit || '100'), 10000);
     // Non-OCAS collections have no rows in `tokens` (backfill only writes
     // token_traits). For listedOnly queries on non-OCAS slugs, drive off
     // listings instead so we see all listed tokens regardless.
-    const isOcasSlug = !slug || slug === 'on-chain-all-stars';
-    const useListingsDriven = listedOnly && slug && !isOcasSlug;
+    const isOcasSlug = slug === OCAS_SLUG;
+    const useListingsDriven = listedOnly && !isOcasSlug;
 
     if (!matches.length && !traitCount && rankMin === null && rankMax === null) {
       return res.status(400).json({ ok: false, error: 'provide matches, trait_count, or rank filter' });
@@ -795,23 +795,22 @@ app.get('/db/multi-trait-tokens', auth, async (req, res) => {
       query += ` FROM tokens t`;
 
       if (listedOnly) {
-        query += ` JOIN listings l ON l.token_id = t.id` + (slug ? ` AND l.collection_slug = $${p++}` : ``);
-        if (slug) params.push(slug);
+        query += ` JOIN listings l ON l.token_id = t.id AND l.collection_slug = $${p++}`;
+        params.push(slug);
       }
-      query += ` LEFT JOIN token_traits tt ON tt.token_id = t.id` + (slug ? ` AND tt.collection_slug = $${p++}` : ``);
-      if (slug) params.push(slug);
+      query += ` LEFT JOIN token_traits tt ON tt.token_id = t.id AND tt.collection_slug = $${p++}`;
+      params.push(slug);
 
-      const conditions = [ACTIVE_TOKEN_CONDITION];
-      if (slug) { conditions.push(`t.collection_slug = $${p++}`); params.push(slug); }
+      const conditions = [ACTIVE_TOKEN_CONDITION, `t.collection_slug = $${p++}`];
+      params.push(slug);
       groups.forEach((group, i) => {
         const ors = [];
         group.forEach(m => {
           ors.push(`(LOWER(g${i}.trait_name) = LOWER($${p++}) AND LOWER(g${i}.trait_value) = LOWER($${p++}))`);
           params.push(m.trait_name, m.trait_value);
         });
-        const slugCond = slug ? ` AND g${i}.collection_slug = $${p++}` : ``;
-        conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND (${ors.join(' OR ')})${slugCond})`);
-        if (slug) params.push(slug);
+        conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND g${i}.collection_slug = $${p++} AND (${ors.join(' OR ')}))`);
+        params.push(slug);
       });
       if (traitCount !== null && !isNaN(traitCount)) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCount); }
       if (rankMin !== null && !isNaN(rankMin)) { conditions.push(`${rankCol} >= $${p++}`); params.push(rankMin); }

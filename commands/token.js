@@ -83,7 +83,7 @@ async function handleTokenCommand(commandName, ctx){
       // Resolve phrase-aware multi-trait search. Longest trait values win:
       // "gold chain diamond choker" → "Gold Chain" + "Diamond Choker".
       if(!tokenId && searchForTraits && RAILWAY_URL){
-        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
+        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET, activeCol.slug || activeCol.collectionSlug);
         const resolved = chooseTraitGroupsFromQuery(searchForTraits, traitIndex);
         matchedGroups = resolved.groups;
 
@@ -99,7 +99,7 @@ async function handleTokenCommand(commandName, ctx){
 
       // ── Combined trait/rank/trait-count search through Railway/Postgres ───
       if(!tokenId && RAILWAY_URL && (matchedGroups.length || traitCount !== null || (rankMin && rankMax))){
-        const qs = new URLSearchParams({ key: API_SECRET || '' });
+        const qs = new URLSearchParams({ key: API_SECRET || '', slug: activeCol.slug || activeCol.collectionSlug || '' });
         if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
         if(traitCount !== null) qs.set('trait_count', String(traitCount));
         if(rankMin && rankMax){ qs.set('rank_min', String(rankMin)); qs.set('rank_max', String(rankMax)); qs.set('rank_type', 'os'); }
