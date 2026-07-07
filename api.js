@@ -1877,7 +1877,8 @@ app.get('/db/burn-best', auth, async (req, res) => {
                bei.burned_token_id,
                t.os_rank, t.obs_rank,
                COALESCE(t.os_rank, t.obs_rank) AS rank,
-               tis.image_data AS snapshot_image
+               tis.image_data AS snapshot_image,
+               tis.traits_json->>'Type' AS type_trait
         FROM burn_event_inputs bei
         JOIN burn_events be ON be.id = bei.burn_event_id
         LEFT JOIN tokens t ON t.id = bei.burned_token_id
@@ -1899,10 +1900,11 @@ app.get('/db/burn-best', auth, async (req, res) => {
         // This token no longer exists as its original self — show its last
         // known appearance rather than attempting a "current" image lookup.
         snapshot_image: r.snapshot_image || null,
+        type_trait: r.type_trait || null,
       }));
 
       const created = await pool.query(`
-        SELECT * FROM (
+        SELECT sub.*, tt.trait_value AS type_trait FROM (
           SELECT DISTINCT ON (be.survivor_token_id)
                  be.tx_hash, be.block_number, be.burner_wallet, be.burned_at,
                  be.survivor_token_id,
@@ -1912,6 +1914,7 @@ app.get('/db/burn-best', auth, async (req, res) => {
           LEFT JOIN tokens t ON t.id = be.survivor_token_id
           ORDER BY be.survivor_token_id, be.burned_at DESC
         ) sub
+        LEFT JOIN token_traits tt ON tt.token_id = sub.survivor_token_id AND tt.trait_name = 'Type' AND tt.collection_slug = 'on-chain-all-stars'
         ORDER BY COALESCE(rank, 999999) ASC
         LIMIT 25
       `);
@@ -1924,6 +1927,7 @@ app.get('/db/burn-best', auth, async (req, res) => {
         os_rank: burnNum(r.os_rank),
         obs_rank: burnNum(r.obs_rank),
         rank: burnNum(r.rank),
+        type_trait: r.type_trait || null,
       }));
     } catch (rankError) {
       if (!isMissingBurnRankData(rankError)) throw rankError;
