@@ -967,6 +967,7 @@ async function handleConfigButton(interaction, ctx){
   // ANY flow that hit the >25-values case, then branches only for the final
   // Done action, since each flow saves its picks differently.
   if(customId.startsWith('vpick:')){
+   try{
     const parsed = parseValuePickerCustomId(customId);
     if(!parsed){
       return interaction.editReply({ content: '❌ Something went wrong with this picker. Please start over.', embeds:[], components:[] });
@@ -1088,6 +1089,10 @@ async function handleConfigButton(interaction, ctx){
         });
       }
     }
+   }catch(e){
+     console.error('[Config] vpick dispatcher error:', e);
+     return interaction.editReply({ content: `❌ Something went wrong saving your picks: ${e.message || 'unknown error'}. Please try again or start over.`, embeds:[], components:[] }).catch(()=>{});
+   }
   }
 
   if(customId.startsWith('cfg_filtertrait:catsel:')){

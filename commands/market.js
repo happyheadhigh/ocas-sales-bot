@@ -5,6 +5,7 @@ const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS, OCAS_SLUG } = require('../lib/constants');
 const { extractPngFromSvg, resolveImage } = require('../lib/images');
 const { isDiscordOk } = require('../utils/format');
+const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
 
 /**
  * Handle market/NFT lookup commands.
@@ -982,10 +983,31 @@ async function showTfValuePicker(interaction, ctx, slug, traitName){
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
   const matchingRows = traitIndex.filter(t => t.trait_name === traitName);
-  const valueRows = matchingRows.slice(0, 25);
-  if(!valueRows.length){
+  if(!matchingRows.length){
     return interaction.update({ content: `No values found for **${traitName}**.`, components: [] });
   }
+
+  // This used to silently slice(0, 25) with zero indication that anything
+  // was hidden -- same underlying 25-option Discord limit as /config's
+  // filter/trait-role pickers, just found in a third place. Stacked menus
+  // let every value actually be reachable instead of quietly dropping the
+  // rest.
+  if(matchingRows.length > 25){
+    const sessionKey = `${interaction.user.id}:traitfind:${slug}:${traitName}`;
+    const allValues = matchingRows.map(r => r.trait_value);
+    initValuePicker(sessionKey, allValues);
+    const customIdPrefix = `traitfind:${encodeURIComponent(slug)}:${encodeURIComponent(traitName)}`;
+    const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
+      placeholder: `Pick ${traitName} value(s)...`,
+      cancelId: `tf_browse:trait:${slug}`,
+    });
+    return interaction.update({
+      content: `**🔍 Trait Find — ${slug} › ${traitName}**\n\nPick one or more values (matches ANY selected)${truncatedNote}\n\nPick from as many of the menus below as you want, then Done.`,
+      components: rows,
+    });
+  }
+
+  const valueRows = matchingRows;
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`tf_browse:val:${slug}:${traitName}`)
     .setPlaceholder(`Pick 1-${valueRows.length} ${traitName} value(s)...`)
@@ -1047,6 +1069,48 @@ async function handleTraitBrowseInteraction(interaction, ctx){
           buildSaleEmbed, buildListingEmbed, postEmbeds, fetchBotApiJson,
           buildTokenSearchEmbed, fetchTokenMetaFromDb, traitObjectToArray } = ctx;
   const customId = interaction.customId;
+
+  if(customId.startsWith('vpick:traitfind:')){
+    try{
+      const parsed = parseValuePickerCustomId(customId);
+      if(!parsed){
+        return interaction.update({ content: '❌ Something went wrong with this picker. Please start over.', components:[] });
+      }
+      const { action, customIdPrefix } = parsed;
+      const [, encSlug, encTraitName] = customIdPrefix.split(':');
+      const slug = decodeURIComponent(encSlug);
+      const traitName = decodeURIComponent(encTraitName);
+      const sessionKey = `${interaction.user.id}:traitfind:${slug}:${traitName}`;
+      const session = getValuePickerSession(sessionKey);
+      if(!session){
+        return interaction.update({ content: '❌ This picker session expired (likely a bot restart mid-flow). Please start over.', components:[] });
+      }
+
+      if(action === 'sel'){
+        recordMenuSelection(sessionKey, parsed.menuIndex, interaction.values || []);
+        const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
+          placeholder: `Pick ${traitName} value(s)...`,
+          cancelId: `tf_browse:trait:${slug}`,
+        });
+        return interaction.update({
+          content: `**🔍 Trait Find — ${slug} › ${traitName}**\n\nPick one or more values (matches ANY selected)${truncatedNote}\n\nPick from as many of the menus below as you want, then Done.`,
+          components: rows,
+        });
+      }
+
+      if(action === 'done'){
+        const selectedValues = [...session.selected];
+        clearValuePicker(sessionKey);
+        if(!selectedValues.length){
+          return interaction.update({ content: `No values were selected for **${traitName}**. Please start over if you want to search.`, components:[] });
+        }
+        return showTfModePicker(interaction, ctx, slug, traitName, selectedValues);
+      }
+    }catch(e){
+      console.error('[TraitFind] vpick dispatcher error:', e);
+      return interaction.update({ content: `❌ Something went wrong: ${e.message || 'unknown error'}. Please try again.`, components:[] }).catch(()=>{});
+    }
+  }
 
   if(customId === 'tf_browse:col'){
     const slug = interaction.values[0];

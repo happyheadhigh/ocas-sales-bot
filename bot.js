@@ -757,6 +757,14 @@ client.on('interactionCreate', async (interaction)=>{
     };
     return handleTraitBrowseInteraction(interaction, tfCtx);
   }
+  if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('vpick:traitfind:')){
+    const tfCtx = {
+      pgPool, getConfig, getRailwayApiUrl, getCachedTraitIndex,
+      buildSaleEmbed, buildListingEmbed, postEmbeds, fetchBotApiJson,
+      buildTokenSearchEmbed, fetchTokenMetaFromDb, traitObjectToArray,
+    };
+    return handleTraitBrowseInteraction(interaction, tfCtx);
+  }
   if(interaction.isStringSelectMenu() && interaction.customId === 'dl_browse:col'){
     return handleDownloadColPick(interaction, { getConfig });
   }
@@ -918,6 +926,16 @@ client.on('interactionCreate', async (interaction)=>{
     return handleConfigButton(interaction, cfgCtx);
   }
   if(interaction.isButton() && interaction.customId.startsWith('cfg_traitrole:manual:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  // Shared paginated multi-select value picker (filtertrait/traitrole flows
+  // only here -- traitfind's own vpick: usage routes to
+  // handleTraitBrowseInteraction separately, further down). This was
+  // missing entirely until now -- every vpick: interaction had nowhere to
+  // go, which is why submitting a stacked value menu failed outright.
+  if((interaction.isStringSelectMenu() || interaction.isButton()) &&
+     (interaction.customId.startsWith('vpick:filtertrait:') || interaction.customId.startsWith('vpick:traitrole:'))){
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
