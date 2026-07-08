@@ -1855,19 +1855,18 @@ app.get('/db/burn-leaderboard', auth, async (req, res) => {
   }
 });
 
-// GET /db/burn-best
 // ── GET /db/burned-ticker ─────────────────────────────────────────────────────
-// Powers the thin scrolling strip under the header showing burned OCAS
-// tokens. Capped at a rotating recent sample rather than literally all
-// 1,400+ burned tokens -- same visual effect (a steady stream of burns
-// drifting by) without rendering that many DOM nodes/images at once. As
-// more burns happen, older ones naturally roll off this window.
+// Powers the header burn ticker. Returns ALL burned OCAS token IDs -- no
+// embedded image data, just a plain list of numbers, so this stays tiny
+// (a few KB) even as the total burn count keeps growing. The frontend
+// renders each one as a real <img src="/render/burned-snapshot/:id">,
+// letting the browser's own lazy-loading and long-lived HTTP caching do
+// the actual heavy lifting instead of shipping every image's bytes
+// through this one response.
 app.get('/db/burned-ticker', auth, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit || '150'), 300);
     const result = await pool.query(`
-      SELECT DISTINCT ON (bei.burned_token_id)
-             bei.burned_token_id, tis.image_data, be.burned_at
+      SELECT DISTINCT ON (bei.burned_token_id) bei.burned_token_id, be.burned_at
       FROM burn_event_inputs bei
       JOIN burn_events be ON be.id = bei.burn_event_id
       JOIN token_image_snapshots tis ON tis.token_id = bei.burned_token_id
@@ -1875,14 +1874,39 @@ app.get('/db/burned-ticker', auth, async (req, res) => {
         AND tis.image_data IS NOT NULL
       ORDER BY bei.burned_token_id, be.burned_at DESC
     `);
-    const rows = result.rows
+    const ids = result.rows
       .sort((a, b) => new Date(b.burned_at) - new Date(a.burned_at))
-      .slice(0, limit)
-      .map(r => ({ token_id: burnNum(r.burned_token_id), image: r.image_data }));
+      .map(r => burnNum(r.burned_token_id));
     res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
-    res.json({ ok: true, tokens: rows, count: rows.length });
+    res.json({ ok: true, token_ids: ids, count: ids.length });
   } catch (e) {
-    burnEndpointError(res, '/db/burned-ticker', e, { tokens: [] });
+    burnEndpointError(res, '/db/burned-ticker', e, { token_ids: [] });
+  }
+});
+
+// ── GET /render/burned-snapshot/:tokenId ─────────────────────────────────────
+// Serves a single burned token's pre-burn snapshot as a real image response
+// (not JSON), so it can be used directly as an <img src>. A burn snapshot is
+// a permanent historical fact -- it never changes once written -- so this is
+// cached essentially forever. After the first time anyone, anywhere, loads
+// a given token, every future load (same visitor or a different one) comes
+// from cache instantly rather than hitting the database again.
+app.get('/render/burned-snapshot/:tokenId', auth, async (req, res) => {
+  try {
+    const tokenId = parseInt(req.params.tokenId, 10);
+    if (!Number.isFinite(tokenId)) return res.status(400).send('invalid token id');
+    const result = await pool.query(
+      `SELECT image_data FROM token_image_snapshots WHERE token_id=$1 AND image_data IS NOT NULL`,
+      [tokenId]
+    );
+    if (!result.rows.length) return res.status(404).send('not found');
+    const svg = result.rows[0].image_data;
+    res.set('Content-Type', 'image/svg+xml');
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    res.send(svg);
+  } catch (e) {
+    console.error('/render/burned-snapshot error:', e.message);
+    res.status(500).send('error');
   }
 });
 
