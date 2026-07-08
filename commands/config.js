@@ -1006,12 +1006,12 @@ async function handleConfigButton(interaction, ctx){
       // rows and page/selection-count label -- editReply needs some content,
       // and re-deriving the exact original heading per-flow isn't worth the
       // duplication, so this stays intentionally generic.
-      return interaction.editReply({ content: `Step in progress${pageLabel}\n\nUse Prev/Next to browse pages, your picks carry over between pages. Click Done when finished.`, embeds:[], components: rows });
+      return interaction.editReply({ content: `Step in progress${pageLabel}`, embeds:[], components: rows });
     }
 
     if(action === 'page'){
       const { rows, pageLabel } = buildValuePickerRows(sessionKey, parsed.page, customIdPrefix, { placeholder, cancelId });
-      return interaction.editReply({ content: `Step in progress${pageLabel}\n\nUse Prev/Next to browse pages, your picks carry over between pages. Click Done when finished.`, embeds:[], components: rows });
+      return interaction.editReply({ content: `Step in progress${pageLabel}`, embeds:[], components: rows });
     }
 
     if(action === 'done'){
@@ -1113,7 +1113,7 @@ async function handleConfigButton(interaction, ctx){
         cancelId: backId,
       });
       return interaction.editReply({
-        content: `**Adding ${kind === 'sales' ? '💰 Sales' : '🔍 Listing'} Filter**\n\nCategory: **${category}**\nStep 2 of 2 — Pick the trait value(s) to filter by${pageLabel}\n\n**${category}** has ${values.length} values, more than fit in one menu -- use Prev/Next to browse pages, your picks carry over between pages. Click Done when finished.`,
+        content: `**Adding ${kind === 'sales' ? '💰 Sales' : '🔍 Listing'} Filter**\n\nCategory: **${category}**\nStep 2 of 2 — Pick the trait value(s) to filter by${pageLabel}`,
         embeds: [],
         components: rows,
       });
@@ -1899,7 +1899,7 @@ Step 2 of 3 — Pick the trait category:`,
         cancelId,
       });
       return interaction.editReply({
-        content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${pageLabel}\n\n**${category}** has ${values.length} values, more than fit in one menu -- use Prev/Next to browse pages, your picks carry over between pages. Click Done when finished.`,
+        content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${pageLabel}`,
         embeds: [],
         components: rows,
       });
