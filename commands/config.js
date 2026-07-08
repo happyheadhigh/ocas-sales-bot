@@ -12,6 +12,7 @@ const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
 const { isPaidFeature } = require('./market');
 const { buildRolePickerRows, parseRolePagerCustomId } = require('../lib/role-picker');
+const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildValuePickerRows, applyPageSelection, parseValuePickerCustomId } = require('../lib/value-picker');
 
 // ── Access control ────────────────────────────────────────────────────────────
 // /config is gated to: server members with Manage Server permission, OR a
@@ -961,6 +962,126 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // ── Filter category selected → show value multi-select ─────────────────
+  // ── Shared paginated multi-select value picker (page/sel/done) ──────────────
+  // Handles Prev/Next navigation and selection-accumulation generically for
+  // ANY flow that hit the >25-values case, then branches only for the final
+  // Done action, since each flow saves its picks differently.
+  if(customId.startsWith('vpick:')){
+    const parsed = parseValuePickerCustomId(customId);
+    if(!parsed){
+      return interaction.editReply({ content: '❌ Something went wrong with this picker. Please start over.', embeds:[], components:[] });
+    }
+    const { action, customIdPrefix } = parsed;
+    const prefixParts = customIdPrefix.split(':');
+    const flow = prefixParts[0]; // 'filtertrait' or 'traitrole'
+
+    // Reconstruct the same sessionKey used when this picker was first opened.
+    let sessionKey, cancelId, placeholder;
+    if(flow === 'filtertrait'){
+      const [, kind, colId, encCategory] = prefixParts;
+      const category = decodeURIComponent(encCategory);
+      sessionKey = `${interaction.user.id}:filtertrait:${kind}:${colId}:${category}`;
+      cancelId = kind === 'sales' ? `cfg:col:salesfilters:${colId}` : `cfg:col:filters:${colId}`;
+      placeholder = 'Pick one or more values...';
+    } else if(flow === 'traitrole'){
+      const [, roleId, catColId, encCategory] = prefixParts;
+      const category = decodeURIComponent(encCategory);
+      const suffix = (catColId && catColId !== '_') ? `:${catColId}` : '';
+      sessionKey = `${interaction.user.id}:traitrole:${roleId}${suffix}:${category}`;
+      cancelId = catColId && catColId !== '_' ? `cfg:col:traitroles:${catColId}` : 'cfg:cat:roles';
+      placeholder = 'Pick one or more values...';
+    } else {
+      return interaction.editReply({ content: '❌ Unknown picker type. Please start over.', embeds:[], components:[] });
+    }
+
+    const session = getValuePickerSession(sessionKey);
+    if(!session){
+      return interaction.editReply({ content: '❌ This picker session expired (likely a bot restart mid-flow). Please start over.', embeds:[], components:[] });
+    }
+
+    if(action === 'sel'){
+      applyPageSelection(sessionKey, parsed.page, interaction.values || []);
+      const { rows, pageLabel } = buildValuePickerRows(sessionKey, parsed.page, customIdPrefix, { placeholder, cancelId });
+      // Keep whatever the original content text was, just refresh the picker
+      // rows and page/selection-count label -- editReply needs some content,
+      // and re-deriving the exact original heading per-flow isn't worth the
+      // duplication, so this stays intentionally generic.
+      return interaction.editReply({ content: `Step in progress${pageLabel}\n\nUse Prev/Next to browse pages, your picks carry over between pages. Click Done when finished.`, embeds:[], components: rows });
+    }
+
+    if(action === 'page'){
+      const { rows, pageLabel } = buildValuePickerRows(sessionKey, parsed.page, customIdPrefix, { placeholder, cancelId });
+      return interaction.editReply({ content: `Step in progress${pageLabel}\n\nUse Prev/Next to browse pages, your picks carry over between pages. Click Done when finished.`, embeds:[], components: rows });
+    }
+
+    if(action === 'done'){
+      const selectedValues = [...session.selected];
+      clearValuePicker(sessionKey);
+      if(!selectedValues.length){
+        return interaction.editReply({ content: '❌ No values were selected. Please start over if you want to add a filter.', embeds:[], components:[] });
+      }
+
+      if(flow === 'filtertrait'){
+        const [, kind, colId, encCategory] = prefixParts;
+        const category = decodeURIComponent(encCategory);
+        const catKey = category.toLowerCase();
+        const lowerValues = selectedValues.map(v => v.toLowerCase());
+        const fieldKey = kind === 'sales' ? 'salesFilters' : 'listingFilters';
+        const isPrimary = colId === 'primary';
+        if(isPrimary){
+          if(!cfg[fieldKey]) cfg[fieldKey] = {};
+          const existing = cfg[fieldKey][catKey] || [];
+          cfg[fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
+        } else {
+          const cols = cfg.collections || [];
+          const idx = parseInt(colId);
+          if(cols[idx]){
+            if(!cols[idx][fieldKey]) cols[idx][fieldKey] = {};
+            const existing = cols[idx][fieldKey][catKey] || [];
+            cols[idx][fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
+            cfg.collections = cols;
+          }
+        }
+        await setConfig(guildId, cfg);
+        const col = isPrimary ? { ...cfg, [fieldKey]: cfg[fieldKey]||{} } : (cfg.collections||[])[parseInt(colId)] || {};
+        const embedFn = kind === 'sales' ? buildColSalesFiltersEmbed : buildColFiltersEmbed;
+        const rowFn = kind === 'sales' ? colSalesFiltersRow : colFiltersRow;
+        return interaction.editReply({
+          content: `✅ Added **${selectedValues.length}** value${selectedValues.length>1?'s':''} for **${category}**.`,
+          embeds: [embedFn(col, colId)],
+          components: rowFn(col, colId),
+        });
+      }
+
+      if(flow === 'traitrole'){
+        const [, roleId, catColId, encCategory] = prefixParts;
+        const category = decodeURIComponent(encCategory);
+        const valColId = (catColId && catColId !== '_') ? catColId : '';
+        let collectionSlugForSave = null;
+        let colLabel;
+        if(valColId && valColId !== 'primary'){
+          const col = (cfg.collections||[])[parseInt(valColId)];
+          collectionSlugForSave = col?.slug || null;
+          colLabel = col?.name || col?.slug;
+        }
+        for(const val of selectedValues){
+          await pgPool.query(
+            `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+             VALUES ($1,$2,$3,$4,1,$5)
+             ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
+            [guildId, roleId, category, val, collectionSlugForSave]
+          ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+        }
+        const trRes = valColId ? await traitRolesQFor(collectionSlugForSave) : await traitRolesQ();
+        return interaction.editReply({
+          content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}>:\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
+          embeds: [buildRolesEmbed(trRes.rows, colLabel)],
+          components: rolesRow(trRes.rows, valColId || undefined),
+        });
+      }
+    }
+  }
+
   if(customId.startsWith('cfg_filtertrait:catsel:')){
     const parts = customId.split(':');
     const kind  = parts[2];
@@ -984,15 +1105,17 @@ async function handleConfigButton(interaction, ctx){
     }
 
     if(values.length > 25){
+      const sessionKey = `${interaction.user.id}:filtertrait:${kind}:${colId}:${category}`;
+      initValuePicker(sessionKey, values);
+      const customIdPrefix = `filtertrait:${kind}:${colId}:${encodeURIComponent(category)}`;
+      const { rows, pageLabel } = buildValuePickerRows(sessionKey, 0, customIdPrefix, {
+        placeholder: 'Pick one or more values...',
+        cancelId: backId,
+      });
       return interaction.editReply({
-        content: `**${category}** has ${values.length} values — too many to list in a dropdown.\n\nClick below to enter the value(s) manually.\nExamples: ${values.slice(0,3).join(', ')}...`,
+        content: `**Adding ${kind === 'sales' ? '💰 Sales' : '🔍 Listing'} Filter**\n\nCategory: **${category}**\nStep 2 of 2 — Pick the trait value(s) to filter by${pageLabel}\n\n**${category}** has ${values.length} values, more than fit in one menu -- use Prev/Next to browse pages, your picks carry over between pages. Click Done when finished.`,
         embeds: [],
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_filtertrait:manual:${kind}:${colId}:${encodeURIComponent(category)}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
-          ),
-        ],
+        components: rows,
       });
     }
 
@@ -1766,17 +1889,19 @@ Step 2 of 3 — Pick the trait category:`,
       return interaction.editReply({ content: `❌ No trait values found for category **${category}**. Try again.`, embeds:[], components:[] });
     }
 
-    // If more than 25 values, fall back to manual entry — Discord select menus cap at 25
+    // If more than 25 values, use the paginated multi-select picker
     if(values.length > 25){
+      const sessionKey = `${interaction.user.id}:traitrole:${roleId}${suffix}:${category}`;
+      initValuePicker(sessionKey, values);
+      const customIdPrefix = `traitrole:${roleId}:${catColId || '_'}:${encodeURIComponent(category)}`;
+      const { rows, pageLabel } = buildValuePickerRows(sessionKey, 0, customIdPrefix, {
+        placeholder: 'Pick one or more values...',
+        cancelId,
+      });
       return interaction.editReply({
-        content: `**${category}** has ${values.length} values — too many to list in a dropdown.\n\nClick below to enter the trait value manually.\nExamples: ${values.slice(0,3).join(', ')}...`,
+        content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${pageLabel}\n\n**${category}** has ${values.length} values, more than fit in one menu -- use Prev/Next to browse pages, your picks carry over between pages. Click Done when finished.`,
         embeds: [],
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}${suffix}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
-          ),
-        ],
+        components: rows,
       });
     }
 
