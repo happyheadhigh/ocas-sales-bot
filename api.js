@@ -1914,9 +1914,11 @@ app.get('/render/burned-snapshot/:tokenId', auth, async (req, res) => {
       res.set('Content-Type', 'image/svg+xml');
       return res.send(raw);
     }
-    const dataMatch = raw.match(/^data:([^;,]+)(;base64)?,(.+)$/s);
+    const dataMatch = raw.match(/^data:([^,]+),(.+)$/s);
     if (dataMatch) {
-      const [, mime, isBase64, payload] = dataMatch;
+      const [, meta, payload] = dataMatch;
+      const isBase64 = /;base64$/i.test(meta);
+      const mime = meta.replace(/;base64$/i, '').split(';')[0] || 'image/svg+xml';
       const buf = isBase64 ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload), 'utf8');
       res.set('Content-Type', mime || 'image/svg+xml');
       return res.send(buf);
