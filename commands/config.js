@@ -12,7 +12,7 @@ const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
 const { isPaidFeature } = require('./market');
 const { buildRolePickerRows, parseRolePagerCustomId } = require('../lib/role-picker');
-const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildValuePickerRows, applyPageSelection, parseValuePickerCustomId } = require('../lib/value-picker');
+const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
 
 // ── Access control ────────────────────────────────────────────────────────────
 // /config is gated to: server members with Manage Server permission, OR a
@@ -976,19 +976,19 @@ async function handleConfigButton(interaction, ctx){
     const flow = prefixParts[0]; // 'filtertrait' or 'traitrole'
 
     // Reconstruct the same sessionKey used when this picker was first opened.
-    let sessionKey, cancelId, placeholder;
+    let sessionKey, cancelId, placeholder, category, kind, colId, roleId, catColId, valColId;
     if(flow === 'filtertrait'){
-      const [, kind, colId, encCategory] = prefixParts;
-      const category = decodeURIComponent(encCategory);
+      [, kind, colId] = prefixParts;
+      category = decodeURIComponent(prefixParts[3]);
       sessionKey = `${interaction.user.id}:filtertrait:${kind}:${colId}:${category}`;
       cancelId = kind === 'sales' ? `cfg:col:salesfilters:${colId}` : `cfg:col:filters:${colId}`;
       placeholder = 'Pick one or more values...';
     } else if(flow === 'traitrole'){
-      const [, roleId, catColId, encCategory] = prefixParts;
-      const category = decodeURIComponent(encCategory);
-      const suffix = (catColId && catColId !== '_') ? `:${catColId}` : '';
-      sessionKey = `${interaction.user.id}:traitrole:${roleId}${suffix}:${category}`;
-      cancelId = catColId && catColId !== '_' ? `cfg:col:traitroles:${catColId}` : 'cfg:cat:roles';
+      [, roleId, catColId] = prefixParts;
+      category = decodeURIComponent(prefixParts[3]);
+      valColId = (catColId && catColId !== '_') ? catColId : '';
+      sessionKey = `${interaction.user.id}:traitrole:${roleId}${valColId ? ':'+valColId : ''}:${category}`;
+      cancelId = valColId ? `cfg:col:traitroles:${valColId}` : 'cfg:cat:roles';
       placeholder = 'Pick one or more values...';
     } else {
       return interaction.editReply({ content: '❌ Unknown picker type. Please start over.', embeds:[], components:[] });
@@ -1000,63 +1000,77 @@ async function handleConfigButton(interaction, ctx){
     }
 
     if(action === 'sel'){
-      applyPageSelection(sessionKey, parsed.page, interaction.values || []);
-      const { rows, pageLabel } = buildValuePickerRows(sessionKey, parsed.page, customIdPrefix, { placeholder, cancelId });
-      // Keep whatever the original content text was, just refresh the picker
-      // rows and page/selection-count label -- editReply needs some content,
-      // and re-deriving the exact original heading per-flow isn't worth the
-      // duplication, so this stays intentionally generic.
-      return interaction.editReply({ content: `Step in progress${pageLabel}`, embeds:[], components: rows });
-    }
+      const newValues = interaction.values || [];
+      recordMenuSelection(sessionKey, parsed.menuIndex, newValues);
 
-    if(action === 'page'){
-      const { rows, pageLabel } = buildValuePickerRows(sessionKey, parsed.page, customIdPrefix, { placeholder, cancelId });
-      return interaction.editReply({ content: `Step in progress${pageLabel}`, embeds:[], components: rows });
+      // Apply THIS menu's picks immediately -- additive by design (adding
+      // new values never removes ones saved from a different menu earlier
+      // in this same session), so there's no need to wait for a "Done"
+      // click just to be correct.
+      if(newValues.length){
+        if(flow === 'filtertrait'){
+          const catKey = category.toLowerCase();
+          const lowerValues = newValues.map(v => v.toLowerCase());
+          const fieldKey = kind === 'sales' ? 'salesFilters' : 'listingFilters';
+          const isPrimary = colId === 'primary';
+          if(isPrimary){
+            if(!cfg[fieldKey]) cfg[fieldKey] = {};
+            const existing = cfg[fieldKey][catKey] || [];
+            cfg[fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
+          } else {
+            const cols = cfg.collections || [];
+            const idx = parseInt(colId);
+            if(cols[idx]){
+              if(!cols[idx][fieldKey]) cols[idx][fieldKey] = {};
+              const existing = cols[idx][fieldKey][catKey] || [];
+              cols[idx][fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
+              cfg.collections = cols;
+            }
+          }
+          await setConfig(guildId, cfg);
+        } else if(flow === 'traitrole'){
+          let collectionSlugForSave = null;
+          if(valColId && valColId !== 'primary'){
+            const col = (cfg.collections||[])[parseInt(valColId)];
+            collectionSlugForSave = col?.slug || null;
+          }
+          for(const val of newValues){
+            await pgPool.query(
+              `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+               VALUES ($1,$2,$3,$4,1,$5)
+               ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
+              [guildId, roleId, category, val, collectionSlugForSave]
+            ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+          }
+        }
+      }
+
+      const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, { placeholder, cancelId });
+      return interaction.editReply({
+        content: `**${category}**${truncatedNote}\n\nPicks save as soon as you make them — pick from as many of the menus below as you want, then Done when finished.`,
+        embeds: [],
+        components: rows,
+      });
     }
 
     if(action === 'done'){
       const selectedValues = [...session.selected];
       clearValuePicker(sessionKey);
-      if(!selectedValues.length){
-        return interaction.editReply({ content: '❌ No values were selected. Please start over if you want to add a filter.', embeds:[], components:[] });
-      }
 
       if(flow === 'filtertrait'){
-        const [, kind, colId, encCategory] = prefixParts;
-        const category = decodeURIComponent(encCategory);
-        const catKey = category.toLowerCase();
-        const lowerValues = selectedValues.map(v => v.toLowerCase());
-        const fieldKey = kind === 'sales' ? 'salesFilters' : 'listingFilters';
-        const isPrimary = colId === 'primary';
-        if(isPrimary){
-          if(!cfg[fieldKey]) cfg[fieldKey] = {};
-          const existing = cfg[fieldKey][catKey] || [];
-          cfg[fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
-        } else {
-          const cols = cfg.collections || [];
-          const idx = parseInt(colId);
-          if(cols[idx]){
-            if(!cols[idx][fieldKey]) cols[idx][fieldKey] = {};
-            const existing = cols[idx][fieldKey][catKey] || [];
-            cols[idx][fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
-            cfg.collections = cols;
-          }
-        }
-        await setConfig(guildId, cfg);
-        const col = isPrimary ? { ...cfg, [fieldKey]: cfg[fieldKey]||{} } : (cfg.collections||[])[parseInt(colId)] || {};
+        const col = colId === 'primary' ? { ...cfg, [kind === 'sales' ? 'salesFilters' : 'listingFilters']: cfg[kind === 'sales' ? 'salesFilters' : 'listingFilters']||{} } : (cfg.collections||[])[parseInt(colId)] || {};
         const embedFn = kind === 'sales' ? buildColSalesFiltersEmbed : buildColFiltersEmbed;
         const rowFn = kind === 'sales' ? colSalesFiltersRow : colFiltersRow;
         return interaction.editReply({
-          content: `✅ Added **${selectedValues.length}** value${selectedValues.length>1?'s':''} for **${category}**.`,
+          content: selectedValues.length
+            ? `✅ Added **${selectedValues.length}** value${selectedValues.length>1?'s':''} for **${category}**.`
+            : `No values were selected for **${category}** — nothing added.`,
           embeds: [embedFn(col, colId)],
           components: rowFn(col, colId),
         });
       }
 
       if(flow === 'traitrole'){
-        const [, roleId, catColId, encCategory] = prefixParts;
-        const category = decodeURIComponent(encCategory);
-        const valColId = (catColId && catColId !== '_') ? catColId : '';
         let collectionSlugForSave = null;
         let colLabel;
         if(valColId && valColId !== 'primary'){
@@ -1064,17 +1078,11 @@ async function handleConfigButton(interaction, ctx){
           collectionSlugForSave = col?.slug || null;
           colLabel = col?.name || col?.slug;
         }
-        for(const val of selectedValues){
-          await pgPool.query(
-            `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
-             VALUES ($1,$2,$3,$4,1,$5)
-             ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
-            [guildId, roleId, category, val, collectionSlugForSave]
-          ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
-        }
         const trRes = valColId ? await traitRolesQFor(collectionSlugForSave) : await traitRolesQ();
         return interaction.editReply({
-          content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}>:\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
+          content: selectedValues.length
+            ? `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}>:\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`
+            : `No values were selected — nothing added for <@&${roleId}>.`,
           embeds: [buildRolesEmbed(trRes.rows, colLabel)],
           components: rolesRow(trRes.rows, valColId || undefined),
         });
@@ -1108,12 +1116,12 @@ async function handleConfigButton(interaction, ctx){
       const sessionKey = `${interaction.user.id}:filtertrait:${kind}:${colId}:${category}`;
       initValuePicker(sessionKey, values);
       const customIdPrefix = `filtertrait:${kind}:${colId}:${encodeURIComponent(category)}`;
-      const { rows, pageLabel } = buildValuePickerRows(sessionKey, 0, customIdPrefix, {
+      const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
         placeholder: 'Pick one or more values...',
         cancelId: backId,
       });
       return interaction.editReply({
-        content: `**Adding ${kind === 'sales' ? '💰 Sales' : '🔍 Listing'} Filter**\n\nCategory: **${category}**\nStep 2 of 2 — Pick the trait value(s) to filter by${pageLabel}`,
+        content: `**Adding ${kind === 'sales' ? '💰 Sales' : '🔍 Listing'} Filter**\n\nCategory: **${category}**\nStep 2 of 2 — Pick the trait value(s) to filter by${truncatedNote}\n\nPicks save as soon as you make them — pick from as many of the menus below as you want.`,
         embeds: [],
         components: rows,
       });
@@ -1889,17 +1897,17 @@ Step 2 of 3 — Pick the trait category:`,
       return interaction.editReply({ content: `❌ No trait values found for category **${category}**. Try again.`, embeds:[], components:[] });
     }
 
-    // If more than 25 values, use the paginated multi-select picker
+    // If more than 25 values, use the stacked multi-menu picker
     if(values.length > 25){
       const sessionKey = `${interaction.user.id}:traitrole:${roleId}${suffix}:${category}`;
       initValuePicker(sessionKey, values);
       const customIdPrefix = `traitrole:${roleId}:${catColId || '_'}:${encodeURIComponent(category)}`;
-      const { rows, pageLabel } = buildValuePickerRows(sessionKey, 0, customIdPrefix, {
+      const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
         placeholder: 'Pick one or more values...',
         cancelId,
       });
       return interaction.editReply({
-        content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${pageLabel}`,
+        content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${truncatedNote}\n\nPicks save as soon as you make them — pick from as many of the menus below as you want.`,
         embeds: [],
         components: rows,
       });
