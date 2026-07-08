@@ -1856,6 +1856,36 @@ app.get('/db/burn-leaderboard', auth, async (req, res) => {
 });
 
 // GET /db/burn-best
+// ── GET /db/burned-ticker ─────────────────────────────────────────────────────
+// Powers the thin scrolling strip under the header showing burned OCAS
+// tokens. Capped at a rotating recent sample rather than literally all
+// 1,400+ burned tokens -- same visual effect (a steady stream of burns
+// drifting by) without rendering that many DOM nodes/images at once. As
+// more burns happen, older ones naturally roll off this window.
+app.get('/db/burned-ticker', auth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || '150'), 300);
+    const result = await pool.query(`
+      SELECT DISTINCT ON (bei.burned_token_id)
+             bei.burned_token_id, tis.image_data, be.burned_at
+      FROM burn_event_inputs bei
+      JOIN burn_events be ON be.id = bei.burn_event_id
+      JOIN token_image_snapshots tis ON tis.token_id = bei.burned_token_id
+      WHERE bei.burned_token_id != be.survivor_token_id
+        AND tis.image_data IS NOT NULL
+      ORDER BY bei.burned_token_id, be.burned_at DESC
+    `);
+    const rows = result.rows
+      .sort((a, b) => new Date(b.burned_at) - new Date(a.burned_at))
+      .slice(0, limit)
+      .map(r => ({ token_id: burnNum(r.burned_token_id), image: r.image_data }));
+    res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
+    res.json({ ok: true, tokens: rows, count: rows.length });
+  } catch (e) {
+    burnEndpointError(res, '/db/burned-ticker', e, { tokens: [] });
+  }
+});
+
 app.get('/db/burn-best', auth, async (req, res) => {
   try {
     const biggest = await pool.query(`
