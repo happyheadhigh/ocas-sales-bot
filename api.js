@@ -1900,10 +1900,31 @@ app.get('/render/burned-snapshot/:tokenId', auth, async (req, res) => {
       [tokenId]
     );
     if (!result.rows.length) return res.status(404).send('not found');
-    const svg = result.rows[0].image_data;
-    res.set('Content-Type', 'image/svg+xml');
+    const raw = String(result.rows[0].image_data || '').trim();
     res.set('Cache-Control', 'public, max-age=31536000, immutable');
-    res.send(svg);
+
+    // This field isn't stored in one consistent format -- same multi-format
+    // detection the frontend already does in several places for this exact
+    // kind of value (raw <svg> markup vs. a complete data: URI vs. some
+    // other URL). The original version only handled the raw-<svg> case,
+    // which sent an already-complete data: URI string as the literal HTTP
+    // body with an image/svg+xml header -- not valid SVG content, hence
+    // broken images.
+    if (raw.startsWith('<svg')) {
+      res.set('Content-Type', 'image/svg+xml');
+      return res.send(raw);
+    }
+    const dataMatch = raw.match(/^data:([^;,]+)(;base64)?,(.+)$/s);
+    if (dataMatch) {
+      const [, mime, isBase64, payload] = dataMatch;
+      const buf = isBase64 ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload), 'utf8');
+      res.set('Content-Type', mime || 'image/svg+xml');
+      return res.send(buf);
+    }
+    // Some other URL format (ipfs://, http(s)://, etc.) -- redirect rather
+    // than try to proxy/fetch it ourselves.
+    const url = raw.startsWith('ipfs://') ? raw.replace('ipfs://', 'https://ipfs.io/ipfs/') : raw;
+    return res.redirect(302, url);
   } catch (e) {
     console.error('/render/burned-snapshot error:', e.message);
     res.status(500).send('error');
