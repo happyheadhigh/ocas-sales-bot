@@ -946,6 +946,10 @@ client.on('interactionCreate', async (interaction)=>{
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
   }
+  if(interaction.isButton() && interaction.customId.startsWith('cfg_traitrole:quickmodal:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
   // Shared paginated multi-select value picker (filtertrait/traitrole flows
   // only here -- traitfind's own vpick: usage routes to
   // handleTraitBrowseInteraction separately, further down). This was

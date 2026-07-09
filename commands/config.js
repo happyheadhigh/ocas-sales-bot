@@ -1878,18 +1878,18 @@ async function handleConfigButton(interaction, ctx){
       const opts = slice.map(c => new StringSelectMenuOptionBuilder().setLabel(c).setValue(c));
       if(i === 0){
         opts.unshift(new StringSelectMenuOptionBuilder()
-          .setLabel('🪙 Token Count (own N or more)')
+          .setLabel('🪙 Token Count')
           .setValue('_count')
           .setDescription('Assign role based on how many tokens the user holds')
         );
         if(isOcasSlug){
           opts.unshift(new StringSelectMenuOptionBuilder()
-            .setLabel('🔥 Total Burns (fed N+ tokens total, ever)')
+            .setLabel('🔥 Total Burns')
             .setValue('_totalburns')
             .setDescription('Cumulative tokens fed into burns across this wallet\'s whole history')
           );
           opts.unshift(new StringSelectMenuOptionBuilder()
-            .setLabel('💥 Biggest Single Burn (N+ tokens at once)')
+            .setLabel('💥 Biggest Single Burn')
             .setValue('_maxburn')
             .setDescription('Largest number of tokens fed into any ONE burn transaction')
           );
