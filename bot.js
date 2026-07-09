@@ -609,7 +609,7 @@ client.on('interactionCreate', async (interaction)=>{
         '❌ Code not found in your OpenSea username.',
         '',
         `Go to https://opensea.io/${osUsername} → Edit Profile → temporarily add this to your bio:`,
-        '```'+code+'```',
+        `# \`${code}\``,
         'Save, then try again. You can remove it after verification.',
       ].join('\n')});
 
@@ -1103,8 +1103,28 @@ client.on('interactionCreate', async (interaction)=>{
     if(!/^0x[0-9a-f]{40}$/i.test(wallet))
       return interaction.editReply({content:'❌ Invalid wallet address. Must start with `0x` and be 42 characters long.'});
 
-    const code      = 'OCAS-'+Math.random().toString(36).slice(2,8).toUpperCase();
-    const expiresAt = new Date(Date.now() + 30*60*1000);
+    // Ephemeral messages can vanish (Discord dismisses them after a while,
+    // or on app restart -- documented platform behavior, not something
+    // fixable here) well before the 30-minute code window is actually up.
+    // Reuse the existing code/expiry for the SAME wallet if one's already
+    // pending, rather than silently generating a new one -- otherwise
+    // whatever the user already pasted into their bio would be
+    // invalidated the moment they come back to re-open the instructions.
+    let code, expiresAt;
+    const existing = await pgPool.query(
+      'SELECT code, wallet, expires_at FROM verification_codes WHERE discord_id=$1 AND guild_id=$2',
+      [discordId, svGuild]
+    ).catch(() => ({ rows: [] }));
+    const existingRow = existing.rows[0];
+    const stillValid = existingRow && new Date(existingRow.expires_at) > new Date() && existingRow.wallet === wallet;
+
+    if(stillValid){
+      code = existingRow.code;
+      expiresAt = new Date(existingRow.expires_at);
+    } else {
+      code      = 'OCAS-'+Math.random().toString(36).slice(2,8).toUpperCase();
+      expiresAt = new Date(Date.now() + 30*60*1000);
+    }
 
     try{
       await pgPool.query(
@@ -1132,11 +1152,11 @@ client.on('interactionCreate', async (interaction)=>{
       .setDescription(
         `**Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\`\n\n` +
         '**Step 1 — Add this code to your OpenSea bio:**\n' +
-        '```' + code + '```' +
+        `# \`${code}\`\n` +
         `Go to https://opensea.io/${wallet} → Edit Profile → paste the code anywhere in your **bio**.\n` +
         `It doesn't need to be your whole bio, just needs to appear somewhere in it.\n\n` +
         '**Step 2 — Once saved, click ✅ I\'ve Added It below.**\n\n' +
-        '*You can remove the code from your bio after verification. Expires in 30 minutes.*'
+        `*You can remove the code from your bio after verification. Expires in ${Math.max(1, Math.round((expiresAt - Date.now()) / 60000))} minutes.*`
       );
     const copyBtn = new ButtonBuilder()
       .setCustomId('sv_copy_code:'+svGuild)
@@ -1158,7 +1178,7 @@ client.on('interactionCreate', async (interaction)=>{
         [discordId]
       );
       const code = r.rows[0]?.code || '(expired — click Verify Wallet again)';
-      return interaction.reply({flags:64, content:'```'+code+'```'});
+      return interaction.reply({flags:64, content:`# \`${code}\``});
     }catch(_){
       return interaction.reply({flags:64, content:'❌ Could not retrieve code. Try again.'});
     }
@@ -1227,7 +1247,7 @@ client.on('interactionCreate', async (interaction)=>{
         '❌ Code not found in your OpenSea profile yet.',
         '',
         `Go to https://opensea.io/${wallet} → Edit Profile → add the code to your **bio**:`,
-        '```'+code+'```',
+        `# \`${code}\``,
         'Save your profile, then click **✅ I\'ve Added It** again.',
       ].join('\n')});
 
