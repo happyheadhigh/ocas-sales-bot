@@ -587,24 +587,33 @@ async function showFilterCategoryPicker(interaction, cfg, colId, kind){
     });
   }
 
-  const catOptions = categories.slice(0, 25).map(c =>
-    new StringSelectMenuOptionBuilder().setLabel(c).setValue(c)
-  );
-
-  const catMenu = new StringSelectMenuBuilder()
-    .setCustomId(`cfg_filtertrait:catsel:${kind}:${colId}`)
-    .setPlaceholder('Step 1 of 2 — Pick a trait category...')
-    .addOptions(catOptions);
+  // Up to 4 stacked menus (100 categories) + 1 row for Cancel, comfortably
+  // covering any realistic trait-category count -- this is a single-select
+  // (pick one category, not several), so unlike the value pickers there's
+  // no accumulation needed at all: whichever menu the user actually uses
+  // fires the existing cfg_filtertrait:catsel: handler completely
+  // unchanged, same as how lib/role-picker.js's paginated role menus work.
+  const CAT_CHUNK = 25;
+  const catMenuCount = Math.min(4, Math.ceil(categories.length / CAT_CHUNK));
+  const catRows = [];
+  for(let i = 0; i < catMenuCount; i++){
+    const slice = categories.slice(i * CAT_CHUNK, (i + 1) * CAT_CHUNK);
+    if(!slice.length) break;
+    const opts = slice.map(c => new StringSelectMenuOptionBuilder().setLabel(c).setValue(c));
+    const m = new StringSelectMenuBuilder()
+      .setCustomId(`cfg_filtertrait:catsel:${kind}:${colId}:${i}`)
+      .setPlaceholder(catMenuCount > 1 ? `Categories ${i * CAT_CHUNK + 1}-${i * CAT_CHUNK + slice.length} of ${categories.length}` : 'Step 1 of 2 — Pick a trait category...')
+      .addOptions(opts);
+    catRows.push(new ActionRowBuilder().addComponents(m));
+  }
+  catRows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+  ));
 
   return interaction.editReply({
     content: `**Adding ${kindLabel} Filter**\n\nStep 1 of 2 — Pick the trait category:`,
     embeds: [],
-    components: [
-      new ActionRowBuilder().addComponents(catMenu),
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
-      ),
-    ],
+    components: catRows,
   });
 }
 
@@ -1825,33 +1834,44 @@ async function handleConfigButton(interaction, ctx){
       });
     }
 
-    // Build category dropdown (cap at 25)
-    const catOptions = categories.slice(0, 24).map(c =>
-      new StringSelectMenuOptionBuilder().setLabel(c).setValue(c)
-    );
-    // Always include token count option
-    catOptions.unshift(new StringSelectMenuOptionBuilder()
-      .setLabel('🪙 Token Count (own N or more)')
-      .setValue('_count')
-      .setDescription('Assign role based on how many tokens the user holds')
-    );
-
-    const catMenu = new StringSelectMenuBuilder()
-      .setCustomId(`cfg_traitrole:catsel:${roleId}${suffix}`)
-      .setPlaceholder('Step 2 of 3 — Pick a trait category...')
-      .addOptions(catOptions.slice(0, 25));
+    // Build category dropdown(s) -- stacked if more than fit in one menu.
+    // Token count option always goes first, on menu 0 only.
+    const CAT_CHUNK = 25;
+    const catMenuCount = Math.min(4, Math.ceil((categories.length + 1) / CAT_CHUNK));
+    const catRows = [];
+    for(let i = 0; i < catMenuCount; i++){
+      const startIdx = i === 0 ? 0 : i * CAT_CHUNK - 1; // account for the extra _count option on menu 0
+      const roomLeft = i === 0 ? CAT_CHUNK - 1 : CAT_CHUNK;
+      const slice = categories.slice(startIdx, startIdx + roomLeft);
+      if(!slice.length && i > 0) break;
+      const opts = slice.map(c => new StringSelectMenuOptionBuilder().setLabel(c).setValue(c));
+      if(i === 0){
+        opts.unshift(new StringSelectMenuOptionBuilder()
+          .setLabel('🪙 Token Count (own N or more)')
+          .setValue('_count')
+          .setDescription('Assign role based on how many tokens the user holds')
+        );
+      }
+      // Fixed-position placeholder ('_' for "no collection id") rather than
+      // conditionally omitting the segment -- appending a chunk index after
+      // a sometimes-present, sometimes-absent suffix would shift what the
+      // handler reads at each position depending on which case applied.
+      const m = new StringSelectMenuBuilder()
+        .setCustomId(`cfg_traitrole:catsel:${roleId}:${catColId || '_'}:${i}`)
+        .setPlaceholder(catMenuCount > 1 ? `Categories (menu ${i + 1} of ${catMenuCount})` : 'Step 2 of 3 — Pick a trait category...')
+        .addOptions(opts.slice(0, 25));
+      catRows.push(new ActionRowBuilder().addComponents(m));
+    }
+    catRows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+    ));
 
     return interaction.editReply({
       content: `**Adding trait role for ${role?.name || 'role'}**
 
 Step 2 of 3 — Pick the trait category:`,
       embeds: [],
-      components: [
-        new ActionRowBuilder().addComponents(catMenu),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
-        ),
-      ],
+      components: catRows,
     });
   }
 
@@ -1859,7 +1879,7 @@ Step 2 of 3 — Pick the trait category:`,
   if(customId.startsWith('cfg_traitrole:catsel:')){
     const parts  = customId.split(':');
     const roleId = parts[2];
-    const catColId = parts[3] || '';
+    const catColId = (parts[3] && parts[3] !== '_') ? parts[3] : '';
     const category = interaction.values[0];
     const cancelId = catColId ? `cfg:col:traitroles:${catColId}` : 'cfg:cat:roles';
     const suffix = catColId ? `:${catColId}` : '';

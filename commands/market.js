@@ -398,15 +398,9 @@ async function handleMarketCommand(commandName, ctx){
       if(allCols.length === 1){
         return showMaTraitPicker(interaction, ctx, allCols[0].slug);
       }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId('ma_browse:col')
-        .setPlaceholder('Pick a collection...')
-        .addOptions(allCols.slice(0,25).map(c =>
-          new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)
-        ));
       return interaction.reply({
         content: '**🔔 My Alert** — Pick a collection:',
-        components: [new ActionRowBuilder().addComponents(menu)],
+        components: buildCollectionPickerRows(allCols, 'ma_browse:col'),
         flags: MessageFlags.Ephemeral,
       });
     }
@@ -1215,6 +1209,27 @@ async function handleTraitBrowseInteraction(interaction, ctx){
 }
 
 // ── /myalert guided flow helpers ─────────────────────────────────────────────
+// Shared "pick a collection" stacked single-select -- all four call sites
+// building this exact kind of menu had the same silent slice(0,25) cap, low
+// risk in practice (a server realistically configuring 25+ collections is
+// unlikely) but fixed the same way as everywhere else for consistency.
+function buildCollectionPickerRows(allCols, baseCustomId){
+  const CHUNK = 25;
+  const menuCount = Math.min(4, Math.ceil(allCols.length / CHUNK));
+  const rows = [];
+  for(let i = 0; i < menuCount; i++){
+    const slice = allCols.slice(i * CHUNK, (i + 1) * CHUNK);
+    if(!slice.length) break;
+    const opts = slice.map(c => new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug));
+    const m = new StringSelectMenuBuilder()
+      .setCustomId(`${baseCustomId}:${i}`)
+      .setPlaceholder(menuCount > 1 ? `Collections (menu ${i + 1} of ${menuCount})` : 'Pick a collection...')
+      .addOptions(opts);
+    rows.push(new ActionRowBuilder().addComponents(m));
+  }
+  return rows;
+}
+
 async function showMaTraitPicker(interaction, ctx, slug, page = 0){
   const { getRailwayApiUrl, getCachedTraitIndex } = ctx;
   const RAILWAY_URL = getRailwayApiUrl();
@@ -1349,7 +1364,7 @@ async function handleMyAlertInteraction(interaction, ctx){
   const { getAlert, setAlert } = ctx;
   const customId = interaction.customId;
 
-  if(customId === 'ma_browse:col'){
+  if(customId.startsWith('ma_browse:col')){
     const slug = interaction.values[0];
     return showMaTraitPicker(interaction, ctx, slug);
   }
@@ -2790,11 +2805,7 @@ async function handleMeInteraction(interaction, ctx){
     for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
     if(!allCols.length) return interaction.update({ content: 'No collections configured on this server.', embeds:[], components:[] });
     if(allCols.length === 1) return showMaTraitPicker(interaction, ctx, allCols[0].slug);
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId('ma_browse:col')
-      .setPlaceholder('Pick a collection...')
-      .addOptions(allCols.slice(0,25).map(c => new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)));
-    return interaction.update({ content: '**📣 Trait Alert** — Pick a collection:', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.update({ content: '**📣 Trait Alert** — Pick a collection:', embeds:[], components: buildCollectionPickerRows(allCols, 'ma_browse:col') });
   }
 
   if(customId === 'me_browse:alert:clear'){
@@ -2821,11 +2832,7 @@ async function handleMeInteraction(interaction, ctx){
     for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
     if(!allCols.length) return interaction.update({ content: 'No collections configured.', embeds:[], components:[] });
     if(allCols.length === 1) return showPriceAlertModal(interaction, allCols[0].slug);
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId('me_browse:pricealert:col')
-      .setPlaceholder('Pick a collection...')
-      .addOptions(allCols.slice(0,25).map(c => new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)));
-    return interaction.update({ content: '**🏷️ Price Alert** — Pick a collection:', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.update({ content: '**🏷️ Price Alert** — Pick a collection:', embeds:[], components: buildCollectionPickerRows(allCols, 'me_browse:pricealert:col') });
   }
 
   if(customId.startsWith('me_browse:pricealert:col')){
@@ -2873,11 +2880,7 @@ async function handleMeInteraction(interaction, ctx){
     for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
     if(!allCols.length) return interaction.update({ content: 'No collections configured.', embeds:[], components:[] });
     if(allCols.length === 1) return showFloorAlertModal(interaction, allCols[0].slug);
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId('me_browse:flooralert:col')
-      .setPlaceholder('Pick a collection...')
-      .addOptions(allCols.slice(0,25).map(c => new StringSelectMenuOptionBuilder().setLabel(c.name).setValue(c.slug)));
-    return interaction.update({ content: '**📉 Floor Alert** — Pick a collection:', embeds:[], components:[new ActionRowBuilder().addComponents(menu)] });
+    return interaction.update({ content: '**📉 Floor Alert** — Pick a collection:', embeds:[], components: buildCollectionPickerRows(allCols, 'me_browse:flooralert:col') });
   }
 
   if(customId.startsWith('me_browse:flooralert:col')){
