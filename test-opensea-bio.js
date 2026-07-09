@@ -27,7 +27,7 @@
 require('dotenv').config();
 const fetch = require('node-fetch');
 
-const OPENSEA_KEY = process.env.OPENSEA_API_KEY;
+const OPENSEA_KEY = process.env.OPENSEA_KEY;
 const target = process.argv[2];
 
 if (!target) {
@@ -35,7 +35,7 @@ if (!target) {
   process.exit(1);
 }
 if (!OPENSEA_KEY) {
-  console.log('No OPENSEA_API_KEY found in environment -- this script uses the exact same key/header pattern the bot already uses everywhere else (lib/constants.js osHeaders()), so if this is missing, the bot itself would be missing it too.');
+  console.log('No OPENSEA_KEY found in environment -- this script uses the exact same key/header pattern the bot already uses everywhere else (lib/constants.js osHeaders()), so if this is missing, the bot itself would be missing it too.');
   process.exit(1);
 }
 
