@@ -672,6 +672,7 @@ async function handleConfigButton(interaction, ctx){
                   tzCustomPicked ||
                   customId.startsWith('cfg:rank:set:') ||
                   customId.startsWith('cfg_traitrole:manual:') ||
+                  customId.startsWith('cfg_traitrole:quickmodal:') ||
                   customId.startsWith('cfg_filtertrait:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
@@ -1789,6 +1790,34 @@ async function handleConfigButton(interaction, ctx){
     return interaction.showModal(modal);
   }
 
+  // ── Quick modal for _count/_totalburns/_maxburn — number field only, the
+  // category is already known from the dropdown pick, no need to retype it ──
+  if(customId.startsWith('cfg_traitrole:quickmodal:')){
+    const qParts   = customId.split(':');
+    const roleId   = qParts[2];
+    const qColId   = qParts[3];
+    const category = qParts[4];
+    const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    const fieldLabels = {
+      _count:      'Minimum tokens owned (default: 1)',
+      _totalburns: 'Minimum total tokens burned (default: 1)',
+      _maxburn:    'Minimum tokens in one burn (default: 1)',
+    };
+    const modal = new ModalBuilder()
+      .setCustomId(`cfg_modal:trquick:${roleId}:${qColId}:${category}`)
+      .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_quick_count')
+          .setLabel((fieldLabels[category] || 'Minimum count').slice(0, 45))
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. 1, 5, 10')
+          .setRequired(false)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
   if(customId === 'cfg_traitrole:rolesel' || customId.startsWith('cfg_traitrole:rolesel:')){
     const rsColId = customId.startsWith('cfg_traitrole:rolesel:') ? customId.split(':')[2] : '';
     const roleId = interaction.values[0];
@@ -1910,7 +1939,7 @@ Step 2 of 3 — Pick the trait category:`,
         embeds: [],
         components: [
           new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}${suffix}`).setLabel(`✏️ ${labels[1]}`).setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`cfg_traitrole:quickmodal:${roleId}:${catColId||'_'}:${category}`).setLabel(`✏️ ${labels[1]}`).setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
           ),
         ],
@@ -2491,6 +2520,49 @@ async function handleConfigModal(interaction, ctx){
        VALUES ($1,$2,$3,$4,$5,$6)
        ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$6`,
       [guildId, roleId, traitType, traitVal||'', minCount, modCollectionSlug]
+    ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+
+    const trRes = modColId
+      ? await pgPool.query(
+          modCollectionSlug
+            ? 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug=$2 ORDER BY trait_type, trait_value'
+            : 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug IS NULL ORDER BY trait_type, trait_value',
+          modCollectionSlug ? [guildId, modCollectionSlug] : [guildId]
+        ).catch(()=>({ rows:[] }))
+      : await pgPool.query(
+          'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
+          [guildId]
+        ).catch(()=>({ rows:[] }));
+
+    return interaction.editReply({ content:'✅ Trait role added.', embeds:[buildRolesEmbed(trRes.rows, modColLabel)], components:rolesRow(trRes.rows, modColId || undefined) });
+  }
+
+  // ── Quick modal submit — category already known from the button, just the number ──
+  if(customId.startsWith('cfg_modal:trquick:')){
+    const qParts   = customId.split(':');
+    const roleId   = qParts[2];
+    const qColId   = qParts[3];
+    const category = qParts[4];
+    const minCount = parseInt(interaction.fields.getTextInputValue('tr_quick_count').trim()) || 1;
+
+    const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    if(!role)
+      return interaction.editReply({ content:'❌ Role not found. Please try again.' });
+
+    const modColId = (qColId && qColId !== '_') ? qColId : '';
+    let modCollectionSlug = null;
+    let modColLabel;
+    if(modColId && modColId !== 'primary'){
+      const col = (cfg.collections||[])[parseInt(modColId)];
+      modCollectionSlug = col?.slug || null;
+      modColLabel = col?.name || col?.slug;
+    }
+
+    await pgPool.query(
+      `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+       VALUES ($1,$2,$3,'',$4,$5)
+       ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
+      [guildId, roleId, category, minCount, modCollectionSlug]
     ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
 
     const trRes = modColId
