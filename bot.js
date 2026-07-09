@@ -603,12 +603,12 @@ client.on('interactionCreate', async (interaction)=>{
     }
 
     // Check code is in their username
-    const displayName = profile.username || '';
-    if(!displayName.includes(code))
+    const bio = profile.bio || '';
+    if(!bio.includes(code))
       return interaction.editReply({content:[
         '❌ Code not found in your OpenSea username.',
         '',
-        `Go to https://opensea.io/${osUsername} → Edit Profile → temporarily add this to your username:`,
+        `Go to https://opensea.io/${osUsername} → Edit Profile → temporarily add this to your bio:`,
         '```'+code+'```',
         'Save, then try again. You can remove it after verification.',
       ].join('\n')});
@@ -1131,10 +1131,10 @@ client.on('interactionCreate', async (interaction)=>{
       .setTitle('🔐 Verify Your Wallet')
       .setDescription(
         `**Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\`\n\n` +
-        '**Step 1 — Add this code to your OpenSea username:**\n' +
+        '**Step 1 — Add this code to your OpenSea bio:**\n' +
         '```' + code + '```' +
-        `Go to https://opensea.io/${wallet} → Edit Profile → add the code anywhere in your **username**.\n` +
-        `Example: \`YourName-${code}\`\n\n` +
+        `Go to https://opensea.io/${wallet} → Edit Profile → paste the code anywhere in your **bio**.\n` +
+        `It doesn't need to be your whole bio, just needs to appear somewhere in it.\n\n` +
         '**Step 2 — Once saved, click ✅ I\'ve Added It below.**\n\n' +
         '*You can remove the code from your bio after verification. Expires in 30 minutes.*'
       );
@@ -1226,7 +1226,7 @@ client.on('interactionCreate', async (interaction)=>{
       return interaction.editReply({content:[
         '❌ Code not found in your OpenSea profile yet.',
         '',
-        `Go to https://opensea.io/${wallet} → Edit Profile → add the code to your **username**:`,
+        `Go to https://opensea.io/${wallet} → Edit Profile → add the code to your **bio**:`,
         '```'+code+'```',
         'Save your profile, then click **✅ I\'ve Added It** again.',
       ].join('\n')});
