@@ -602,11 +602,11 @@ client.on('interactionCreate', async (interaction)=>{
       return interaction.editReply({content:'❌ Failed to reach OpenSea. Try again.'});
     }
 
-    // Check code is in their username
+    // Check code is in their bio
     const bio = profile.bio || '';
     if(!bio.includes(code))
       return interaction.editReply({content:[
-        '❌ Code not found in your OpenSea username.',
+        '❌ Code not found in your OpenSea bio.',
         '',
         `Go to https://opensea.io/${osUsername} → Edit Profile → temporarily add this to your bio:`,
         `# \`${code}\``,
@@ -680,7 +680,7 @@ client.on('interactionCreate', async (interaction)=>{
       walletList,
       `🪙 **Tokens found:** ${tokenCount} across all wallets`,
       '',
-      'You can remove the code from your OpenSea username now.',
+      'You can remove the code from your OpenSea bio now.',
       '',
       '💡 Try `/me` to see your wallet dashboard, or `/help` to explore everything I can do.',
     ].join('\n')});
@@ -1329,7 +1329,7 @@ client.on('interactionCreate', async (interaction)=>{
       `🪙 **Tokens found:** ${tokenCount}`,
       ...(roleParts.length ? ['', ...roleParts] : []),
       '',
-      'You can remove the code from your OpenSea username now.',
+      'You can remove the code from your OpenSea bio now.',
       'Your wallet is saved — future servers will verify you instantly.',
       '',
       '💡 Try `/me` to see your wallet dashboard, or `/help` to explore everything I can do.',
