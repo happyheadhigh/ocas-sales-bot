@@ -1158,30 +1158,11 @@ client.on('interactionCreate', async (interaction)=>{
         '**Step 2 — Once saved, click ✅ I\'ve Added It below.**\n\n' +
         `*You can remove the code from your bio after verification. Expires in ${Math.max(1, Math.round((expiresAt - Date.now()) / 60000))} minutes.*`
       );
-    const copyBtn = new ButtonBuilder()
-      .setCustomId('sv_copy_code:'+svGuild)
-      .setLabel('📋 Copy Code')
-      .setStyle(ButtonStyle.Secondary);
     const doneBtn = new ButtonBuilder()
       .setCustomId('sv_done:'+svGuild)
       .setLabel("✅ I've Added It")
       .setStyle(ButtonStyle.Success);
-    return interaction.editReply({embeds:[codeEmbed], components:[new ActionRowBuilder().addComponents(copyBtn, doneBtn)]});
-  }
-
-  // ── Copy Code button ──────────────────────────────────────────────────────
-  if(interaction.isButton() && interaction.customId.startsWith('sv_copy_code:')){
-    const discordId = interaction.user.id;
-    try{
-      const r = await pgPool.query(
-        'SELECT code FROM verification_codes WHERE discord_id=$1 ORDER BY expires_at DESC LIMIT 1',
-        [discordId]
-      );
-      const code = r.rows[0]?.code || '(expired — click Verify Wallet again)';
-      return interaction.reply({flags:64, content:`# \`${code}\``});
-    }catch(_){
-      return interaction.reply({flags:64, content:'❌ Could not retrieve code. Try again.'});
-    }
+    return interaction.editReply({embeds:[codeEmbed], components:[new ActionRowBuilder().addComponents(doneBtn)]});
   }
 
   // ── I've Added It — fetch OS profile by wallet, check bio for code ────────
