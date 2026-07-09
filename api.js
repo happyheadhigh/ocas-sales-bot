@@ -1593,7 +1593,51 @@ app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
     for (const r of survivorSnapsRes.rows) survivorSnapMap[r.burn_event_id] = r.image_data;
 
     const allInputIds = inputsRes.rows.map(r => r.burned_token_id);
-    const inputSnapshots = await fetchInputSnapshots(allInputIds);
+
+    // A token fed into a burn isn't necessarily destroyed -- it can BE the
+    // survivor, evolving instead (confirmed directly: token #2941 here has
+    // survived twice, with a genuinely different look each time per its own
+    // History tab). A plain token_id-keyed "pre-burn" lookup breaks for any
+    // such token, since it's had more than one true "pre-burn" moment in its
+    // life, not just one. The correct image for token X as an input to event
+    // E is whatever it looked like the last time it became a survivor,
+    // before E -- burn_state_snapshots already stores exactly that, per
+    // (token_id, burn_event_id), it just wasn't being consulted here.
+    const priorSnapsRes = await pool.query(
+      `SELECT bss.token_id, bss.burn_event_id, bss.image_data, be.block_number
+       FROM burn_state_snapshots bss
+       JOIN burn_events be ON be.id = bss.burn_event_id
+       WHERE bss.token_id = ANY($1::int[])`,
+      [allInputIds]
+    );
+    const priorSnapsByToken = {};
+    for (const r of priorSnapsRes.rows) {
+      (priorSnapsByToken[r.token_id] ||= []).push({ blockNumber: parseInt(r.block_number), image: r.image_data });
+    }
+    for (const list of Object.values(priorSnapsByToken)) list.sort((a, b) => a.blockNumber - b.blockNumber);
+
+    function resolveInputImage(tokenId, currentEventBlockNumber, fallbackMap) {
+      const candidates = priorSnapsByToken[tokenId] || [];
+      // Most recent prior survivor-state strictly before this event -- that
+      // is what this token actually looked like right before being fed in.
+      let best = null;
+      for (const c of candidates) {
+        if (c.blockNumber < currentEventBlockNumber && (!best || c.blockNumber > best.blockNumber)) best = c;
+      }
+      if (best) return best.image;
+      // Never survived a prior burn -- this is its first and only
+      // burn-related appearance, so the plain mint-time/first snapshot is
+      // correct as-is.
+      return fallbackMap[tokenId] || null;
+    }
+
+    const originalSnapshots = await fetchInputSnapshots(allInputIds);
+    const inputSnapshots = {};
+    for (const e of events) {
+      for (const tokenId of (inputsByEvent[e.id] || [])) {
+        inputSnapshots[`${e.id}:${tokenId}`] = resolveInputImage(tokenId, parseInt(e.block_number), originalSnapshots);
+      }
+    }
 
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
     res.json({
