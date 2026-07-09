@@ -1857,7 +1857,7 @@ async function handleConfigButton(interaction, ctx){
       // a sometimes-present, sometimes-absent suffix would shift what the
       // handler reads at each position depending on which case applied.
       const m = new StringSelectMenuBuilder()
-        .setCustomId(`cfg_traitrole:catsel:${roleId}:${catColId || '_'}:${i}`)
+        .setCustomId(`cfg_traitrole:catsel:${roleId}:${rsColId || '_'}:${i}`)
         .setPlaceholder(catMenuCount > 1 ? `Categories (menu ${i + 1} of ${catMenuCount})` : 'Step 2 of 3 — Pick a trait category...')
         .addOptions(opts.slice(0, 25));
       catRows.push(new ActionRowBuilder().addComponents(m));
