@@ -673,6 +673,7 @@ async function handleConfigButton(interaction, ctx){
                   customId.startsWith('cfg:rank:set:') ||
                   customId.startsWith('cfg_traitrole:manual:') ||
                   customId.startsWith('cfg_traitrole:quickmodal:') ||
+                  (customId.startsWith('vpick:traitrole:') && customId.endsWith(':done')) ||
                   customId.startsWith('cfg_filtertrait:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
@@ -1018,57 +1019,69 @@ async function handleConfigButton(interaction, ctx){
       const newValues = interaction.values || [];
       recordMenuSelection(sessionKey, parsed.menuIndex, newValues);
 
-      // Apply THIS menu's picks immediately -- additive by design (adding
-      // new values never removes ones saved from a different menu earlier
-      // in this same session), so there's no need to wait for a "Done"
-      // click just to be correct.
-      if(newValues.length){
-        if(flow === 'filtertrait'){
-          const catKey = category.toLowerCase();
-          const lowerValues = newValues.map(v => v.toLowerCase());
-          const fieldKey = kind === 'sales' ? 'salesFilters' : 'listingFilters';
-          const isPrimary = colId === 'primary';
-          if(isPrimary){
-            if(!cfg[fieldKey]) cfg[fieldKey] = {};
-            const existing = cfg[fieldKey][catKey] || [];
-            cfg[fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
-          } else {
-            const cols = cfg.collections || [];
-            const idx = parseInt(colId);
-            if(cols[idx]){
-              if(!cols[idx][fieldKey]) cols[idx][fieldKey] = {};
-              const existing = cols[idx][fieldKey][catKey] || [];
-              cols[idx][fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
-              cfg.collections = cols;
-            }
-          }
-          await setConfig(guildId, cfg);
-        } else if(flow === 'traitrole'){
-          let collectionSlugForSave = null;
-          if(valColId && valColId !== 'primary'){
-            const col = (cfg.collections||[])[parseInt(valColId)];
-            collectionSlugForSave = col?.slug || null;
-          }
-          for(const val of newValues){
-            await pgPool.query(
-              `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
-               VALUES ($1,$2,$3,$4,1,$5)
-               ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
-              [guildId, roleId, category, val, collectionSlugForSave]
-            ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+      if(newValues.length && flow === 'filtertrait'){
+        // Additive by design (adding new values never removes ones saved
+        // from a different menu earlier in this same session), so filters
+        // still apply immediately -- no minimum-count concept here at all,
+        // nothing to wait for.
+        const catKey = category.toLowerCase();
+        const lowerValues = newValues.map(v => v.toLowerCase());
+        const fieldKey = kind === 'sales' ? 'salesFilters' : 'listingFilters';
+        const isPrimary = colId === 'primary';
+        if(isPrimary){
+          if(!cfg[fieldKey]) cfg[fieldKey] = {};
+          const existing = cfg[fieldKey][catKey] || [];
+          cfg[fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
+        } else {
+          const cols = cfg.collections || [];
+          const idx = parseInt(colId);
+          if(cols[idx]){
+            if(!cols[idx][fieldKey]) cols[idx][fieldKey] = {};
+            const existing = cols[idx][fieldKey][catKey] || [];
+            cols[idx][fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
+            cfg.collections = cols;
           }
         }
+        await setConfig(guildId, cfg);
       }
+      // traitrole: just record the pick in the session -- nothing saves to
+      // trait_roles until Done, since a minimum-count modal happens next
+      // and the count needs to be known before any row is written.
 
       const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, { placeholder, cancelId });
+      const doneHint = flow === 'traitrole'
+        ? `pick from as many of the menus below as you want, then Done — you'll be asked how many are needed next.`
+        : `Picks save as soon as you make them — pick from as many of the menus below as you want, then Done when finished.`;
       return interaction.editReply({
-        content: `**${category}**${truncatedNote}\n\nPicks save as soon as you make them — pick from as many of the menus below as you want, then Done when finished.`,
+        content: `**${category}**${truncatedNote}\n\n${doneHint}`,
         embeds: [],
         components: rows,
       });
     }
 
     if(action === 'done'){
+      if(flow === 'traitrole'){
+        // Don't clear the session or save anything yet -- need the count
+        // first. showModal must be this interaction's first response, so
+        // this branch is listed in the isModal skip-defer check up top.
+        if(!session.selected.size){
+          return interaction.editReply({ content: 'No values were selected. Please pick at least one value first.', embeds:[], components:[] });
+        }
+        const modal = new ModalBuilder()
+          .setCustomId(`cfg_modal:trcount:${roleId}:${valColId || '_'}:${encodeURIComponent(category)}`)
+          .setTitle(`${category}`.slice(0, 45));
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('tr_count_min')
+              .setLabel('How many needed? (default: 1)')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('e.g. 1, 3, 5')
+              .setRequired(false)
+          ),
+        );
+        return interaction.showModal(modal);
+      }
+
       const selectedValues = [...session.selected];
       clearValuePicker(sessionKey);
 
@@ -1082,24 +1095,6 @@ async function handleConfigButton(interaction, ctx){
             : `No values were selected for **${category}** — nothing added.`,
           embeds: [embedFn(col, colId)],
           components: rowFn(col, colId),
-        });
-      }
-
-      if(flow === 'traitrole'){
-        let collectionSlugForSave = null;
-        let colLabel;
-        if(valColId && valColId !== 'primary'){
-          const col = (cfg.collections||[])[parseInt(valColId)];
-          collectionSlugForSave = col?.slug || null;
-          colLabel = col?.name || col?.slug;
-        }
-        const trRes = valColId ? await traitRolesQFor(collectionSlugForSave) : await traitRolesQ();
-        return interaction.editReply({
-          content: selectedValues.length
-            ? `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}>:\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`
-            : `No values were selected — nothing added for <@&${roleId}>.`,
-          embeds: [buildRolesEmbed(trRes.rows, colLabel)],
-          components: rolesRow(trRes.rows, valColId || undefined),
         });
       }
     }
@@ -1970,45 +1965,21 @@ Step 2 of 3 — Pick the trait category:`,
       return interaction.editReply({ content: `❌ No trait values found for category **${category}**. Try again.`, embeds:[], components:[] });
     }
 
-    // If more than 25 values, use the stacked multi-menu picker
-    if(values.length > 25){
-      const sessionKey = `${interaction.user.id}:traitrole:${roleId}${suffix}:${category}`;
-      initValuePicker(sessionKey, values);
-      const customIdPrefix = `traitrole:${roleId}:${catColId || '_'}:${encodeURIComponent(category)}`;
-      const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
-        placeholder: 'Pick one or more values...',
-        cancelId,
-      });
-      return interaction.editReply({
-        content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${truncatedNote}\n\nPicks save as soon as you make them — pick from as many of the menus below as you want.`,
-        embeds: [],
-        components: rows,
-      });
-    }
-
-    const valOptions = values.map(v =>
-      new StringSelectMenuOptionBuilder().setLabel(v).setValue(v)
-    );
-
-    const valMenu = new StringSelectMenuBuilder()
-      .setCustomId(`cfg_traitrole:valsel:${roleId}:${encodeURIComponent(category)}${suffix}`)
-      .setPlaceholder('Step 3 of 3 — Pick one or more values...')
-      .setMinValues(1)
-      .setMaxValues(valOptions.length)
-      .addOptions(valOptions);
-
+    // Always use the stacked/session picker now, regardless of value count --
+    // a minimum-count step needs to happen after Done either way (see the
+    // vpick: 'done' handler below), so there's no longer a reason for a
+    // separate direct-menu path only for small categories.
+    const sessionKey = `${interaction.user.id}:traitrole:${roleId}${suffix}:${category}`;
+    initValuePicker(sessionKey, values);
+    const customIdPrefix = `traitrole:${roleId}:${catColId || '_'}:${encodeURIComponent(category)}`;
+    const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
+      placeholder: 'Pick one or more values...',
+      cancelId,
+    });
     return interaction.editReply({
-      content: `**Adding trait role**
-
-Category: **${category}**
-Step 3 of 3 — Pick the trait value(s) that qualify for this role:`,
+      content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${truncatedNote}\n\nPick from as many of the menus below as you want, then Done — you'll be asked how many are needed next.`,
       embeds: [],
-      components: [
-        new ActionRowBuilder().addComponents(valMenu),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
-        ),
-      ],
+      components: rows,
     });
   }
 
@@ -2578,6 +2549,59 @@ async function handleConfigModal(interaction, ctx){
         ).catch(()=>({ rows:[] }));
 
     return interaction.editReply({ content:'✅ Trait role added.', embeds:[buildRolesEmbed(trRes.rows, modColLabel)], components:rolesRow(trRes.rows, modColId || undefined) });
+  }
+
+  // ── Trait role count modal — finalize the session with the chosen minimum ──
+  if(customId.startsWith('cfg_modal:trcount:')){
+    const tcParts   = customId.split(':');
+    const roleId    = tcParts[2];
+    const tcColId   = tcParts[3];
+    const category  = decodeURIComponent(tcParts[4]);
+    const valColId  = (tcColId && tcColId !== '_') ? tcColId : '';
+    const minCount  = parseInt(interaction.fields.getTextInputValue('tr_count_min').trim()) || 1;
+
+    const suffix = valColId ? `:${valColId}` : '';
+    const sessionKey = `${interaction.user.id}:traitrole:${roleId}${suffix}:${category}`;
+    const session = getValuePickerSession(sessionKey);
+    if(!session || !session.selected.size){
+      return interaction.editReply({ content: '❌ This session expired before you set a count. Please pick the value(s) again.', embeds:[], components:[] });
+    }
+    const selectedValues = [...session.selected];
+    clearValuePicker(sessionKey);
+
+    let collectionSlugForSave = null;
+    let colLabel;
+    if(valColId && valColId !== 'primary'){
+      const col = (cfg.collections||[])[parseInt(valColId)];
+      collectionSlugForSave = col?.slug || null;
+      colLabel = col?.name || col?.slug;
+    }
+
+    for(const val of selectedValues){
+      await pgPool.query(
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$6`,
+        [guildId, roleId, category, val, minCount, collectionSlugForSave]
+      ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+    }
+
+    const trRes = valColId
+      ? await pgPool.query(
+          collectionSlugForSave
+            ? 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug=$2 ORDER BY trait_type, trait_value'
+            : 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug IS NULL ORDER BY trait_type, trait_value',
+          collectionSlugForSave ? [guildId, collectionSlugForSave] : [guildId]
+        ).catch(()=>({ rows:[] }))
+      : await pgPool.query(
+          'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
+          [guildId]
+        ).catch(()=>({ rows:[] }));
+    return interaction.editReply({
+      content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}> (need ${minCount}+):\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
+      embeds: [buildRolesEmbed(trRes.rows, colLabel)],
+      components: rolesRow(trRes.rows, valColId || undefined),
+    });
   }
 }
 
