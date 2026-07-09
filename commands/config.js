@@ -1766,7 +1766,7 @@ async function handleConfigButton(interaction, ctx){
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category (or _count/_totalburns/_maxburn)')
+          .setLabel('Trait Category (or _count etc.)')
           .setStyle(TextInputStyle.Short)
           .setPlaceholder('e.g. Type, _count, _totalburns, or _maxburn')
           .setRequired(true)
