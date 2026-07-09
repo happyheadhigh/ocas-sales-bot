@@ -1105,7 +1105,7 @@ client.on('interactionCreate', async (interaction)=>{
 
     // Ephemeral messages can vanish (Discord dismisses them after a while,
     // or on app restart -- documented platform behavior, not something
-    // fixable here) well before the 30-minute code window is actually up.
+    // fixable here) well before the 5-minute code window is actually up.
     // Reuse the existing code/expiry for the SAME wallet if one's already
     // pending, rather than silently generating a new one -- otherwise
     // whatever the user already pasted into their bio would be
@@ -1123,7 +1123,7 @@ client.on('interactionCreate', async (interaction)=>{
       expiresAt = new Date(existingRow.expires_at);
     } else {
       code      = 'OCAS-'+Math.random().toString(36).slice(2,8).toUpperCase();
-      expiresAt = new Date(Date.now() + 30*60*1000);
+      expiresAt = new Date(Date.now() + 5*60*1000);
     }
 
     try{
