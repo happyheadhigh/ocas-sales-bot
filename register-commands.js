@@ -76,7 +76,8 @@ const commands = [
   new SlashCommandBuilder().setName('resetverify')
     .setDescription('Clear a member\'s verification so they can verify again (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addUserOption(o => o.setName('user').setDescription('User to reset (leave blank to reset yourself)').setRequired(false)),
+    .addUserOption(o => o.setName('user').setDescription('User to reset (leave blank to reset yourself)').setRequired(false))
+    .addBooleanOption(o => o.setName('global').setDescription('Also clear the cross-server verification shortcut (owner only)').setRequired(false)),
 ].map(c=>c.toJSON());
 
 if(!process.env.DISCORD_TOKEN){

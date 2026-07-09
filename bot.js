@@ -2024,12 +2024,26 @@ client.on('interactionCreate', async (interaction)=>{
     if(!isAdmin) return interaction.reply({flags:64, content:'❌ Admin only.'});
     await interaction.deferReply({flags:64});
     const target = interaction.options.getUser('user') || interaction.user;
+    const wantsGlobal = interaction.options.getBoolean('global') || false;
+    const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+    if(wantsGlobal && !isOwner){
+      return interaction.editReply({content:'❌ The `global` option is restricted to the bot owner only.'});
+    }
     try{
-      // Delete guild-specific record only — keep global so instant re-verify works on other servers
-      await pgPool.query(
-        'DELETE FROM user_registrations WHERE discord_id=$1 AND guild_id=$2',
-        [target.id, guildId]
-      );
+      if(wantsGlobal){
+        // Owner-only, and only when explicitly requested -- this clears the
+        // cross-server shortcut too (every registration row for this user,
+        // not just this guild's), so a from-scratch re-verify can actually
+        // be tested end-to-end. Regular /resetverify intentionally leaves
+        // this alone so the shortcut keeps working for everyone else.
+        await pgPool.query('DELETE FROM user_registrations WHERE discord_id=$1', [target.id]);
+      } else {
+        // Delete guild-specific record only — keep global so instant re-verify works on other servers
+        await pgPool.query(
+          'DELETE FROM user_registrations WHERE discord_id=$1 AND guild_id=$2',
+          [target.id, guildId]
+        );
+      }
       await pgPool.query('DELETE FROM verification_codes WHERE discord_id=$1', [target.id]);
 
       // Remove all verification-related Discord roles
@@ -2056,7 +2070,7 @@ client.on('interactionCreate', async (interaction)=>{
         }
       }
 
-      return interaction.editReply({content:`✅ Verification reset for ${target.tag} — DB records and all verification roles removed. They can verify fresh.`});
+      return interaction.editReply({content:`✅ Verification reset for ${target.tag}${wantsGlobal ? ' (including the cross-server shortcut)' : ''} — DB records and all verification roles removed. They can verify fresh.`});
     }catch(e){
       return interaction.editReply({content:'❌ Error: '+e.message});
     }
