@@ -673,7 +673,7 @@ async function handleConfigButton(interaction, ctx){
                   customId.startsWith('cfg:rank:set:') ||
                   customId.startsWith('cfg_traitrole:manual:') ||
                   customId.startsWith('cfg_traitrole:quickmodal:') ||
-                  (customId.startsWith('vpick:traitrole:') && customId.endsWith(':done')) ||
+                  (customId.startsWith('vpick:traitrole:') && customId.endsWith(':setcount')) ||
                   customId.startsWith('cfg_filtertrait:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
@@ -1048,9 +1048,9 @@ async function handleConfigButton(interaction, ctx){
       // trait_roles until Done, since a minimum-count modal happens next
       // and the count needs to be known before any row is written.
 
-      const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, { placeholder, cancelId });
+      const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, { placeholder, cancelId, countButton: flow === 'traitrole' });
       const doneHint = flow === 'traitrole'
-        ? `pick from as many of the menus below as you want, then Done — you'll be asked how many are needed next.`
+        ? `pick from as many of the menus below as you want, then Done to finish (defaults to needing 1), or Set Count first if you want a different minimum.`
         : `Picks save as soon as you make them — pick from as many of the menus below as you want, then Done when finished.`;
       return interaction.editReply({
         content: `**${category}**${truncatedNote}\n\n${doneHint}`,
@@ -1059,29 +1059,32 @@ async function handleConfigButton(interaction, ctx){
       });
     }
 
-    if(action === 'done'){
-      if(flow === 'traitrole'){
-        // Don't clear the session or save anything yet -- need the count
-        // first. showModal must be this interaction's first response, so
-        // this branch is listed in the isModal skip-defer check up top.
-        if(!session.selected.size){
-          return interaction.editReply({ content: 'No values were selected. Please pick at least one value first.', embeds:[], components:[] });
-        }
-        const modal = new ModalBuilder()
-          .setCustomId(`cfg_modal:trcount:${roleId}:${valColId || '_'}:${encodeURIComponent(category)}`)
-          .setTitle(`${category}`.slice(0, 45));
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('tr_count_min')
-              .setLabel('How many needed? (default: 1)')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. 1, 3, 5')
-              .setRequired(false)
-          ),
-        );
-        return interaction.showModal(modal);
+    if(action === 'setcount'){
+      if(flow !== 'traitrole'){
+        return interaction.editReply({ content: '❌ Not applicable here.', embeds:[], components:[] });
       }
+      // Don't clear the session or save anything yet -- need the count
+      // first. showModal must be this interaction's first response, so
+      // this branch is listed in the isModal skip-defer check up top.
+      if(!session.selected.size){
+        return interaction.editReply({ content: 'No values were selected. Please pick at least one value first.', embeds:[], components:[] });
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`cfg_modal:trcount:${roleId}:${valColId || '_'}:${encodeURIComponent(category)}`)
+        .setTitle(`${category}`.slice(0, 45));
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_count_min')
+            .setLabel('How many needed? (default: 1)')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. 1, 3, 5')
+            .setRequired(false)
+        ),
+      );
+      return interaction.showModal(modal);
+    }
 
+    if(action === 'done'){
       const selectedValues = [...session.selected];
       clearValuePicker(sessionKey);
 
@@ -1095,6 +1098,48 @@ async function handleConfigButton(interaction, ctx){
             : `No values were selected for **${category}** — nothing added.`,
           embeds: [embedFn(col, colId)],
           components: rowFn(col, colId),
+        });
+      }
+
+      if(flow === 'traitrole'){
+        // Done is the one-click "just finish, default to needing 1" path --
+        // Set Count (a separate button, see the 'setcount' action above) is
+        // where an actual custom minimum gets collected. Nothing here waits
+        // on user input, so this saves immediately at count=1, same as
+        // before the count feature existed at all.
+        if(!selectedValues.length){
+          return interaction.editReply({ content: `No values were selected — nothing added.`, embeds:[], components:[] });
+        }
+        let collectionSlugForSave = null;
+        let colLabel;
+        if(valColId && valColId !== 'primary'){
+          const col = (cfg.collections||[])[parseInt(valColId)];
+          collectionSlugForSave = col?.slug || null;
+          colLabel = col?.name || col?.slug;
+        }
+        for(const val of selectedValues){
+          await pgPool.query(
+            `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+             VALUES ($1,$2,$3,$4,1,$5)
+             ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
+            [guildId, roleId, category, val, collectionSlugForSave]
+          ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+        }
+        const trRes = valColId
+          ? await pgPool.query(
+              collectionSlugForSave
+                ? 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug=$2 ORDER BY trait_type, trait_value'
+                : 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug IS NULL ORDER BY trait_type, trait_value',
+              collectionSlugForSave ? [guildId, collectionSlugForSave] : [guildId]
+            ).catch(()=>({ rows:[] }))
+          : await pgPool.query(
+              'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
+              [guildId]
+            ).catch(()=>({ rows:[] }));
+        return interaction.editReply({
+          content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}>:\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
+          embeds: [buildRolesEmbed(trRes.rows, colLabel)],
+          components: rolesRow(trRes.rows, valColId || undefined),
         });
       }
     }
@@ -1975,9 +2020,10 @@ Step 2 of 3 — Pick the trait category:`,
     const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
       placeholder: 'Pick one or more values...',
       cancelId,
+      countButton: true,
     });
     return interaction.editReply({
-      content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${truncatedNote}\n\nPick from as many of the menus below as you want, then Done — you'll be asked how many are needed next.`,
+      content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${truncatedNote}\n\nPick from as many of the menus below as you want, then Done to finish (defaults to needing 1), or Set Count first if you want a different minimum.`,
       embeds: [],
       components: rows,
     });
