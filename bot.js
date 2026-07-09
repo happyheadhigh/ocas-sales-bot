@@ -304,6 +304,31 @@ async function syncTraitRoles(guild, discordId, wallet){
     const member = await guild.members.fetch(discordId).catch(()=>null);
     if(!member) return { assigned: [], skipped: [], alreadyHad: [] };
 
+    // Burn-based rules (_totalburns/_maxburn) aren't tied to any one
+    // collection's ownership data the way trait/count rules are -- compute
+    // once per wallet, only if some rule here actually needs it, rather
+    // than inside the per-collection loop below.
+    let burnStats = null;
+    const needsBurnStats = traitRolesRes.rows.some(tr => tr.trait_type === '_totalburns' || tr.trait_type === '_maxburn');
+    if(needsBurnStats){
+      try{
+        const burnRes = await pgPool.query(
+          `SELECT bei.burn_event_id, COUNT(*)::int AS tokens_in_event
+           FROM burn_event_inputs bei
+           JOIN burn_events be ON be.id = bei.burn_event_id
+           WHERE LOWER(be.burner_wallet) = LOWER($1)
+           GROUP BY bei.burn_event_id`,
+          [wallet]
+        );
+        let total = 0, max = 0;
+        for(const r of burnRes.rows){ total += r.tokens_in_event; if(r.tokens_in_event > max) max = r.tokens_in_event; }
+        burnStats = { total, max };
+      }catch(e){
+        console.warn('[TraitSync] burn stats query failed:', e.message);
+        burnStats = { total: 0, max: 0 };
+      }
+    }
+
     const rolesSummary = { assigned: [], skipped: [], alreadyHad: [] };
     let totalOwnedAcrossCollections = 0;
 
@@ -350,6 +375,10 @@ async function syncTraitRoles(guild, discordId, wallet){
         let count;
         if(tr.trait_type === '_count'){
           count = ownedTokenIds.length;
+        } else if(tr.trait_type === '_totalburns'){
+          count = burnStats?.total || 0;
+        } else if(tr.trait_type === '_maxburn'){
+          count = burnStats?.max || 0;
         } else {
           count = traitCounts[tr.trait_type+'::'+tr.trait_value] || traitCounts[tr.trait_type+'::'+String(tr.trait_value||'')] || 0;
         }

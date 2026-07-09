@@ -327,14 +327,18 @@ function rankAlertRow(col, colId){
 
 
 // ── Roles screen ──────────────────────────────────────────────────────────────
+function traitRuleLabel(r){
+  if(r.trait_type === '_count') return `Own ${r.minimum_count}+ tokens`;
+  if(r.trait_type === '_totalburns') return `Fed ${r.minimum_count}+ tokens into burns, total`;
+  if(r.trait_type === '_maxburn') return `${r.minimum_count}+ tokens in a single burn`;
+  return `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`;
+}
+
 function buildRolesEmbed(traitRoles, collectionLabel){
   const list = traitRoles.length === 0
     ? '*No trait roles configured yet.*'
     : traitRoles.map((r, i) =>
-        `**${i+1}.** ${r.role_id ? `<@&${r.role_id}>` : 'Unknown Role'} — ` +
-        (r.trait_type === '_count'
-          ? `Own ${r.minimum_count}+ tokens`
-          : `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`)
+        `**${i+1}.** ${r.role_id ? `<@&${r.role_id}>` : 'Unknown Role'} — ${traitRuleLabel(r)}`
       ).join('\n');
 
   return new EmbedBuilder()
@@ -361,7 +365,7 @@ function rolesRow(traitRoles, colId){
   if(traitRoles.length > 0){
     const options = traitRoles.slice(0, 25).map((r, i) =>
       new StringSelectMenuOptionBuilder()
-        .setLabel(`${i+1}. ${r.trait_type === '_count' ? `Own ${r.minimum_count}+ tokens` : `${r.trait_type}: ${r.trait_value || 'any'}`}`)
+        .setLabel(`${i+1}. ${traitRuleLabel(r)}`)
         .setDescription(`Role: ${r.role_id ? `<@&${r.role_id}>` : 'Unknown'}`)
         .setValue(`${r.id}`)
     );
@@ -1762,9 +1766,9 @@ async function handleConfigButton(interaction, ctx){
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category  (use "_count" for token count)')
+          .setLabel('Trait Category (or _count/_totalburns/_maxburn)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Type   or   Background   or   _count')
+          .setPlaceholder('e.g. Type, _count, _totalburns, or _maxburn')
           .setRequired(true)
       ),
       new ActionRowBuilder().addComponents(
@@ -1828,13 +1832,18 @@ async function handleConfigButton(interaction, ctx){
     }
 
     // Build category dropdown(s) -- stacked if more than fit in one menu.
-    // Token count option always goes first, on menu 0 only.
+    // Special options (Token Count + burn-based, when this is OCAS) always
+    // go first, on menu 0 only. Burns are inherently OCAS-only (this bot's
+    // burn tracking never applied to any other collection), so those two
+    // options only show up when configuring the OCAS collection specifically.
+    const isOcasSlug = slug === OCAS_SLUG;
+    const specialCount = isOcasSlug ? 3 : 1;
     const CAT_CHUNK = 25;
-    const catMenuCount = Math.min(4, Math.ceil((categories.length + 1) / CAT_CHUNK));
+    const catMenuCount = Math.min(4, Math.ceil((categories.length + specialCount) / CAT_CHUNK));
     const catRows = [];
     for(let i = 0; i < catMenuCount; i++){
-      const startIdx = i === 0 ? 0 : i * CAT_CHUNK - 1; // account for the extra _count option on menu 0
-      const roomLeft = i === 0 ? CAT_CHUNK - 1 : CAT_CHUNK;
+      const startIdx = i === 0 ? 0 : i * CAT_CHUNK - specialCount;
+      const roomLeft = i === 0 ? CAT_CHUNK - specialCount : CAT_CHUNK;
       const slice = categories.slice(startIdx, startIdx + roomLeft);
       if(!slice.length && i > 0) break;
       const opts = slice.map(c => new StringSelectMenuOptionBuilder().setLabel(c).setValue(c));
@@ -1844,6 +1853,18 @@ async function handleConfigButton(interaction, ctx){
           .setValue('_count')
           .setDescription('Assign role based on how many tokens the user holds')
         );
+        if(isOcasSlug){
+          opts.unshift(new StringSelectMenuOptionBuilder()
+            .setLabel('🔥 Total Burns (fed N+ tokens total, ever)')
+            .setValue('_totalburns')
+            .setDescription('Cumulative tokens fed into burns across this wallet\'s whole history')
+          );
+          opts.unshift(new StringSelectMenuOptionBuilder()
+            .setLabel('💥 Biggest Single Burn (N+ tokens at once)')
+            .setValue('_maxburn')
+            .setDescription('Largest number of tokens fed into any ONE burn transaction')
+          );
+        }
       }
       // Fixed-position placeholder ('_' for "no collection id") rather than
       // conditionally omitting the segment -- appending a chunk index after
@@ -1877,14 +1898,19 @@ Step 2 of 3 — Pick the trait category:`,
     const cancelId = catColId ? `cfg:col:traitroles:${catColId}` : 'cfg:cat:roles';
     const suffix = catColId ? `:${catColId}` : '';
 
-    // Token count shortcut — already deferred, so show a button that opens the modal next click
-    if(category === '_count'){
+    // Token count / burn-based shortcuts — already deferred, so show a button that opens the modal next click
+    if(category === '_count' || category === '_totalburns' || category === '_maxburn'){
+      const labels = {
+        _count: ['Token Count Rule', 'Set Token Count', 'the minimum token count'],
+        _totalburns: ['Total Burns Rule', 'Set Total Burns', 'the minimum total tokens fed into burns, ever'],
+        _maxburn: ['Biggest Single Burn Rule', 'Set Burn Size', 'the minimum tokens in any ONE burn transaction'],
+      }[category];
       return interaction.editReply({
-        content: `**Token Count Rule**\n\nClick below to set the minimum token count for this role.`,
+        content: `**${labels[0]}**\n\nClick below to set ${labels[2]} for this role.`,
         embeds: [],
         components: [
           new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}${suffix}`).setLabel('✏️ Set Token Count').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}${suffix}`).setLabel(`✏️ ${labels[1]}`).setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
           ),
         ],
