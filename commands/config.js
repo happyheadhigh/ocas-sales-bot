@@ -11,7 +11,7 @@ const {
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
 const { isPaidFeature } = require('./market');
-const { buildRolePickerRows, parseRolePagerCustomId } = require('../lib/role-picker');
+const { buildRolePickerRows } = require('../lib/role-picker');
 const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
 
 // ── Access control ────────────────────────────────────────────────────────────
@@ -1530,7 +1530,7 @@ async function handleConfigButton(interaction, ctx){
   }
 
   if(customId === 'cfg:access:set'){
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:botmanager', 0, 'cfg:cat:access', 'Pick the Bot Manager role');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:botmanager', 'cfg:cat:access', 'Pick the Bot Manager role');
     return interaction.editReply({ content:'**Select the role that should be able to use `/config`** (in addition to Manage Server admins):'+pageLabel, embeds:[], components: rows });
   }
 
@@ -1692,11 +1692,11 @@ async function handleConfigButton(interaction, ctx){
     ]});
   }
   if(customId === 'cfg:ver:role'){
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:verify', 0, 'cfg:cat:verification', 'Pick the ✅ Verified Wallet role');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:verify', 'cfg:cat:verification', 'Pick the ✅ Verified Wallet role');
     return interaction.editReply({ content:'**Select the ✅ Verified Wallet role:**'+pageLabel, embeds:[], components: rows });
   }
   if(customId === 'cfg:ver:holder'){
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:holder', 0, 'cfg:cat:verification', 'Pick the 🏆 Holder role');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:holder', 'cfg:cat:verification', 'Pick the 🏆 Holder role');
     return interaction.editReply({ content:'**Select the 🏆 Holder role:**'+pageLabel, embeds:[], components: rows });
   }
   if(customId === 'cfg:ver:deploy'){
@@ -1743,19 +1743,12 @@ async function handleConfigButton(interaction, ctx){
     const addColId = customId.startsWith('cfg:role:add:') ? customId.split(':')[3] : '';
     const targetId = addColId ? `cfg_traitrole:rolesel:${addColId}` : 'cfg_traitrole:rolesel';
     const cancelId = addColId ? `cfg:col:traitroles:${addColId}` : 'cfg:cat:roles';
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, targetId, 0, cancelId, 'Pick a role to assign...');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, targetId, cancelId, 'Pick a role to assign...');
     return interaction.editReply({
       content: '**Step 1 of 3 — Pick the Discord role to assign:**'+pageLabel,
       embeds: [],
       components: rows,
     });
-  }
-
-  // ── role picker: page navigation ─────────────────────────────────────────
-  if(customId.startsWith('rolepg:')){
-    const parsed = parseRolePagerCustomId(customId);
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, parsed.targetCustomId, parsed.page, parsed.cancelId, 'Pick a role...');
-    return interaction.editReply({ content:'**Select a role:**'+pageLabel, embeds:[], components: rows });
   }
 
   if(customId.startsWith('cfg_traitrole:manual:')){

@@ -729,18 +729,6 @@ client.on('interactionCreate', async (interaction)=>{
     const setupCtx = { pgPool, setConfig };
     return handleSetupButton(interaction, setupCtx);
   }
-  // Role-picker page navigation buttons (setup or config wizard — routed by prefix)
-  if(interaction.isButton() && interaction.customId.startsWith('rolepg:')){
-    const target = interaction.customId.slice('rolepg:'.length);
-    if(target.startsWith('setup_')){
-      const setupCtx = { pgPool, setConfig };
-      return handleSetupButton(interaction, setupCtx);
-    }
-    if(target.startsWith('cfg_')){
-      const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
-      return handleConfigButton(interaction, cfgCtx);
-    }
-  }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_traitrole:')){
     const setupCtx = { pgPool, setConfig };
     return handleSetupButton(interaction, setupCtx);
