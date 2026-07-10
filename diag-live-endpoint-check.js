@@ -15,6 +15,9 @@
 
 require('dotenv').config();
 const fetch = require('node-fetch');
+const crypto = require('crypto');
+
+function hash(s) { return s ? crypto.createHash('sha256').update(s).digest('hex').slice(0, 16) : null; }
 
 const address = (process.argv[2] || '').trim();
 if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
@@ -49,10 +52,27 @@ async function main() {
   console.log('\n=== input_snapshots keys touching token 901 or event 146 ===');
   const relevant = Object.entries(data.input_snapshots || {}).filter(([k]) => k.includes(':901') || k.startsWith('146:'));
   for (const [k, v] of relevant) {
-    console.log(`  "${k}": ${v ? `<image, length ${v.length}>` : 'null'}`);
+    console.log(`  "${k}": hash=${hash(v)}  length=${v ? v.length : 0}`);
   }
   if (!relevant.length) {
     console.log('  (no matching keys found at all -- neither "146:*" nor "*:901" exists in input_snapshots)');
+  }
+
+  console.log('\n=== Direct comparison ===');
+  const survivorHash = hash(event146.survivorSnapshotImage);
+  const burnedRowHash = hash((data.input_snapshots || {})['146:901']);
+  console.log(`  Event 146 survivor image (#901, current card's survivor row): ${survivorHash}`);
+  console.log(`  Event 146 input_snapshots["146:901"] (the Burned row's #901):  ${burnedRowHash}`);
+  if (survivorHash && survivorHash === burnedRowHash) {
+    console.log('\n  MATCH: the API itself is returning the identical image for both the');
+    console.log('  survivor slot and the burned slot -- this IS the actual bug, and it\'s in the');
+    console.log('  backend response, not the frontend. Since #901\'s mint-time snapshot is');
+    console.log('  confirmed to genuinely differ from this, something is resolving to the wrong');
+    console.log('  value here despite the fallback data being available and correct.');
+  } else {
+    console.log('\n  DIFFERENT: the API is returning two genuinely different images for these');
+    console.log('  two slots. If the page is still showing the same look for both, the bug is');
+    console.log('  in the frontend, not this endpoint.');
   }
 }
 
