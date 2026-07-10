@@ -329,7 +329,7 @@ function rankAlertRow(col, colId){
 // ── Roles screen ──────────────────────────────────────────────────────────────
 function traitRuleLabel(r){
   if(r.trait_type === '_count') return `Own ${r.minimum_count}+ tokens`;
-  if(r.trait_type === '_totalburns') return `Fed ${r.minimum_count}+ tokens into burns, total`;
+  if(r.trait_type === '_totalburns') return `${r.minimum_count}+ burn transactions, ever`;
   if(r.trait_type === '_maxburn') return `${r.minimum_count}+ tokens in a single burn`;
   return `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`;
 }
@@ -1840,7 +1840,7 @@ async function handleConfigButton(interaction, ctx){
     const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     const fieldLabels = {
       _count:      'Minimum tokens owned (default: 1)',
-      _totalburns: 'Minimum total tokens burned (default: 1)',
+      _totalburns: 'Minimum burn transactions (default: 1)',
       _maxburn:    'Minimum tokens in one burn (default: 1)',
     };
     const modal = new ModalBuilder()
@@ -1926,7 +1926,7 @@ async function handleConfigButton(interaction, ctx){
           opts.unshift(new StringSelectMenuOptionBuilder()
             .setLabel('🔥 Total Burns')
             .setValue('_totalburns')
-            .setDescription('Cumulative tokens fed into burns across this wallet\'s whole history')
+            .setDescription('Number of separate burn transactions this wallet has ever participated in')
           );
           opts.unshift(new StringSelectMenuOptionBuilder()
             .setLabel('💥 Biggest Single Burn')
@@ -1971,7 +1971,7 @@ Step 2 of 3 — Pick the trait category:`,
     if(category === '_count' || category === '_totalburns' || category === '_maxburn'){
       const labels = {
         _count: ['Token Count Rule', 'Set Token Count', 'the minimum token count'],
-        _totalburns: ['Total Burns Rule', 'Set Total Burns', 'the minimum total tokens fed into burns, ever'],
+        _totalburns: ['Total Burns Rule', 'Set Total Burns', 'the minimum number of burn transactions this wallet has ever done'],
         _maxburn: ['Biggest Single Burn Rule', 'Set Burn Size', 'the minimum tokens in any ONE burn transaction'],
       }[category];
       return interaction.editReply({

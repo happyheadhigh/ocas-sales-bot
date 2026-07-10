@@ -320,8 +320,15 @@ async function syncTraitRoles(guild, discordId, wallet){
            GROUP BY bei.burn_event_id`,
           [wallet]
         );
-        let total = 0, max = 0;
-        for(const r of burnRes.rows){ total += r.tokens_in_event; if(r.tokens_in_event > max) max = r.tokens_in_event; }
+        let max = 0;
+        for(const r of burnRes.rows){ if(r.tokens_in_event > max) max = r.tokens_in_event; }
+        // Each row is already one distinct burn_event_id (GROUP BY above),
+        // so row count IS the number of burn events this wallet has ever
+        // participated in -- not the sum of tokens across all of them,
+        // which is a different, easily-confused metric (a wallet could
+        // participate in 3 events with 2 tokens each: that's "3 burns", not
+        // "6 tokens burned total").
+        const total = burnRes.rows.length;
         burnStats = { total, max };
       }catch(e){
         console.warn('[TraitSync] burn stats query failed:', e.message);
