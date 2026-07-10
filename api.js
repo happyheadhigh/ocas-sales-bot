@@ -1172,12 +1172,32 @@ async function fetchInputSnapshots(tokenIds) {
   const ids = burnIdArray(tokenIds);
   if (!ids.length) return {};
   try {
-    const result = await pool.query(
-      `SELECT token_id, image_data FROM token_image_snapshots WHERE token_id = ANY($1::int[]) AND image_data IS NOT NULL`,
-      [ids]
-    );
+    // token_image_snapshots is normally the correct bulk-archived pre-burn
+    // state for the original 10,000 tokens, but its rows can get
+    // overwritten by the burn-poller's own "burn-start-input" write path
+    // (source column confirms this) for tokens that are simultaneously an
+    // input AND the resulting survivor of the same burn transaction --
+    // that write captures "state at the moment of being fed in", not the
+    // true original mint state, and for a self-referential burn those two
+    // moments coincide, silently corrupting what should be a fixed
+    // historical record. token_original_snapshots doesn't have this
+    // problem (populated via a real backfill, not live burn processing),
+    // so prefer it wherever it has a row, falling back to
+    // token_image_snapshots only where it doesn't -- can only improve
+    // accuracy, never lose data that was already being shown.
+    const [originalRes, imageRes] = await Promise.all([
+      pool.query(
+        `SELECT token_id, image_data FROM token_original_snapshots WHERE token_id = ANY($1::int[]) AND image_data IS NOT NULL`,
+        [ids]
+      ),
+      pool.query(
+        `SELECT token_id, image_data FROM token_image_snapshots WHERE token_id = ANY($1::int[]) AND image_data IS NOT NULL`,
+        [ids]
+      ),
+    ]);
     const map = {};
-    for (const r of result.rows) map[String(r.token_id)] = r.image_data;
+    for (const r of imageRes.rows) map[String(r.token_id)] = r.image_data; // fallback layer first
+    for (const r of originalRes.rows) map[String(r.token_id)] = r.image_data; // preferred layer overwrites it where present
     return map;
   } catch (e) {
     console.warn('[fetchInputSnapshots]', e.message);
