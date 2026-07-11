@@ -2017,6 +2017,25 @@ app.get('/db/burn-best', auth, async (req, res) => {
       LIMIT 10
     `);
 
+    const topPoints = await pool.query(`
+      SELECT be.id AS burn_event_id, be.tx_hash, be.log_index, be.block_number, be.burner_wallet,
+             be.survivor_token_id, be.burned_at, be.points_used, bs.image_data AS snapshot_image,
+             COALESCE(
+               array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
+                 FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id),
+               '{}'
+             ) AS input_token_ids,
+             (COUNT(DISTINCT bei.burned_token_id)
+               FILTER (WHERE bei.burned_token_id IS NOT NULL AND bei.burned_token_id != be.survivor_token_id))::int AS input_count
+      FROM burn_events be
+      LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+      LEFT JOIN burn_state_snapshots bs ON bs.burn_event_id = be.id AND bs.token_id = be.survivor_token_id
+      WHERE be.points_used IS NOT NULL
+      GROUP BY be.id, bs.image_data
+      ORDER BY be.points_used DESC, be.burned_at DESC NULLS LAST, be.block_number DESC NULLS LAST
+      LIMIT 10
+    `);
+
     let rarestBurnedInputs = [];
     let bestCreatedTokens = [];
     try {
@@ -2086,15 +2105,17 @@ app.get('/db/burn-best', auth, async (req, res) => {
     }
 
     const biggestBurns = biggest.rows.map(burnEventJson);
-    // Same reasoning as /db/burn-latest — biggest_burns' input galleries show
+    const topPointsBurns = topPoints.rows.map(burnEventJson);
+    // Same reasoning as /db/burn-latest — these input galleries show
     // destroyed tokens, so they need pre-burn snapshots, not a current lookup.
-    const allInputIds = biggestBurns.flatMap(b => b.input_token_ids);
+    const allInputIds = [...biggestBurns, ...topPointsBurns].flatMap(b => b.input_token_ids);
     const inputSnapshots = await fetchInputSnapshots(allInputIds);
 
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
     res.json({
       ok: true,
       biggest_burns: biggestBurns,
+      top_points_burns: topPointsBurns,
       input_snapshots: inputSnapshots,
       rarest_burned_inputs: rarestBurnedInputs,
       best_created_tokens: bestCreatedTokens,
