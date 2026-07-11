@@ -24,7 +24,7 @@ async function checkTable(tableName) {
       i.relname AS index_name,
       ix.indisunique AS is_unique,
       ix.indisprimary AS is_primary,
-      array_agg(a.attname ORDER BY array_position(ix.indkey, a.attnum)) AS columns
+      array_agg(a.attname::text ORDER BY array_position(ix.indkey, a.attnum)) AS columns
     FROM pg_class t
     JOIN pg_index ix ON t.oid = ix.indrelid
     JOIN pg_class i ON i.oid = ix.indexrelid
