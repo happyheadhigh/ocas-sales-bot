@@ -1,3091 +1,204 @@
 /**
- * NFT Sales + Listings Bot — Multi-Server Public Edition
- * ─────────────────────────────────────────────────────────────
- * Posts NFT sales AND listings to separate channels.
- * Supports personal DM alerts per user with their own filters.
- *
- * SERVER ADMIN COMMANDS (Manage Server required):
- *   /setup         — Configure sales channel + collection
- *   /setlistings   — Set the listings channel
- *   /setchannel    — Change sales channel
- *   /setcollection — Change collection
- *   /salesfilter   — Filter auto-posted sales by trait
- *   /listingfilter — Filter auto-posted listings by trait
- *   /clearfilters  — Clear all server-level filters
- *   /pause /resume — Pause/resume all auto-posts
- *   /status        — Show server config
- *
- * PUBLIC COMMANDS (anyone):
- *   /lastsale            — Most recent sale
- *   /recentsales         — Last N sales
- *   /sale token:1234     — Specific token's last sale
- *   /traitfind           — Search tokens/listings/sales by trait
- *   /listings            — Show current active listings
- *   /myalert             — Set personal DM alert (sales + listings)
- *   /myalertclear        — Remove your personal DM alert
- *   /myalertstatus       — See your current alert settings
- *   /help
- *   /rankfilter       — Show listed tokens by OS/TraitView rank range
- *
- * SERVER ADMIN COMMANDS (continued):
- *   /setrankalert     — Alert when a top-rank token gets listed
- *   /clearrankalert   — Remove rank alert
+ * NFT Sales + Listings Bot — Modular Edition
+ * Entry point — wires all modules together.
  */
 
 require('dotenv').config();
+
 const {
-  Client, GatewayIntentBits, REST, Routes,
+  Client, GatewayIntentBits,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   EmbedBuilder, AttachmentBuilder, PermissionFlagsBits, MessageFlags,
 } = require('discord.js');
 const fetch = require('node-fetch');
 const sharp = require('sharp');
-const fs    = require('fs');
-const path  = require('path');
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const OPENSEA_KEY   = process.env.OPENSEA_KEY || '';
-const POLL_MS       = parseInt(process.env.POLL_MS || '30000', 10);
-const SERVER_FILE   = path.join(__dirname, 'server-configs.json');
-const ALERTS_FILE   = path.join(__dirname, 'user-alerts.json');
-const ALCHEMY_KEY         = process.env.ALCHEMY_API_KEY || '';
-const ERROR_WEBHOOK_URL   = process.env.ERROR_WEBHOOK_URL || '';
+// ── Lib ───────────────────────────────────────────────────────────────────────
+const {
+  DISCORD_TOKEN, OPENSEA_KEY, ALCHEMY_KEY, API_SECRET,
+  COLORS, OCAS_CONTRACT, BURN_CONTRACT,
+  POLL_MS, RANK_SYNC_INTERVAL, BOT_ENV,
+  osHeaders, getRailwayApiUrl, getRankTierColor,
+  PENDING_DRAW_SEED_PREFIX, DEFAULT_LOTTERY_TIMEZONE,
+  OWNER_DISCORD_IDS,
+  } = require('./lib/constants');
 
+const {
+  pgPool, runMigrations, dbLoad, dbSave,
+  loadAllConfigs, getConfig, setConfig, getAllConfigs, getUserAlerts,
+} = require('./lib/db');
 
-// ── Brand colors ──────────────────────────────────────────────────────────────
-const COLORS = {
-  OCAS_BG:       0x4C6464,
-  OCAS_GREEN:    0x1CFFAF,
-  OPENSEA_BLUE:  0x0786FF,
-  RANK_TOP_100:  0xF59E0B,
-  RANK_TOP_1000: 0xC758FF,
-  WETH_ROSE:     0xF43F5E,
-};
+const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
 
-// ── Background OS rank sync ──────────────────────────────────────────────────
-// Never triggered by user commands — purely background.
-// rankSyncQueue: token IDs waiting for a delayed OS rank fetch after burn finalization.
-const rankSyncQueue = new Set();
-const RANK_SYNC_DELAY_MS  = 45_000;  // wait 45s after burn for OS to update their end
-const RANK_SYNC_BATCH     = 50;      // tokens per rolling hourly batch
-const RANK_SYNC_INTERVAL  = 3600_000 / RANK_SYNC_BATCH * 1000; // spread 50 checks over 1hr (~72s each)
+const {
+  getCachedImage, setCachedImage, clearCachedImage,
+  getCachedTraits, setCachedTraits, OCAS_TRAITS_CACHE_MAX,
+  sweepSessions, slideshowSessions,
+  recentChannelPosts, alertedEventIds, commandCooldowns,
+  checkCooldown, dedupeChannelPost, ocasTraitsCache, imageCache,
+} = require('./lib/cache');
 
-async function fetchAndStoreOsRank(tokenId){
-  const id = parseInt(tokenId);
-  if(!id) return;
-  try{
-    const r = await fetch(
-      `https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}`,
-      { headers: osHeaders() }
-    );
-    if(r.status === 429){ console.warn(`[RankSync] 429 on #${id} — will retry next cycle`); return; }
-    if(!r.ok) return;
-    const j = await r.json();
-    const rank = j?.nft?.rarity?.rank ? parseInt(j.nft.rarity.rank) : null;
-    if(!rank) return;
-    await pgPool.query('UPDATE tokens SET os_rank=$1 WHERE id=$2', [rank, id]).catch(()=>{});
-    console.log(`[RankSync] #${id} os_rank updated → ${rank}`);
-  }catch(e){
-    console.warn(`[RankSync] #${id} failed:`, e.message);
-  }
-}
+const { burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock, realTraitCount, burnBlockTimestampCache } = require('./lib/rpc');
+const { rollingRankSync, drainRankSyncQueue, queueRankSync, rankSyncQueue } = require('./lib/rank-sync');
 
-// Rolling background re-sync — checks one token every ~72 seconds, covering
-// all ~8,750 active tokens roughly once per week. Shrinks automatically as burns reduce supply.
-let _rankSyncCursor = 1;
-async function rollingRankSync(){
-  // Skip if a burn-queued rank sync is pending — let that run first
-  if(rankSyncQueue.size) return;
-  try{
-    const result = await pgPool.query(
-      `SELECT id FROM tokens WHERE id >= $1 AND id NOT IN (
-         SELECT DISTINCT burned_token_id FROM burn_event_inputs bei
-         JOIN burn_events be ON be.id = bei.burn_event_id
-         WHERE bei.burned_token_id != be.survivor_token_id
-       ) ORDER BY id ASC LIMIT 1`,
-      [_rankSyncCursor]
-    );
-    if(!result.rows.length){
-      _rankSyncCursor = 1; // wrap around
-      return;
-    }
-    const tokenId = result.rows[0].id;
-    _rankSyncCursor = tokenId + 1;
-    await fetchAndStoreOsRank(tokenId);
-  }catch(e){
-    console.warn('[RankSync] rolling sync error:', e.message);
-  }
-}
+const { BURN_COLORS, E1_TYPE_NAMES, normalizeOcasType, resolveOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji } = require('./lib/burn-constants');
+const {
+  burnConfig, loadBurnConfig, saveBurnConfig,
+  getBurnConfig, getConfiguredBurnChannelId,
+  checkCommandCooldown, fetchBotApiJson,
+  buildNavRow, postEmbeds,
+  getTraitIndex, chooseTraitGroupsFromQuery, normalizePhrase,
+  cachedFloors,
+} = require('./lib/burn-config');
 
-// Drain the burn-finalized rank queue (runs every 5s, only acts when queue has items)
-async function drainRankSyncQueue(){
-  if(!rankSyncQueue.size) return;
-  const id = rankSyncQueue.values().next().value;
-  rankSyncQueue.delete(id);
-  await fetchAndStoreOsRank(id);
-}
+const {
+  pollBurnEvents, processPendingBurnAlerts,
+  buildBurnEmbed, triggerOsMetadataRefresh,
+  setClient, traitDisplayLines, fetchTokenUriFromContract,
+  pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
+} = require('./lib/burn-poller');
 
-function getRankTierColor(osRank){
-  const n = Number(osRank);
-  if(!n || !Number.isFinite(n)) return null;
-  if(n >= 1 && n <= 100)  return COLORS.RANK_TOP_100;
-  if(n >= 101 && n <= 1000) return COLORS.RANK_TOP_1000;
-  return null;
-}
+const {
+  buildBurnLotteryEmbed, buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
+  buildGenericLotteryStartEmbed, buildGenericLotteryResultEmbed,
+  buildGenericLotteryComponents, getGenericLotteryEntryCount,
+  drawGenericLottery, processDueGenericLotteries,
+  getBurnLotteryEntries, drawAndPostBurnLottery, processDueBurnLotteries,
+  findActiveGenericLottery, lotteryNumberFromSeed,
+} = require('./lib/lottery-engine');
 
-// ── Burn Machine ──────────────────────────────────────────────────────────────
-const BURN_CONTRACT = '0x1095c73C337CC5e03f9E1D426c524CC3e32a50f6';
-const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
-const BURN_START_BLOCK = process.env.BURN_START_BLOCK ? parseInt(process.env.BURN_START_BLOCK, 10) : null;
-const BURN_BACKFILL_ALERTS = String(process.env.BURN_BACKFILL_ALERTS || 'false').toLowerCase() === 'true';
-const BURN_BLOCK_CHUNK = Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10)); // Alchemy free tier max 10 blocks per eth_getLogs
-const BURN_LAG_ALERT_BLOCKS = 50; // send webhook alert if burn poller falls more than N blocks behind
-let _lastLagAlertTs = 0; // debounce lag alerts — max one per 10 minutes
-const BURN_ALERT_CHANNEL_ID = process.env.BURN_ALERT_CHANNEL_ID || '';
-const BURN_METADATA_REFRESH_ENABLED = true; // always on — needed for correct post-burn traits in alert
-const BURN_COLORS = {
-  FIRE:        0xFF6B00, // default burn embed
-  RADIOACTIVE: 0x39FF14, // radioactive type
-  ZOMBIE:      0x7CFC00, // zombie type
-  SKELETON:    0xC0C0C0, // skeleton type
-  HUMAN:       0xFF6B00, // human type (same as fire)
-  ANGEL:       0xFFD700, // angel variant
-};
-// E_1_Type enum — confirmed from on-chain events and contract source
-// 0=Human, 1=Zombie, 2=Skeleton, 3=Radioactive (angel variants overlap)
-// E_1_Type enum — confirmed from contract source
-// 0-5=Human variants, 6=Zombie, 7=Ape, 8=Skeleton, 9=Alien, 10=Radioactive, 11=Demonic, Angel=isAngel flag
-const E1_TYPE_NAMES = { 0:'Human', 1:'Human', 2:'Human', 3:'Human', 4:'Human', 5:'Human', 6:'Zombie', 7:'Ape', 8:'Skeleton', 9:'Alien', 10:'Radioactive', 11:'Demonic' };
-function burnTypeLabel(bodyType, isAngel){
-  const base = E1_TYPE_NAMES[bodyType] || ('Type '+bodyType);
-  return isAngel ? base+' Angel' : base;
-}
-function burnTypeColor(bodyType, isAngel){
-  if(isAngel) return BURN_COLORS.ANGEL;
-  switch(Number(bodyType)){
-    case 3: return BURN_COLORS.RADIOACTIVE;
-    case 2: return BURN_COLORS.SKELETON;
-    case 1: return BURN_COLORS.ZOMBIE;
-    default: return BURN_COLORS.HUMAN;
-  }
-}
-function burnTypeEmoji(bodyType, isAngel){
-  if(isAngel) return '😇';
-  switch(Number(bodyType)){
-    case 3: return '☢️';
-    case 2: return '💀';
-    case 1: return '🧟';
-    default: return '🔥';
-  }
-}
-function normAddr(addr){
-  const s = String(addr || '').trim().toLowerCase();
-  return /^0x[a-f0-9]{40}$/.test(s) ? s : '';
-}
+const { fetchTokenMetaFromDb, upsertTokenTraitRows, buildSaleEmbed, buildListingEmbed,
+  traitObjectToArray, burnTypeBreakdown, fetchBurnDisplayTraits, fetchSnapshotImageForToken,
+  osRankBadge, titleTokenId, tokenMetaCache: embedsTokenMetaCache,
+} = require('./lib/embeds');
+const { resolveImage, sendEmbed, extractPngFromSvg, buildEmbedPayload, tokenMetaCache: imagesTokenMetaCache } = require('./lib/images');
 
-// ── Error reporting webhook ──────────────────────────────────────────────────────
-// Posts critical errors to a private Discord channel via webhook.
-// Set ERROR_WEBHOOK_URL in Railway env vars to enable.
-async function sendErrorWebhook(label, error, context = ''){
-  if(!ERROR_WEBHOOK_URL) return;
-  try{
-    const env = process.env.BOT_ENV || 'unknown';
-    const envTag = env === 'production' ? '🔴 PRODUCTION' : env === 'staging' ? '🟡 STAGING' : `⚪ ${env}`;
-    const msg = [
-      `🚨 **[${envTag}] ${label}**`,
-      `\`\`\`${String(error?.message || error).slice(0, 800)}\`\`\``,
-      context ? `**Context:** ${String(context).slice(0, 300)}` : '',
-      `**Time:** <t:${Math.floor(Date.now()/1000)}:f>`,
-    ].filter(Boolean).join('\n');
-    await fetch(ERROR_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: msg.slice(0, 2000), username: 'OCAS Bot Errors' }),
-    });
-  }catch(_){} // never let webhook errors break the bot
-}
+const {
+  pollSales, pollListings,
+  getAlert, setAlert, deleteAlert,
+  loadAllAlerts, loadSaleCursors, loadListingCursors,
+  saveSaleCursors, saveListingCursors,
+  setClient: setPollClient,
+  traitGroupsLabel, buildTokenSearchEmbed,
+  lastSaleIds, lastListingIds,
+} = require('./lib/poll');
 
-// ── Startup env var checks ────────────────────────────────────────────────────
-function checkStartupEnvVars(){
-  const required = [
-    ['DISCORD_TOKEN',    'Bot will not connect to Discord'],
-    ['DATABASE_URL',     'DB pool will fail — all features broken'],
-    ['ALCHEMY_API_KEY',  'Burn poller + lottery ETH seed disabled (set ALCHEMY_WEBSOCKET_URL as fallback)'],
-    ['OPENSEA_KEY',      'OpenSea API calls will hit rate limits quickly'],
-    ['API_SECRET',       'TraitView API auth disabled'],
-    ['RAILWAY_API_URL',  'Trait search, rank search, floor commands will not work'],
-  ];
-  for(const [key, impact] of required){
-    if(!process.env[key]){
-      console.warn(`[Startup] ⚠️  Missing env var ${key}: ${impact}`);
-    }
-  }
-  if(ERROR_WEBHOOK_URL){
-    console.log('[Startup] Error webhook: enabled');
-  } else {
-    console.warn('[Startup] ERROR_WEBHOOK_URL not set — errors will only appear in Railway logs');
-  }
-}
+// ── Utils ─────────────────────────────────────────────────────────────────────
+const {
+  normAddr, shortAddr, formatEth, formatListingEth,
+  timeSince, lotteryTime, formatBurnLotteryWindow,
+  isSvg, isDiscordOk, matchesFilters,
+} = require('./utils/format');
 
-// ── Railway Postgres pool (same DB as api.js) ─────────────────────────────────
-const { Pool } = require('pg');
-const pgPool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('railway.internal')
-    ? false
-    : { rejectUnauthorized: false },
-  max: 8,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
-pgPool.on('error', e => { console.error('[PG bot]', e.message); sendErrorWebhook('DB Pool Error', e); });
+const {
+  lotteryHash, lotteryPick, randomLotterySeed,
+  pendingDrawSeed, isPendingDrawSeed,
+  parseLotteryDate, normalizeLotteryTimezone, resolveLotteryWindow,
+  LOTTERY_DURATION_RE,
+} = require('./utils/lottery');
 
-// ── Create bot_state table if it doesn't exist ───────────────────────────────
-async function ensureBotStateTable(){
-  try{
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS bot_state (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    console.log('[DB] bot_state table ready');
-    // Burn events tables
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS burn_events (
-        id               SERIAL PRIMARY KEY,
-        tx_hash          TEXT NOT NULL,
-        block_number     BIGINT NOT NULL,
-        log_index        INT NOT NULL,
-        burner_wallet    TEXT NOT NULL,
-        survivor_token_id INT NOT NULL,
-        result_body_type  INT,
-        result_is_angel   BOOLEAN DEFAULT FALSE,
-        points_used       INT,
-        boost_chance      INT,
-        burn_seed         TEXT,
-        burned_at         TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    await pgPool.query(`ALTER TABLE burn_events DROP CONSTRAINT IF EXISTS burn_events_tx_hash_key`);
-    await pgPool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS burn_events_tx_log_idx ON burn_events(tx_hash, log_index)
-    `);
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS burn_event_inputs (
-        id              SERIAL PRIMARY KEY,
-        burn_event_id   INT NOT NULL REFERENCES burn_events(id) ON DELETE CASCADE,
-        burned_token_id INT NOT NULL
-      )
-    `);
-    await pgPool.query(`
-      DELETE FROM burn_event_inputs a
-      USING burn_event_inputs b
-      WHERE a.id > b.id
-        AND a.burn_event_id = b.burn_event_id
-        AND a.burned_token_id = b.burned_token_id
-    `);
-    await pgPool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS burn_event_inputs_event_token_idx
-      ON burn_event_inputs(burn_event_id, burned_token_id)
-    `);
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS burn_started_events (
-        id                SERIAL PRIMARY KEY,
-        tx_hash           TEXT NOT NULL,
-        block_number      BIGINT NOT NULL,
-        log_index         INT NOT NULL,
-        owner_wallet      TEXT NOT NULL,
-        survivor_token_id INT NOT NULL,
-        points_used       INT,
-        result_body_type  INT,
-        result_is_angel   BOOLEAN DEFAULT FALSE,
-        boost_chance      INT,
-        reveal_block      BIGINT,
-        selection_hash    TEXT,
-        started_at        TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    await pgPool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS burn_started_tx_log_idx ON burn_started_events(tx_hash, log_index)
-    `);
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS burn_started_survivor_idx ON burn_started_events(survivor_token_id)
-    `);
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS burn_started_inputs (
-        id              SERIAL PRIMARY KEY,
-        burn_started_id INT NOT NULL REFERENCES burn_started_events(id) ON DELETE CASCADE,
-        burned_token_id INT NOT NULL
-      )
-    `);
-    await pgPool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS burn_started_inputs_event_token_idx
-      ON burn_started_inputs(burn_started_id, burned_token_id)
-    `);
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS burn_events_burner_idx ON burn_events(burner_wallet)
-    `);
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS burn_events_survivor_idx ON burn_events(survivor_token_id)
-    `);
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS burn_inputs_token_idx ON burn_event_inputs(burned_token_id)
-    `);
-    // Index for trait lookups — prevents full table scan on traitfind/rankfind
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS burn_alert_posts (
-        id           SERIAL PRIMARY KEY,
-        tx_hash      TEXT NOT NULL,
-        log_index    INT NOT NULL,
-        guild_id     TEXT,
-        channel_id   TEXT NOT NULL,
-        posted_at    TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    await pgPool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS burn_alert_posts_tx_log_channel_idx
-      ON burn_alert_posts(tx_hash, log_index, channel_id)
-    `);
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS token_traits (
-        id          SERIAL PRIMARY KEY,
-        token_id    INT NOT NULL,
-        trait_name  TEXT NOT NULL,
-        trait_value TEXT NOT NULL,
-        trait_index INT DEFAULT 0
-      )
-    `);
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS token_traits_token_id_idx ON token_traits(token_id)
-    `).catch(()=>{});
-    await pgPool.query(`ALTER TABLE token_traits ADD COLUMN IF NOT EXISTS trait_index INT DEFAULT 0`).catch(()=>{});
-    await pgPool.query(`ALTER TABLE token_traits DROP CONSTRAINT IF EXISTS token_traits_token_id_trait_name_key`).catch(()=>{});
-    await pgPool.query(`DROP INDEX IF EXISTS token_traits_token_id_trait_name_key`).catch(()=>{});
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS token_traits_token_id_trait_index_idx ON token_traits(token_id, trait_index)
-    `).catch(()=>{});
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS token_traits_name_value_idx ON token_traits(LOWER(trait_name), LOWER(trait_value))
-    `).catch(()=>{});
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS token_image_snapshots (
-        token_id    INT PRIMARY KEY,
-        image_data  TEXT,
-        traits_json JSONB,
-        source      TEXT,
-        updated_at  TIMESTAMPTZ DEFAULT NOW()
-      )
-    `).catch(()=>{});
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS token_original_snapshots (
-        token_id   INT PRIMARY KEY,
-        image_data TEXT,
-        traits_json JSONB,
-        source     TEXT DEFAULT 'traitview-original-archive',
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `).catch(()=>{});
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS token_original_snapshots_updated_idx
-      ON token_original_snapshots(updated_at)
-    `).catch(()=>{});
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS burn_state_snapshots (
-        id            SERIAL PRIMARY KEY,
-        burn_event_id INT NOT NULL,
-        token_id      INT NOT NULL,
-        image_data    TEXT,
-        traits_json   JSONB,
-        created_at    TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(burn_event_id, token_id)
-      )
-    `).catch(()=>{});
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS burn_state_snapshots_token_idx ON burn_state_snapshots(token_id)
-    `).catch(()=>{});
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS burn_state_snapshots_event_idx ON burn_state_snapshots(burn_event_id)
-    `).catch(()=>{});
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS burn_lotteries (
-        id SERIAL PRIMARY KEY,
-        guild_id TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
-        created_by TEXT,
-        title TEXT,
-        prize TEXT,
-        mode TEXT NOT NULL DEFAULT 'wallet',
-        start_time TIMESTAMPTZ NOT NULL,
-        end_time TIMESTAMPTZ NOT NULL,
-        seed TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'active',
-        winner_wallet TEXT,
-        qualified_wallets INT DEFAULT 0,
-        total_burns INT DEFAULT 0,
-        result_json JSONB,
-        timezone TEXT DEFAULT 'Europe/London',
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        completed_at TIMESTAMPTZ
-      )
-    `).catch(()=>{});
-    await pgPool.query(`ALTER TABLE burn_lotteries ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'Europe/London'`).catch(()=>{});
-    await pgPool.query(`ALTER TABLE burn_lotteries ADD COLUMN IF NOT EXISTS message_id TEXT`).catch(()=>{});
-    await pgPool.query(`
-      CREATE INDEX IF NOT EXISTS burn_lotteries_status_end_idx ON burn_lotteries(status, end_time)
-    `).catch(()=>{});
-    await pgPool.query(`CREATE TABLE IF NOT EXISTS generic_lotteries (
-      id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT,
-      created_by TEXT, title TEXT, prize TEXT, type TEXT NOT NULL DEFAULT 'giveaway',
-      min_number INT, max_number INT, winner_mode TEXT DEFAULT 'random', winning_number INT,
-      start_time TIMESTAMPTZ NOT NULL, end_time TIMESTAMPTZ NOT NULL, seed TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'active', winner_user_id TEXT, winner_display TEXT, winner_guess INT,
-      entry_count INT DEFAULT 0, result_json JSONB, created_at TIMESTAMPTZ DEFAULT NOW(), completed_at TIMESTAMPTZ
-    )`).catch(()=>{});
-    await pgPool.query(`CREATE INDEX IF NOT EXISTS generic_lotteries_status_end_idx ON generic_lotteries(status, end_time)`).catch(()=>{});
-    await pgPool.query(`CREATE TABLE IF NOT EXISTS generic_lottery_entries (
-      id SERIAL PRIMARY KEY, lottery_id INT NOT NULL REFERENCES generic_lotteries(id) ON DELETE CASCADE,
-      user_id TEXT NOT NULL, username TEXT, guess_number INT, entered_at TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE(lottery_id, user_id)
-    )`).catch(()=>{});
-    await pgPool.query(`CREATE INDEX IF NOT EXISTS generic_lottery_entries_lottery_idx ON generic_lottery_entries(lottery_id)`).catch(()=>{});
-    console.log('[DB] burn tables ready');
-  }catch(e){ console.error('[DB] ensureBotStateTable error:', e.message); }
-}
+// ── Command modules ───────────────────────────────────────────────────────────
+const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick }   = require('./commands/market');
+const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
+const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
+const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
+const { handleBurnCommand, BURN_COMMANDS }       = require('./commands/burn');
+const { handleGiveawayCommand, handleGiveawayInteraction, GIVEAWAY_COMMANDS } = require('./commands/giveaway');
+const { handleMiscCommand, MISC_COMMANDS }       = require('./commands/misc');
+const { handleDownloadCommand, handleDownloadColPick, handleDownloadModalSubmit, DOWNLOAD_COMMANDS } = require('./commands/download');
+const { handleSetupCommand, handleSetupButton, handleSetupModal, SETUP_COMMANDS } = require('./commands/setup');
+const { handleConfigCommand, handleConfigButton, handleConfigModal, CONFIG_COMMANDS } = require('./commands/config');
+const { handleLotteriesCommand, handleLotteriesButton, LOTTERIES_COMMANDS } = require('./commands/lotteries');
 
-// ── Persistence helpers ───────────────────────────────────────────────────────
-function loadJson(file){ try{ return JSON.parse(fs.readFileSync(file,'utf8')); }catch{ return {}; } }
-function saveJson(file, data){ try{ fs.writeFileSync(file, JSON.stringify(data,null,2)); }catch{} }
+// ── Discord client ────────────────────────────────────────────────────────────
+const client = new Client({ intents: [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMembers,  // needed for guildMemberRemove and members.fetch()
+] });
+setClient(client); // inject into burn-poller
+setPollClient(client); // inject into poll
 
-async function dbLoad(key){
-  try{
-    const r = await pgPool.query('SELECT value FROM bot_state WHERE key=$1', [key]);
-    if(!r.rows.length) return null;
-    return JSON.parse(r.rows[0].value);
-  }catch(e){ console.warn('[DB] load error', key, e.message); return null; }
-}
-
-async function dbSave(key, value){
-  try{
-    await pgPool.query(
-      `INSERT INTO bot_state(key,value,updated_at) VALUES($1,$2,NOW())
-       ON CONFLICT(key) DO UPDATE SET value=$2, updated_at=NOW()`,
-      [key, JSON.stringify(value)]
-    );
-  }catch(e){ console.warn('[DB] save error', key, e.message); }
-}
-
-// Resolved once at startup — avoids re-reading env vars on every command invocation
-const RAILWAY_API_URL_CACHED = String(
-  process.env.RAILWAY_API_URL ||
-  process.env.TRAITVIEW_API_URL ||
-  process.env.RAILWAY_URL ||
-  process.env.API_URL ||
-  process.env.BOT_API_URL ||
-  ''
-).trim().replace(/\/+$/, '');
-
-function getRailwayApiUrl(){ return RAILWAY_API_URL_CACHED; }
-
-// ── Config helpers ────────────────────────────────────────────────────────────
-async function loadAllConfigs(){
-  // Try Railway Postgres first, then Supabase fallback, then local file
-  let db = await dbLoad('server_configs');
-  if(db){ serverConfigs = db; console.log('[Config] Loaded '+Object.keys(db).length+' server(s) from Railway DB'); return; }
-  // Supabase fallback — migrate data to Railway DB on first load
-  if(process.env.SUPABASE_URL && process.env.SUPABASE_KEY){
-    try{
-      const { createClient } = require('@supabase/supabase-js');
-      const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-      const {data} = await sb.from('bot_config').select('value').eq('key','server_configs').single();
-      if(data?.value){
-        const parsed = typeof data.value==='string' ? JSON.parse(data.value) : data.value;
-        serverConfigs = parsed;
-        await dbSave('server_configs', serverConfigs); // migrate to Railway DB
-        console.log('[Config] Migrated '+Object.keys(parsed).length+' server(s) from Supabase → Railway DB');
-        return;
-      }
-    }catch(e){ console.warn('[Config] Supabase fallback failed:', e.message); }
-  }
-  serverConfigs = loadJson(SERVER_FILE);
-  console.log('[Config] Loaded from local file ('+Object.keys(serverConfigs).length+' servers)');
-}
-
-async function saveAllConfigs(){
-  saveJson(SERVER_FILE, serverConfigs);
-  await dbSave('server_configs', serverConfigs);
-}
-
-async function loadAllAlerts(){
-  let db = await dbLoad('user_alerts');
-  if(db){ userAlerts = db; console.log('[Alerts] Loaded from Railway DB'); return; }
-  if(process.env.SUPABASE_URL && process.env.SUPABASE_KEY){
-    try{
-      const { createClient } = require('@supabase/supabase-js');
-      const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-      const {data} = await sb.from('bot_config').select('value').eq('key','user_alerts').single();
-      if(data?.value){
-        const parsed = typeof data.value==='string' ? JSON.parse(data.value) : data.value;
-        userAlerts = parsed;
-        await dbSave('user_alerts', userAlerts);
-        console.log('[Alerts] Migrated from Supabase → Railway DB');
-        return;
-      }
-    }catch(e){ console.warn('[Alerts] Supabase fallback failed:', e.message); }
-  }
-  userAlerts = loadJson(ALERTS_FILE);
-}
-
-async function saveAllAlerts(){
-  saveJson(ALERTS_FILE, userAlerts);
-  await dbSave('user_alerts', userAlerts);
-}
-
-// ── Sale cursor persistence — survives restarts ───────────────────────────────
-async function loadSaleCursors(){
-  const db = await dbLoad('sale_cursors');
-  if(db){ for(const [k,v] of Object.entries(db)) lastSaleIds.set(k,v); console.log('[Cursors] Loaded sale cursors from Railway DB'); }
-}
-async function loadListingCursors(){
-  const db = await dbLoad('listing_cursors');
-  if(db){ for(const [k,v] of Object.entries(db)) lastListingIds.set(k,v); console.log('[Cursors] Loaded listing cursors from Railway DB'); }
-}
-async function saveSaleCursors(){
-  await dbSave('sale_cursors', Object.fromEntries(lastSaleIds));
-}
-async function saveListingCursors(){
-  await dbSave('listing_cursors', Object.fromEntries(lastListingIds));
-}
-
-let serverConfigs = {}; // loaded from Supabase or local file on startup
-let userAlerts    = {}; // loaded from Supabase or local file on startup
-
-function getConfig(guildId){ return serverConfigs[guildId] || {}; }
-function setConfig(guildId, updates){ serverConfigs[guildId] = { ...getConfig(guildId), ...updates }; saveAllConfigs(); }
-function getAlert(userId){ return userAlerts[userId] || null; }
-function setAlert(userId, updates){ userAlerts[userId] = { ...(userAlerts[userId]||{}), ...updates }; saveAllAlerts(); }
-function deleteAlert(userId){ delete userAlerts[userId]; saveAllAlerts(); }
-
-// ── Cursors (not persisted) ───────────────────────────────────────────────────
-const lastSaleIds     = new Map(); // guildId → last sale id
-const lastListingIds  = new Map(); // guildId → last listing id
-const alertedEventIds = new Set(); // dedup personal DM alerts across multiple servers
-const recentChannelPosts = new Map(); // dedup: channelId+tokenId → timestamp, prevents double-posting
-// Rate limit for /burnrefresh: userId+tokenId → last used timestamp
-// One use per token per user per 5 minutes — prevents OS API spam
-const burnRefreshCooldowns = new Map();
-// Per-user rate limiting for heavy search commands (traitfind, rankfind, burn)
-// Prevents DB spam — 1 use per user per 8 seconds
-const commandCooldowns = new Map();
-const COMMAND_COOLDOWN_MS = 8000;
-function checkCommandCooldown(userId, command){
-  const key = `${userId}:${command}`;
-  const last = commandCooldowns.get(key);
-  if(last && Date.now() - last < COMMAND_COOLDOWN_MS){
-    const secsLeft = Math.ceil((COMMAND_COOLDOWN_MS - (Date.now() - last)) / 1000);
-    return secsLeft;
-  }
-  commandCooldowns.set(key, Date.now());
-  // Prune old entries every 2000 entries
-  if(commandCooldowns.size > 2000){
-    const cutoff = Date.now() - COMMAND_COOLDOWN_MS;
-    for(const [k,v] of commandCooldowns) if(v < cutoff) commandCooldowns.delete(k);
-  }
-  return 0;
-}
-function isRecentChannelPost(channelId, tokenId, windowMs=180000){
-  const key = channelId + ':' + tokenId;
-  const last = recentChannelPosts.get(key);
-  if(last && Date.now() - last < windowMs) return true;
-  recentChannelPosts.set(key, Date.now());
-  // Prune old entries every 500 posts
-  if(recentChannelPosts.size > 500){ const cutoff=Date.now()-windowMs; for(const [k,v] of recentChannelPosts) if(v<cutoff) recentChannelPosts.delete(k); }
-  return false;
-}
-const imageCache      = new Map(); // "contract:tokenId" → {result, ts}
-const IMAGE_CACHE_TTL = 60 * 60 * 1000; // 1 hour TTL
-
-const IMAGE_CACHE_MAX   = 2000; // max entries
-const IMAGE_CACHE_EVICT = 200;  // evict this many when full
-
-function getCachedImage(key){
-  const entry = imageCache.get(key);
-  if(!entry) return null;
-  if(Date.now() - entry.ts > IMAGE_CACHE_TTL){ imageCache.delete(key); return null; }
-  return entry.result;
-}
-function setCachedImage(key, result){
-  if(imageCache.size >= IMAGE_CACHE_MAX){
-    // Map preserves insertion order — first keys are oldest, no sort needed
-    let evicted = 0;
-    for(const k of imageCache.keys()){
-      imageCache.delete(k);
-      if(++evicted >= IMAGE_CACHE_EVICT) break;
-    }
-  }
-  imageCache.set(key, { result, ts: Date.now() });
-}
-
-// ── Slideshow sessions ────────────────────────────────────────────────────────
-// Stores paginated embed sessions keyed by message ID.
-// Each session: { embeds: [], index: 0, userId, expiresAt }
-const slideshowSessions = new Map();
-const ocasTraitsCache = new Map(); // tokenId → {traits, expires}
-const OCAS_TRAITS_CACHE_MAX = 1000;
-
-// ── Hoisted trait parser helpers (shared by /ocas and /sweep) ───────────────
-const sweepSessions = new Map(); // sessionId → { listings, page }
-
-// ── Burn machine config (stored per-guild via bot_state) ─────────────────────
-// burnConfig: guildId -> { burnAlertChannelId }.
-// Legacy { channelId } is still read for backwards compatibility.
-let burnConfig = {};
-async function loadBurnConfig(){
-  const db = await dbLoad('burn_config');
-  if(db){
-    burnConfig = db;
-    const configured = Object.entries(burnConfig || {})
-      .map(([guildId, cfg]) => `${guildId}:${getConfiguredBurnChannelId(cfg) || 'none'}`)
-      .join(', ');
-    console.log(`[Burn] Config loaded (${Object.keys(burnConfig || {}).length} guilds): ${configured || 'none'}`);
-  } else {
-    burnConfig = {};
-    console.log('[Burn] Config loaded (0 guilds): none');
-  }
-}
-async function saveBurnConfig(){
-  await dbSave('burn_config', burnConfig);
-}
-function getBurnConfig(guildId){ return burnConfig[guildId] || null; }
-function getConfiguredBurnChannelId(cfg){
-  return cfg?.burnAlertChannelId || cfg?.channelId || null;
-}
-
-function normalizePhrase(s){
-  return String(s||"").toLowerCase().replace(/&/g," and ").replace(/[^a-z0-9]+/g," ").replace(/\s+/g," ").trim();
-}
-
-async function getTraitIndex(RAILWAY_URL, API_SECRET){
-  const now = Date.now();
-  if(global.__ocasTraitIndexCache && now - global.__ocasTraitIndexCache.ts < 60*60*1000)
-    return global.__ocasTraitIndexCache.items;
-  if(!RAILWAY_URL) return [];
-  const qs = new URLSearchParams({ key: API_SECRET||"" });
-  const r = await fetch(`${RAILWAY_URL}/db/trait-index?${qs}`);
-  if(!r.ok) throw new Error(`trait-index API HTTP ${r.status}`);
-  const j = await r.json();
-  if(!j.ok) throw new Error(j.error||"trait-index API error");
-  const items = (j.traits||[])
-    .map(t => ({ trait_name:t.trait_name, trait_value:t.trait_value, token_count:Number(t.token_count||0), norm:normalizePhrase(t.trait_value) }))
-    .filter(t => t.norm)
-    .sort((a,b) => {
-      const aw=a.norm.split(" ").length, bw=b.norm.split(" ").length;
-      if(bw!==aw) return bw-aw;
-      if(b.norm.length!==a.norm.length) return b.norm.length-a.norm.length;
-      return (b.token_count||0)-(a.token_count||0);
-    });
-  global.__ocasTraitIndexCache = { ts:now, items };
-  return items;
-}
-
-function chooseTraitGroupsFromQuery(search, traitIndex){
-  let remaining = ` ${normalizePhrase(search)} `;
-  const groups=[], unmatched=[], seenNorms=new Set();
-  const byNorm = new Map();
-  for(const item of traitIndex){
-    if(!byNorm.has(item.norm)) byNorm.set(item.norm,[]);
-    byNorm.get(item.norm).push(item);
-  }
-  const phrases = [...byNorm.keys()].sort((a,b)=>{
-    const aw=a.split(" ").length, bw=b.split(" ").length;
-    if(bw!==aw) return bw-aw;
-    return b.length-a.length;
-  });
-  for(const phrase of phrases){
-    if(seenNorms.has(phrase)) continue;
-    const re = new RegExp(`(^|\\s)${phrase.replace(/[.*+?^${}()|[\\]\\]/g,"\\$&")}(?=\\s|$)`,"i");
-    if(re.test(remaining)){
-      const alts = byNorm.get(phrase).sort((a,b)=>(b.token_count||0)-(a.token_count||0)).map(x=>({trait_name:x.trait_name,trait_value:x.trait_value}));
-      groups.push(alts);
-      seenNorms.add(phrase);
-      remaining = remaining.replace(re," ").replace(/\s+/g," ");
-    }
-  }
-  let leftover = normalizePhrase(remaining).split(" ").filter(Boolean).filter(w=>!["and","with","plus"].includes(w));
-  for(const word of leftover.slice()){
-    if(word.length<3) continue;
-    const re = new RegExp(`(^|\\s)${word.replace(/[.*+?^${}()|[\\]\\]/g,"\\$&")}(?=\\s|$)`,"i");
-    const alts = traitIndex.filter(x=>re.test(x.norm)).slice(0,25);
-    if(alts.length && alts.length<=12){
-      groups.push(alts.map(x=>({trait_name:x.trait_name,trait_value:x.trait_value})));
-      leftover = leftover.filter(w=>w!==word);
-    }
-  }
-  unmatched.push(...leftover);
-  return { groups, unmatched };
-}
-
-function getSweepTokenId(item){
-  return item?.token_id ?? item?.id ?? item?.identifier ?? item?.tokenId ?? item?.tokenID ?? null;
-}
-
-function normalizeSweepListing(item){
-  const tokenId = getSweepTokenId(item);
-  return {
-    token_id: tokenId ? parseInt(tokenId) : null,
-    price_eth: item?.price_eth != null ? parseFloat(item.price_eth) : null,
-    url: item?.url || null,
-    os_rank: item?.os_rank ? parseInt(item.os_rank) : null,
-    obs_rank: item?.obs_rank ? parseInt(item.obs_rank) : null,
-    trait_count: item?.trait_count ? parseInt(item.trait_count) : null
-  };
-}
-
-function sweepTokenUrl(item){
-  const tokenId = getSweepTokenId(item);
-  const contract = '0x078be86f3104a32313a47815792230a3808642cc';
-  return tokenId ? ('https://opensea.io/assets/ethereum/' + contract + '/' + tokenId) : 'https://opensea.io/collection/on-chain-all-stars';
-}
-
-function formatSweepTokenLine(item){
-  const tokenId = getSweepTokenId(item);
-  const rank = item?.os_rank ? ('⬥' + Number(item.os_rank).toLocaleString()) : (item?.obs_rank ? ('⬥' + Number(item.obs_rank).toLocaleString()) : null);
-  const tokenLink = '[#' + tokenId + '](' + sweepTokenUrl(item) + ')';
-  const price = 'Ξ ' + parseFloat(item.price_eth).toFixed(4);
-  return [tokenLink, rank, price].filter(Boolean).join(' · ');
-}
-
-
-// Clean up expired sessions every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for(const [id, s] of slideshowSessions) {
-    if(s.expiresAt < now) slideshowSessions.delete(id);
-  }
-}, 5 * 60 * 1000);
-
-// Build navigation row
-function buildNavRow(index, total) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('slide_prev')
-      .setLabel('◀')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(index === 0),
-    new ButtonBuilder()
-      .setCustomId('slide_pos')
-      .setLabel(`${index + 1} / ${total}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(true),
-    new ButtonBuilder()
-      .setCustomId('slide_next')
-      .setLabel('▶')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(index === total - 1)
-  );
-}
-
-// Post a slideshow or individual embeds depending on count
-async function postEmbeds(interaction, embeds, headerText) {
-  if(embeds.length === 0) return;
-
-  if(embeds.length <= 5) {
-    // 5 or fewer — post all individually
-    await interaction.editReply(headerText);
-    for(const embed of embeds) {
-      if(!embed) continue;
-      await sendEmbed(interaction.channel, embed);
-      await new Promise(r => setTimeout(r, 600));
-    }
-  } else {
-    // 6+ — post first 5 individually, then a "Show More" button for the rest
-    await interaction.editReply(headerText);
-    const first5 = embeds.slice(0, 5);
-    const remaining = embeds.slice(5);
-
-    for(const embed of first5) {
-      if(!embed) continue;
-      await sendEmbed(interaction.channel, embed);
-      await new Promise(r => setTimeout(r, 600));
-    }
-
-    // Post "Show More" button for remaining results
-    const showMoreRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('show_more')
-        .setLabel(`Show More (${remaining.length} remaining)`)
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji('▶️')
-    );
-    const moreMsg = await interaction.channel.send({
-      content: `_${remaining.length} more result${remaining.length===1?'':'s'} — click to browse:_`,
-      components: [showMoreRow]
-    });
-
-    // Store remaining embeds as a slideshow session keyed to this message
-    slideshowSessions.set(moreMsg.id, {
-      embeds: remaining,
-      index: 0,
-      userId: interaction.user.id,
-      expiresAt: Date.now() + 15 * 60 * 1000,
-      isShowMore: true  // flag so we know to open slideshow on first click
-    });
-  }
-}
-
-// ── Sweep detection ───────────────────────────────────────────────────────────
-// Groups sales by buyer + tx hash within a poll batch.
-// When a group hits 5+ tokens, marks each sale with _isSweep=true and fires
-// a summary embed after the last sale in the sweep is posted.
-
-const cachedFloors = new Map(); // guildId → floor ETH at start of poll cycle
-
-async function fetchFloorEth(slug) {
-  try {
-    const r = await fetch(
-      `https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}/stats`,
-      { headers: osHeaders() }
-    );
-    if (!r.ok) return null;
-    const j = await r.json();
-    return j?.total?.floor_price ?? j?.stats?.floor_price ?? null;
-  } catch { return null; }
-}
-
-async function fireSweepAlert({ sales: sweepSales, config }, channel) {
-  const buyer = sweepSales[0].buyer || 'unknown';
-  const count = sweepSales.length;
-  const total = sweepSales.reduce((sum, s) => sum + (parseFloat(formatEth(s)) || 0), 0);
-  const avg   = total / count;
-
-  const fmt = n => (n != null && n > 0) ? (n >= 1 ? n.toFixed(3) : n.toFixed(4)) : '—';
-  const buyerLink = buyer !== 'unknown'
-    ? `[${shortAddr(buyer)}](https://opensea.io/${buyer})`
-    : 'unknown';
-
-  const embed = new EmbedBuilder()
-    .setTitle(`🧹 Sweep Alert`)
-    .setColor(0xf59e0b)
-    .addFields(
-      { name: 'Buyer',       value: buyerLink,           inline: true },
-      { name: 'Swept',       value: `${count} OCAS`,     inline: true },
-      { name: '​',      value: '​',             inline: true },
-      { name: 'Total Spent', value: `${fmt(total)} ETH`, inline: true },
-      { name: 'Avg Buy',     value: `${fmt(avg)} ETH`,   inline: true },
-    )
-    .setFooter({ text: `Sales Bot · ${config.slug}` })
-    .setTimestamp();
-
-  try {
-    await channel.send({ embeds: [embed] });
-    console.log(`[Sweep] ${count} tokens by ${shortAddr(buyer)} in ${config.slug}`);
-  } catch(e) {
-    console.error('[Sweep alert post]', e.message);
-  }
-}
-
-// ── Burn Machine poller ──────────────────────────────────────────────────────
-// Uses Alchemy JSON-RPC to poll for BurnFinalized + BurnStarted events.
-// BurnStarted: stores burned token IDs + owner (commit phase)
-// BurnFinalized: cross-references BurnStarted, posts embed (reveal phase)
-
-const BURN_STARTED_TOPIC   = '0x' + require('crypto').createHash('sha256').update('').digest('hex').slice(0,0)
-  || null; // computed at runtime below
-
-// Event topic signatures (keccak256 of event signature)
-// BurnStarted(address,uint256,uint256,uint256[],uint16,uint8,bool,uint8,uint64,bytes32)
-// BurnFinalized(uint256,uint256,uint256,uint16,uint8,bool,uint8)
-// We compute these inline using ethers-style manual topic matching via log.topics[0]
-const BURN_STARTED_SIG   = 'BurnStarted(address,uint256,uint256,uint256[],uint16,uint8,bool,uint8,uint64,bytes32)';
-const BURN_FINALIZED_SIG = 'BurnFinalized(uint256,uint256,uint256,uint16,uint8,bool,uint8)';
-
-// Correct keccak256 topic hashes — computed from actual event signatures
-// BurnStarted(address,uint256,uint256,uint256[],uint16,uint8,bool,uint8,uint64,bytes32)
-const TOPIC_BURN_STARTED   = '0x4dd367d2c410889fbff76f34abdefdceb947ad0c58baaf327ead8ac9d6a38c22';
-// BurnFinalized(uint256,uint256,uint256,uint16,uint8,bool,uint8)
-const TOPIC_BURN_FINALIZED = '0x4c7b2090df533e8b1f7bd4ab01aadb95fedf5006f15ff4300c1709b97c4c6d5e';
-
-// ABI fragments for decoding
-const BURN_STARTED_ABI = [
-  'event BurnStarted(address indexed owner, uint256 indexed survivorTokenId, uint256 indexed survivorTokenIdSeed, uint256[] tokenIds, uint16 points, uint8 resultBodyType, bool resultIsAngel, uint8 boostChance, uint64 revealBlock, bytes32 selectionHash)'
-];
-const BURN_FINALIZED_ABI = [
-  'event BurnFinalized(uint256 indexed survivorTokenId, uint256 indexed survivorTokenIdSeed, uint256 burnSeed, uint16 points, uint8 resultBodyType, bool resultIsAngel, uint8 boostChance)'
-];
+// ── resolveDiscordChannel — needs client, defined here ───────────────────────
+// Inject client into burn-poller so it can resolve channels
 
 async function resolveDiscordChannel(channelId){
   if(!channelId) return null;
   return client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(()=>null);
 }
 
-async function getBurnAlertChannels(){
-  const configured = [];
-  const seen = new Set();
-  for(const [guildId, cfg] of Object.entries(burnConfig || {})){
-    const channelId = getConfiguredBurnChannelId(cfg);
-    if(channelId && !seen.has(channelId)){
-      seen.add(channelId);
-      configured.push({ guildId, channelId });
-    }
-  }
-
-  if(!configured.length && BURN_ALERT_CHANNEL_ID){
-    configured.push({ guildId: 'fallback', channelId: BURN_ALERT_CHANNEL_ID });
-  }
-
-  const channels = [];
-  for(const item of configured){
-    const { guildId, channelId } = item;
-    const ch = await resolveDiscordChannel(channelId);
-    if(ch) channels.push({ guildId, channelId, channel: ch });
-    else console.warn(`[Burn] Configured burn alert channel not found guild=${guildId} channel=${channelId}`);
-  }
-  return channels;
-}
-
-function cleanTraitLabel(label){
-  return String(label || '').replace(/\d+$/, '').trim() || String(label || '');
-}
-
-const TRAIT_META_KEYS = new Set(['__image', '__attributes']);
-
-function normalizeTraitAttribute(t){
-  if(!t || typeof t !== 'object') return null;
-  const trait_type = t.trait_type || t.traitType || t.type || t.name;
-  const value = t.value;
-  if(!trait_type || value == null) return null;
-  return { trait_type:String(trait_type), value:String(value) };
-}
-
-function traitsArrayFromInput(input){
-  if(!input) return [];
-  if(Array.isArray(input)) return input.map(normalizeTraitAttribute).filter(Boolean);
-  if(typeof input === 'object'){
-    const embedded = input.__attributes || input.attributes || input.traits_array || input.trait_array;
-    if(Array.isArray(embedded)){
-      const arr = embedded.map(normalizeTraitAttribute).filter(Boolean);
-      if(arr.length) return arr;
-    }
-    return Object.entries(input)
-      .filter(([k,v]) => !TRAIT_META_KEYS.has(k) && v != null && typeof v !== 'object')
-      .map(([trait_type,value]) => ({ trait_type:String(trait_type), value:String(value) }));
-  }
-  return [];
-}
-
-function traitsObjectFromArray(attrs, image=null){
-  const clean = traitsArrayFromInput(attrs);
-  const obj = {};
-  for(const t of clean){
-    // Compatibility object lookup for old code. Duplicate trait names are preserved
-    // in __attributes even though this object key will contain the last value.
-    obj[t.trait_type] = t.value;
-  }
-  if(clean.length) obj.__attributes = clean;
-  if(image) obj.__image = image;
-  return obj;
-}
-
-function realTraitCount(traits){
-  return traitsArrayFromInput(traits).length;
-}
-
-function traitValue(traits, name){
-  const wanted = String(name || '').toLowerCase();
-  const attrs = traitsArrayFromInput(traits);
-  const found = attrs.find(t => String(t.trait_type || '').toLowerCase() === wanted);
-  if(found) return found.value;
-  return traits && typeof traits === 'object' ? (traits[name] || traits[String(name).toLowerCase()]) : null;
-}
-
-function traitDisplayLines(traits, limit=14){
-  return traitsArrayFromInput(traits)
-    .slice(0, limit)
-    .map(t => `**${cleanTraitLabel(t.trait_type)}:** ${t.value}`);
-}
-
-function getTraitImageSource(traits){
-  return traits && typeof traits === 'object' ? traits.__image : null;
-}
-
-
-async function buildBurnEmbed(finalEvent, startEvent, overrideTraits = null){
-  const survivorId   = finalEvent.survivorTokenId;
-  const bodyType     = finalEvent.resultBodyType;
-  const isAngel      = finalEvent.resultIsAngel;
-  const points       = finalEvent.points;
-  const burnerWallet = startEvent?.owner || 'unknown';
-  const burnedIds    = startEvent?.tokenIds || [];
-  const txHash       = finalEvent.txHash || '';
-  const burnEventId  = finalEvent.burnEventId || null;
-
-  const color     = burnTypeColor(bodyType, isAngel);
-
-  const contract  = OCAS_CONTRACT;
-  const osUrl     = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
-  const tvUrl     = `https://traitview.com/?token=${survivorId}`;
-  const etherscan = txHash ? `https://etherscan.io/tx/${txHash}` : null;
-  const burnerLink = burnerWallet !== 'unknown'
-    ? `[${shortAddr(burnerWallet)}](https://opensea.io/${burnerWallet})`
-    : 'unknown';
-
-  const burnedCount = burnedIds.length || '?';
-  // Type breakdown: "3 · 3x Human" or "2 · 1x Zombie, 1x Ape"
-  const burnedCountStr = burnedIds.length
-    ? await burnTypeBreakdown(burnedIds, burnEventId).catch(()=>String(burnedCount))
-    : String(burnedCount);
-
-  // Prefer directly-passed freshTraits over cache to avoid stale-cache races.
-  let dbMeta = null;
-  if(overrideTraits && realTraitCount(overrideTraits)){
-    dbMeta = { traits: overrideTraits, trait_count: realTraitCount(overrideTraits) };
-  } else {
-    const cached = tokenMetaCache.get(parseInt(survivorId)) || tokenMetaCache.get(`os:${parseInt(survivorId)}`);
-    dbMeta = (cached && Date.now() < cached.expires) ? cached.meta : null;
-  }
-
-  // Image — contract tokenURI first (always current), fall back to OS
-  imageCache?.delete?.(`${contract}:${survivorId}`);
-  let imgResult = null;
-  try{
-    // Use contract image from traits cache if available
-    const contractImgSrc = getTraitImageSource(dbMeta?.traits);
-    if(contractImgSrc){
-      if(contractImgSrc.startsWith('<svg') || contractImgSrc.startsWith('data:image/svg') || contractImgSrc.toLowerCase().includes('image/svg')){
-        try{
-          const buf = await extractPngFromSvg(contractImgSrc);
-          if(buf) imgResult = { type:'buffer', buffer:buf, filename:`token-${survivorId}.png` };
-        }catch(_){}
-      }
-      if(!imgResult && contractImgSrc.startsWith('http') && isDiscordOk(contractImgSrc)){
-        imgResult = { type:'url', url:contractImgSrc };
-      }
-    }
-    // Fall back to OpenSea if contract image unavailable
-    if(!imgResult){
-      imgResult = await resolveImage({identifier:String(survivorId)}, contract, 'ethereum');
-      if(imgResult) setCachedImage(`${contract}:${survivorId}`, imgResult);
-    }
-  }catch(e){ console.warn('[Burn embed image]', e.message); }
-
-  const embed = new EmbedBuilder()
-    .setTitle(`🔥 OCAS Burn • #${survivorId} created`)
-    .setColor(color)
-    .setURL(osUrl)
-    // No description — all info is in fields
-    .addFields(
-      { name:'Burner',         value:burnerLink,                inline:true },
-      { name:'Tokens Burned',  value:burnedCountStr,            inline:true },
-      { name:'Points Used',    value:`${points || 0} pts`,      inline:true },
-    );
-
-  // Single Traits field in 2 columns — same layout as sales/listings.
-  // Use __attributes when available so duplicate categories like Clothes are preserved.
-  const burnTraitLines = traitDisplayLines(dbMeta?.traits, 14);
-  if(burnTraitLines.length){
-    const half = Math.ceil(burnTraitLines.length / 2);
-    embed.addFields(
-      { name:'Traits',    value: burnTraitLines.slice(0, half).join('\n') || '\u200b', inline:true },
-      { name:'\u200b',   value: burnTraitLines.slice(half).join('\n')   || '\u200b', inline:true },
-    );
-  } else {
-    embed.addFields({ name:'Traits', value:'_Syncing — check TraitView or OpenSea shortly_', inline:false });
-  }
-
-  const linkParts = [`[OpenSea](${osUrl})`, `[TraitView](${tvUrl})`];
-  if(etherscan) linkParts.push(`[Etherscan](${etherscan})`);
-  embed.addFields({ name:'Links', value:linkParts.join(' | '), inline:false });
-  embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
-
-  embed._imageResult = imgResult || null;
-
-  // Always show Show Burned Tokens button
-  const burnKey = finalEvent.burnEventId || `${finalEvent.txHash}:${finalEvent.logIndex}`;
-  embed._components = [new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`burn_ids:${burnKey}`)
-      .setLabel(`Show Burned Tokens (${burnedCount})`)
-      .setStyle(ButtonStyle.Secondary)
-  )];
-
-  return embed;
-}
-
-// Pending burn map: survivorTokenId → { owner, tokenIds, points, resultBodyType, resultIsAngel, boostChance, blockNumber, txHash }
-const pendingBurns = new Map();
-
-// ── Pending burn alert queue ──────────────────────────────────────────────────
-// survivorTokenId → { finalEvent, startEvent, preBurnTraits, addedAt, attempts, slowMode }
-// Populated on BurnFinalized; drained by processPendingBurnAlerts every 30s.
-const pendingBurnAlerts = new Map();
-
-// Fetch fresh OS metadata for a token, bypassing ALL caches.
-async function fetchFreshOsMeta(tokenId){
-  const id = parseInt(tokenId);
-  if(!id) return null;
-  // Delete both cache keys so the next call hits the network
-  tokenMetaCache.delete(id);
-  tokenMetaCache.delete(`os:${id}`);
-  // Also bust the image cache so the embed gets the new image
-  const imgKey = `${OCAS_CONTRACT}:${id}`;
-  if(typeof imageCache !== 'undefined') imageCache?.delete?.(imgKey);
-  try{
-    const r = await fetch(
-      `https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}`,
-      { headers: osHeaders() }
-    );
-    if(!r.ok){ console.warn(`[BurnMeta] OS fetch failed for #${id}: HTTP ${r.status}`); return null; }
-    const j = await r.json();
-    const n = j.nft || j;
-    const rawTraits = Array.isArray(n.traits) ? n.traits : (Array.isArray(n.attributes) ? n.attributes : []);
-    const traits = traitsObjectFromArray(rawTraits, n.image || n.image_url || n.display_image_url || null);
-    return realTraitCount(traits) ? traits : null;
-  }catch(e){
-    console.warn(`[BurnMeta] fetchFreshOsMeta error for #${id}:`, e.message);
-    return null;
-  }
-}
-
-// ── Fetch metadata directly from the OCAS contract via tokenURI(uint256) ────
-// Uses Alchemy eth_call — ~2 CUs, 100-300ms, always returns current on-chain data.
-// Returns traits object or null on failure.
-async function fetchTokenUriFromContract(tokenId){
-  const id = parseInt(tokenId);
-  if(!id) return null;
-  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-  if(!ALCHEMY_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return null;
-  try{
-    // Function selector: keccak256("tokenURI(uint256)") = 0xc87b56dd
-    const paddedId = id.toString(16).padStart(64, '0');
-    const result = await burnRpc(rpcUrl, 'eth_call', [{
-      to: OCAS_CONTRACT,
-      data: '0xc87b56dd' + paddedId,
-    }, 'latest']);
-    if(!result || result === '0x') return null;
-    // Decode ABI-encoded string: offset(32) + length(32) + utf8 data
-    const hex = result.slice(2);
-    const lengthWords = parseInt(hex.slice(64, 128), 16);
-    let uri = Buffer.from(hex.slice(128, 128 + lengthWords * 2), 'hex').toString('utf-8');
-    if(uri.startsWith('data:application/json;base64,'))
-      uri = Buffer.from(uri.slice('data:application/json;base64,'.length), 'base64').toString('utf-8');
-    else if(uri.startsWith('data:application/json,'))
-      uri = decodeURIComponent(uri.slice('data:application/json,'.length));
-    const meta = JSON.parse(uri);
-    const rawAttrs = Array.isArray(meta.attributes) ? meta.attributes : (Array.isArray(meta.traits) ? meta.traits : []);
-    const traits = traitsObjectFromArray(rawAttrs, meta.image || meta.image_data || meta.image_url || null);
-    if(realTraitCount(traits)){
-      console.log(`[Contract] tokenURI #${id} → Type=${traitValue(traits,'Type')||'?'} (${realTraitCount(traits)} traits)`);
-      return traits;
-    }
-    return null;
-  }catch(e){
-    console.warn(`[Contract] tokenURI fetch failed for #${id}:`, e.message);
-    return null;
-  }
-}
-
-// One-time fire-and-forget POST to OpenSea's metadata refresh endpoint.
-// Tells OpenSea to re-fetch this token's metadata from the contract.
-// Only called once per burn event. Does not block — errors are logged and ignored.
-async function triggerOsMetadataRefresh(tokenId){
-  if(!BURN_METADATA_REFRESH_ENABLED) return;
-  const id = parseInt(tokenId);
-  if(!id) return;
-  try{
-    const r = await fetch(
-      `https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}/refresh`,
-      { method:'POST', headers: osHeaders() }
-    );
-    console.log(`[BurnMeta] OS refresh triggered for #${id} — HTTP ${r.status}`);
-  }catch(e){
-    console.warn(`[BurnMeta] OS refresh trigger failed for #${id}:`, e.message);
-  }
-}
-
-// Returns true if two trait objects differ (or one is null and the other isn't).
-function traitsDiffer(a, b){
-  const arrA = traitsArrayFromInput(a);
-  const arrB = traitsArrayFromInput(b);
-  if(!arrA.length && !arrB.length) return false;
-  if(arrA.length !== arrB.length) return true;
-  for(let i = 0; i < arrA.length; i++){
-    if(String(arrA[i].trait_type) !== String(arrB[i].trait_type)) return true;
-    if(String(arrA[i].value) !== String(arrB[i].value)) return true;
-  }
-  return false;
-}
-
-async function storeBurnStarted(event){
-  try{
-    // Snapshot pre-burn DB traits for the survivor token so we can detect when metadata refreshes
-    const preBurnMeta = await fetchTokenMetaFromDb(event.survivorTokenId).catch(()=>null);
-    const preBurnTraits = preBurnMeta?.traits ? { ...preBurnMeta.traits } : null;
-    if(preBurnTraits) console.log(`[BurnMeta] Pre-burn snapshot for #${event.survivorTokenId}: Type=${preBurnTraits.Type||preBurnTraits.type||'?'}`);
-
-    // Snapshot every selected token while it still exists on-chain. This gives /burn
-    // historical thumbnails for tokens that are later consumed and no longer have a useful tokenURI.
-    for(const tid of (event.tokenIds || [])){
-      snapshotTokenFromContract(tid, 'burn-start-input').catch(e =>
-        console.warn(`[BurnMeta] input snapshot failed for #${tid}:`, e.message)
-      );
-    }
-
-    // Cache in memory for cross-referencing with BurnFinalized
-    pendingBurns.set(String(event.survivorTokenId), {
-      owner:         event.owner,
-      tokenIds:      event.tokenIds.map(Number),
-      points:        event.points,
-      resultBodyType: event.resultBodyType,
-      resultIsAngel: event.resultIsAngel,
-      boostChance:   event.boostChance,
-      blockNumber:   event.blockNumber,
-      logIndex:       event.logIndex,
-      txHash:        event.txHash,
-      preBurnTraits, // snapshot for metadata refresh detection
-    });
-    const r = await pgPool.query(
-      `INSERT INTO burn_started_events
-         (tx_hash, block_number, log_index, owner_wallet, survivor_token_id,
-          points_used, result_body_type, result_is_angel, boost_chance, reveal_block, selection_hash)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       ON CONFLICT (tx_hash, log_index) DO UPDATE SET
-          owner_wallet=EXCLUDED.owner_wallet,
-          survivor_token_id=EXCLUDED.survivor_token_id,
-          points_used=EXCLUDED.points_used,
-          result_body_type=EXCLUDED.result_body_type,
-          result_is_angel=EXCLUDED.result_is_angel,
-          boost_chance=EXCLUDED.boost_chance,
-          reveal_block=EXCLUDED.reveal_block,
-          selection_hash=EXCLUDED.selection_hash
-       RETURNING id`,
-      [
-        event.txHash || '', event.blockNumber || 0, event.logIndex || 0,
-        normAddr(event.owner) || event.owner || '', event.survivorTokenId,
-        event.points, event.resultBodyType, event.resultIsAngel,
-        event.boostChance, event.revealBlock || null, event.selectionHash || null,
-      ]
-    );
-    const burnStartedId = r.rows[0]?.id;
-    if(burnStartedId){
-      for(const tokenId of event.tokenIds || []){
-        await pgPool.query(
-          `INSERT INTO burn_started_inputs (burn_started_id, burned_token_id)
-           VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-          [burnStartedId, tokenId]
-        ).catch(()=>{});
-      }
-    }
-  }catch(e){ console.warn('[Burn] storeBurnStarted error:', e.message); }
-}
-
-const burnBlockTimestampCache = new Map();
-
-function burnRpcUrl(){
-  const key = process.env.ALCHEMY_API_KEY;
-  return process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-    (key ? `https://eth-mainnet.g.alchemy.com/v2/${key}` : '');
-}
-
-async function getBurnBlockTimestamp(blockNumber){
-  const n = Number(blockNumber);
-  if(!Number.isFinite(n) || n <= 0) return null;
-  if(burnBlockTimestampCache.has(n)) return burnBlockTimestampCache.get(n);
-  const rpcUrl = burnRpcUrl();
-  if(!rpcUrl) return null;
-  const block = await burnRpc(rpcUrl, 'eth_getBlockByNumber', ['0x' + n.toString(16), false]);
-  const ts = parseInt(block?.timestamp || '0x0', 16);
-  const burnedAt = ts ? new Date(ts * 1000) : null;
-  if(burnedAt) burnBlockTimestampCache.set(n, burnedAt);
-  return burnedAt;
-}
-
-async function storeBurnFinalized(finalEvent, startEvent){
-  try{
-    const burnedIds = startEvent?.tokenIds || [];
-    const burnedAt = await getBurnBlockTimestamp(finalEvent.blockNumber);
-    if(!burnedAt) throw new Error(`block timestamp unavailable for finalized tx=${finalEvent.txHash || 'unknown'} block=${finalEvent.blockNumber || 'unknown'}`);
-    const r = await pgPool.query(
-      `INSERT INTO burn_events
-         (tx_hash, block_number, log_index, burner_wallet, survivor_token_id,
-           result_body_type, result_is_angel, points_used, boost_chance, burn_seed, burned_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       ON CONFLICT (tx_hash, log_index) DO UPDATE SET
-           block_number=EXCLUDED.block_number,
-           burner_wallet=EXCLUDED.burner_wallet,
-           survivor_token_id=EXCLUDED.survivor_token_id,
-           result_body_type=EXCLUDED.result_body_type,
-           result_is_angel=EXCLUDED.result_is_angel,
-           points_used=EXCLUDED.points_used,
-           boost_chance=EXCLUDED.boost_chance,
-           burn_seed=EXCLUDED.burn_seed,
-           burned_at=EXCLUDED.burned_at
-       RETURNING id`,
-      [
-        finalEvent.txHash || '', finalEvent.blockNumber || 0, finalEvent.logIndex || 0,
-        startEvent?.owner || '', finalEvent.survivorTokenId,
-        finalEvent.resultBodyType, finalEvent.resultIsAngel,
-        finalEvent.points, finalEvent.boostChance,
-        String(finalEvent.burnSeed || ''), burnedAt,
-      ]
-    );
-    if(r.rows.length && burnedIds.length){
-      const burnEventId = r.rows[0].id;
-      for(const tokenId of burnedIds){
-        await pgPool.query(
-          `INSERT INTO burn_event_inputs (burn_event_id, burned_token_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-          [burnEventId, tokenId]
-        ).catch(()=>{});
-      }
-    }
-    return r.rows[0]?.id || null;
-  }catch(e){ console.warn('[Burn] storeBurnFinalized DB error:', e.message); }
-  return null;
-}
-
-async function postBurnAlertToConfiguredChannels(finalEvent, startEvent, freshTraits = null){
-  const burnChannels = await getBurnAlertChannels();
-  if(!burnChannels.length){
-    console.log(`[Burn alert] no configured burn alert channels for tx=${finalEvent.txHash || 'unknown'} log=${finalEvent.logIndex ?? 'unknown'}`);
-    return;
-  }
-  const dedupeKey = `burn:${finalEvent.txHash || ''}:${finalEvent.logIndex ?? ''}`;
-  for(const target of burnChannels){
-    const { guildId, channelId, channel } = target;
-    try{
-      if(isRecentChannelPost(channelId, dedupeKey)){
-        console.log(`[Burn alert] skipped guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex}`);
-        continue;
-      }
-      const posted = await pgPool.query(
-        'SELECT 1 FROM burn_alert_posts WHERE tx_hash=$1 AND log_index=$2 AND channel_id=$3 LIMIT 1',
-        [finalEvent.txHash || '', finalEvent.logIndex || 0, channelId]
-      ).catch(e => {
-        console.warn(`[Burn alert] dedupe lookup failed guild=${guildId} channel=${channelId}: ${e.message}`);
-        return { rows: [] };
-      });
-      if(posted.rows.length){
-        console.log(`[Burn alert] skipped guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex} reason=already-posted`);
-        continue;
-      }
-      const embed = await buildBurnEmbed(finalEvent, startEvent, freshTraits);
-      await sendEmbed(channel, embed);
-      await pgPool.query(
-        `INSERT INTO burn_alert_posts (tx_hash, log_index, guild_id, channel_id)
-         VALUES ($1,$2,$3,$4)
-         ON CONFLICT (tx_hash, log_index, channel_id) DO NOTHING`,
-        [finalEvent.txHash || '', finalEvent.logIndex || 0, guildId, channelId]
-      ).catch(e => console.warn(`[Burn alert] post marker failed guild=${guildId} channel=${channelId}: ${e.message}`));
-      console.log(`[Burn alert] posted guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex}`);
-    }catch(e){
-      console.warn(`[Burn alert] failed guild=${guildId} channel=${channelId} tx=${finalEvent.txHash} log=${finalEvent.logIndex}: ${e.message}`);
-    }
-  }
-}
-
-async function pollBurnEventsLegacy(){
-  if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL) return;
-  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-
-  try{
-    const lastBlockRaw = await dbLoad('burn_last_block');
-    let fromBlock = lastBlockRaw ? parseInt(lastBlockRaw) + 1 : null;
-
-    if(!fromBlock){
-      const r = await fetch(rpcUrl,{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({jsonrpc:'2.0',id:1,method:'eth_blockNumber',params:[]})});
-      const j = await r.json();
-      fromBlock = Math.max(0, parseInt(j.result,16) - 2000);
-      console.log('[Burn] First run, starting from block', fromBlock);
-    }
-
-    const r2 = await fetch(rpcUrl,{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({jsonrpc:'2.0',id:1,method:'eth_blockNumber',params:[]})});
-    const j2 = await r2.json();
-    const toBlock = parseInt(j2.result,16);
-    if(fromBlock >= toBlock) return;
-
-    const logsRes = await fetch(rpcUrl,{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({jsonrpc:'2.0',id:2,method:'eth_getLogs',params:[{
-        address: BURN_CONTRACT,
-        fromBlock: '0x'+fromBlock.toString(16),
-        toBlock:   '0x'+toBlock.toString(16),
-        // Filter for only our two event topics
-        topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
-      }]})});
-    const logsJson = await logsRes.json();
-    const logs = logsJson.result || [];
-    if(logsJson.error) throw new Error('eth_getLogs error: ' + JSON.stringify(logsJson.error));
-
-    if(logs.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${fromBlock}→${toBlock}`);
-
-    // ── Pass 1: process BurnStarted — store pending burns ─────────────────
-    for(const log of logs){
-      if(log.topics[0]?.toLowerCase() !== TOPIC_BURN_STARTED) continue;
-      // BurnStarted topics: [topic0, owner(indexed), survivorTokenId(indexed), survivorTokenIdSeed(indexed)]
-      // data: tokenIds[], points, resultBodyType, resultIsAngel, boostChance, revealBlock, selectionHash
-      try{
-        const owner           = '0x' + log.topics[1].slice(26);
-        const survivorTokenId = parseInt(log.topics[2], 16);
-        const txHash          = log.transactionHash;
-        const blockNum        = parseInt(log.blockNumber, 16);
-        const data            = log.data.slice(2);
-        const words           = [];
-        for(let i=0;i<data.length;i+=64) words.push(data.slice(i,i+64));
-
-        // ABI: data starts with offset to tokenIds[] dynamic array
-        // word[0] = offset (bytes) to start of tokenIds array = 0xe0 = 224 = 7*32
-        // word[1..6] = 6 static params (points, bodyType, isAngel, boostChance, revealBlock, selectionHash)
-        // BUT: dynamic array comes FIRST in data for this event
-        // Actual layout: offset_to_array | points | bodyType | isAngel | boostChance | revealBlock | selectionHash | array_len | array_items...
-        const offset   = parseInt(words[0]||'0', 16); // byte offset = 0xe0 = 224 → word index 7
-        const arrWord  = offset / 32;                 // = 7
-        const arrLen   = parseInt(words[arrWord]||'0', 16);
-        const tokenIds = [];
-        for(let i=0;i<arrLen;i++) tokenIds.push(parseInt(words[arrWord+1+i]||'0',16));
-
-        // Static params are words 1..6 (before the array)
-        const points      = parseInt(words[1]||'0',16);
-        const bodyType    = parseInt(words[2]||'0',16);
-        const isAngel     = parseInt(words[3]||'0',16) === 1;
-        const boostChance = parseInt(words[4]||'0',16);
-
-        await storeBurnStarted({ owner, survivorTokenId, tokenIds, points,
-          resultBodyType: bodyType, resultIsAngel: isAngel, boostChance, blockNumber: blockNum, txHash });
-        console.log(`[Burn] BurnStarted: #${survivorTokenId} ← [${tokenIds.join(',')}] by ${shortAddr(owner)} pts=${points} type=${bodyType}`);
-      }catch(e){ console.warn('[Burn] BurnStarted decode error:', e.message, 'topics:', log.topics, 'data:', log.data?.slice(0,130)); }
-    }
-
-    // ── Pass 2: process BurnFinalized — post embeds ────────────────────────
-    for(const log of logs){
-      if(log.topics[0]?.toLowerCase() !== TOPIC_BURN_FINALIZED) continue;
-      // BurnFinalized topics: [topic0, survivorTokenId(indexed), survivorTokenIdSeed(indexed)]
-      // data: burnSeed, points, resultBodyType, resultIsAngel, boostChance
-      try{
-        const survivorTokenId = parseInt(log.topics[1], 16);
-        const txHash          = log.transactionHash;
-        const blockNum        = parseInt(log.blockNumber, 16);
-        const logIndex        = parseInt(log.logIndex, 16);
-        const data            = log.data.slice(2);
-        const words           = [];
-        for(let i=0;i<data.length;i+=64) words.push(data.slice(i,i+64));
-
-        // data layout: burnSeed | points | resultBodyType | resultIsAngel | boostChance
-        const burnSeed    = words[0] || '';
-        const points      = parseInt(words[1]||'0',16);
-        const bodyType    = parseInt(words[2]||'0',16);
-        const isAngel     = parseInt(words[3]||'0',16) === 1;
-        const boostChance = parseInt(words[4]||'0',16);
-
-        console.log(`[Burn] BurnFinalized raw: #${survivorTokenId} bodyType=${bodyType} isAngel=${isAngel} points=${points}`);
-
-        // Check duplicate
-        const existing = await pgPool.query(
-          'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
-        );
-        const wasAlreadyStored = existing.rows.length > 0;
-        if(wasAlreadyStored) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; skipping replay alert`);
-
-        // Cross-reference with BurnStarted data
-        const startEvent = pendingBurns.get(String(survivorTokenId)) ||
-          await loadBurnStartFromDB(survivorTokenId);
-
-        if(!startEvent) console.warn(`[Burn] No BurnStarted found for survivor #${survivorTokenId} — embed will show unknown burner/burned IDs`);
-
-        const finalEvent = { survivorTokenId, burnSeed, points, resultBodyType: bodyType,
-          resultIsAngel: isAngel, boostChance, txHash, blockNumber: blockNum, logIndex };
-
-        finalEvent.burnEventId = await storeBurnFinalized(finalEvent, startEvent);
-        console.log(`[Burn] BurnFinalized: #${survivorTokenId} → ${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
-
-        // Queue to pending alert system — same as processBurnLogs.
-        // Do not re-alert already-stored historical burns during staging/repair catch-up.
-        if(!wasAlreadyStored){
-          const alertKey = String(survivorTokenId);
-          if(!pendingBurnAlerts.has(alertKey)){
-            pendingBurnAlerts.set(alertKey, {
-              finalEvent: { ...finalEvent },
-              startEvent: { ...startEvent },
-              preBurnTraits: startEvent?.preBurnTraits || null,
-              addedAt:  Date.now(),
-              attempts: 0,
-              slowMode: false,
-            });
-            console.log(`[BurnMeta] Queued pending alert for #${survivorTokenId} — awaiting metadata refresh`);
-            // Fire-and-forget OS metadata refresh — helps speed up metadata propagation
-            triggerOsMetadataRefresh(survivorTokenId);
-          }
-        }
-        pendingBurns.delete(String(survivorTokenId));
-      }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
-    }
-
-    await dbSave('burn_last_block', String(toBlock));
-  }catch(e){ console.error('[Burn poller]', e.message); }
-}
-
-async function burnRpc(rpcUrl, method, params){
-  const r = await fetch(rpcUrl,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({jsonrpc:'2.0',id:Date.now(),method,params})});
-  const j = await r.json();
-  if(j.error) throw new Error(`${method} error: ${JSON.stringify(j.error)}`);
-  return j.result;
-}
-
-async function processBurnLogs(logs, shouldAlert){
-  if(logs.length) console.log(`[Burn] processing ${logs.length} log(s), alerts=${shouldAlert ? 'on' : 'off'}`);
-
-  for(const log of logs){
-    if(log.topics[0]?.toLowerCase() !== TOPIC_BURN_STARTED) continue;
-    try{
-      const owner           = normAddr('0x' + log.topics[1].slice(26));
-      const survivorTokenId = parseInt(log.topics[2], 16);
-      const txHash          = String(log.transactionHash || '').toLowerCase();
-      const blockNum        = parseInt(log.blockNumber, 16);
-      const logIndex        = parseInt(log.logIndex, 16);
-      const data            = log.data.slice(2);
-      const words           = [];
-      for(let i=0;i<data.length;i+=64) words.push(data.slice(i,i+64));
-
-      const offset   = parseInt(words[0]||'0', 16);
-      const arrWord  = offset / 32;
-      const arrLen   = parseInt(words[arrWord]||'0', 16);
-      const tokenIds = [];
-      for(let i=0;i<arrLen;i++) tokenIds.push(parseInt(words[arrWord+1+i]||'0',16));
-
-      const points        = parseInt(words[1]||'0',16);
-      const bodyType      = parseInt(words[2]||'0',16);
-      const isAngel       = parseInt(words[3]||'0',16) === 1;
-      const boostChance   = parseInt(words[4]||'0',16);
-      const revealBlock   = parseInt(words[5]||'0',16);
-      const selectionHash = words[6] ? '0x' + words[6] : null;
-
-      await storeBurnStarted({ owner, survivorTokenId, tokenIds, points,
-        resultBodyType: bodyType, resultIsAngel: isAngel, boostChance,
-        revealBlock, selectionHash, blockNumber: blockNum, logIndex, txHash });
-      console.log(`[Burn] BurnStarted: #${survivorTokenId} <- [${tokenIds.join(',')}] by ${shortAddr(owner)} pts=${points} tier=${bodyType}`);
-    }catch(e){ console.warn('[Burn] BurnStarted decode error:', e.message, 'topics:', log.topics, 'data:', log.data?.slice(0,130)); }
-  }
-
-  for(const log of logs){
-    if(log.topics[0]?.toLowerCase() !== TOPIC_BURN_FINALIZED) continue;
-    try{
-      const survivorTokenId = parseInt(log.topics[1], 16);
-      const txHash          = String(log.transactionHash || '').toLowerCase();
-      const blockNum        = parseInt(log.blockNumber, 16);
-      const logIndex        = parseInt(log.logIndex, 16);
-      const data            = log.data.slice(2);
-      const words           = [];
-      for(let i=0;i<data.length;i+=64) words.push(data.slice(i,i+64));
-
-      const burnSeed    = words[0] || '';
-      const points      = parseInt(words[1]||'0',16);
-      const bodyType    = parseInt(words[2]||'0',16);
-      const isAngel     = parseInt(words[3]||'0',16) === 1;
-      const boostChance = parseInt(words[4]||'0',16);
-
-      const existing = await pgPool.query(
-        'SELECT id FROM burn_events WHERE tx_hash=$1 AND log_index=$2', [txHash, logIndex]
-      );
-      const wasAlreadyStored = existing.rows.length > 0;
-      if(wasAlreadyStored) console.log(`[Burn] Already stored tx ${txHash.slice(0,10)} log=${logIndex}; skipping replay alert`);
-
-      const startEvent = pendingBurns.get(String(survivorTokenId)) ||
-        await loadBurnStartFromDB(survivorTokenId);
-      if(!startEvent) console.warn(`[Burn] No BurnStarted found for survivor #${survivorTokenId} - embed will show unknown burner/burned IDs`);
-
-      const finalEvent = { survivorTokenId, burnSeed, points, resultBodyType: bodyType,
-        resultIsAngel: isAngel, boostChance, txHash, blockNumber: blockNum, logIndex };
-
-      finalEvent.burnEventId = await storeBurnFinalized(finalEvent, startEvent);
-      console.log(`[Burn] BurnFinalized: #${survivorTokenId} tier=${burnTypeLabel(bodyType,isAngel)} burned=[${startEvent?.tokenIds?.join(',')||'?'}]`);
-
-      if(shouldAlert && !wasAlreadyStored){
-        // Queue to pending alert system — do NOT post immediately.
-        // processPendingBurnAlerts() will wait for metadata to refresh before posting.
-        // Already-stored burns are DB replays/backfills and should not repost to Discord.
-        const preBurnTraits = startEvent?.preBurnTraits || null;
-        const alertKey = String(survivorTokenId);
-        if(!pendingBurnAlerts.has(alertKey)){
-          pendingBurnAlerts.set(alertKey, {
-            finalEvent: { ...finalEvent },
-            startEvent: { ...startEvent },
-            preBurnTraits,
-            addedAt:  Date.now(),
-            attempts: 0,
-            slowMode: false,
-          });
-          console.log(`[BurnMeta] Queued pending alert for #${survivorTokenId} — awaiting metadata refresh`);
-          // Fire-and-forget OS metadata refresh — helps speed up metadata propagation
-          triggerOsMetadataRefresh(survivorTokenId);
-        }
-      }
-      pendingBurns.delete(String(survivorTokenId));
-    }catch(e){ console.warn('[Burn] BurnFinalized error:', e.message); }
-  }
-}
-
-// ── Pending burn alert processor ─────────────────────────────────────────────
-// Runs every 30s. For each queued burn event, fetches fresh OS metadata and
-// Reads traits directly from contract tokenURI — no OS polling or snapshot wait needed.
-// Contract always has current on-chain state the moment BurnFinalized is confirmed.
-// Falls back to OS metadata if contract call fails. Retries up to 2 hours on post failure.
-async function processPendingBurnAlerts(){
-  if(!pendingBurnAlerts.size) return;
-  const now = Date.now();
-  const TWO_HOURS = 2 * 60 * 60_000;
-
-  for(const [key, entry] of pendingBurnAlerts){
-    const { finalEvent, startEvent, addedAt, attempts } = entry;
-    const survivorId = finalEvent.survivorTokenId;
-    const ageMs      = now - addedAt;
-    entry.attempts++;
-
-    // Hard cap: 2 hours — post minimal fallback and remove
-    if(ageMs > TWO_HOURS){
-      console.warn(`[BurnMeta] #${survivorId} failed to post after 2 hours — posting minimal fallback`);
-      try{ await postBurnFallbackAlert(finalEvent, startEvent); }catch(e){ console.error(`[BurnMeta] fallback failed for #${survivorId}:`, e.message); }
-      pendingBurnAlerts.delete(key);
-      continue;
-    }
-
-    // Fetch traits from contract — always current post-burn state
-    let freshTraits = null;
-    try{
-      freshTraits = await fetchTokenUriFromContract(survivorId);
-      if(freshTraits) console.log(`[BurnMeta] #${survivorId} contract traits OK → Type=${freshTraits.Type||freshTraits.type||'?'}`);
-    }catch(e){
-      console.warn(`[BurnMeta] contract tokenURI failed for #${survivorId}:`, e.message);
-    }
-
-    // Fallback to OS if contract call failed
-    if(!freshTraits){
-      console.log(`[BurnMeta] #${survivorId} contract failed — trying OS fallback`);
-      try{ freshTraits = await fetchFreshOsMeta(survivorId); }catch(e){ console.warn(`[BurnMeta] OS fallback also failed for #${survivorId}:`, e.message); }
-    }
-
-    if(!freshTraits){
-      console.log(`[BurnMeta] #${survivorId} no traits yet (attempt ${entry.attempts}) — retrying next tick`);
-      continue;
-    }
-
-    // Set traits into cache so buildBurnEmbed picks them up
-    const freshMeta = { os_rank: null, traits: freshTraits, trait_count: realTraitCount(freshTraits) };
-    tokenMetaCache.set(parseInt(survivorId), { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
-    tokenMetaCache.set(`os:${parseInt(survivorId)}`, { meta: freshMeta, expires: Date.now() + 5 * 60_000 });
-    imageCache?.delete?.(`${OCAS_CONTRACT}:${survivorId}`);
-
-    try{
-      await postBurnAlertToConfiguredChannels(finalEvent, startEvent, freshTraits);
-      // Write post-burn traits to DB so /burnlatest and /burn work after restarts
-      try{
-        await upsertTokenTraitRows(survivorId, freshTraits, 'burn-finalized-survivor');
-        console.log(`[BurnMeta] Wrote ${realTraitCount(freshTraits)} post-burn trait rows to DB for #${survivorId}`);
-        // Queue a delayed OS rank fetch — wait for OS to update their end before fetching
-        setTimeout(() => { rankSyncQueue.add(parseInt(survivorId)); }, RANK_SYNC_DELAY_MS);
-        console.log(`[BurnMeta] OS rank update queued for #${survivorId} in ${RANK_SYNC_DELAY_MS/1000}s`);
-      }catch(dbErr){
-        console.warn(`[BurnMeta] Failed to write post-burn traits for #${survivorId}:`, dbErr.message);
-      }
-      // Write to burn_state_snapshots — permanent record of post-burn state per burn event
-      try{
-        const burnEventId = finalEvent.burnEventId;
-        console.log(`[BurnMeta] burn_state_snapshots write attempt: burnEventId=${burnEventId} survivorId=${survivorId} hasImage=${!!getTraitImageSource(freshTraits)}`);
-        if(burnEventId){
-          const snapImg = getTraitImageSource(freshTraits) || null;
-          await pgPool.query(
-            `INSERT INTO burn_state_snapshots (burn_event_id, token_id, image_data, traits_json)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (burn_event_id, token_id) DO UPDATE SET
-               image_data=EXCLUDED.image_data,
-               traits_json=EXCLUDED.traits_json`,
-            [burnEventId, survivorId, snapImg, JSON.stringify(freshTraits)]
-          );
-          console.log(`[BurnMeta] Saved burn_state_snapshot for burn_event_id=${burnEventId} token=#${survivorId}`);
-        } else {
-          console.warn(`[BurnMeta] Skipped burn_state_snapshot for #${survivorId} — burnEventId is null/falsy`);
-        }
-      }catch(snapErr){
-        console.warn(`[BurnMeta] Failed to write burn_state_snapshot for #${survivorId}:`, snapErr.message);
-      }
-      pendingBurnAlerts.delete(key);
-    }catch(e){
-      console.error(`[BurnMeta] post failed for #${survivorId}:`, e.message); sendErrorWebhook(`Burn Alert Post Failed #${survivorId}`, e);
-      // Keep in queue — retry next tick
-    }
-  }
-}
-
-// Minimal fallback alert — no traits/image — used when metadata never refreshed after 2h
-async function postBurnFallbackAlert(finalEvent, startEvent){
-  const burnChannels = await getBurnAlertChannels();
-  if(!burnChannels.length) return;
-  const survivorId  = finalEvent.survivorTokenId;
-  const contract    = OCAS_CONTRACT;
-  const osUrl       = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
-  const tvUrl       = `https://traitview.com/?token=${survivorId}`;
-  const txHash      = finalEvent.txHash || '';
-  const etherscan   = txHash ? `https://etherscan.io/tx/${txHash}` : null;
-  const burnedCount = startEvent?.tokenIds?.length || '?';
-  const burnerWallet = startEvent?.owner || 'unknown';
-  const burnerLink  = burnerWallet !== 'unknown'
-    ? `[${shortAddr(burnerWallet)}](https://opensea.io/${burnerWallet})` : 'unknown';
-  const color       = burnTypeColor(finalEvent.resultBodyType, finalEvent.resultIsAngel);
-  const linkParts   = [`[OpenSea](${osUrl})`, `[TraitView](${tvUrl})`];
-  if(etherscan) linkParts.push(`[Etherscan](${etherscan})`);
-  const burnKey = finalEvent.burnEventId || `${txHash}:${finalEvent.logIndex}`;
-
-  const embed = new EmbedBuilder()
-    .setTitle(`🔥 OCAS Burn • #${survivorId} created`)
-    .setColor(color)
-    .setURL(osUrl)
-    .addFields(
-      { name:'Burner',        value:burnerLink,           inline:true },
-      { name:'Tokens Burned', value:String(burnedCount),  inline:true },
-      { name:'Points Used',   value:`${finalEvent.points || 0} pts`, inline:true },
-      { name:'Traits',        value:'_Metadata still syncing — check TraitView or OpenSea_', inline:false },
-      { name:'Links',         value:linkParts.join(' | '), inline:false },
-    )
-    .setFooter({ text:'OCAS Burn Machine' })
-    .setTimestamp();
-
-  embed._components = [new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`burn_ids:${burnKey}`)
-      .setLabel(`Show Burned Tokens (${burnedCount})`)
-      .setStyle(ButtonStyle.Secondary)
-  )];
-
-  const dedupeKey = `burn:${txHash}:${finalEvent.logIndex ?? ''}`;
-  for(const target of burnChannels){
-    const { guildId, channelId, channel } = target;
-    try{
-      if(isRecentChannelPost(channelId, dedupeKey)) continue;
-      await sendEmbed(channel, embed);
-      console.log(`[BurnMeta] fallback alert posted guild=${guildId} channel=${channelId}`);
-    }catch(e){ console.warn(`[BurnMeta] fallback post failed guild=${guildId}:`, e.message); }
-  }
-}
-
-let _pollBurnRunning = false;
-let _lastKnownBurnBlock = null; // in-memory cursor fallback
-async function pollBurnEvents(){
-  if(_pollBurnRunning){ console.log('[Burn] Poll tick skipped — previous still running'); return; }
-  _pollBurnRunning = true;
-  try{
-  if(!process.env.ALCHEMY_API_KEY && !process.env.ALCHEMY_WEBSOCKET_URL && !process.env.ETH_RPC_URL && !process.env.BURN_RPC_OVERRIDE) return;
-  const _baseRpc = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://')
-    || `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-  // BURN_RPC_OVERRIDE: set to Infura URL for fast catch-up, auto-ignored when caught up
-  const rpcUrl = process.env.BURN_RPC_OVERRIDE?.replace('wss://','https://') || _baseRpc;
-
-  try{
-    // Retry dbLoad up to 3 times — staging DB can fail on startup
-    let lastBlockRaw = null;
-    for(let _attempt = 1; _attempt <= 3; _attempt++){
-      try{ lastBlockRaw = await dbLoad('burn_last_block'); break; }
-      catch(e){
-        console.error(`[dbLoad] burn_last_block attempt ${_attempt} failed:`, e.message);
-        if(_attempt < 3) await new Promise(r=>setTimeout(r, 2000));
-      }
-    }
-    // In-memory cursor guard — if DB fails, use last known block to avoid rewind
-    if(!lastBlockRaw && _lastKnownBurnBlock){
-      console.warn(`[Burn] burn_last_block DB read failed; using in-memory cursor ${_lastKnownBurnBlock} to avoid rewind`);
-      lastBlockRaw = String(_lastKnownBurnBlock);
-    }
-    const latest = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
-    let fromBlock = lastBlockRaw ? parseInt(lastBlockRaw, 10) + 1 : null;
-    let historicalBackfill = false;
-
-    if(!fromBlock){
-      if(Number.isFinite(BURN_START_BLOCK) && BURN_START_BLOCK >= 0){
-        fromBlock = BURN_START_BLOCK;
-        historicalBackfill = true;
-        console.log(`[Burn] No burn_last_block; starting historical backfill from BURN_START_BLOCK=${fromBlock}`);
-      } else {
-        fromBlock = Math.max(0, latest - 2000);
-        historicalBackfill = true;
-        console.warn(`[Burn] BURN_START_BLOCK missing; safe fallback starts at latest-2000 (${fromBlock}). Set BURN_START_BLOCK for full historical backfill.`);
-      }
-    }
-
-    if(fromBlock > latest) return;
-
-    // Process ONE chunk per poll tick — keeps the event loop free so
-    // api.js requests (traitfind, rankfind, etc) don't time out during backfill.
-    // Adaptive chunk: catch up faster when behind, stay small when live
-    const blockGap = latest - fromBlock;
-    const effectiveChunk = (process.env.BURN_RPC_OVERRIDE && blockGap > 100)
-      ? Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK_OVERRIDE || '5000', 10))  // use 5000 with Infura
-      : Math.max(1, parseInt(process.env.BURN_BLOCK_CHUNK || '10', 10));
-    const adaptiveChunk = blockGap > 3 ? effectiveChunk : 2;
-    if(process.env.BURN_RPC_OVERRIDE && blockGap <= 100)
-      console.log('[Burn] Caught up — BURN_RPC_OVERRIDE ignored, using default RPC');
-    const chunkTo = Math.min(latest, fromBlock + adaptiveChunk - 1);
-    const shouldAlert = !historicalBackfill || BURN_BACKFILL_ALERTS;
-    const logs = await burnRpc(rpcUrl, 'eth_getLogs', [{
-      address: BURN_CONTRACT,
-      fromBlock: '0x'+fromBlock.toString(16),
-      toBlock:   '0x'+chunkTo.toString(16),
-      topics: [[TOPIC_BURN_STARTED, TOPIC_BURN_FINALIZED]],
-    }]);
-    console.log(`[Burn] Polling blocks ${fromBlock}-${chunkTo} (latest=${latest})`);
-    if(logs?.length) console.log(`[Burn] ${logs.length} log(s) in blocks ${fromBlock}-${chunkTo}`);
-    await processBurnLogs(logs || [], shouldAlert);
-    await dbSave('burn_last_block', String(chunkTo));
-    const lagBlocks = latest - chunkTo;
-      _lastKnownBurnBlock = chunkTo;
-    if(lagBlocks > 0){
-      console.log(`[Burn] Behind by ${lagBlocks} block(s)`);
-      // Alert if lag exceeds threshold and we haven't alerted recently
-      if(lagBlocks >= BURN_LAG_ALERT_BLOCKS && Date.now() - _lastLagAlertTs > 10 * 60 * 1000){
-        _lastLagAlertTs = Date.now();
-        sendErrorWebhook(
-          'Burn Poller Lag Alert',
-          new Error(`Poller is ${lagBlocks} blocks behind latest block ${latest}`),
-          `fromBlock=${fromBlock} chunkTo=${chunkTo} gap=${lagBlocks}`
-        );
-        console.warn(`[Burn] ⚠️ Lag alert fired — ${lagBlocks} blocks behind`);
-      }
-    }
-  }catch(e){ console.error('[Burn poller]', e.message); sendErrorWebhook('Burn Poller Error', e); }
-  } finally { _pollBurnRunning = false; }
-}
-
-async function loadBurnStartFromDB(survivorTokenId){
-  // Prefer the persisted BurnStarted event so backfills/restarts can still
-  // attach burned input IDs to the later BurnFinalized event.
-  try{
-    const r = await pgPool.query(
-      `SELECT bse.owner_wallet, bse.points_used, bse.result_body_type, bse.result_is_angel,
-              bse.boost_chance, array_agg(bsi.burned_token_id ORDER BY bsi.burned_token_id) AS token_ids
-       FROM burn_started_events bse
-       LEFT JOIN burn_started_inputs bsi ON bsi.burn_started_id = bse.id
-       WHERE bse.survivor_token_id = $1
-       GROUP BY bse.id
-       ORDER BY bse.block_number DESC, bse.log_index DESC
-       LIMIT 1`,
-      [survivorTokenId]
-    );
-    if(r.rows.length){
-      return {
-        owner: r.rows[0].owner_wallet,
-        tokenIds: (r.rows[0].token_ids||[]).filter(Boolean),
-        points: r.rows[0].points_used,
-        resultBodyType: r.rows[0].result_body_type,
-        resultIsAngel: r.rows[0].result_is_angel,
-        boostChance: r.rows[0].boost_chance,
-      };
-    }
-  }catch(e){}
-  try{
-    const r = await pgPool.query(
-      `SELECT be.burner_wallet, array_agg(bei.burned_token_id) AS token_ids
-       FROM burn_events be
-       LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-       WHERE be.survivor_token_id = $1
-       GROUP BY be.burner_wallet LIMIT 1`,
-      [survivorTokenId]
-    );
-    if(r.rows.length) return { owner: r.rows[0].burner_wallet, tokenIds: (r.rows[0].token_ids||[]).filter(Boolean) };
-  }catch(e){}
-  return null;
-}
-
-// ── Discord client ────────────────────────────────────────────────────────────
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function osHeaders(){ const h={accept:'application/json'}; if(OPENSEA_KEY) h['x-api-key']=OPENSEA_KEY; return h; }
-
-function trimEth(eth){
-  // Strip trailing zeros: 0.00700 → 0.007, 1.2300 → 1.23, 0.00570 → 0.0057
-  if(eth >= 1)    return parseFloat(eth.toFixed(4)).toString();
-  if(eth >= 0.1)  return parseFloat(eth.toFixed(4)).toString();
-  if(eth >= 0.01) return parseFloat(eth.toFixed(4)).toString();
-  return parseFloat(eth.toFixed(5)).toString();
-}
-
-function formatEth(event){
-  try{
-    const qty = BigInt(event.payment?.quantity||'0');
-    const dec = event.payment?.decimals??18;
-    const eth = Number(qty)/Math.pow(10,dec);
-    if(!isFinite(eth)||eth<=0) return null;
-    return trimEth(eth);
-  }catch{ return null; }
-}
-
-function formatListingEth(listing){
-  try{
-    const qty = listing.payment?.quantity;
-    if(!qty) return null;
-    const dec = listing.payment?.decimals ?? 18;
-    const eth = Number(qty) / Math.pow(10, dec);
-    if(!isFinite(eth)||eth<=0) return null;
-    return trimEth(eth);
-  }catch{ return null; }
-}
-
-function shortAddr(addr){ if(!addr||addr.length<10) return addr||'unknown'; return addr.slice(0,6)+'...'+addr.slice(-4); }
-function timeSince(ts){
-  const s=Math.floor(Date.now()/1000-ts);
-  if(s<60)   return s+'s ago';
-  if(s<3600) return Math.floor(s/60)+'m ago';
-  if(s<86400) return Math.floor(s/3600)+'h ago';
-  if(s<2592000) return Math.floor(s/86400)+'d ago';
-  if(s<31536000) return Math.floor(s/2592000)+'mo ago';
-  return Math.floor(s/31536000)+'y ago';
-}
-function isSvg(url){ if(!url) return false; const s=String(url).trim(); return s.startsWith('<svg')||s.startsWith('data:image/svg')||s.toLowerCase().endsWith('.svg')||s.includes('image/svg'); }
-function isDiscordOk(url){ if(!url||isSvg(url)) return false; const s=url.toLowerCase(); return (s.startsWith('http://')||s.startsWith('https://'))&&!s.startsWith('data:'); }
-
-function matchesFilters(traits, filters){
-  if(!filters||Object.keys(filters).length===0) return true;
-  const lookup={};
-  for(const t of (traits||[])) lookup[t.trait_type?.toLowerCase()]=String(t.value).toLowerCase();
-  // OR logic across all filter keys:
-  // A token matches if it satisfies ANY of the filter conditions.
-  // Within a single key, multiple values are also OR (e.g. type=zombie OR ape).
-  for(const [k,v] of Object.entries(filters)){
-    const allowed = Array.isArray(v) ? v : [v];
-    if(allowed.includes(lookup[k])) return true;
-  }
-  return false;
-}
-
-// ── SVG → PNG (OCAS on-chain SVG with embedded PNG + gradient background) ────
-async function extractPngFromSvg(svgSource){
-  let svgText;
-  if(svgSource.startsWith('data:image/svg')){
-    const b64=svgSource.split(',')[1]; if(!b64) throw new Error('Empty SVG');
-    svgText=Buffer.from(b64,'base64').toString('utf-8');
-  } else {
-    const r=await fetch(svgSource); if(!r.ok) throw new Error('SVG fetch '+r.status);
-    svgText=await r.text();
-  }
-  const SIZE=500;
-
-  // Render the original SVG directly so pixel-banded backgrounds are preserved
-  // exactly as authored — no gradient reconstruction. Previously the background
-  // rect bands were discarded and rebuilt as a smooth linearGradient, causing
-  // the blurry gradient look vs OpenSea's sharp pixel bands.
-  let bgBuf;
-  try{
-    bgBuf=await sharp(Buffer.from(svgText))
-      .resize(SIZE,SIZE,{kernel:'nearest',fit:'fill'})
-      .png()
-      .toBuffer();
-  }catch(e){ throw new Error('SVG render failed: '+e.message); }
-
-  // Extract the embedded character PNG and re-composite at full size with
-  // nearest-neighbor upscaling so character pixels stay crisp.
-  const pngMatch=svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
-  if(pngMatch){
-    try{
-      const rawPng=Buffer.from(pngMatch[1].replace(/\s/g,''),'base64');
-      const charBuf=await sharp(rawPng).resize(SIZE,SIZE,{kernel:'nearest'}).png().toBuffer();
-      return sharp(bgBuf).composite([{input:charBuf,blend:'over'}]).png().toBuffer();
-    }catch(e){ console.warn('[extractPngFromSvg] char composite failed, using full SVG render:',e.message); }
-  }
-
-  return bgBuf;
-}
-
-// ── Image resolver ────────────────────────────────────────────────────────────
-async function resolveImage(nft, contract, chain){
-  const id=nft?.identifier||nft?.token_id;
-  const key=`${contract}:${id}`;
-  if(id&&imageCache.has(key)) return imageCache.get(key);
-  const candidates=[nft?.display_image_url,nft?.image_url,nft?.image_preview_url];
-  for(const url of candidates){ if(isDiscordOk(url)){ const r={type:'url',url}; if(id) imageCache.set(key,r); return r; } }
-  if(id){
-    try{
-      const chainForImg=chain||'ethereum';
-      const r=await fetch(`https://api.opensea.io/api/v2/chain/${chainForImg}/contract/${contract}/nfts/${id}`,{headers:osHeaders()});
-      if(r.ok){
-        const j=await r.json(); const n=j.nft||j;
-        const deep=[n.display_image_url,n.image_url,n.image_preview_url,n.image_thumbnail_url];
-        for(const url of deep){ if(isDiscordOk(url)){ const res={type:'url',url}; imageCache.set(key,res); return res; } }
-        const svgSrc=deep.find(u=>u&&!u.startsWith('<svg')&&!u.startsWith('data:')&&isSvg(u))||candidates.find(u=>u&&isSvg(u));
-        if(svgSrc){ const buf=await extractPngFromSvg(svgSrc); const res={type:'buffer',buffer:buf,filename:`token-${id}.png`}; imageCache.set(key,res); return res; }
-      }
-    }catch(e){ console.warn('[Image]',id,e.message); }
-  }
-  return null;
-}
-
-// ── Send embed (handles buffer attachment vs URL) ─────────────────────────────
-async function sendEmbed(target, embed){
-  return target.send(buildEmbedPayload(embed));
-}
-
-function buildEmbedPayload(embed){
-  const ir=embed._imageResult; delete embed._imageResult;
-  const components = embed._components || [];
-  delete embed._components;
-  if(ir?.type==='buffer'){ const att=new AttachmentBuilder(ir.buffer,{name:ir.filename}); embed.setThumbnail(`attachment://${ir.filename}`); return {embeds:[embed],files:[att],components}; }
-  if(ir?.type==='url') embed.setThumbnail(ir.url);
-  return {embeds:[embed],components};
-}
-
-
-// ── Token DB metadata helper — OS rank + traits for listing/sale cards ──────
-const tokenMetaCache = new Map(); // tokenId → { meta, expires }
-async function fetchTokenMetaFromDb(tokenId){
-  const id = parseInt(tokenId);
-  if(!id) return null;
-  const cached = tokenMetaCache.get(id);
-  if(cached && Date.now() < cached.expires) return cached.meta;
-
-  const RAILWAY_URL = getRailwayApiUrl();
-  const API_SECRET  = process.env.API_SECRET;
-  if(!RAILWAY_URL) return null;
-
-  try{
-    const qs = new URLSearchParams({ key: API_SECRET || '' });
-    const r = await fetch(`${RAILWAY_URL}/db/token/${id}?${qs}`);
-    if(!r.ok) return null;
-    const j = await r.json();
-    if(!j.ok || !j.token) return null;
-    const localMeta = await fetchTokenMetaFromLocalDb(id).catch(()=>null);
-    const apiTraits = j.token.traits || null;
-    const bestTraits = realTraitCount(localMeta?.traits) > realTraitCount(apiTraits) ? localMeta.traits : apiTraits;
-    const meta = {
-      os_rank: j.token.os_rank ? parseInt(j.token.os_rank) : null,
-      traits:  bestTraits || null,
-      trait_count: realTraitCount(bestTraits) || (j.token.trait_count ? parseInt(j.token.trait_count) : null),
-    };
-    tokenMetaCache.set(id, { meta, expires: Date.now() + 5 * 60 * 1000 });
-    return meta;
-  }catch(e){
-    console.warn('[Token meta]', id, e.message);
-    return null;
-  }
-}
-
-async function fetchTokenMetaFromOpenSea(tokenId){
-  const id = parseInt(tokenId);
-  if(!id) return null;
-  const cacheKey = `os:${id}`;
-  const cached = tokenMetaCache.get(cacheKey);
-  if(cached && Date.now() < cached.expires) return cached.meta;
-  try{
-    const r = await fetch(`https://api.opensea.io/api/v2/chain/ethereum/contract/${OCAS_CONTRACT}/nfts/${id}`, { headers: osHeaders() });
-    if(!r.ok) return null;
-    const j = await r.json();
-    const n = j.nft || j;
-    const rawTraits = Array.isArray(n.traits) ? n.traits : (Array.isArray(n.attributes) ? n.attributes : []);
-    const traits = traitsObjectFromArray(rawTraits, n.image || n.image_url || n.display_image_url || null);
-    const meta = {
-      os_rank: null,
-      traits: realTraitCount(traits) ? traits : null,
-      trait_count: realTraitCount(traits) || null,
-    };
-    tokenMetaCache.set(cacheKey, { meta, expires: Date.now() + 2 * 60 * 1000 });
-    return meta;
-  }catch(e){
-    console.warn('[Token meta OpenSea]', id, e.message);
-    return null;
-  }
-}
-
-
-async function fetchTokenMetaFromLocalDb(tokenId){
-  const id = parseInt(tokenId);
-  if(!id) return null;
-  try{
-    // Prefer snapshot JSON when available because it preserves the full __attributes array.
-    const snap = await pgPool.query(
-      `SELECT traits_json FROM token_image_snapshots WHERE token_id=$1 AND traits_json IS NOT NULL LIMIT 1`,
-      [id]
-    ).catch(()=>({ rows:[] }));
-    const snapTraits = snap.rows[0]?.traits_json || null;
-    if(snapTraits && realTraitCount(snapTraits)){
-      return { os_rank:null, traits:snapTraits, trait_count:realTraitCount(snapTraits) };
-    }
-
-    let r;
-    try{
-      r = await pgPool.query(
-        `SELECT trait_name, trait_value FROM token_traits WHERE token_id=$1 ORDER BY trait_index ASC, id ASC`,
-        [id]
-      );
-    }catch(_){
-      // Backwards compatibility before trait_index column exists.
-      r = await pgPool.query(
-        `SELECT trait_name, trait_value FROM token_traits WHERE token_id=$1 ORDER BY id ASC`,
-        [id]
-      );
-    }
-    if(!r.rows.length) return null;
-    const attrs = r.rows
-      .filter(row => row.trait_name && row.trait_value != null)
-      .map(row => ({ trait_type:String(row.trait_name), value:String(row.trait_value) }));
-    const traits = traitsObjectFromArray(attrs);
-    return realTraitCount(traits) ? { os_rank:null, traits, trait_count:realTraitCount(traits) } : null;
-  }catch(e){
-    console.warn('[Token local meta]', id, e.message);
-    return null;
-  }
-}
-
-async function upsertTokenTraitRows(tokenId, traits, source='unknown'){
-  const id = parseInt(tokenId);
-  const attrs = traitsArrayFromInput(traits);
-  if(!id || !attrs.length) return false;
-  try{
-    await pgPool.query('DELETE FROM token_traits WHERE token_id=$1', [id]);
-    for(let i = 0; i < attrs.length; i++){
-      const t = attrs[i];
-      await pgPool.query(
-        `INSERT INTO token_traits (token_id, trait_name, trait_value, trait_index)
-         VALUES ($1, $2, $3, $4)`,
-        [id, String(t.trait_type), String(t.value), i]
-      );
-    }
-    const img = getTraitImageSource(traits);
-    if(img){
-      // Never overwrite a higher-priority snapshot source with a lower one.
-      // Priority order: burn-start-input > backfill-chunks > burn-finalized-survivor
-      // This ensures original mint traits (backfill-chunks) are never lost when
-      // a token later becomes a burn survivor and gets new post-burn traits written.
-      const SOURCE_PRIORITY = { 'burn-start-input': 3, 'backfill-chunks': 2, 'burn-finalized-survivor': 1 };
-      const newPriority = SOURCE_PRIORITY[source] || 0;
-      const traitsForSnapshot = traitsObjectFromArray(attrs, img);
-      await pgPool.query(
-        `INSERT INTO token_image_snapshots (token_id, image_data, traits_json, source, updated_at)
-         VALUES ($1,$2,$3,$4,NOW())
-         ON CONFLICT (token_id) DO UPDATE SET
-           image_data=EXCLUDED.image_data,
-           traits_json=EXCLUDED.traits_json,
-           source=EXCLUDED.source,
-           updated_at=NOW()
-         WHERE (
-           CASE WHEN token_image_snapshots.source = 'burn-start-input' THEN 3
-                WHEN token_image_snapshots.source = 'backfill-chunks' THEN 2
-                WHEN token_image_snapshots.source = 'burn-finalized-survivor' THEN 1
-                ELSE 0 END
-         ) < $5`,
-        [id, String(img), JSON.stringify(traitsForSnapshot), source, newPriority]
-      ).catch(()=>{});
-    }
-    return true;
-  }catch(e){
-    console.warn(`[Token snapshot] failed for #${id}:`, e.message);
-    return false;
-  }
-}
-
-async function snapshotTokenFromContract(tokenId, source='burn-start'){
-  const id = parseInt(tokenId);
-  if(!id) return null;
-  const traits = await fetchTokenUriFromContract(id).catch(()=>null);
-  if(traits && realTraitCount(traits)){
-    await upsertTokenTraitRows(id, traits, source);
-    return traits;
-  }
-  return null;
-}
-
-async function fetchSnapshotImageForToken(tokenId){
-  const id = parseInt(tokenId);
-  if(!id) return null;
-  try{
-    const snap = await pgPool.query('SELECT image_data FROM token_image_snapshots WHERE token_id=$1', [id]);
-    let imgSrc = snap.rows[0]?.image_data || null;
-    if(!imgSrc){
-      const meta = await fetchTokenMetaFromLocalDb(id);
-      imgSrc = meta?.traits?.__image || null;
-    }
-    if(!imgSrc) return null;
-    if(imgSrc.startsWith('<svg') || imgSrc.startsWith('data:image/svg') || imgSrc.toLowerCase().includes('image/svg')){
-      const buf = await extractPngFromSvg(imgSrc);
-      if(buf) return { type:'buffer', buffer:buf, filename:`token-${id}.png` };
-    }
-    if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)) return { type:'url', url:imgSrc };
-  }catch(e){
-    console.warn(`[Token snapshot image] #${id}:`, e.message);
-  }
-  return null;
-}
-
-// Normalize raw OCAS Type trait to clean display name.
-// "Human 5" → "Human", "Human Trait Booster" → "Human", "Zombie 2" → "Zombie"
-function normalizeOcasType(raw){
-  if(!raw) return null;
-  const s = String(raw).trim();
-  const words = s.split(/\s+/).filter(w => !/^(trait|booster|\d+)$/i.test(w));
-  return words.join(' ') || s.split(/\s+/)[0] || s;
-}
-
-// Returns a compact type breakdown string for a list of burned token IDs.
-// Looks up each token's Type trait from token_traits DB.
-// Example output: "3 · 3x Human" or "2 · 1x Zombie, 1x Ape"
-async function burnTypeBreakdown(tokenIds, burnEventId=null){
-  if(!tokenIds || !tokenIds.length) return String(tokenIds?.length || '?');
-  try{
-    const ids = tokenIds.filter(Boolean).map(Number);
-    if(!ids.length) return String(tokenIds.length);
-
-    const typeMap = {};
-
-    // Step 1 (best): burn_state_snapshots from the PREVIOUS burn event for each token.
-    // This is the most historically accurate source — it records the post-burn state
-    // of a token after each burn, which equals the pre-burn state going into the next burn.
-    // For a given burn event, we look for the most recent burn_state_snapshot for each
-    // input token that was written BEFORE this burn event.
-    if(burnEventId){
-      const stateSnap = await pgPool.query(
-        `SELECT DISTINCT ON (bss.token_id) bss.token_id, bss.traits_json
-         FROM burn_state_snapshots bss
-         WHERE bss.token_id = ANY($1)
-           AND bss.burn_event_id < $2
-         ORDER BY bss.token_id, bss.burn_event_id DESC`,
-        [ids, burnEventId]
-      );
-      for(const row of stateSnap.rows){
-        if(!row.traits_json) continue;
-        const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
-        const rawType = tj?.Type || tj?.type || null;
-        if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
-      }
-    }
-
-    // Step 2: burn-start-input snapshots — for tokens not covered by state snapshots,
-    // use the snapshot captured at the moment the token was selected for burning.
-    // Note: for re-burned tokens this may be stale (frozen at first burn), so it's
-    // only used as fallback when no state snapshot exists.
-    const missing0 = ids.filter(id => !typeMap[id]);
-    if(missing0.length){
-      const snapBurn = await pgPool.query(
-        `SELECT token_id, traits_json FROM token_image_snapshots
-         WHERE token_id = ANY($1) AND source = 'burn-start-input'`,
-        [missing0]
-      );
-      for(const row of snapBurn.rows){
-        if(!row.traits_json) continue;
-        const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
-        const rawType = tj?.Type || tj?.type || null;
-        if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
-      }
-    }
-
-    // Step 3: backfill-chunks snapshots — original mint traits, correct for tokens
-    // that were never snapshotted at burn time (first-time burns, never re-burned).
-    const missing1 = ids.filter(id => !typeMap[id]);
-    if(missing1.length){
-      const snapBackfill = await pgPool.query(
-        `SELECT token_id, traits_json FROM token_image_snapshots
-         WHERE token_id = ANY($1) AND source = 'backfill-chunks'`,
-        [missing1]
-      );
-      for(const row of snapBackfill.rows){
-        if(!row.traits_json) continue;
-        const tj = typeof row.traits_json === 'string' ? JSON.parse(row.traits_json) : row.traits_json;
-        const rawType = tj?.Type || tj?.type || null;
-        if(rawType) typeMap[row.token_id] = normalizeOcasType(rawType);
-      }
-    }
-
-    // Step 4: token_traits — last resort, may reflect current state after re-burns
-    const missing2 = ids.filter(id => !typeMap[id]);
-    if(missing2.length){
-      const r = await pgPool.query(
-        `SELECT token_id, trait_value FROM token_traits
-         WHERE token_id = ANY($1) AND LOWER(trait_name) = 'type'`,
-        [missing2]
-      );
-      for(const row of r.rows) typeMap[row.token_id] = normalizeOcasType(row.trait_value);
-    }
-
-    const counts = {};
-    for(const id of ids){
-      const t = typeMap[id] || null;
-      if(t) counts[t] = (counts[t] || 0) + 1;
-    }
-
-    const known = Object.entries(counts).sort((a,b) => b[1] - a[1]);
-    const unknownCount = ids.length - Object.values(counts).reduce((s,n)=>s+n, 0);
-    const parts = known.map(([type, n]) => `${n}x ${type}`);
-    if(unknownCount > 0) parts.push(`${unknownCount}x ?`);
-
-    const breakdown = parts.join(', ');
-    return breakdown ? `${ids.length} · ${breakdown}` : String(ids.length);
-  }catch(e){
-    return String(tokenIds.length);
-  }
-}
-
-async function fetchBurnDisplayTraits(tokenId){
-  const id = parseInt(tokenId);
-  if(!id) return null;
-  let traits = await fetchTokenUriFromContract(id).catch(()=>null);
-  if(!traits) traits = await fetchFreshOsMeta(id).catch(()=>null);
-  if(!traits){
-    const local = await fetchTokenMetaFromLocalDb(id).catch(()=>null);
-    traits = local?.traits || null;
-  }
-  if(traits && realTraitCount(traits)){
-    const freshMeta = { os_rank:null, traits, trait_count:realTraitCount(traits) };
-    tokenMetaCache.set(id, { meta:freshMeta, expires:Date.now() + 5 * 60_000 });
-    tokenMetaCache.set(`os:${id}`, { meta:freshMeta, expires:Date.now() + 5 * 60_000 });
-  }
-  return traits;
-}
-
-async function fetchCreatedTokenMeta(tokenId){
-  const contractTraits = await fetchTokenUriFromContract(tokenId).catch(()=>null);
-  if(contractTraits && realTraitCount(contractTraits)){
-    return { os_rank:null, traits:contractTraits, trait_count:realTraitCount(contractTraits) };
-  }
-  const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-  if(dbMeta?.traits && realTraitCount(dbMeta.traits)) return dbMeta;
-  const localMeta = await fetchTokenMetaFromLocalDb(tokenId).catch(()=>null);
-  if(localMeta?.traits && realTraitCount(localMeta.traits)) return localMeta;
-  const osMeta = await fetchTokenMetaFromOpenSea(tokenId).catch(()=>null);
-  return osMeta?.traits ? { ...(dbMeta || {}), ...osMeta } : dbMeta;
-}
-
-function traitObjectToArray(traitsObj){
-  return traitsArrayFromInput(traitsObj);
-}
-
-function osRankBadge(osRank){
-  return osRank ? `⬥${Number(osRank).toLocaleString()}` : '';
-}
-
-function titleTokenId(tokenId, fallbackName){
-  return tokenId ? `#${tokenId}` : (fallbackName || 'Unknown');
-}
-
-// ── Build SALE embed ──────────────────────────────────────────────────────────
-async function buildSaleEmbed(sale, config){
-  const id=sale.nft?.identifier;
-  const name=sale.nft?.name||`#${id}`;
-  const eth=formatEth(sale);
-  const contract=config.contract||'';
-  const slug=config.slug||'';
-  const chain=config.chain||'ethereum';
-  const osUrl=contract?`https://opensea.io/assets/${chain}/${contract}/${id}`:`https://opensea.io/assets/${chain}/${id}`;
-  const tvUrl=`https://traitview.com/?jump=${id}`;
-  const timeStr=sale.event_timestamp?timeSince(sale.event_timestamp):'';
-  const buyerLink=sale.buyer&&sale.buyer!=='unknown'?`[${shortAddr(sale.buyer)}](https://opensea.io/${sale.buyer})`:'unknown';
-  const sellerLink=sale.seller&&sale.seller!=='unknown'?`[${shortAddr(sale.seller)}](https://opensea.io/${sale.seller})`:'unknown';
-
-  // Detect ETH vs WETH and sale type
-  const paymentToken = sale.payment?.symbol || '';
-  const paymentAddr  = (sale.payment?.token_address||'').toLowerCase();
-  const WETH_ADDR    = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
-  const isWeth       = paymentAddr === WETH_ADDR || paymentToken.toLowerCase() === 'weth';
-  const currencySymbol = isWeth ? 'WETH' : 'ETH';
-
-  const dbMeta = id ? await fetchTokenMetaFromDb(id) : null;
-  const osRank = dbMeta?.os_rank || sale.nft?.os_rank || null;
-  const rankPart = osRankBadge(osRank);
-  const sweepPrefix = sale._isSweep ? '🧹 ' : '';
-  const tokenLabel = titleTokenId(id, name);
-  const embedTitle = `${sweepPrefix}${eth ? eth+' '+currencySymbol : '--'} • ${tokenLabel}${rankPart ? ' '+rankPart : ''} • Sold`;
-
-  const footerBits = ['Sales Bot', slug];
-  if(timeStr) footerBits.push(timeStr);
-
-  // Sale color = payment type only. Rank is visible in the title (⬥) and
-  // does not affect sidebar color — that would confuse ETH vs WETH signal.
-  const saleColor = isWeth ? COLORS.WETH_ROSE : COLORS.OCAS_GREEN;
-
-  const embed=new EmbedBuilder()
-    .setTitle(embedTitle)
-    .setColor(saleColor)
-    .setURL(osUrl)
-    .setFooter({text:footerBits.filter(Boolean).join(' • ')})
-    .setTimestamp();
-
-  embed._imageResult=await resolveImage(sale.nft,contract,config.chain||'ethereum');
-
-  // Buyer + Seller on same row, then Traits stacked underneath.
-  embed.addFields(
-    {name:'Buyer',  value:buyerLink,  inline:true},
-    {name:'Seller', value:sellerLink, inline:true},
-    {name:'​',   value:'​',        inline:true},
-  );
-  let traits=sale.nft?.traits||[];
-  if((!traits || traits.length===0) && dbMeta?.traits) traits = traitObjectToArray(dbMeta.traits);
-  if(traits.length>0){
-    const traitLines = traitDisplayLines(traits, 12);
-    const half = Math.ceil(traitLines.length/2);
-    const col1 = traitLines.slice(0,half).join('\n');
-    const col2 = traitLines.slice(half).join('\n');
-    embed.addFields(
-      {name:'Traits', value:col1, inline:true},
-      {name:'​',  value:col2||'​', inline:true},
-    );
-  }
-  embed.addFields({name:'Links',value:`[OpenSea](${osUrl}) • [TraitView](${tvUrl})`,inline:false});
-  return embed;
-}
-
-// ── Build LISTING embed ───────────────────────────────────────────────────────
-// OpenSea listing events (event_type:"order") real structure from debug:
-//   listing.asset        → NFT data (token_id, name, image_url, traits)
-//   listing.payment      → { quantity (wei), decimals, symbol }
-//   listing.maker        → seller address (string)
-//   listing.criteria     → trait filter if collection offer
-async function buildListingEmbed(listing, config){
-  // OpenSea listing event structure (confirmed via /debuglisting):
-  //   asset = null for some collections (OCAS)
-  //   criteria.encoded_token_ids = token ID when asset is null
-  //   criteria.contract.address = contract address
-  //   payment.quantity = price in wei
-  //   maker = seller address string
-  const asset      = listing.asset || {};
-  const criteria   = listing.criteria || {};
-  const eth        = formatListingEth(listing);
-  const slug       = config.slug || '';
-  const chain      = config.chain || 'ethereum';
-
-  // Token ID: from asset first, then criteria
-  const id = String(
-    asset.token_id ||
-    asset.identifier ||
-    criteria.encoded_token_ids ||
-    listing.token_id ||
-    listing.identifier ||
-    ''
-  );
-
-  // Contract: from config first, then asset, then criteria
-  const contract = config.contract ||
-    (asset.asset_contract && asset.asset_contract.address) ||
-    (criteria.contract && criteria.contract.address) ||
-    '0x078be86f3104a32313a47815792230a3808642cc';
-
-  const osUrl  = (contract && id) ? 'https://opensea.io/assets/'+chain+'/'+contract+'/'+id : 'https://opensea.io/collection/'+slug;
-  const tvUrl  = id ? 'https://traitview.com/?jump='+id : '';
-
-  const sellerAddr = (typeof listing.maker === 'string' ? listing.maker : (listing.maker && listing.maker.address)) || listing.seller || '';
-  const sellerLink = sellerAddr ? '['+shortAddr(sellerAddr)+'](https://opensea.io/'+sellerAddr+')' : 'unknown';
-
-  const dbMeta = listing._dbToken || (id ? await fetchTokenMetaFromDb(id) : null);
-  const osRank = dbMeta?.os_rank || listing.os_rank || asset.os_rank || null;
-  const rankPart = osRankBadge(osRank);
-  const tokenLabel = titleTokenId(id, asset.name);
-  const embedTitle = `${eth ? eth+' ETH' : '--'} • ${tokenLabel}${rankPart ? ' '+rankPart : ''} • Listed`;
-
-  const footerBits = ['Listings Bot', slug];
-  if(config._rankAlert) footerBits.push('Rank Alert');
-
-  // Listing color: rank tier first, then OpenSea blue
-  const rankTierColor = getRankTierColor(osRank);
-  const listingColor = rankTierColor ?? COLORS.OPENSEA_BLUE;
-
-  const embed = new EmbedBuilder()
-    .setTitle(embedTitle)
-    .setColor(listingColor)
-    .setURL(osUrl)
-    .setFooter({text:footerBits.filter(Boolean).join(' • ')})
-    .setTimestamp();
-
-  // resolveImage fetches from OpenSea NFT endpoint using the token ID
-  // This handles the case where asset is null - it goes direct to the NFT endpoint
-  const nftLike = {
-    identifier:        id,
-    image_url:         asset.image_url || null,
-    display_image_url: asset.display_image_url || null,
-    image_preview_url: asset.image_preview_url || null,
-  };
-  embed._imageResult = id ? await resolveImage(nftLike, contract, chain) : null;
-
-  // Seller + Buy Now on same row, then Traits stacked underneath like sale cards.
-  embed.addFields(
-    {name:'Seller',  value: sellerLink,             inline:true},
-    {name:'Buy Now', value: '[OpenSea]('+osUrl+')', inline:true},
-    {name:'​',  value:'​', inline:true},
-  );
-
-  let traits = asset.traits || [];
-  if((!traits || traits.length === 0) && dbMeta?.traits) traits = traitObjectToArray(dbMeta.traits);
-  if(traits.length > 0){
-    const traitLines = traitDisplayLines(traits, 12);
-    const half = Math.ceil(traitLines.length/2);
-    const col1 = traitLines.slice(0,half).join('\n');
-    const col2 = traitLines.slice(half).join('\n');
-    embed.addFields(
-      {name:'Traits', value:col1, inline:true},
-      {name:'​', value:col2||'​', inline:true},
-    );
-  }
-
-  const linkParts = ['[OpenSea]('+osUrl+')'];
-  if(tvUrl) linkParts.push('[TraitView]('+tvUrl+')');
-  embed.addFields({name:'Links', value:linkParts.join(' • '), inline:false});
-  return embed;
-}
-
-// ── Command search helpers ───────────────────────────────────────────────────
-function traitGroupsLabel(groups, fallback){
-  const parts = (groups || []).map(group => {
-    const first = group && group[0];
-    return first ? `${first.trait_name}: ${first.trait_value}` : null;
-  }).filter(Boolean);
-  return parts.length ? parts.join(' + ') : String(fallback || '').trim();
-}
-
-async function fetchBotApiJson(url, label){
-  let r;
-  try{
-    r = await fetch(url);
-  }catch(e){
-    throw new Error(`${label} unavailable: ${e.message}`);
-  }
-  if(!r.ok){
-    let detail = '';
-    try{ detail = (await r.text()).slice(0, 180).replace(/\s+/g, ' ').trim(); }catch(_){}
-    throw new Error(`${label} returned HTTP ${r.status}${detail ? ` (${detail})` : ''}`);
-  }
-  const j = await r.json();
-  if(!j.ok) throw new Error(`${label} error: ${j.error || 'unknown error'}`);
-  return j;
-}
-
-async function buildTokenSearchEmbed(token, config, footerLabel){
-  const tokenId = token.token_id ?? token.id ?? token.identifier;
-  const id = String(tokenId || '');
-  const contract = config.contract || '';
-  const chain = config.chain || 'ethereum';
-  const slug = config.slug || '';
-  const dbMeta = token._dbToken || (id ? await fetchTokenMetaFromDb(id) : null);
-  const osRank = dbMeta?.os_rank || token.os_rank || null;
-  const rankPart = osRankBadge(osRank);
-  const osUrl = id ? `https://opensea.io/assets/${chain}/${contract}/${id}` : `https://opensea.io/collection/${slug}`;
-  const tvUrl = id ? `https://traitview.com/?jump=${id}` : 'https://traitview.com/';
-  const embed = new EmbedBuilder()
-    .setTitle(`${titleTokenId(id)}${rankPart ? ' '+rankPart : ''}`)
-    .setColor(getRankTierColor(osRank) ?? COLORS.OCAS_BG)
-    .setURL(osUrl)
-    .setFooter({ text: footerLabel || 'Trait Search' })
-    .setTimestamp();
-
-  const traits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
-  const stats = [];
-  if(osRank) stats.push(`OS Rank: ${Number(osRank).toLocaleString()}`);
-  if(token.obs_rank) stats.push(`TraitView Rank: ${Number(token.obs_rank).toLocaleString()}`);
-  if(realTraitCount(dbMeta?.traits) || dbMeta?.trait_count || token.trait_count) stats.push(`Traits: ${realTraitCount(dbMeta?.traits) || dbMeta?.trait_count || token.trait_count}`);
-  if(stats.length) embed.addFields({ name:'Stats', value:stats.join('\n'), inline:false });
-
-  if(traits.length){
-    const traitLines = traitDisplayLines(traits, 12);
-    const half = Math.ceil(traitLines.length / 2);
-    embed.addFields(
-      { name:'Traits', value:traitLines.slice(0, half).join('\n'), inline:true },
-      { name:'\u200b', value:traitLines.slice(half).join('\n') || '\u200b', inline:true },
-    );
-  }
-  embed.addFields({ name:'Links', value:`[OpenSea](${osUrl}) - [TraitView](${tvUrl})`, inline:false });
-  try{ embed._imageResult = id ? await resolveImage({ identifier:id }, contract, chain) : null; }catch(_){}
-  return embed;
-}
-
-// ── Poll sales ────────────────────────────────────────────────────────────────
-async function pollSales(){
-  for(const [guildId,config] of Object.entries(serverConfigs)){
-    if(!config.channelId||!config.slug||config.paused) continue;
-    try{
-      const lastId=lastSaleIds.get(guildId);
-      const newSales=[];
-      let cursor=null;
-      let pages=0;
-      const MAX_PAGES=5; // catch up on up to 500 missed sales
-
-      // Paginate until we find the last seen sale or run out of pages
-      outer: while(pages<MAX_PAGES){
-        const qs=new URLSearchParams({event_type:'sale',limit:'100'});
-        if(cursor) qs.set('next',cursor);
-        const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(config.slug)}?${qs}`,{headers:osHeaders()});
-        if(!r.ok) break;
-        const j=await r.json();
-        const sales=j.asset_events||[];
-        if(!sales.length) break;
-
-        // First run — just set cursor, don't post
-        if(!lastId){
-          lastSaleIds.set(guildId,String(sales[0].id||sales[0].event_timestamp));
-          console.log('['+config.slug+'] Watching from sale '+lastSaleIds.get(guildId));
-          break;
-        }
-
-        for(const s of sales){
-          const sid=String(s.id||s.event_timestamp);
-          if(sid===lastId) break outer; // caught up
-          newSales.push(s);
-        }
-
-        cursor=j.next||null;
-        if(!cursor) break;
-        pages++;
-      }
-
-      if(!newSales.length) continue;
-      lastSaleIds.set(guildId,String(newSales[0].id||newSales[0].event_timestamp));
-      saveSaleCursors().catch(()=>{});
-
-      const channel=client.channels.cache.get(config.channelId);
-      if(!channel) continue;
-
-      console.log('['+config.slug+'] Posting '+newSales.length+' new sale(s)');
-
-      // Build all embeds — oldest first
-      const toPost = newSales.reverse();
-
-      // ── Sweep detection: count buyer+tx combos across this batch ─────────
-      // WETH sales = accepted offers, not floor sweeps — exclude them entirely.
-      const WETH_CONTRACT = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
-      const isWethSale = s => {
-        const sym  = (s.payment?.symbol || s.currency || '').toUpperCase();
-        const addr = (s.payment?.token_address || '').toLowerCase();
-        return sym === 'WETH' || addr === WETH_CONTRACT;
-      };
-      const sweepCounts = new Map();
-      for(const sale of toPost){
-        if(isWethSale(sale)) continue; // accepted offers don't count as sweeps
-        const buyer  = sale.buyer || '';
-        const txHash = sale.transaction || sale.order_hash || sale.id || '';
-        if(!buyer || buyer === 'unknown') continue;
-        const key = txHash
-          ? `${buyer}:${txHash}`
-          : `${buyer}:${Math.floor((sale.event_timestamp||Date.now()/1000)/5)}`;
-        sweepCounts.set(key, (sweepCounts.get(key)||0) + 1);
-      }
-      // Mark sweep sales before building embeds so 🧹 appears in title
-      for(const sale of toPost){
-        if(isWethSale(sale)) continue; // never mark WETH sales as sweeps
-        const buyer  = sale.buyer || '';
-        const txHash = sale.transaction || sale.order_hash || sale.id || '';
-        const key    = txHash
-          ? `${buyer}:${txHash}`
-          : `${buyer}:${Math.floor((sale.event_timestamp||Date.now()/1000)/5)}`;
-        if((sweepCounts.get(key)||0) >= 5) sale._isSweep = true;
-      }
-
-      // ── Build embeds (image fetching runs in parallel) ────────────────────
-      const filteredSales = toPost.filter(sale => matchesFilters(sale.nft?.traits, config.salesFilters));
-      const builtEmbeds   = await Promise.all(
-        filteredSales.map(sale => buildSaleEmbed(sale, config).catch(e => { console.error('[Build sale]', e.message); return null; }))
-      );
-
-      // ── Post embeds, fire sweep summary after last sweep token ────────────
-      const sweepPosted = new Set();
-      for(let i = 0; i < builtEmbeds.length; i++){
-        const embed = builtEmbeds[i];
-        const sale  = filteredSales[i];
-        if(!embed) continue;
-        try{ await sendEmbed(channel, embed); }catch(e){ console.error('[Sale post]', e.message); }
-        await new Promise(r => setTimeout(r, 300));
-
-        if(sale._isSweep){
-          const buyer  = sale.buyer || '';
-          const txHash = sale.transaction || sale.order_hash || sale.id || '';
-          const key    = txHash
-            ? `${buyer}:${txHash}`
-            : `${buyer}:${Math.floor((sale.event_timestamp||Date.now()/1000)/5)}`;
-          const sweepSales    = filteredSales.filter(s => s._isSweep && s.buyer === buyer &&
-            (s.transaction||s.order_hash||s.id||'') === txHash);
-          const lastSweepSale = sweepSales[sweepSales.length - 1];
-          if(sale === lastSweepSale && !sweepPosted.has(key)){
-            sweepPosted.add(key);
-            await fireSweepAlert({ sales: sweepSales, config }, channel);
-          }
-        }
-      }
-
-      // Personal DM alerts
-      for(const sale of toPost) await sendPersonalAlerts(sale, 'sale', config);
-
-    }catch(e){ console.error('[Poll sales]',guildId,e.message); sendErrorWebhook('Poll Sales Error', e, `guild=${guildId}`); }
-  }
-}
-
-// ── Poll listings ─────────────────────────────────────────────────────────────
-async function pollListings(){
-  for(const [guildId,config] of Object.entries(serverConfigs)){
-    if(!config.listingsChannelId||!config.slug||config.paused) continue;
-    try{
-      const lastId=lastListingIds.get(guildId);
-      const newListings=[];
-      let cursor=null;
-      let pages=0;
-      const MAX_PAGES=5;
-
-      outer: while(pages<MAX_PAGES){
-        const qs=new URLSearchParams({event_type:'listing',limit:'100'});
-        if(cursor) qs.set('next',cursor);
-        const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(config.slug)}?${qs}`,{headers:osHeaders()});
-        if(!r.ok) break;
-        const j=await r.json();
-        const listings=j.asset_events||[];
-        if(!listings.length) break;
-
-        if(!lastId){
-          lastListingIds.set(guildId,String(listings[0].id||listings[0].event_timestamp));
-          break;
-        }
-
-        for(const l of listings){
-          const lid=String(l.id||l.event_timestamp);
-          if(lid===lastId) break outer;
-          newListings.push(l);
-        }
-
-        cursor=j.next||null;
-        if(!cursor) break;
-        pages++;
-      }
-
-      if(!newListings.length) continue;
-      lastListingIds.set(guildId,String(newListings[0].id||newListings[0].event_timestamp));
-      saveListingCursors().catch(()=>{});
-
-      const channel=client.channels.cache.get(config.listingsChannelId);
-      if(!channel) continue;
-
-      console.log('['+config.slug+'] Posting '+newListings.length+' new listing(s)');
-
-      const toPost=newListings.reverse();
-      const toPostListings = toPost.filter(l=>matchesFilters((l.asset&&l.asset.traits)||[],config.listingFilters));
-      const embeds=await Promise.all(
-        toPostListings
-          .map(l=>buildListingEmbed(l,config).catch(e=>{console.error('[Build listing]',e.message);return null;}))
-      );
-
-      for(let i=0;i<embeds.length;i++){
-        const embed=embeds[i]; if(!embed) continue;
-        const lid=toPostListings[i]; const tokenId=String(lid?.asset?.token_id||lid?.asset?.identifier||lid?.criteria?.encoded_token_ids||lid?.token_id||'');
-        if(tokenId && isRecentChannelPost(channel.id, tokenId)) { console.log('[Listing dedup] skipping #'+tokenId+' already posted to channel'); continue; }
-        try{ await sendEmbed(channel,embed); }catch(e){ console.error('[Listing post]',e.message); }
-        await new Promise(r=>setTimeout(r,300));
-      }
-
-      // ── OS Rank listing alert ─────────────────────────────────────────────
-      // Rank alerts intentionally check ALL new listings, not just the ones that
-      // passed trait listing filters. Bot uses OS rank only.
-      const rankAlertCfg = config.rankAlert;
-      if(rankAlertCfg?.min && rankAlertCfg?.max){
-        const RAILWAY_URL = getRailwayApiUrl();
-        if(RAILWAY_URL){
-          for(const listing of toPost){
-            const id = parseInt(
-              (listing.asset?.token_id) ||
-              (listing.asset?.identifier) ||
-              (listing.criteria?.encoded_token_ids) ||
-              (listing.nft?.identifier) || 0
-            );
-            if(!id) continue;
-            try{
-              const dbMeta = await fetchTokenMetaFromDb(id);
-              const osRank = dbMeta?.os_rank;
-              if(!osRank) continue;
-              if(osRank >= rankAlertCfg.min && osRank <= rankAlertCfg.max){
-                const alertChannel = client.channels.cache.get(
-                  rankAlertCfg.channelId || config.listingsChannelId || config.channelId
-                );
-                if(!alertChannel) continue;
-                const alertEmbed = await buildListingEmbed(
-                  { ...listing, _dbToken: dbMeta },
-                  { ...config, _rankAlert: true }
-                );
-                if(isRecentChannelPost(alertChannel.id, String(id))){
-                  console.log(`[Rank Alert] #${id} deduped — already posted to channel recently`);
-                } else {
-                  try{ await sendEmbed(alertChannel, alertEmbed); }
-                  catch(e){ console.error('[Rank alert post]', e.message); }
-                  console.log(`[Rank Alert] #${id} OS Rank #${osRank} listed`);
-                }
-              }
-            }catch(e){ console.warn('[Rank alert]', e.message); }
-          }
-        }
-      }
-
-      for(const l of toPost) await sendPersonalAlerts(l,'listing',config);
-
-    }catch(e){ console.error('[Poll listings]',guildId,e.message); sendErrorWebhook('Poll Listings Error', e, `guild=${guildId}`); }
-  }
-}
-
-// ── Personal DM alerts ────────────────────────────────────────────────────────
-async function sendPersonalAlerts(event, type, config){
-  // Dedup: same event can come through multiple guild configs — only DM once per event
-  const eventKey = `placeholder:${type}:${event.id||event.event_timestamp}`;
-  for(const [userId, alert] of Object.entries(userAlerts)){
-    try{
-      if(alert.slug && alert.slug !== config.slug) continue;
-      if(type==='sale'&&!alert.alertSales) continue;
-      if(type==='listing'&&!alert.alertListings) continue;
-      const traits=type==='sale'?(event.nft?.traits||[]):(event.asset?.traits||event.item?.traits||event.nft?.traits||[]);
-      if(!matchesFilters(traits,alert.traitFilters)) continue;
-      // Skip if already sent this event to this user
-      const dedupKey = `${userId}:${type}:${event.id||event.event_timestamp}`;
-      if(alertedEventIds.has(dedupKey)) continue;
-      alertedEventIds.add(dedupKey);
-      // Keep set from growing forever — trim oldest 500 when over 5000
-      if(alertedEventIds.size > 5000){
-        const toDelete = [...alertedEventIds].slice(0, 500);
-        for(const k of toDelete) alertedEventIds.delete(k);
-      }
-      const user=await client.users.fetch(userId).catch(()=>null);
-      if(!user) continue;
-      const embed=type==='sale'
-        ? await buildSaleEmbed(event,config,false)
-        : await buildListingEmbed(event,config,false);
-      embed.setFooter({text:`Your personal alert - ${config.slug}`});
-      await sendEmbed(user,embed);
-    }catch(e){ console.warn('[DM alert]',userId,e.message); }
-  }
-}
-
-// ── Slash commands ────────────────────────────────────────────────────────────
-
-// ── Lottery helpers ───────────────────────────────────────────────────────────
-function lotteryHash(seed){ return require('crypto').createHash('sha256').update(String(seed)).digest('hex'); }
-function lotteryPick(entries, seed){
-  if(!entries.length) return null;
-  // Deterministic proof:
-  // 1) Build the final ordered entry list.
-  // 2) Hash public seed + exact ordered entries using SHA-256.
-  // 3) Convert the full 256-bit hash into a number and pick index modulo entry count.
-  // Same seed + same ordered entries = same winner every time.
-  const h = lotteryHash(seed + '\n' + entries.join('|'));
-  const idx = Number(BigInt('0x' + h) % BigInt(entries.length));
-  return { winner: entries[idx], index: idx, position: idx + 1, proof: h };
-}
-
-const PENDING_DRAW_SEED_PREFIX = '__PENDING_DRAW_SEED__';
-
-function randomLotterySeed(){
-  return require('crypto').randomBytes(32).toString('hex');
-}
-
-// Fetch the block hash of a specific Ethereum block number via the existing RPC.
-// Used as the public, tamper-proof seed for burn lotteries.
-async function fetchEthBlockHashSeed(targetBlock){
-  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-  const block = await burnRpc(rpcUrl, 'eth_getBlockByNumber', ['0x' + targetBlock.toString(16), false]);
-  if(!block || !block.hash) throw new Error(`Block #${targetBlock} not found or has no hash`);
-  return { hash: block.hash, blockNumber: targetBlock };
-}
-
-// Wait for a target block to be mined, polling every 12 seconds, timeout 3 minutes.
-async function waitForEthBlock(targetBlock){
-  const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-    `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-  const deadline = Date.now() + 3 * 60 * 1000;
-  while(Date.now() < deadline){
-        try{
-      const latest = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
-      if(latest >= targetBlock) return true;
-    }catch(_){}
-    await new Promise(r => setTimeout(r, 12000));
-  }
-  return false;
-}
-
-function pendingDrawSeed(){
-  // Stored only so scheduled lotteries can be created before the final random seed exists.
-  // The real public draw seed is generated at draw time.
-  return `${PENDING_DRAW_SEED_PREFIX}:${require('crypto').randomBytes(16).toString('hex')}`;
-}
-
-function isPendingDrawSeed(seed){
-  return String(seed || '').startsWith(PENDING_DRAW_SEED_PREFIX);
-}
-function parseLotteryDate(s, fallback=null){
-  if(!s) return fallback;
-  const v = String(s).trim().toLowerCase();
-  if(v === 'now') return new Date();
-  const d = new Date(s);
-  return Number.isNaN(d.getTime()) ? fallback : d;
-}
-
-const DEFAULT_LOTTERY_TIMEZONE = 'Europe/London';
-
-function normalizeLotteryTimezone(tz){
-  const v = String(tz || '').trim();
-  if(!v) return DEFAULT_LOTTERY_TIMEZONE;
-  const aliases = {
-    uk:'Europe/London',
-    london:'Europe/London',
-    gmt:'Europe/London',
-    bst:'Europe/London',
-    eastern:'America/New_York',
-    et:'America/New_York',
-    est:'America/New_York',
-    edt:'America/New_York',
-    newyork:'America/New_York',
-    'new-york':'America/New_York',
-    ny:'America/New_York',
-    utc:'UTC',
-    z:'UTC',
-  };
-  const key = v.toLowerCase().replace(/\s+/g,'').replace(/_/g,'-');
-  const out = aliases[key] || v;
-  try{
-    new Intl.DateTimeFormat('en-US', { timeZone: out }).format(new Date());
-    return out;
-  }catch(_){
-    throw new Error(`Invalid timezone "${v}". Use something like Europe/London or America/New_York.`);
-  }
-}
-
-function zonedParts(date, timeZone){
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone, year:'numeric', month:'2-digit', day:'2-digit',
-    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
-  }).formatToParts(date);
-  const o = {};
-  for(const p of parts) if(p.type !== 'literal') o[p.type] = p.value;
+// ── Shared context builder ────────────────────────────────────────────────────
+// Passed to every command handler so they have access to all shared state.
+function buildCtx(interaction, guildId, config, isAdmin){
   return {
-    year:Number(o.year), month:Number(o.month), day:Number(o.day),
-    hour:Number(o.hour === '24' ? '0' : o.hour), minute:Number(o.minute), second:Number(o.second)
+    interaction, guildId, config, isAdmin,
+    // Constants
+COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTERY_TIMEZONE,
+    // Helpers
+    osHeaders, getRailwayApiUrl, getRankTierColor, fetchBotApiJson, resolveDiscordChannel,
+    checkCommandCooldown, normalizeOcasType, resolveOcasType, burnTypeLabel, burnTypeColor, burnTypeEmoji,
+    API_SECRET, sendErrorWebhook,
+    // DB
+    pgPool, dbLoad, dbSave, getConfig, setConfig,
+    // Cache
+    getCachedImage, setCachedImage, clearCachedImage, getCachedTraits, setCachedTraits,
+    sweepSessions, slideshowSessions, recentChannelPosts,
+    // RPC
+    burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock,
+    // Embeds
+    buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
+    resolveImage, extractPngFromSvg, fetchTokenMetaFromDb,
+    buildBurnEmbed, buildBurnLotteryEmbed,
+    buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
+    buildGenericLotteryStartEmbed, buildGenericLotteryResultEmbed,
+    buildGenericLotteryComponents,
+    // Burn
+    burnConfig, saveBurnConfig, getBurnConfig, getConfiguredBurnChannelId,
+    upsertTokenTraitRows, triggerOsMetadataRefresh,
+    getBurnLotteryEntries, drawAndPostBurnLottery,
+    processDueBurnLotteries,
+    // Lottery
+    drawGenericLottery, processDueGenericLotteries, getGenericLotteryEntryCount,
+    // Crypto
+    lotteryPick, lotteryHash, pendingDrawSeed, isPendingDrawSeed,
+    randomLotterySeed, resolveLotteryWindow, LOTTERY_DURATION_RE,
+    // Alerts
+    getAlert, setAlert, deleteAlert,
+    // Format
+    resolveDiscordChannel,
+    // Trait/search helpers
+    getTraitIndex, chooseTraitGroupsFromQuery, normalizePhrase,
+    traitGroupsLabel, buildTokenSearchEmbed,
+    traitDisplayLines, traitObjectToArray, fetchTokenUriFromContract,
+    burnTypeBreakdown, fetchBurnDisplayTraits, fetchSnapshotImageForToken,
+    buildEmbedPayload, osRankBadge, titleTokenId,
+    // Lottery extras
+    findActiveGenericLottery, lotteryNumberFromSeed,
+    // Cache
+    ocasTraitsCache,
+    normAddr, shortAddr, formatEth, timeSince, lotteryTime,
+    formatBurnLotteryWindow, isSvg, isDiscordOk, matchesFilters,
+    // Rank sync
+    rankSyncQueue, queueRankSync,
+     // Wallet sync
+     backfillWallet,
+     getSyncStatus,
+     syncWalletForUser: _syncWalletForUser,
+    // Components
+    ActionRowBuilder, ButtonBuilder, ButtonStyle,
+    EmbedBuilder, AttachmentBuilder, MessageFlags, PermissionFlagsBits,
   };
 }
 
-function timezoneOffsetMs(date, timeZone){
-  const p = zonedParts(date, timeZone);
-  const asUTC = Date.UTC(p.year, p.month-1, p.day, p.hour, p.minute, p.second);
-  return asUTC - date.getTime();
-}
+// ── interactionCreate — button handlers + command dispatch ────────────────────
 
-function zonedDateTimeToUtc(year, month, day, hour=0, minute=0, second=0, timeZone=DEFAULT_LOTTERY_TIMEZONE){
-  const localAsUTC = Date.UTC(year, month-1, day, hour, minute, second);
-  let utc = localAsUTC - timezoneOffsetMs(new Date(localAsUTC), timeZone);
-  // DST boundary correction.
-  utc = localAsUTC - timezoneOffsetMs(new Date(utc), timeZone);
-  return new Date(utc);
-}
 
-function addDaysToYmd(year, month, day, delta){
-  const d = new Date(Date.UTC(year, month-1, day + delta, 12, 0, 0));
-  return { year:d.getUTCFullYear(), month:d.getUTCMonth()+1, day:d.getUTCDate() };
-}
-
-function parseLotteryTimeToken(token){
-  const s = String(token || '').trim().toLowerCase();
-  const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
-  if(!m) throw new Error(`Could not parse time "${token}". Try 10am, 10:30am, or 22:00.`);
-  let hour = Number(m[1]);
-  const minute = m[2] ? Number(m[2]) : 0;
-  const ampm = m[3];
-  if(minute < 0 || minute > 59) throw new Error(`Invalid minute in "${token}".`);
-  if(ampm){
-    if(hour < 1 || hour > 12) throw new Error(`Invalid 12-hour time "${token}".`);
-    if(ampm === 'pm' && hour !== 12) hour += 12;
-    if(ampm === 'am' && hour === 12) hour = 0;
-  }else if(hour < 0 || hour > 23){
-    throw new Error(`Invalid 24-hour time "${token}".`);
-  }
-  return { hour, minute };
-}
-
-function parseLotteryDurationHours(text, fallbackHours=24){
-  const s = String(text || '').toLowerCase();
-  const m = s.match(/(\d+(?:\.\d+)?)\s*(w|week|weeks|d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b/);
-  if(!m) return fallbackHours;
-  const n = Number(m[1]);
-  if(!Number.isFinite(n) || n <= 0) return fallbackHours;
-  const unit = m[2];
-  let hours;
-  if(unit.startsWith('w')) hours = n * 168;
-  else if(unit.startsWith('d')) hours = n * 24;
-  else if(unit === 'm' || unit.startsWith('mi')) hours = n / 60;
-  else hours = n;
-  if(hours > 168) throw new Error('Burn lottery window duration cannot exceed 168 hours (1 week).');
-  if(hours < (1/60)) throw new Error('Burn lottery window duration must be at least 1 minute.');
-  return hours;
-}
-
-const LOTTERY_DURATION_RE = /(\d+(?:\.\d+)?)\s*(w|week|weeks|d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b/i;
-
-function parseLotteryWindowAnchor(anchorText, timeZone, now=new Date()){
-  let s = String(anchorText || '').trim().toLowerCase();
-  const ukStyle = s.startsWith('uk:');
-  if(ukStyle) s = s.slice(3).trim();
-  if(!s || s === 'now') return new Date(now);
-
-  // Accept "yesterday-10am", "yesterday 10am", "today-10:30am", "tomorrow-18:00".
-  s = s.replace(/\s+/g, '-');
-  const rel = s.match(/^(yesterday|today|tomorrow)-(.+)$/);
-  if(rel){
-    const today = zonedParts(now, timeZone);
-    const delta = rel[1] === 'yesterday' ? -1 : rel[1] === 'tomorrow' ? 1 : 0;
-    const ymd = addDaysToYmd(today.year, today.month, today.day, delta);
-    const tm = parseLotteryTimeToken(rel[2]);
-    return zonedDateTimeToUtc(ymd.year, ymd.month, ymd.day, tm.hour, tm.minute, 0, timeZone);
-  }
-
-  // Accept "2026-06-08-10am", "2026-06-08 10am", "2026/06/08-10am".
-  const abs = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})[- ](.+)$/);
-  if(abs){
-    const tm = parseLotteryTimeToken(abs[4]);
-    return zonedDateTimeToUtc(Number(abs[1]), Number(abs[2]), Number(abs[3]), tm.hour, tm.minute, 0, timeZone);
-  }
-
-  // Accept US-style "06-07-2026-10am", "06/07/2026-10am", "06/07/2026 10am".
-  // With a "uk:" prefix, parse the same forms as DD-MM-YYYY / DD/MM/YYYY.
-  const usAbs = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})[- ](.+)$/);
-  if(usAbs){
-    const day = Number(ukStyle ? usAbs[1] : usAbs[2]);
-    const month = Number(ukStyle ? usAbs[2] : usAbs[1]);
-    if(month < 1 || month > 12 || day < 1 || day > 31){
-      throw new Error(`Invalid ${ukStyle ? 'DD-MM-YYYY' : 'MM-DD-YYYY'} date in "${anchorText}".`);
-    }
-    const tm = parseLotteryTimeToken(usAbs[4]);
-    return zonedDateTimeToUtc(Number(usAbs[3]), month, day, tm.hour, tm.minute, 0, timeZone);
-  }
-
-  // Fall back to normal ISO/date parsing for advanced users.
-  const d = new Date(anchorText);
-  if(!Number.isNaN(d.getTime())) return d;
-  throw new Error(`Could not parse window "${anchorText}".`);
-}
-
-function resolveLotteryWindow({ windowText, startText, endText, hours, timezone, now=new Date() }){
-  const timeZone = normalizeLotteryTimezone(timezone);
-  const fallbackHours = Math.max(1, Math.min(168, Number(hours || 24)));
-  if(windowText){
-    const durationHours = parseLotteryDurationHours(windowText, fallbackHours);
-    const anchor = String(windowText).replace(LOTTERY_DURATION_RE, '').trim();
-    const start = parseLotteryWindowAnchor(anchor || 'now', timeZone, now);
-    const end = new Date(start.getTime() + durationHours * 3600000);
-    return { start, end, hours:durationHours, timeZone };
-  }
-  const start = parseLotteryDate(startText, null);
-  const end = parseLotteryDate(endText, null);
-  if(start && end) return { start, end, hours:(end-start)/3600000, timeZone };
-  if(start && !end) return { start, end:new Date(start.getTime()+fallbackHours*3600000), hours:fallbackHours, timeZone };
-  if(!start && end) return { start:new Date(end.getTime()-fallbackHours*3600000), end, hours:fallbackHours, timeZone };
-  const defaultEnd = now;
-  return { start:new Date(defaultEnd.getTime()-fallbackHours*3600000), end:defaultEnd, hours:fallbackHours, timeZone };
-}
-
+// ── Burn lottery proof helpers (migrated from main) ───────────────────────────
 function formatZonedLotteryTime(d, timeZone){
   return new Intl.DateTimeFormat('en-US', {
     timeZone, month:'short', day:'numeric', year:'numeric',
     hour:'numeric', minute:'2-digit', timeZoneName:'short'
   }).format(new Date(d));
-}
-
-function lotteryTime(d){ return `<t:${Math.floor(new Date(d).getTime()/1000)}:f>`; }
-function formatBurnLotteryLocalTime(d, timeZone){
-  return new Intl.DateTimeFormat('en-GB', {
-    timeZone, day:'2-digit', month:'short', year:'numeric',
-    hour:'numeric', minute:'2-digit', hour12:true
-  }).format(new Date(d)).replace(/\b(am|pm)\b/ig, m=>m.toUpperCase());
 }
 
 function formatLotteryHours(hours){
@@ -3110,17 +223,13 @@ function burnLotteryWindowDetails(start, end, timeZone){
   ].join('\n');
 }
 
-function burnLotteryWindowSummary(start, end){
-  return `${lotteryTime(start)} -> ${lotteryTime(end)}\nDuration: ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))}`;
+function etherscanAddressLink(addr){
+  const a = String(addr || '').toLowerCase();
+  if(!/^0x[a-f0-9]{40}$/.test(a)) return String(addr || 'unknown');
+  return `[${shortAddr(a)}](https://etherscan.io/address/${a})`;
 }
 
-function burnLotteryWindowStatusLine(row){
-  const tz = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
-  const start = new Date(row.start_time);
-  const end = new Date(row.end_time);
-  return `#${row.id} · ${row.status} · ${lotteryTime(start)} -> ${lotteryTime(end)} · ${formatLotteryHours(burnLotteryWindowDurationHours(start, end))} · ${tz}${row.winner_wallet?' · winner '+shortAddr(row.winner_wallet):''}`;
-}
-
+// ── Burn lottery display helpers (migrated from main) ─────────────────────────
 function burnLotteryParseErrorMessage(){
   return [
     'I could not parse that burn lottery window.',
@@ -3132,34 +241,14 @@ function burnLotteryParseErrorMessage(){
   ].join('\n');
 }
 
-function etherscanAddressLink(addr){
-  const a = String(addr || '').toLowerCase();
-  if(!/^0x[a-f0-9]{40}$/.test(a)) return String(addr || 'unknown');
-  return `[${shortAddr(a)}](https://etherscan.io/address/${a})`;
+function burnLotteryModeNote(mode){
+  return mode === 'burn'
+    ? 'One entry per burn. Wallets may appear multiple times.'
+    : 'One entry per wallet.';
 }
 
-function buildBurnLotteryComponents(lotteryId){
-  if(!lotteryId) return [];
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`burnlottery_proof:${lotteryId}`)
-      .setLabel('Show Draw Proof')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(`burnlottery_entries:${lotteryId}:0`)
-      .setLabel('Show Entries')
-      .setStyle(ButtonStyle.Secondary)
-  )];
-}
-
-function buildActiveBurnLotteryComponents(lotteryId){
-  if(!lotteryId) return [];
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`burnlottery_current_entries:${lotteryId}:0`)
-      .setLabel('Show Entries')
-      .setStyle(ButtonStyle.Secondary)
-  )];
+function burnLotteryDisplayEntries(entries, wallets, mode){
+  return mode === 'burn' ? entries : wallets;
 }
 
 function buildBurnLotteryEntryPageComponents(lotteryId, page, totalPages, live=false){
@@ -3179,487 +268,1166 @@ function buildBurnLotteryEntryPageComponents(lotteryId, page, totalPages, live=f
   )];
 }
 
-function burnLotteryModeNote(mode){
-  return mode === 'burn'
-    ? 'One entry per burn. Wallets may appear multiple times.'
-    : 'One entry per wallet.';
+
+// ── Recursive string search ─────────────────────────────────────────────────
+function collectStringsDeep(obj, out=[]){
+  if(obj == null) return out;
+  if(typeof obj === 'string'){ out.push(obj); return out; }
+  if(Array.isArray(obj)){ for(const item of obj) collectStringsDeep(item, out); return out; }
+  if(typeof obj === 'object'){ for(const val of Object.values(obj)) collectStringsDeep(val, out); }
+  return out;
 }
 
-function burnLotteryDisplayEntries(entries, wallets, mode){
-  return mode === 'burn' ? entries : wallets;
-}
-
-function formatBurnLotteryWindow(start, end, timeZone){
-  return burnLotteryWindowSummary(start, end);
-  // Public embed uses Discord timestamps so each viewer sees the window in their own local time.
-  // The source timezone and full proof details stay behind the Show Draw Proof button.
-  return `${lotteryTime(start)} → ${lotteryTime(end)}`;
-}
-
-async function getBurnLotteryEntries(start, end, mode='wallet'){
-  const r = await pgPool.query(`
-    SELECT id, burner_wallet, survivor_token_id, tx_hash, burned_at
-    FROM burn_events
-    WHERE burned_at >= $1 AND burned_at < $2
-      AND burner_wallet IS NOT NULL AND TRIM(burner_wallet) <> ''
-    ORDER BY burned_at ASC, id ASC
-  `, [start, end]);
-  const burns = r.rows;
-  const wallets = [...new Set(burns.map(b=>String(b.burner_wallet).toLowerCase()).filter(Boolean))];
-  const entries = mode === 'burn' ? burns.map(b=>String(b.burner_wallet).toLowerCase()).filter(Boolean) : wallets;
-  return { entries, wallets, burns };
-}
-function buildBurnLotteryEmbed({title='OCAS Burn Lottery', prize, mode, start, end, seed, entries, wallets, burns, pick, lotteryId, timezone=DEFAULT_LOTTERY_TIMEZONE, seedMeta=null}){
-  const timeZone = normalizeLotteryTimezone(timezone);
-  const embed = new EmbedBuilder().setTitle(`🎟️ ${title}`).setColor(COLORS.OCAS_GREEN).addFields(
-    { name:'Window', value:formatBurnLotteryWindow(start, end, timeZone), inline:false },
-    { name:'Mode', value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet', inline:true },
-    { name:'Qualified Wallets', value:String(wallets.length), inline:true },
-    { name:'Total Burns', value:String(burns.length), inline:true },
-  );
-  if(prize) embed.addFields({ name:'Prize', value:String(prize).slice(0,1024), inline:false });
-  if(pick?.winner) embed.addFields({ name:'Winner', value:etherscanAddressLink(pick.winner), inline:false });
-  if(pick?.proof){
-    const blockLine = seedMeta?.block_number
-      ? `\nSeed source: Ethereum block [#${seedMeta.block_number}](https://etherscan.io/block/${seedMeta.block_number})`
-      : seedMeta?.seed_type === 'random_fallback' ? `\nSeed source: cryptographic random (ETH RPC unavailable — result is fair but not on-chain verifiable)` : '';
-    embed.addFields({
-      name:'Draw Proof',
-      value:`Winning entry: **${(pick.position || pick.index + 1).toLocaleString()} of ${entries.length.toLocaleString()}**\nProof: \`${pick.proof.slice(0,32)}...\`${blockLine}`,
-      inline:false
-    });
-  }
-  embed.setFooter({ text: lotteryId ? `Lottery ID ${lotteryId}` : 'Instant draw' }).setTimestamp();
-  return embed;
-}
-function buildBurnLotteryWinnerEmbed({title='OCAS Burn Lottery Winner', entries, wallets, burns, pick, lotteryId, seedMeta=null}){
-  const blockNum = seedMeta?.block_number || null;
-  const embed = new EmbedBuilder()
-    .setTitle(`🎉 ${title}`)
-    .setColor(COLORS.OCAS_GREEN)
-    .addFields(
-      { name:'Winner', value:pick?.winner ? `🏆 ${etherscanAddressLink(pick.winner)}` : 'No eligible winner.', inline:false },
-      { name:'Lottery #', value:`#${lotteryId}`, inline:true },
-      { name:'Qualified Wallets', value:String(wallets.length), inline:true },
-      { name:'Total Burns', value:String(burns.length), inline:true }
-    );
-  if(blockNum) embed.addFields({ name:'Seed Block', value:`[#${blockNum}](https://etherscan.io/block/${blockNum})`, inline:true });
-  return embed.setFooter({ text:`Lottery ID ${lotteryId}` }).setTimestamp();
-}
-async function drawAndPostBurnLottery(row){
-  // Claim the lottery immediately to prevent double-draw during ETH block wait
-  const claim = await pgPool.query(`UPDATE burn_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`, [row.id]);
-  if(!claim.rows.length) return; // Another process already claimed it
-  const start = new Date(row.start_time), end = new Date(row.end_time);
-  const timeZone = row.timezone || DEFAULT_LOTTERY_TIMEZONE;
-  const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, row.mode);
-
-  // Edit the original scheduled embed to show fetching state
-  let originalMsg = null;
-  if(row.message_id && row.channel_id){
-    try{
-      const ch = await resolveDiscordChannel(row.channel_id);
-      if(ch){
-        originalMsg = await ch.messages.fetch(row.message_id).catch(() => null);
-        if(originalMsg){
-          const fetchingEmbed = EmbedBuilder.from(originalMsg.embeds[0])
-            .setDescription('⏳ Entry window closed — fetching Ethereum block hash for tamper-proof seed...');
-          await originalMsg.edit({ embeds:[fetchingEmbed], components:buildActiveBurnLotteryComponents(row.id) }).catch(() => {});
-        }
-      }
-    }catch(_){}
-  }
-
-  let drawSeed, seedMeta = {};
-
-  if(isPendingDrawSeed(row.seed)){
-    // Use Ethereum block hash as the tamper-proof public seed.
-    // Target: the block mined 5 blocks after the end of the lottery window,
-    // giving finality and ensuring no one (including the bot operator) can
-    // predict or influence the seed before the entry window closes.
-    try{
-      const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-        `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-      const latestBlock = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
-      const targetBlock = latestBlock + 5;
-      console.log(`[BurnLottery #${row.id}] Waiting for Ethereum block #${targetBlock} (current: ${latestBlock})...`);
-      const arrived = await waitForEthBlock(targetBlock);
-      if(arrived){
-        const { hash, blockNumber } = await fetchEthBlockHashSeed(targetBlock);
-        drawSeed = hash; // Full 66-char 0x-prefixed block hash is the seed
-        seedMeta = { seed_type: 'eth_block_hash', block_number: blockNumber, block_hash: hash };
-        console.log(`[BurnLottery #${row.id}] Seed: block #${blockNumber} hash ${hash}`);
-      } else {
-        // Fallback to randomBytes if RPC unavailable after timeout
-        drawSeed = randomLotterySeed();
-        seedMeta = { seed_type: 'random_fallback', reason: 'eth_block_timeout' };
-        console.warn(`[BurnLottery #${row.id}] ETH block timeout — falling back to random seed`);
-      }
-    }catch(e){
-      drawSeed = randomLotterySeed();
-      seedMeta = { seed_type: 'random_fallback', reason: e.message };
-      console.warn(`[BurnLottery #${row.id}] ETH block fetch failed: ${e.message} — falling back to random seed`);
-    }
-  } else {
-    // Admin-supplied seed or already-completed lottery being re-viewed — keep as-is
-    drawSeed = String(row.seed || randomLotterySeed());
-    seedMeta = { seed_type: 'admin_supplied' };
-  }
-
-  const pick = lotteryPick(entries, drawSeed);
-  await pgPool.query(
-    `UPDATE burn_lotteries
-     SET status='completed', seed=$1, winner_wallet=$2, qualified_wallets=$3, total_burns=$4,
-         result_json=$5, completed_at=NOW()
-     WHERE id=$6`,
-    [drawSeed, pick?.winner||null, wallets.length, burns.length,
-     JSON.stringify({entries:entries.length, proof:pick?.proof||null, winner_index:pick?.index ?? null, winner_position:pick?.position ?? null, ...seedMeta}),
-     row.id]
-  );
-  const resultEmbed = buildBurnLotteryEmbed({title:row.title||'OCAS Burn Lottery', prize:row.prize, mode:row.mode, start, end, seed:drawSeed, entries, wallets, burns, pick, lotteryId:row.id, timezone:timeZone, seedMeta});
-  const resultComponents = buildBurnLotteryComponents(row.id);
-  const winnerEmbed = buildBurnLotteryWinnerEmbed({title:'OCAS Burn Lottery Winner', entries, wallets, burns, pick, lotteryId:row.id, seedMeta});
-  let announcementChannel = originalMsg?.channel || null;
-
-  if(originalMsg){
-    // Edit the original message to show the full result — no second message posted
-    try{
-      await originalMsg.edit({ embeds:[resultEmbed], components:resultComponents }).catch(() => {});
-    }catch(_){}
-  } else {
-    // No original message to edit (e.g. auto-draw with no stored message_id) — post fresh
-    const ch = await resolveDiscordChannel(row.channel_id);
-    if(ch){
-      announcementChannel = ch;
-      await ch.send({ embeds:[resultEmbed], components:resultComponents });
-    }
-  }
-  if(announcementChannel) await announcementChannel.send({ embeds:[winnerEmbed], components:resultComponents }).catch(() => {});
-}
-async function processDueBurnLotteries(){
-  const r = await pgPool.query(`SELECT * FROM burn_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`).catch(()=>({rows:[]}));
-  for(const row of r.rows){
-    try{
-      console.log(`[BurnLottery #${row.id}] Auto-draw triggered`);
-      await drawAndPostBurnLottery(row);
-      console.log(`[BurnLottery #${row.id}] Draw complete`);
-    }catch(e){
-      console.warn('[BurnLottery auto]', row.id, e.message);
-      sendErrorWebhook('BurnLottery Auto-Draw Error', e, `lottery=${row.id}`);
-    }
-  }
-}
-function lotteryNumberFromSeed(seed,min,max){ const lo=Math.min(parseInt(min),parseInt(max)), hi=Math.max(parseInt(min),parseInt(max)); const h=lotteryHash(seed); return lo + Number(BigInt('0x'+h.slice(0,16)) % BigInt(hi-lo+1)); }
-function lotteryEntryButton(row){ return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`lottery_enter:${row.id}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success)); }
-function buildGenericLotteryComponents(lotteryId, type='giveaway', active=true){
-  const rows = [];
-  if(active){
-    const buttons = [];
-    if(type === 'giveaway'){
-      buttons.push(new ButtonBuilder().setCustomId(`lottery_enter:${lotteryId}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success));
-    }
-    buttons.push(new ButtonBuilder().setCustomId(`generic_lottery_entries:${lotteryId}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary));
-    rows.push(new ActionRowBuilder().addComponents(...buttons));
-  } else {
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`generic_lottery_proof:${lotteryId}`).setLabel('Show Draw Proof').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`generic_lottery_entries:${lotteryId}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary)
-    ));
-  }
-  return rows;
-}
-function buildGenericLotteryStartEmbed(row, count=0){
-  const type = String(row.type || 'giveaway');
-  const title = row.title || (type === 'guess' ? 'Guess the Number' : 'Giveaway Lottery');
-
-  const embed = new EmbedBuilder()
-    .setTitle(`🎲 ${title}`)
-    .setColor(COLORS.OCAS_GREEN)
-    .addFields(
-      { name:'ID',     value:String(row.id),                                       inline:true },
-      { name:'Type',   value:type === 'guess' ? 'Guess the number' : 'Giveaway button entries', inline:true },
-      { name:'Window', value:`${lotteryTime(row.start_time)} → ${lotteryTime(row.end_time)}`,   inline:false },
+// ── Trait role sync ─────────────────────────────────────────────────────────
+async function syncTraitRoles(guild, discordId, wallet){
+  try{
+    // Get all trait roles configured for this guild — collection_slug NULL means "primary collection"
+    const traitRolesRes = await pgPool.query(
+      'SELECT trait_type, trait_value, role_id, minimum_count, collection_slug FROM trait_roles WHERE guild_id=$1',
+      [guild.id]
     );
 
-  if(row.prize) embed.addFields({ name:'Prize', value:String(row.prize).slice(0, 1024), inline:false });
+    if(!traitRolesRes.rows.length) return { assigned: [], skipped: [], alreadyHad: [] }; // No trait roles configured
 
-  if(type === 'guess'){
-    embed.addFields(
-      { name:'Range',       value:`${row.min_number}–${row.max_number}`,                       inline:true },
-      { name:'Winner Mode', value:row.winner_mode === 'exact' ? 'Exact only' : 'Closest wins', inline:true },
-      { name:'How to Play', value:`Use \`/lottery guess id:${row.id} number:<guess>\``,         inline:false },
-    );
-  } else {
-    embed.addFields(
-      { name:'Entries',    value:String(count),                                                inline:true },
-      { name:'How to Enter', value:'Click **Enter Giveaway** below, or use `/lottery enter`.', inline:false },
-    );
-  }
+    const cfg = getConfig(guild.id) || {};
+    const primarySlug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+    const extraCollections = (cfg.collections || []).filter(c => c.slug);
 
-  embed
-    .setFooter({ text:`Lottery ID ${row.id}` })
-    .setTimestamp();
-
-  return embed;
-}
-function buildGenericLotteryResultEmbed(row, entries, result){
-  const type = String(row.type || 'giveaway');
-  const title = row.title || (type === 'guess' ? 'Guess the Number Result' : 'Giveaway Result');
-
-  const embed = new EmbedBuilder()
-    .setTitle(`🏆 ${title}`)
-    .setColor(COLORS.OCAS_GREEN)
-    .addFields(
-      { name:'ID',      value:String(row.id),       inline:true },
-      { name:'Entries', value:String(entries.length), inline:true },
-      ...(row.start_time && row.end_time && String(row.start_time) !== String(row.end_time)
-        ? [{ name:'Window', value:`${lotteryTime(row.start_time)} → ${lotteryTime(row.end_time)}`, inline:false }]
-        : []),
-    );
-
-  if(row.prize) embed.addFields({ name:'Prize', value:String(row.prize).slice(0, 1024), inline:false });
-
-  if(type === 'guess'){
-    embed.addFields({ name:'Winning Number', value:String(row.winning_number), inline:true });
-    if(result?.winner){
-      embed.addFields(
-        { name:'Winner',       value:`<@${result.winner.user_id}>`,    inline:true },
-        { name:'Winning Guess', value:String(result.winner.guess_number), inline:true },
-      );
-    } else {
-      embed.addFields({ name:'Winner', value:row.winner_mode === 'exact' ? 'No exact guess.' : 'No valid guesses.', inline:false });
+    // Group rules by their target collection slug (NULL/primary rules go under primarySlug)
+    const rulesBySlug = {};
+    for(const tr of traitRolesRes.rows){
+      const slug = tr.collection_slug || primarySlug;
+      if(!rulesBySlug[slug]) rulesBySlug[slug] = [];
+      rulesBySlug[slug].push(tr);
     }
-  } else {
-    if(result?.winner){
-      // row.winner_display = raw entry value for instant draws (name/number)
-      // Otherwise use Discord mention for real user IDs, or plain username fallback
-      const isSnowflake = /^\d{17,19}$/.test(String(result.winner.user_id || ''));
-      const baseName = row.winner_display
-        ? String(row.winner_display)
-        : isSnowflake
-          ? `<@${result.winner.user_id}>`
-          : String(result.winner.username || result.winner.user_id || 'Unknown');
-      const pos = result.position || row.result_json?.winner_position || null;
-      const winnerDisplay = baseName;
-      embed.addFields({ name:'Winner', value:winnerDisplay, inline:false });
-    } else {
-      embed.addFields({ name:'Winner', value:'No eligible entries.', inline:false });
-    }
-  }
 
-  const rj = row.result_json || {};
-  const blockNum = rj.block_number || null;
-  const seedLine = blockNum
-    ? `[Block #${blockNum}](https://etherscan.io/block/${blockNum}) — \`${String(row.seed).slice(0, 100)}\``
-    : `\`${String(row.seed).slice(0, 256)}\``;
-  embed.addFields({ name:'Seed', value:seedLine, inline:false });
-  if(result?.proof) embed.addFields({ name:'Proof', value:`\`${result.proof.slice(0, 32)}...\``, inline:false });
+    const member = await guild.members.fetch(discordId).catch(()=>null);
+    if(!member) return { assigned: [], skipped: [], alreadyHad: [] };
 
-  return embed.setFooter({ text:`Lottery ID ${row.id}` }).setTimestamp();
-}
-function formatGenericLotteryWinner(row, result){
-  if(!result?.winner) return 'No eligible winner.';
-  if(row.winner_display) return String(row.winner_display);
-  if(typeof result.winner === 'string') return String(result.winner);
-  const userId = result.winner.user_id;
-  if(/^\d{17,19}$/.test(String(userId || ''))) return `<@${userId}>`;
-  return String(result.winner.username || userId || 'Unknown');
-}
-function buildGenericLotteryWinnerEmbed(row, entries, result){
-  const rj = row.result_json || {};
-  const blockNum = rj.block_number || null;
-  const embed = new EmbedBuilder()
-    .setTitle('🎉 OCAS Lottery Winner')
-    .setColor(COLORS.OCAS_GREEN)
-    .addFields(
-      { name:'Winner', value:`🏆 ${formatGenericLotteryWinner(row, result)}`, inline:false },
-      { name:'Lottery #', value:`#${row.id}`, inline:true },
-      { name:'Total Entries', value:String(entries.length), inline:true }
-    );
-  if(blockNum) embed.addFields({ name:'Seed Block', value:`[#${blockNum}](https://etherscan.io/block/${blockNum})`, inline:true });
-  return embed.setFooter({ text:`Lottery ID ${row.id}` }).setTimestamp();
-}
-async function findActiveGenericLottery(guildId,type=null){ const params=[guildId]; let q=`SELECT * FROM generic_lotteries WHERE guild_id=$1 AND status='active' AND end_time > NOW()`; if(type){params.push(type); q+=` AND type=$2`;} q+=` ORDER BY id DESC LIMIT 1`; const r=await pgPool.query(q,params); return r.rows[0]||null; }
-async function getGenericLotteryEntryCount(id){ const r=await pgPool.query('SELECT COUNT(*)::int count FROM generic_lottery_entries WHERE lottery_id=$1',[id]).catch(()=>({rows:[{count:0}]})); return parseInt(r.rows[0]?.count||0); }
-async function drawGenericLottery(row, post=true, ethSeed=null, ethBlockNumber=null, preClaimed=false){
-  // Claim to prevent double-draw. Skip if caller already claimed (processDueGenericLotteries).
-  if(!preClaimed){
-    const claim = await pgPool.query(
-      `UPDATE generic_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`,
-      [row.id]
-    );
-    if(!claim.rows.length) return { embed:null, entries:[], result:{winner:null,proof:null}, components:[] };
-  }
-
-  // Fetch entries ordered by entry time then user ID for deterministic results
-  const er = await pgPool.query(
-    'SELECT user_id, username, guess_number, entered_at FROM generic_lottery_entries WHERE lottery_id=$1 ORDER BY entered_at ASC, user_id ASC',
-    [row.id]
-  );
-  const entries = er.rows;
-  let result = { winner: null, proof: null };
-
-  // Use ETH block hash seed if provided.
-  // If ETH fetch failed and the stored seed is still a pending placeholder, generate a
-  // cryptographic random seed so the result embed never shows a raw __PENDING_DRAW_SEED__ string.
-  const activeSeed = ethSeed || (isPendingDrawSeed(row.seed) ? randomLotterySeed() : row.seed);
-
-  if(row.type === 'guess'){
-    const valid = entries.filter(x => x.guess_number != null);
-    // Determine winning number from seed if not already set
-    row.winning_number = row.winning_number ?? lotteryNumberFromSeed(
-      `${activeSeed}:winning-number`, row.min_number || 1, row.max_number || 100
-    );
-    // Find exact matches first
-    let pool = valid.filter(x => parseInt(x.guess_number) === parseInt(row.winning_number));
-    // Fall back to closest guess if no exact match and not exact-only mode
-    if(!pool.length && row.winner_mode !== 'exact' && valid.length){
-      const minDist = Math.min(...valid.map(x => Math.abs(parseInt(x.guess_number) - parseInt(row.winning_number))));
-      pool = valid.filter(x => Math.abs(parseInt(x.guess_number) - parseInt(row.winning_number)) === minDist);
-    }
-    if(pool.length){
-      const p = lotteryPick(pool.map(x => x.user_id), `${activeSeed}:guess:${row.id}:${row.winning_number}`);
-      result = { winner: pool.find(x => x.user_id === p.winner) || pool[0], proof: p.proof, index: p.index, position: p.position };
-    }
-  } else {
-    // Giveaway mode — pick from all entries
-    const p = lotteryPick(entries.map(x => x.user_id), `${activeSeed}:giveaway:${row.id}`);
-    if(p) result = { winner: entries.find(x => x.user_id === p.winner) || entries[p.index], proof: p.proof, index: p.index, position: p.position };
-  }
-
-  // Always write the final seed back to DB — covers ETH hash, random fallback, and pending→resolved
-  await pgPool.query('UPDATE generic_lotteries SET seed=$1 WHERE id=$2', [activeSeed, row.id]).catch(() => {});
-
-  // Mark completed and store result
-  const resultJson = { proof: result.proof || null, winner_index: result.index ?? null, winner_position: result.position ?? null, block_number: ethBlockNumber || null };
-  await pgPool.query(
-    `UPDATE generic_lotteries
-     SET status='completed', winner_user_id=$1, winner_display=$2, winner_guess=$3,
-         entry_count=$4, result_json=$5, completed_at=NOW(), winning_number=$6
-     WHERE id=$7`,
-    [
-      result.winner?.user_id || null,
-      result.winner?.username || null,
-      result.winner?.guess_number ?? null,
-      entries.length,
-      JSON.stringify(resultJson),
-      row.winning_number ?? null,
-      row.id,
-    ]
-  );
-
-  // Ensure row.seed reflects the final resolved seed for the result embed
-  row.seed = activeSeed;
-  row.result_json = resultJson;
-  const embed = buildGenericLotteryResultEmbed(row, entries, result);
-  const resultComponents = buildGenericLotteryComponents(row.id, row.type, false);
-  if(post){
-    const ch = await resolveDiscordChannel(row.channel_id);
-    if(ch){
-      await ch.send({ embeds: [embed], components: resultComponents });
-      await ch.send({ embeds: [buildGenericLotteryWinnerEmbed(row, entries, result)], components: resultComponents }).catch(() => {});
-    }
-  }
-  return { embed, entries, result, components: resultComponents };
-}
-
-async function processDueGenericLotteries(){
-  const r = await pgPool.query(
-    `SELECT * FROM generic_lotteries WHERE status='active' AND end_time <= NOW() ORDER BY end_time ASC LIMIT 5`
-  ).catch(() => ({ rows: [] }));
-
-  for(const row of r.rows){
-    try{
-      // Claim immediately — prevents a second poller cycle from racing during the ETH block wait
-      const claim = await pgPool.query(
-        `UPDATE generic_lotteries SET status='processing' WHERE id=$1 AND status='active' RETURNING id`,
-        [row.id]
-      );
-      if(!claim.rows.length){ console.log(`[Lottery #${row.id}] Already claimed, skipping`); continue; }
-
-      console.log(`[Lottery #${row.id}] Auto-draw triggered type=${row.type}`);
-
-      // Edit original message to show fetching state
-      let originalMsg = null;
-      if(row.message_id && row.channel_id){
-        try{
-          const ch = await resolveDiscordChannel(row.channel_id);
-          if(ch){
-            originalMsg = await ch.messages.fetch(row.message_id).catch(() => null);
-            if(originalMsg){
-              const fetchingEmbed = EmbedBuilder.from(originalMsg.embeds[0])
-                .setDescription('⏳ Entry window closed — fetching Ethereum block hash for tamper-proof seed...');
-              await originalMsg.edit({ embeds:[fetchingEmbed], components:[] }).catch(() => {});
-            }
-          }
-        }catch(_){}
-      }
-
-      // Fetch ETH block hash seed
-      let ethSeed = null;
-      let ethBlockNumber = null;
+    // Burn-based rules (_totalburns/_maxburn) aren't tied to any one
+    // collection's ownership data the way trait/count rules are -- compute
+    // once per wallet, only if some rule here actually needs it, rather
+    // than inside the per-collection loop below.
+    let burnStats = null;
+    const needsBurnStats = traitRolesRes.rows.some(tr => tr.trait_type === '_totalburns' || tr.trait_type === '_maxburn');
+    if(needsBurnStats){
       try{
-        const rpcUrlA = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://', 'https://') ||
-          `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-        const latestBlockA = parseInt(await burnRpc(rpcUrlA, 'eth_blockNumber', []), 16);
-        const targetBlockA = latestBlockA + 5;
-        console.log(`[Lottery #${row.id}] Waiting for Ethereum block #${targetBlockA} (current: ${latestBlockA})...`);
-        const arrivedA = await waitForEthBlock(targetBlockA);
-        if(arrivedA){
-          const { hash: bHashA } = await fetchEthBlockHashSeed(targetBlockA);
-          ethSeed = bHashA;
-          ethBlockNumber = targetBlockA;
-          console.log(`[Lottery #${row.id}] Seed: block hash ${bHashA}`);
-        } else {
-          console.warn(`[Lottery #${row.id}] ETH block timeout — using stored seed`);
-        }
-      }catch(ethErr){
-        console.warn(`[Lottery #${row.id}] ETH seed failed: ${ethErr.message} — using stored seed`);
+        const burnRes = await pgPool.query(
+          `SELECT bei.burn_event_id, COUNT(*)::int AS tokens_in_event
+           FROM burn_event_inputs bei
+           JOIN burn_events be ON be.id = bei.burn_event_id
+           WHERE LOWER(be.burner_wallet) = LOWER($1)
+           GROUP BY bei.burn_event_id`,
+          [wallet]
+        );
+        let max = 0;
+        for(const r of burnRes.rows){ if(r.tokens_in_event > max) max = r.tokens_in_event; }
+        // Each row is already one distinct burn_event_id (GROUP BY above),
+        // so row count IS the number of burn events this wallet has ever
+        // participated in -- not the sum of tokens across all of them,
+        // which is a different, easily-confused metric (a wallet could
+        // participate in 3 events with 2 tokens each: that's "3 burns", not
+        // "6 tokens burned total").
+        const total = burnRes.rows.length;
+        burnStats = { total, max };
+      }catch(e){
+        console.warn('[TraitSync] burn stats query failed:', e.message);
+        burnStats = { total: 0, max: 0 };
       }
-
-      await drawGenericLottery(row, true, ethSeed, ethBlockNumber, true);
-
-      // Update original message to show draw complete
-      if(originalMsg){
-        try{
-          const doneEmbed = EmbedBuilder.from(originalMsg.embeds[0]).setDescription('✅ Draw complete.');
-          await originalMsg.edit({ embeds:[doneEmbed], components:[] }).catch(() => {});
-        }catch(_){}
-      }
-
-      console.log(`[Lottery #${row.id}] Draw complete`);
-    }catch(e){
-      console.warn('[GenericLottery auto]', row.id, e.message);
-      sendErrorWebhook('GenericLottery Auto-Draw Error', e, `lottery=${row.id}`);
     }
+
+    const rolesSummary = { assigned: [], skipped: [], alreadyHad: [] };
+    let totalOwnedAcrossCollections = 0;
+
+    // Process each collection separately — fetch ownership + traits scoped to that slug
+    for(const slug of Object.keys(rulesBySlug)){
+      const rules = rulesBySlug[slug];
+
+      const osRes = await fetch(
+        `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?collection=${slug}&limit=200`,
+        { headers: osHeaders() }
+      );
+      if(!osRes.ok){
+        console.error('[TraitSync] OpenSea NFT fetch failed for', slug, ':', osRes.status);
+        continue;
+      }
+      const osData = await osRes.json();
+      const ownedTokenIds = (osData.nfts||[]).map(n => parseInt(n.identifier)).filter(Boolean);
+      totalOwnedAcrossCollections += ownedTokenIds.length;
+
+      // Build trait count map for this collection's owned tokens.
+      // Primary OCAS collection uses the legacy token_traits table (rich on-chain data);
+      // other collections derive trait counts from the OpenSea per-NFT trait list directly.
+      const traitCounts = {};
+      if(slug === primarySlug){
+        if(ownedTokenIds.length){
+          const traitsRes = await pgPool.query(
+            'SELECT trait_name, trait_value, COUNT(*) as count FROM token_traits WHERE token_id = ANY($1::int[]) GROUP BY trait_name, trait_value',
+            [ownedTokenIds]
+          );
+          for(const r of traitsRes.rows)
+            traitCounts[r.trait_name+'::'+r.trait_value] = parseInt(r.count);
+        }
+      } else {
+        for(const nft of (osData.nfts || [])){
+          for(const t of (nft.traits || [])){
+            const key = t.trait_type + '::' + t.value;
+            traitCounts[key] = (traitCounts[key] || 0) + 1;
+          }
+        }
+      }
+
+      for(const tr of rules){
+        const hasRole = member.roles.cache.has(tr.role_id);
+        let count;
+        if(tr.trait_type === '_count'){
+          count = ownedTokenIds.length;
+        } else if(tr.trait_type === '_totalburns'){
+          count = burnStats?.total || 0;
+        } else if(tr.trait_type === '_maxburn'){
+          count = burnStats?.max || 0;
+        } else {
+          count = traitCounts[tr.trait_type+'::'+tr.trait_value] || traitCounts[tr.trait_type+'::'+String(tr.trait_value||'')] || 0;
+        }
+        const minNeeded = parseInt(tr.minimum_count) || 1;
+        const meetsMin = count >= minNeeded;
+        console.log('[TraitSync]', slug, '| rule:', tr.trait_type, tr.trait_value||'', '>=', minNeeded, '| count:', count, '| meets:', meetsMin);
+
+        if(meetsMin && !hasRole){
+          const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
+          if(!conflict){
+            await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
+            rolesSummary.assigned.push(tr.role_id);
+          } else {
+            console.log('[TraitSync] SKIP add — role managed by other bot:', tr.role_id);
+            rolesSummary.skipped.push(tr.role_id);
+          }
+        } else if(meetsMin && hasRole){
+          rolesSummary.alreadyHad.push(tr.role_id);
+        }
+        if(!meetsMin && hasRole){
+          const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
+          if(!conflict) await member.roles.remove(tr.role_id).catch(e=>console.error('[TraitSync] remove role:', e.message));
+        }
+      }
+    }
+
+    // Assign verified + holder roles from verification panel config
+    const panel = await pgPool.query(
+      'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1',
+      [guild.id]
+    );
+    if(panel.rows.length){
+      const { role_id, holder_role_id } = panel.rows[0];
+      // Verified role — any registered wallet
+      if(role_id && !member.roles.cache.has(role_id))
+        await member.roles.add(role_id).catch(e=>console.error('[TraitSync] add verified role:', e.message));
+      // Holder role — must own ≥1 token across any configured collection
+      if(holder_role_id){
+        if(totalOwnedAcrossCollections >= 1 && !member.roles.cache.has(holder_role_id))
+          await member.roles.add(holder_role_id).catch(e=>console.error('[TraitSync] add holder role:', e.message));
+        if(totalOwnedAcrossCollections === 0 && member.roles.cache.has(holder_role_id))
+          await member.roles.remove(holder_role_id).catch(e=>console.error('[TraitSync] remove holder role:', e.message));
+      }
+    }
+
+    console.log('[TraitSync] Synced roles for', discordId, 'in', guild.name, '| tokens:', totalOwnedAcrossCollections, '| assigned:', rolesSummary.assigned.length, '| skipped:', rolesSummary.skipped.length);
+    return rolesSummary;
+  }catch(e){
+    console.error('[TraitSync] Error:', e.message);
+    return { assigned: [], skipped: [], alreadyHad: [] };
   }
+}
+
+// ── 24hr trait role sync job ──────────────────────────────────────────────────
+async function runDailyTraitSync(){
+  console.log('[TraitSync] Starting daily sync...');
+  try{
+    // Get all verified registrations
+    const regs = await pgPool.query(
+      'SELECT discord_id, guild_id, wallet FROM user_registrations WHERE verified=true'
+    );
+    for(const reg of regs.rows){
+      const guild = client.guilds.cache.get(reg.guild_id);
+      if(!guild) continue;
+      await syncTraitRoles(guild, reg.discord_id, reg.wallet);
+      await new Promise(r=>setTimeout(r, 500)); // Rate limit buffer
+    }
+    console.log('[TraitSync] Daily sync complete —', regs.rows.length, 'wallets synced');
+  }catch(e){
+    console.error('[TraitSync] Daily sync error:', e.message);
+  }
+}
+
+// ── Discord winner ping lookup ──────────────────────────────────────────────
+async function lookupDiscordPing(wallet){
+  if(!wallet) return null;
+  try{
+    const r = await pgPool.query(
+      `SELECT discord_id FROM user_registrations WHERE wallet=$1 AND verified=true`,
+      [wallet.toLowerCase()]
+    );
+    return r.rows.length ? `<@${r.rows[0].discord_id}>` : null;
+  }catch(_){ return null; }
+}
+
+// ── Role conflict detection ──────────────────────────────────────────────────
+async function checkRoleConflict(guild, roleId){
+  try{
+    const role = await guild.roles.fetch(roleId);
+    if(!role) return null;
+    // Managed roles are controlled by integrations — never touch
+    if(role.managed) return 'managed';
+    // Check audit log — if another bot last assigned this role, flag it
+    const logs = await guild.fetchAuditLogs({ type:25, limit:20 }).catch(()=>null); // type 25 = MEMBER_ROLE_UPDATE
+    if(logs){
+      const entries = logs.entries.filter(e =>
+        e.changes?.some(c => c.key === '$add' && c.new?.some(r => r.id === roleId))
+      );
+      const otherBotEntry = entries.find(e =>
+        e.executor?.bot && e.executor.id !== guild.members.me?.id
+      );
+      if(otherBotEntry) return 'other_bot:'+otherBotEntry.executor.id;
+    }
+    return null;
+  }catch(_){ return null; }
+}
+
+// Cache of role conflicts per guild to avoid repeated audit log fetches
+const _roleConflictCache = new Map(); // 'guildId:roleId' -> {result, ts}
+
+// ── Trait index cache — per slug, 10-min TTL ─────────────────────────────────
+const _traitIndexCache = new Map();
+async function getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug) {
+  const cached = _traitIndexCache.get(slug);
+  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached.rows;
+  try {
+    const rows = await getTraitIndex(RAILWAY_URL, API_SECRET, slug);
+    _traitIndexCache.set(slug, { rows, ts: Date.now() });
+    return rows;
+  } catch(e) {
+    if (cached) return cached.rows;
+    throw e;
+  }
+}
+async function isRoleManagedByOtherBot(guild, roleId){
+  const key = guild.id+':'+roleId;
+  const cached = _roleConflictCache.get(key);
+  // Cache for 10 minutes
+  if(cached && Date.now() - cached.ts < 10*60*1000) return cached.result;
+  const result = await checkRoleConflict(guild, roleId);
+  const conflict = result !== null;
+  _roleConflictCache.set(key, { result: conflict, ts: Date.now() });
+  if(conflict) console.log('[RoleConflict]', roleId, 'in', guild.name, ':', result);
+  return conflict;
 }
 
 client.on('interactionCreate', async (interaction)=>{
+  // ── Autocomplete for collection slugs ───────────────────────────────────────
+  if(interaction.isAutocomplete()){
+    const focused = interaction.options.getFocused(true); // {name, value}
+    const focusedValue = focused.value.toLowerCase();
+    const guildId = interaction.guildId;
+    const cfg = getConfig(guildId) || {};
+    const commandName = interaction.commandName;
+
+    // trait/value autocomplete for traitfind — uses in-memory cache for instant response
+    if(commandName === 'traitfind' && (focused.name === 'trait' || focused.name === 'value')){
+      const RAILWAY_URL = getRailwayApiUrl();
+      const API_SECRET = process.env.API_SECRET;
+      const colInput = interaction.options.getString('collection') || null;
+      const allCols = [];
+      const primarySlug = cfg.collectionSlug || cfg.slug;
+      if(primarySlug) allCols.push({ slug: primarySlug, name: cfg.contractName || primarySlug });
+      for(const c of cfg.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+      if(!colInput && allCols.length > 1 && focused.name === 'trait'){
+        return interaction.respond([{ name: '← Select a collection first', value: '__select_collection__' }]);
+      }
+      let slug = primarySlug || 'on-chain-all-stars';
+      if(colInput){
+        const match = allCols.find(c => c.slug === colInput || c.name === colInput);
+        if(match) slug = match.slug;
+        else slug = colInput;
+      }
+      try {
+        const traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug);
+        let choices = [];
+        if(focused.name === 'trait'){
+          const names = [...new Set(traitIndex.map(t => t.trait_name))];
+          choices = names
+            .filter(n => n.toLowerCase().includes(focusedValue))
+            .slice(0, 25)
+            .map(n => ({ name: n, value: n }));
+        } else {
+          const selectedTrait = (interaction.options.getString('trait') || '').toLowerCase();
+          const vals = traitIndex
+            .filter(t => (!selectedTrait || t.trait_name.toLowerCase() === selectedTrait) && t.trait_value.toLowerCase().includes(focusedValue))
+            .map(t => t.trait_value);
+          choices = [...new Set(vals)].slice(0, 25).map(v => ({ name: v, value: v }));
+        }
+        return interaction.respond(choices);
+      } catch(e) {
+        return interaction.respond([]);
+      }
+    }
+
+    // collection slug autocomplete (all commands)
+    const choices = [];
+    if(cfg.slug || cfg.collectionSlug){
+      const slug = cfg.slug || cfg.collectionSlug;
+      const name = cfg.contractName || slug;
+      choices.push({ name: `${name} (${slug})`, value: slug });
+    }
+    for(const col of cfg.collections || []){
+      if(col.slug) choices.push({ name: `${col.name||col.slug} (${col.slug})`, value: col.slug });
+    }
+    const filtered = choices
+      .filter(c => c.name.toLowerCase().includes(focusedValue) || c.value.toLowerCase().includes(focusedValue))
+      .slice(0, 25);
+    return interaction.respond(filtered.length ? filtered : choices.slice(0,25));
+  }
+
+
+  // ── Wallet verification button ────────────────────────────────────────────
+
+  // ── start_verification wallet modal submit ────────────────────────────────────
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('dl_modal:token:')){
+    return handleDownloadModalSubmit(interaction, { getConfig, osHeaders });
+  }
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('rf_modal:range:')){
+    return handleRankFindModalSubmit(interaction, {});
+  }
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('sv_modal:username:')){
+    await interaction.deferReply({flags:64});
+    const discordId  = interaction.user.id;
+    const guildId    = interaction.guildId;
+    const osUsername = (interaction.fields.getTextInputValue('os_username')||'').trim();
+
+    if(!osUsername)
+      return interaction.editReply({content:'❌ Please enter your OpenSea username.'});
+
+    // Look up pending code for this user
+    let codeRow;
+    try{
+      const r = await pgPool.query(
+        'SELECT code, expires_at FROM verification_codes WHERE discord_id=$1 ORDER BY expires_at DESC LIMIT 1',
+        [discordId]
+      );
+      codeRow = r.rows[0];
+    }catch(e){
+      console.error('[SVModal] DB lookup error:', e.message);
+      return interaction.editReply({content:'❌ DB error. Please try again.'});
+    }
+
+    if(!codeRow) return interaction.editReply({content:'❌ No pending verification. Click Verify Wallet again.'});
+    if(new Date() > new Date(codeRow.expires_at))
+      return interaction.editReply({content:'❌ Code expired. Click Verify Wallet again.'});
+
+    const code = codeRow.code;
+    // Fetch OpenSea profile by username
+    let profile;
+    try{
+      const osRes = await fetch(`https://api.opensea.io/api/v2/accounts/${osUsername}`, { headers:osHeaders() });
+      if(!osRes.ok){
+        if(osRes.status===404) return interaction.editReply({content:`❌ OpenSea username \`${osUsername}\` not found. Check the spelling and try again.`});
+        return interaction.editReply({content:`❌ OpenSea error (${osRes.status}). Try again.`});
+      }
+      profile = await osRes.json();
+    }catch(e){
+      console.error('[SVModal]', e.message);
+      return interaction.editReply({content:'❌ Failed to reach OpenSea. Try again.'});
+    }
+
+    // Check code is in their bio
+    const bio = profile.bio || '';
+    if(!bio.includes(code))
+      return interaction.editReply({content:[
+        '❌ Code not found in your OpenSea bio.',
+        '',
+        `Go to https://opensea.io/${osUsername} → Edit Profile → temporarily add this to your bio:`,
+        `# \`${code}\``,
+        'Save, then try again. You can remove it after verification.',
+      ].join('\n')});
+
+    // Get all wallets linked to this OpenSea account
+    const addresses = profile.addresses || [];
+    const wallets = addresses
+      .map(a => (a.address||'').toLowerCase())
+      .filter(a => /^0x[0-9a-f]{40}$/.test(a));
+
+    if(!wallets.length)
+      return interaction.editReply({content:'❌ No Ethereum wallets linked to that OpenSea account. Connect a wallet on OpenSea first.'});
+
+    // Use first wallet as primary, check holdings across all
+    const primaryWallet = wallets[0];
+    const cfg = getConfig(guildId) || {};
+    const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+
+    // Fetch NFTs across all wallets combined
+    let totalTokens = [];
+    for(const w of wallets){
+      try{
+        const nftRes = await fetch(
+          `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+          { headers:osHeaders(), agent:osAgent }
+        );
+        if(nftRes.ok){
+          const nftData = await nftRes.json();
+          totalTokens = totalTokens.concat(nftData.nfts||[]);
+        }
+      }catch(_){}
+    }
+    const tokenCount = totalTokens.length;
+
+    // Save registration with primary wallet
+    await pgPool.query(
+      `INSERT INTO user_registrations (discord_id,guild_id,wallet,verified,verified_at,updated_at)
+       VALUES ($1,$2,$3,true,NOW(),NOW())
+       ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,verified=true,verified_at=NOW(),updated_at=NOW()`,
+      [discordId, guildId, primaryWallet]
+    ).catch(e => console.error('[SVModal] reg insert:', e.message));
+
+    // Trigger wallet backfill (fire-and-forget)
+    backfillWallet(primaryWallet, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+
+    // Assign roles
+    try{
+      const panelR = await pgPool.query(
+        'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1', [guildId]
+      );
+      if(panelR.rows[0]){
+        const { role_id, holder_role_id } = panelR.rows[0];
+        const member = await interaction.guild.members.fetch(discordId).catch(()=>null);
+        if(member && role_id) await member.roles.add(role_id).catch(e=>console.error('[Verify] add verified role:', e.message));
+        if(member && holder_role_id && tokenCount >= 1)
+          await member.roles.add(holder_role_id).catch(e=>console.error('[Verify] add holder role:', e.message));
+      }
+    }catch(e){ console.error('[Verify] role assignment block failed:', e.message); }
+
+    // Clean up code
+    await pgPool.query('DELETE FROM verification_codes WHERE discord_id=$1 AND guild_id=$2', [discordId, guildId]).catch(()=>{});
+
+    const walletList = wallets.length > 1
+      ? `\n🔗 **${wallets.length} wallets** linked (${wallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
+      : `\n🔗 **Wallet:** \`${primaryWallet.slice(0,6)}...${primaryWallet.slice(-4)}\``;
+
+    return interaction.editReply({content:[
+      '✅ **Verified!**',
+      walletList,
+      `🪙 **Tokens found:** ${tokenCount} across all wallets`,
+      '',
+      'You can remove the code from your OpenSea bio now.',
+      '',
+      '💡 Try `/me` to see your wallet dashboard, or `/help` to explore everything I can do.',
+    ].join('\n')});
+  }
+  // ── Setup wizard modal + button handlers ───────────────────────────────────
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('setup_modal:')){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupModal(interaction, setupCtx);
+  }
+  if(interaction.isModalSubmit() && (interaction.customId.startsWith('cfg_modal:') || interaction.customId.startsWith('cfg_modal:col_filter:'))){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigModal(interaction, cfgCtx);
+  }
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('gva_modal:')){
+    const gGuildId = interaction.guildId;
+    const gConfig = getConfig(gGuildId);
+    const gIsAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+    return handleGiveawayInteraction(interaction, buildCtx(interaction, gGuildId, gConfig, gIsAdmin));
+  }
+
+  if(interaction.isButton() && interaction.customId.startsWith('setup:')){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
+  if(interaction.isButton() && (interaction.customId.startsWith('cfg:') || interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col_filter:'))){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('ltrs:')){
+    return handleLotteriesButton(interaction, { pgPool, getConfig });
+  }
+  if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('gva:')){
+    const gGuildId = interaction.guildId;
+    const gConfig = getConfig(gGuildId);
+    const gIsAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+    return handleGiveawayInteraction(interaction, buildCtx(interaction, gGuildId, gConfig, gIsAdmin));
+  }
+  // Channel select menus from setup wizard (still native Discord component)
+  if(interaction.isChannelSelectMenu() && interaction.customId.startsWith('setup_chsel:')){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
+  // Role select menus from setup wizard — now a manually-paginated StringSelectMenu
+  // (see lib/role-picker.js); isRoleSelectMenu() kept as a harmless fallback.
+  if((interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) && interaction.customId.startsWith('setup_rolesel:')){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_traitrole:')){
+    const setupCtx = { pgPool, setConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
+  if(interaction.isStringSelectMenu() && (interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col:') || interaction.customId.startsWith('cfg_filter:') || interaction.customId.startsWith('cfg_col_filter:') || interaction.customId.startsWith('cfg_col_salesfilter:') || interaction.customId.startsWith('cfg_tzsel:'))){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('tf_browse:')){
+    const tfCtx = {
+      pgPool, getConfig, getRailwayApiUrl, getCachedTraitIndex,
+      buildSaleEmbed, buildListingEmbed, postEmbeds, fetchBotApiJson,
+      buildTokenSearchEmbed, fetchTokenMetaFromDb, traitObjectToArray,
+    };
+    return handleTraitBrowseInteraction(interaction, tfCtx);
+  }
+  if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('vpick:traitfind:')){
+    const tfCtx = {
+      pgPool, getConfig, getRailwayApiUrl, getCachedTraitIndex,
+      buildSaleEmbed, buildListingEmbed, postEmbeds, fetchBotApiJson,
+      buildTokenSearchEmbed, fetchTokenMetaFromDb, traitObjectToArray,
+    };
+    return handleTraitBrowseInteraction(interaction, tfCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId === 'dl_browse:col'){
+    return handleDownloadColPick(interaction, { getConfig });
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId === 'rf_browse:col'){
+    return handleRfColPick(interaction, {});
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('rf_browse:mode:')){
+    const rfCtx = {
+      getConfig, getRailwayApiUrl, fetchBotApiJson, buildSaleEmbed, postEmbeds,
+      traitObjectToArray, fetchTokenMetaFromDb, getRankTierColor, COLORS,
+      resolveImage, traitDisplayLines,
+    };
+    return handleRankFindBrowseInteraction(interaction, rfCtx);
+  }
+  if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('ma_browse:')){
+    const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert };
+    return handleMyAlertInteraction(interaction, maCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('mac_browse:')){
+    const macCtx = { getAlert, setAlert, deleteAlert };
+    return handleMaClearInteraction(interaction, macCtx);
+  }
+  if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
+    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser };
+    return handleMeInteraction(interaction, meCtx);
+  }
+
+  // Modal submissions for price/floor alerts
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('me_modal:')){
+    const parts = interaction.customId.split(':');
+    const alertType = parts[1];
+    const slug = parts.slice(2).join(':');
+
+    if(alertType === 'pricealert'){
+      const tokenId = parseInt(interaction.fields.getTextInputValue('token_id').trim());
+      const threshold = parseFloat(interaction.fields.getTextInputValue('threshold').trim());
+      const onceVal = (interaction.fields.getTextInputValue('once').trim() || 'once').toLowerCase();
+      const alertOnce = onceVal !== 'repeat';
+      const repeatAlert = !alertOnce;
+      if(isNaN(tokenId) || isNaN(threshold) || threshold <= 0){
+        return interaction.reply({ content: '❌ Invalid token ID or threshold. Token ID must be a number, threshold must be ETH like 0.05.', flags: MessageFlags.Ephemeral });
+      }
+      await pgPool.query(
+        `INSERT INTO user_price_alerts (discord_id, slug, token_id, threshold_eth, alert_once, repeat_alert)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [interaction.user.id, slug, tokenId, threshold, alertOnce, repeatAlert]
+      ).catch(()=>{});
+      // Reply then show price alerts section
+      const { ActionRowBuilder: AR2, ButtonBuilder: BB2, ButtonStyle: BS2 } = require('discord.js');
+      await interaction.reply({
+        content: `✅ Price alert set! I'll DM you when **#${tokenId}** (${slug}) is listed below **Ξ ${threshold.toFixed(4)}** (${alertOnce ? 'once' : 'repeating'}).`,
+        components: [new AR2().addComponents(new BB2().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(BS2.Secondary))],
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    if(alertType === 'flooralert'){
+      const threshold = parseFloat(interaction.fields.getTextInputValue('threshold').trim());
+      const directionRaw = (interaction.fields.getTextInputValue('direction').trim() || 'below').toLowerCase();
+      const direction = ['above','either'].includes(directionRaw) ? directionRaw : 'below';
+      const cooldownStr = interaction.fields.getTextInputValue('cooldown').trim() || '1h';
+      // Parse repeat interval — supports 30m, 2h, 1d, or plain number (minutes)
+      const cooldownMinutes = (() => {
+        const s = cooldownStr.toLowerCase();
+        const m = s.match(/^([\d.]+)\s*([mhd]?)$/);
+        if(!m) return 60;
+        const val = parseFloat(m[1]);
+        const unit = m[2] || 'm';
+        if(unit === 'd') return Math.round(val * 24 * 60);
+        if(unit === 'h') return Math.round(val * 60);
+        return Math.round(val);
+      })();
+      if(isNaN(threshold) || threshold <= 0){
+        return interaction.reply({ content: '❌ Invalid threshold. Enter an ETH amount like 0.05.', flags: MessageFlags.Ephemeral });
+      }
+      await pgPool.query(
+        `INSERT INTO user_floor_alerts (discord_id, slug, threshold_eth, cooldown_minutes, direction)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (discord_id, slug) DO UPDATE SET threshold_eth=$3, cooldown_minutes=$4, direction=$5`,
+        [interaction.user.id, slug, threshold, cooldownMinutes, direction]
+      ).catch(()=>{});
+      const cdDisplay = cooldownMinutes >= 1440 ? `${(cooldownMinutes/1440).toFixed(1).replace(/\.0$/,'')}d`
+        : cooldownMinutes >= 60 ? `${(cooldownMinutes/60).toFixed(1).replace(/\.0$/,'')}h`
+        : `${cooldownMinutes}m`;
+      const dirLabel = direction === 'above' ? 'rises above' : direction === 'either' ? 'crosses' : 'drops below';
+      const { ActionRowBuilder: AR3, ButtonBuilder: BB3, ButtonStyle: BS3 } = require('discord.js');
+      await interaction.reply({
+        content: `✅ Floor alert set! I'll DM you when the **${slug}** floor ${dirLabel} **Ξ ${threshold.toFixed(4)}** (repeats after: ${cdDisplay}).`,
+        components: [new AR3().addComponents(new BB3().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(BS3.Secondary))],
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+  }
+  if(interaction.isChannelSelectMenu() && interaction.customId.startsWith('cfg_chsel:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if((interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) && interaction.customId.startsWith('cfg_rolesel:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isRoleSelectMenu() && interaction.customId === 'setup_traitrole:rolesel'){
+    // Must call showModal — cannot deferUpdate first
+    const roleId = interaction.values[0];
+    const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+    const modal = new ModalBuilder()
+      .setCustomId('setup_modal:traitrole:'+roleId)
+      .setTitle(`Role: ${(role?.name||'Selected').slice(0,40)}`);
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_trait_type')
+          .setLabel('Trait Category (optional — e.g. Type)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('Leave blank to require a token count instead')
+          .setRequired(false)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_trait_value')
+          .setLabel('Trait Value (optional — e.g. Zombie, Gold)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('Leave blank if using token count')
+          .setRequired(false)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_min_count')
+          .setLabel('Minimum tokens to qualify (default: 1)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. 1, 5, 20')
+          .setRequired(false)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+  if((interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) && (interaction.customId === 'cfg_traitrole:rolesel' || interaction.customId.startsWith('cfg_traitrole:rolesel:'))){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_traitrole:catsel:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_traitrole:valsel:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_filtertrait:catsel:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_filtertrait:valsel:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('cfg_filtertrait:manual:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('cfg_traitrole:manual:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('cfg_traitrole:quickmodal:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  // Shared paginated multi-select value picker (filtertrait/traitrole flows
+  // only here -- traitfind's own vpick: usage routes to
+  // handleTraitBrowseInteraction separately, further down). This was
+  // missing entirely until now -- every vpick: interaction had nowhere to
+  // go, which is why submitting a stacked value menu failed outright.
+  if((interaction.isStringSelectMenu() || interaction.isButton()) &&
+     (interaction.customId.startsWith('vpick:filtertrait:') || interaction.customId.startsWith('vpick:traitrole:'))){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_role:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_col:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+  if(interaction.isStringSelectMenu() && interaction.customId.startsWith('cfg_filter:')){
+    const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
+    return handleConfigButton(interaction, cfgCtx);
+  }
+
+  // ── Legacy handler ──────────────────────────────────────────────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('verify_wallet:')){
+    return interaction.reply({flags:64, content:'Please click **Verify Wallet** again to use the updated flow.'});
+  }
+
+  // ── Start Verification button ─────────────────────────────────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
+    const svGuild = interaction.guildId;
+    const svUser  = interaction.user.id;
+
+    // Check if already verified in this server
+    try{
+      const svEx = await pgPool.query(
+        'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true',
+        [svUser, svGuild]
+      );
+      if(svEx.rows.length){
+        const w = svEx.rows[0].wallet;
+        return interaction.reply({flags:64, content:'✅ Already verified in this server!\n🔗 Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+      }
+    }catch(_){}
+
+    // Check if already verified in ANY server (cross-server shortcut)
+    try{
+      const globalEx = await pgPool.query(
+        'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1',
+        [svUser]
+      );
+      if(globalEx.rows.length){
+        await interaction.deferReply({flags:64});
+        const knownWallet = globalEx.rows[0].wallet;
+        const gCfg = getConfig(svGuild) || {};
+        const slug = gCfg.collectionSlug || gCfg.slug || 'on-chain-all-stars';
+
+        // Full OS profile fetch — get ALL linked wallets
+        let allWallets = [knownWallet];
+        try{
+          const osRes = await fetch(
+            `https://api.opensea.io/api/v2/accounts/${knownWallet}`,
+            { headers:osHeaders() }
+          );
+          if(osRes.ok){
+            const profile = await osRes.json();
+            const extra = (profile.addresses||[])
+              .map(a=>(a.address||'').toLowerCase())
+              .filter(a=>/^0x[0-9a-f]{40}$/.test(a) && a!==knownWallet);
+            allWallets = [knownWallet, ...extra];
+          }
+        }catch(_){}
+
+        // Fetch token holdings across all wallets
+        let totalTokens = [];
+        for(const w of allWallets){
+          try{
+            const nftRes = await fetch(
+              `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+              { headers:osHeaders() }
+            );
+            if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
+          }catch(_){}
+        }
+        const tokenCount = totalTokens.length;
+
+        // Save to this guild
+        await pgPool.query(
+          `INSERT INTO user_registrations (discord_id,guild_id,wallet,verified,verified_at,updated_at)
+           VALUES ($1,$2,$3,true,NOW(),NOW())
+           ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,verified=true,verified_at=NOW(),updated_at=NOW()`,
+          [svUser, svGuild, knownWallet]
+        ).catch(()=>{});
+
+        // Assign roles
+        try{
+          const panelR = await pgPool.query(
+            'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1', [svGuild]
+          );
+          console.log('[SVInstant] panel row:', JSON.stringify(panelR.rows[0]));
+          if(panelR.rows[0]){
+            const { role_id, holder_role_id } = panelR.rows[0];
+            const member = await interaction.guild.members.fetch(svUser).catch(e=>{ console.error('[SVInstant] fetch member:', e.message); return null; });
+            console.log('[SVInstant] member found:', !!member, 'role_id:', role_id, 'tokens:', tokenCount);
+            if(member && role_id){
+              await member.roles.add(role_id).catch(e=>console.error('[SVInstant] add verified role:', e.message));
+            }
+            if(member && holder_role_id && tokenCount >= 1){
+              await member.roles.add(holder_role_id).catch(e=>console.error('[SVInstant] add holder role:', e.message));
+            }
+          } else {
+            console.warn('[SVInstant] No verification_panels row for guild:', svGuild);
+          }
+        }catch(e){ console.error('[SVInstant] role assign error:', e.message); }
+
+        // Sync trait roles immediately and collect summary
+        const roleSummaryInst = await syncTraitRoles(interaction.guild, svUser, knownWallet).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
+
+        const rolePartsInst = [];
+        if(roleSummaryInst.assigned.length)   rolePartsInst.push(`✅ Roles assigned: ${roleSummaryInst.assigned.map(id=>`<@&${id}>`).join(', ')}`);
+        if(roleSummaryInst.alreadyHad.length) rolePartsInst.push(`☑️ Already had: ${roleSummaryInst.alreadyHad.map(id=>`<@&${id}>`).join(', ')}`);
+
+        const walletSummary = allWallets.length > 1
+          ? `🔗 **${allWallets.length} wallets** on file (${allWallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
+          : `🔗 **Wallet:** \`${knownWallet.slice(0,6)}...${knownWallet.slice(-4)}\``;
+
+        return interaction.editReply({content:[
+          '✅ **Verified instantly!**',
+          walletSummary,
+          `🪙 **Tokens found:** ${tokenCount}`,
+          ...(rolePartsInst.length ? ['', ...rolePartsInst] : []),
+          '',
+          'Your wallet was recognised from another server — no re-verification needed.',
+          '',
+          '💡 Try `/me` to see your wallet dashboard, or `/help` to explore everything I can do.',
+        ].join('\n')});
+      }
+    }catch(e){
+      console.error('[SVInstant] Error in instant re-verify:', e.message);
+      // Don't fall through to modal silently — tell the user something went wrong
+      if(!interaction.deferred && !interaction.replied){
+        return interaction.reply({ flags:64, content:'❌ Something went wrong during instant verification. Please try again.' });
+      }
+      return interaction.editReply({ content:'❌ Something went wrong during instant verification. Please try again.' });
+    }
+
+    // New user — show wallet input modal
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+    const svModal = new ModalBuilder()
+      .setCustomId('sv_modal:wallet:'+svGuild)
+      .setTitle('Verify Your Wallet');
+    svModal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('wallet_input')
+          .setLabel('Your Ethereum Wallet Address')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('0x...')
+          .setMinLength(42).setMaxLength(42).setRequired(true)
+      )
+    );
+    return interaction.showModal(svModal);
+  }
+
+  // ── Wallet address submitted — generate code, show instructions ──────────
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('sv_modal:wallet:')){
+    await interaction.deferReply({flags:64});
+    const svGuild   = interaction.customId.split(':')[2];
+    const discordId = interaction.user.id;
+    const wallet    = (interaction.fields.getTextInputValue('wallet_input')||'').trim().toLowerCase();
+
+    if(!/^0x[0-9a-f]{40}$/i.test(wallet))
+      return interaction.editReply({content:'❌ Invalid wallet address. Must start with `0x` and be 42 characters long.'});
+
+    // Ephemeral messages can vanish (Discord dismisses them after a while,
+    // or on app restart -- documented platform behavior, not something
+    // fixable here) well before the 5-minute code window is actually up.
+    // Reuse the existing code/expiry for the SAME wallet if one's already
+    // pending, rather than silently generating a new one -- otherwise
+    // whatever the user already pasted into their bio would be
+    // invalidated the moment they come back to re-open the instructions.
+    let code, expiresAt;
+    const existing = await pgPool.query(
+      'SELECT code, wallet, expires_at FROM verification_codes WHERE discord_id=$1 AND guild_id=$2',
+      [discordId, svGuild]
+    ).catch(() => ({ rows: [] }));
+    const existingRow = existing.rows[0];
+    const stillValid = existingRow && new Date(existingRow.expires_at) > new Date() && existingRow.wallet === wallet;
+
+    if(stillValid){
+      code = existingRow.code;
+      expiresAt = new Date(existingRow.expires_at);
+    } else {
+      code      = 'OCAS-'+Math.random().toString(36).slice(2,8).toUpperCase();
+      expiresAt = new Date(Date.now() + 5*60*1000);
+    }
+
+    try{
+      await pgPool.query(
+        `INSERT INTO verification_codes (discord_id,guild_id,wallet,code,expires_at)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,code=$4,expires_at=$5`,
+        [discordId, svGuild, wallet, code, expiresAt]
+      );
+    }catch(e){
+      // Fallback for old single-column PK
+      try{
+        await pgPool.query(
+          `INSERT INTO verification_codes (discord_id,guild_id,wallet,code,expires_at)
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT (discord_id) DO UPDATE SET guild_id=$2,wallet=$3,code=$4,expires_at=$5`,
+          [discordId, svGuild, wallet, code, expiresAt]
+        );
+      }catch(e2){ console.error('[SVWallet] insert error:', e2.message); }
+    }
+
+    const { ButtonBuilder, ButtonStyle, ActionRowBuilder, EmbedBuilder } = require('discord.js');
+    const codeEmbed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('🔐 Verify Your Wallet')
+      .setDescription(
+        `**Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\`\n\n` +
+        '**Step 1 — Add this code to your OpenSea bio:**\n' +
+        `# \`${code}\`\n` +
+        `Go to https://opensea.io/${wallet} → Edit Profile → paste the code anywhere in your **bio**.\n` +
+        `It doesn't need to be your whole bio, just needs to appear somewhere in it.\n\n` +
+        '**Step 2 — Once saved, click ✅ I\'ve Added It below.**\n\n' +
+        `*You can remove the code from your bio after verification. Expires in ${Math.max(1, Math.round((expiresAt - Date.now()) / 60000))} minutes.*`
+      );
+    const doneBtn = new ButtonBuilder()
+      .setCustomId('sv_done:'+svGuild)
+      .setLabel("✅ I've Added It")
+      .setStyle(ButtonStyle.Success);
+    return interaction.editReply({embeds:[codeEmbed], components:[new ActionRowBuilder().addComponents(doneBtn)]});
+  }
+
+  // ── I've Added It — fetch OS profile by wallet, check bio for code ────────
+  if(interaction.isButton() && interaction.customId.startsWith('sv_done:')){
+    await interaction.deferReply({flags:64});
+    const svGuild   = interaction.customId.split(':')[1];
+    const discordId = interaction.user.id;
+
+    // Look up pending code + wallet
+    let codeRow;
+    try{
+      const r = await pgPool.query(
+        'SELECT code, wallet, expires_at FROM verification_codes WHERE discord_id=$1 ORDER BY expires_at DESC LIMIT 1',
+        [discordId]
+      );
+      codeRow = r.rows[0];
+    }catch(e){
+      console.error('[SVDone] DB lookup:', e.message);
+      return interaction.editReply({content:'❌ DB error. Please try again.'});
+    }
+
+    if(!codeRow)
+      return interaction.editReply({content:'❌ No pending verification. Click **Verify Wallet** again.'});
+    if(new Date() > new Date(codeRow.expires_at))
+      return interaction.editReply({content:'❌ Code expired. Click **Verify Wallet** again to get a new one.'});
+
+    const { code, wallet } = codeRow;
+
+    // Fetch OpenSea profile by wallet address — add cache-bust to get fresh data
+    let profile;
+    try{
+      const cacheBust = `&_=${Date.now()}`;
+      const osRes = await fetch(
+        `https://api.opensea.io/api/v2/accounts/${wallet}?${cacheBust}`,
+        { headers:{ ...osHeaders(), 'Cache-Control':'no-cache', 'Pragma':'no-cache' } }
+      );
+      if(!osRes.ok){
+        if(osRes.status===404) return interaction.editReply({content:`❌ No OpenSea account found for wallet \`${wallet.slice(0,6)}...${wallet.slice(-4)}\`. Make sure this wallet is connected to OpenSea.`});
+        return interaction.editReply({content:`❌ OpenSea error (${osRes.status}). Please try again.`});
+      }
+      profile = await osRes.json();
+      // If username looks stale (no code), try fetching fresh by username
+      const allStringsFirst = collectStringsDeep(profile).join(' ');
+      if(!allStringsFirst.includes(code) && profile.username){
+        try{
+          const osRes2 = await fetch(
+            `https://api.opensea.io/api/v2/accounts/${profile.username}?_=${Date.now()}`,
+            { headers:{ ...osHeaders(), 'Cache-Control':'no-cache', 'Pragma':'no-cache' } }
+          );
+          if(osRes2.ok) profile = await osRes2.json();
+        }catch(_){}
+      }
+      console.log('[SVDone] username:', profile.username, '| code in profile:', collectStringsDeep(profile).join(' ').includes(code));
+    }catch(e){
+      console.error('[SVDone] OS fetch:', e.message);
+      return interaction.editReply({content:'❌ Could not reach OpenSea. Please try again.'});
+    }
+
+    // Search entire profile object for the code (handles any field name OS uses)
+    const allStrings = collectStringsDeep(profile).join(' ');
+    if(!allStrings.includes(code))
+      return interaction.editReply({content:[
+        '❌ Code not found in your OpenSea profile yet.',
+        '',
+        `Go to https://opensea.io/${wallet} → Edit Profile → add the code to your **bio**:`,
+        `# \`${code}\``,
+        'Save your profile, then click **✅ I\'ve Added It** again.',
+      ].join('\n')});
+
+    // Get all linked wallets from profile
+    const addresses = profile.addresses || [];
+    const wallets = [wallet, ...addresses
+      .map(a => (a.address||'').toLowerCase())
+      .filter(a => /^0x[0-9a-f]{40}$/.test(a) && a !== wallet)
+    ];
+
+    const cfg  = getConfig(svGuild) || {};
+    const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+
+    // Fetch token holdings across all wallets
+    let totalTokens = [];
+    for(const w of wallets){
+      try{
+        const nftRes = await fetch(
+          `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+          { headers:osHeaders() }
+        );
+        if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
+      }catch(_){}
+    }
+    const tokenCount = totalTokens.length;
+
+    // Save to user_registrations — global (no guild_id) + this guild
+    const upsertReg = async (gid) => pgPool.query(
+      `INSERT INTO user_registrations (discord_id,guild_id,wallet,verified,verified_at,updated_at)
+       VALUES ($1,$2,$3,true,NOW(),NOW())
+       ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,verified=true,verified_at=NOW(),updated_at=NOW()`,
+      [discordId, gid, wallet]
+    ).catch(e=>console.error('[SVDone] upsertReg failed guild='+gid+':', e.message));
+    await upsertReg(svGuild);
+    // Trigger wallet backfill (fire-and-forget)
+    backfillWallet(wallet, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+    // Global cross-server record — DELETE existing global row for this wallet/discord_id then re-insert
+    console.log('[SVDone] saving global row for discord_id:', discordId, 'wallet:', wallet.slice(0,8));
+    try {
+      await pgPool.query(
+        `DELETE FROM user_registrations WHERE guild_id='global' AND (discord_id=$1 OR wallet=$2)`,
+        [discordId, wallet]
+      );
+      await pgPool.query(
+        `INSERT INTO user_registrations (discord_id,guild_id,wallet,verified,verified_at,updated_at)
+         VALUES ($1,'global',$2,true,NOW(),NOW())`,
+        [discordId, wallet]
+      );
+      console.log('[SVDone] global row saved OK');
+    } catch(e) {
+      console.error('[SVDone] global row save failed:', e.message);
+    }
+    console.log('[SVDone] saved registration for', discordId, 'guild:', svGuild);
+
+    // Assign roles
+    try{
+      const panelR = await pgPool.query(
+        'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1', [svGuild]
+      );
+      console.log('[SVDone] panel row:', JSON.stringify(panelR.rows[0]));
+      if(panelR.rows[0]){
+        const { role_id, holder_role_id } = panelR.rows[0];
+        const member = await interaction.guild.members.fetch(discordId).catch(e=>{ console.error('[SVDone] fetch member:', e.message); return null; });
+        console.log('[SVDone] member found:', !!member, 'role_id:', role_id, 'tokens:', tokenCount);
+        if(member && role_id){
+          const conflict = await isRoleManagedByOtherBot(interaction.guild, role_id);
+          if(!conflict) await member.roles.add(role_id).catch(e=>console.error('[SVDone] add verified role:', e.message));
+          else console.log('[SVDone] SKIP verified role — managed by other bot:', role_id);
+        }
+        if(member && holder_role_id && tokenCount >= 1){
+          await member.roles.add(holder_role_id).catch(e=>console.error('[SVDone] add holder role:', e.message));
+        }
+      } else {
+        console.warn('[SVDone] No verification_panels row for guild:', svGuild);
+      }
+    }catch(e){ console.error('[SVDone] role assign error:', e.message); }
+
+    // Clean up code
+    await pgPool.query(
+      'DELETE FROM verification_codes WHERE discord_id=$1',
+      [discordId]
+    ).catch(()=>{});
+
+    const walletSummary = wallets.length > 1
+      ? `🔗 **${wallets.length} wallets** found (${wallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
+      : `🔗 **Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``;
+
+    // Sync trait roles immediately and collect summary
+    const roleSummary = await syncTraitRoles(interaction.guild, discordId, wallet).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
+
+    const roleParts = [];
+    if(roleSummary.assigned.length)   roleParts.push(`✅ Roles assigned: ${roleSummary.assigned.map(id=>`<@&${id}>`).join(', ')}`);
+    if(roleSummary.alreadyHad.length) roleParts.push(`☑️ Already had: ${roleSummary.alreadyHad.map(id=>`<@&${id}>`).join(', ')}`);
+
+    return interaction.editReply({content:[
+      '✅ **Verified!**',
+      walletSummary,
+      `🪙 **Tokens found:** ${tokenCount}`,
+      ...(roleParts.length ? ['', ...roleParts] : []),
+      '',
+      'You can remove the code from your OpenSea bio now.',
+      'Your wallet is saved — future servers will verify you instantly.',
+      '',
+      '💡 Try `/me` to see your wallet dashboard, or `/help` to explore everything I can do.',
+    ].join('\n')});
+  }
+
   if(interaction.isButton() && interaction.customId.startsWith('lottery_enter:')){
     const lotteryId=parseInt(interaction.customId.split(':')[1]);
+    // deferReply immediately so Discord doesn't expire the interaction during DB work
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(()=>{});
     try{
       const r=await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1',[lotteryId]); const row=r.rows[0];
-      if(!row) return interaction.reply({content:'Lottery not found.',flags:MessageFlags.Ephemeral});
-      if(row.status!=='active' || new Date(row.end_time)<=new Date()) return interaction.reply({content:'This lottery is closed.',flags:MessageFlags.Ephemeral});
-      if(row.type!=='giveaway') return interaction.reply({content:'This is a guess lottery. Use /lottery guess.',flags:MessageFlags.Ephemeral});
+      if(!row) return interaction.editReply({content:'Lottery not found.'});
+      if(row.status!=='active' || new Date(row.end_time)<=new Date()) return interaction.editReply({content:'This lottery is closed.'});
+      if(row.type!=='giveaway') return interaction.editReply({content:'This is a guess lottery — use the **Submit Guess** button instead.'});
       const username=interaction.member?.displayName||interaction.user?.globalName||interaction.user?.username||interaction.user.id;
       await pgPool.query(`INSERT INTO generic_lottery_entries (lottery_id,user_id,username) VALUES ($1,$2,$3) ON CONFLICT (lottery_id,user_id) DO UPDATE SET username=EXCLUDED.username`,[lotteryId,interaction.user.id,username]);
       const count=await getGenericLotteryEntryCount(lotteryId);
       try{
-  const msg = interaction.message;
-  const oldEmbed = msg.embeds[0];
-  if(oldEmbed){
-    const updated = EmbedBuilder.from(oldEmbed);
-    const fields = updated.data.fields?.map(f =>
-      f.name === 'Entries' ? { ...f, value: String(count) } : f
-    );
-    if(fields) updated.setFields(fields);
-    await msg.edit({ embeds: [updated] });
+        const msg = interaction.message;
+        const oldEmbed = msg.embeds[0];
+        if(oldEmbed){
+          const updated = EmbedBuilder.from(oldEmbed);
+          const fields = updated.data.fields?.map(f =>
+            f.name === 'Entries' ? { ...f, value: String(count) } : f
+          );
+          if(fields) updated.setFields(fields);
+          await msg.edit({ embeds: [updated] });
+        }
+      }catch(_){}
+      return interaction.editReply({content:`You are entered in lottery #${lotteryId}. Current entries: ${count}.`});
+    }catch(e){ return interaction.editReply({content:'Could not enter lottery: '+e.message}).catch(()=>{}); }
   }
-}catch(_){}
-      return interaction.reply({content:`You are entered in lottery #${lotteryId}. Current entries: ${count}.`,flags:MessageFlags.Ephemeral});
-    }catch(e){ return interaction.reply({content:'Could not enter lottery: '+e.message,flags:MessageFlags.Ephemeral}).catch(()=>{}); }
+  // ── Guess lottery: button opens a modal asking for the number ────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('lottery_guess:')){
+    const { ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+    const lotteryId = parseInt(interaction.customId.split(':')[1]);
+    const modal = new ModalBuilder().setCustomId(`lottery_guess_modal:${lotteryId}`).setTitle('Submit Your Guess');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('number').setLabel('Your guess').setStyle(TextInputStyle.Short)
+          .setPlaceholder('Enter a number').setRequired(true)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('lottery_guess_modal:')){
+    const lotteryId = parseInt(interaction.customId.split(':')[1]);
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(()=>{});
+    try{
+      const numRaw = interaction.fields.getTextInputValue('number').trim();
+      const number = parseInt(numRaw);
+      if(!Number.isInteger(number)) return interaction.editReply({ content:'Please enter a whole number.' });
+      const r = await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1', [lotteryId]);
+      const row = r.rows[0];
+      if(!row) return interaction.editReply({ content:'Lottery not found.' });
+      if(row.status !== 'active' || new Date(row.end_time) <= new Date())
+        return interaction.editReply({ content:'This guess event is closed.' });
+      if(number < row.min_number || number > row.max_number)
+        return interaction.editReply({ content:`Guess must be between ${row.min_number} and ${row.max_number}.` });
+      const username = interaction.member?.displayName || interaction.user?.globalName || interaction.user?.username || interaction.user.id;
+      await pgPool.query(
+        `INSERT INTO generic_lottery_entries (lottery_id, user_id, username, guess_number)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (lottery_id, user_id) DO UPDATE SET
+           username=EXCLUDED.username, guess_number=EXCLUDED.guess_number, entered_at=NOW()`,
+        [row.id, interaction.user.id, username, number]
+      );
+      return interaction.editReply({ content:`Your guess for lottery #${row.id} is **${number}**.` });
+    }catch(e){ return interaction.editReply({content:'Could not submit guess: '+e.message}).catch(()=>{}); }
   }
   // ── Slideshow button handler ───────────────────────────────────────────────
   // ── Show More button — opens slideshow of remaining results ──────────────
@@ -3719,6 +1487,72 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // ── Sweep pagination buttons ─────────────────────────────────────────────
+  if(interaction.isButton() && interaction.customId.startsWith('pa_pause:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`UPDATE user_price_alerts SET is_active=false WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`pa_resume:${id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`pa_stop:${id}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('pa_resume:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`UPDATE user_price_alerts SET is_active=true WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`pa_pause:${id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`pa_stop:${id}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('pa_stop:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`DELETE FROM user_price_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return interaction.update({ content: '🗑️ Price alert deleted.', embeds: [], components: [] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId === 'ta_pause'){
+    setAlert(interaction.user.id, { paused: true });
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('ta_resume').setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('ta_stop').setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId === 'ta_resume'){
+    setAlert(interaction.user.id, { paused: false });
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('ta_pause').setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('ta_stop').setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId === 'ta_stop'){
+    deleteAlert(interaction.user.id);
+    return interaction.update({ content: '🗑️ Trait alert deleted.', embeds: [], components: [] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('fa_pause:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`UPDATE user_floor_alerts SET is_active=false WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`fa_resume:${id}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`fa_stop:${id}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('fa_resume:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`UPDATE user_floor_alerts SET is_active=true WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`fa_pause:${id}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`fa_stop:${id}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.update({ components: [row] }).catch(()=>{});
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('fa_stop:')){
+    const id = parseInt(interaction.customId.split(':')[1], 10);
+    await pgPool.query(`DELETE FROM user_floor_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
+    return interaction.update({ content: '🗑️ Floor alert deleted.', embeds: [], components: [] }).catch(()=>{});
+  }
   if(interaction.isButton() && interaction.customId.startsWith('sweep:')){
     const parts = interaction.customId.split(':');
     const action = parts[1];
@@ -3782,11 +1616,7 @@ client.on('interactionCreate', async (interaction)=>{
         });
         if(contractTraits && realTraitCount(contractTraits)){
           traits = contractTraits;
-          if(ocasTraitsCache.size >= OCAS_TRAITS_CACHE_MAX){
-          const oldest = [...ocasTraitsCache.keys()].slice(0, 200);
-          for(const k of oldest) ocasTraitsCache.delete(k);
-        }
-        ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+          setCachedTraits(tokenId, traits);
         }
       }
 
@@ -3800,11 +1630,7 @@ client.on('interactionCreate', async (interaction)=>{
             if(tj.ok && tj.token?.traits) traits = tj.token.traits;
           }
           if(traits){
-            if(ocasTraitsCache.size >= OCAS_TRAITS_CACHE_MAX){
-              const oldest = [...ocasTraitsCache.keys()].slice(0, 200);
-              for(const k of oldest) ocasTraitsCache.delete(k);
-            }
-            ocasTraitsCache.set(tokenId, { traits, expires: Date.now() + 5 * 60 * 1000 });
+            setCachedTraits(tokenId, traits);
           }
         }catch(apiErr){
           console.warn('[ShowTraits API]', apiErr.message);
@@ -3812,7 +1638,7 @@ client.on('interactionCreate', async (interaction)=>{
       }
 
       if(!traits || !realTraitCount(traits)){
-        const local = await fetchTokenMetaFromLocalDb(tokenId).catch(()=>null);
+        const local = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
         traits = local?.traits || null;
       }
 
@@ -4023,19 +1849,33 @@ client.on('interactionCreate', async (interaction)=>{
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const r = await pgPool.query(`
         SELECT be.burned_at, be.points_used,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+               array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
+               FILTER (WHERE bei.burned_token_id IS NOT NULL) AS burned_ids,
+               COALESCE(started.token_count, 0) AS started_count
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        LEFT JOIN LATERAL (
+          SELECT COUNT(bsi.burned_token_id) AS token_count
+          FROM burn_started_events bse
+          JOIN burn_started_inputs bsi ON bsi.burn_started_id = bse.id
+          WHERE bse.survivor_token_id = be.survivor_token_id
+            AND bse.owner_wallet = be.burner_wallet
+            AND bse.block_number <= be.block_number
+          GROUP BY bse.id
+          ORDER BY MAX(bse.block_number) DESC
+          LIMIT 1
+        ) started ON true
         WHERE be.survivor_token_id = $1
-        GROUP BY be.id
+        GROUP BY be.id, started.token_count
         ORDER BY be.burned_at ASC NULLS LAST
       `, [survivorId]);
       if(!r.rows.length){ await interaction.editReply({ content:'No burn history found.' }); return; }
       const lines = r.rows.map((b, i) => {
         const burnNum = i + 1;
         const ids = (b.burned_ids||[]).filter(Boolean);
-        const idsStr = ids.length ? ids.map(id=>`#${id}`).join(', ') : '?';
-        return `**Burn ${burnNum}:** ${idsStr} → #${survivorId}`;
+        const count = Number(b.started_count) || ids.length;
+        const idsStr = ids.length ? ids.filter(id => id !== survivorId).map(id=>`#${id}`).join(', ') : '?';
+        return `**Burn ${burnNum} (${count} tokens):** ${idsStr} → #${survivorId}`;
       });
       const msgContent = lines.join('\n').slice(0, 1900);
       await interaction.editReply({ content: msgContent });
@@ -4054,12 +1894,25 @@ client.on('interactionCreate', async (interaction)=>{
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       // Fetch all burn events for this token in chronological order
       const r = await pgPool.query(`
-        SELECT be.id, be.burned_at, be.result_body_type, be.result_is_angel, be.points_used,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
+        SELECT be.id, be.tx_hash, be.burned_at, be.result_body_type, be.result_is_angel, be.points_used,
+               array_agg(DISTINCT bei.burned_token_id ORDER BY bei.burned_token_id)
+               FILTER (WHERE bei.burned_token_id IS NOT NULL) AS burned_ids,
+               COALESCE(started.token_count, 0) AS started_count
         FROM burn_events be
         LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
+        LEFT JOIN LATERAL (
+          SELECT COUNT(bsi.burned_token_id) AS token_count
+          FROM burn_started_events bse
+          JOIN burn_started_inputs bsi ON bsi.burn_started_id = bse.id
+          WHERE bse.survivor_token_id = be.survivor_token_id
+            AND bse.owner_wallet = be.burner_wallet
+            AND bse.block_number <= be.block_number
+          GROUP BY bse.id
+          ORDER BY MAX(bse.block_number) DESC
+          LIMIT 1
+        ) started ON true
         WHERE be.survivor_token_id = $1
-        GROUP BY be.id
+        GROUP BY be.id, started.token_count
         ORDER BY be.burned_at ASC NULLS LAST
       `, [survivorId]);
       if(!r.rows.length){ await interaction.editReply({ content:'No burn history found.' }); return; }
@@ -4087,9 +1940,11 @@ client.on('interactionCreate', async (interaction)=>{
         const b = r.rows[i];
         const burnNum = i + 1;
         const ago = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-        const ids = (b.burned_ids||[]).filter(Boolean);
-        const tokensStr = await burnTypeBreakdown(ids, b.id).catch(()=>String(ids.length||'?'));
-        // Pre-burn state: Burn 1 = original archive, Burn N = post-state of Burn N-1
+        const allIds = (b.burned_ids||[]).filter(Boolean).map(Number);
+        const consumedIds = allIds.filter(id => id !== survivorId);
+        const displayCount = Number(b.started_count) > 0 ? Number(b.started_count) - 1 : consumedIds.length;
+        const tokenTypes = await burnTypeBreakdown(consumedIds, b.id).catch(()=>String(displayCount||'?'));
+        const tokensStr = tokenTypes.replace(/^\d+/, String(displayCount));
         let snap = null;
         if(i === 0){
           snap = mintSnap;
@@ -4101,19 +1956,20 @@ client.on('interactionCreate', async (interaction)=>{
         if(snap?.traits_json){
           const tj = typeof snap.traits_json==='string' ? JSON.parse(snap.traits_json) : snap.traits_json;
           const raw = tj?.Type || tj?.type || null;
-          if(raw) preBurnType = normalizeOcasType(typeof raw==='string' ? raw.replace(/^"|"$/g,'') : String(raw));
+          if(raw !== null && raw !== undefined) preBurnType = resolveOcasType(raw);
         }
         const osUrl = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
+        const txUrl = b.tx_hash ? `https://etherscan.io/tx/${b.tx_hash}` : null;
         const slideEmbed = new EmbedBuilder()
           .setColor(BURN_COLORS.FIRE)
           .setTitle(`Before Burn ${burnNum} — ${ago}`)
-          .setURL(osUrl)
           .addFields(
             { name:'Tokens Burned', value:tokensStr, inline:true },
             { name:'Points Used',   value:String(b.points_used||0)+' pts', inline:true },
             { name:'Type Before',   value:preBurnType || '—', inline:true },
           )
-          .setFooter({ text:`#${survivorId} · Burn ${burnNum} of ${r.rows.length}` });
+          .setFooter({ text:`#${survivorId} · Burn ${burnNum} of ${r.rows.length}${txUrl ? ' · View on Etherscan' : ''}` })
+          .setURL(txUrl || osUrl);
         // Attach image if available
         if(snap?.image_data){
           const imgSrc = snap.image_data;
@@ -4175,2148 +2031,109 @@ client.on('interactionCreate', async (interaction)=>{
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
   const config=getConfig(guildId);
-  const isAdmin=interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+  const isAdmin=interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
+    || OWNER_DISCORD_IDS.has(String(interaction.user.id));
 
   // /setup
-  if(commandName==='setup'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const channel=interaction.options.getChannel('channel');
-    const slug=interaction.options.getString('collection');
-    const contract=(interaction.options.getString('contract')||'').toLowerCase().trim();
-    const chain=(interaction.options.getString('chain')||'ethereum').toLowerCase().trim();
-    setConfig(guildId,{channelId:channel.id,slug:slug.toLowerCase().trim(),contract,chain,salesFilters:{},listingFilters:{},paused:false});
-    await interaction.reply({embeds:[new EmbedBuilder().setTitle('Sales Bot Configured!').setColor(0x2dd4bf)
-      .addFields({name:'Sales Channel',value:`<#${channel.id}>`,inline:true},{name:'Collection',value:slug,inline:true},{name:'Contract',value:contract||'not set',inline:true})
-      .setDescription('Sales will post automatically. Use `/setlistings` to also enable listing alerts.')]});
-    return;
-  }
 
-  // /setuphere — mobile-friendly setup, uses the CURRENT channel automatically
-  if(commandName==='setuphere'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const slug=interaction.options.getString('collection');
-    const contract=(interaction.options.getString('contract')||'').toLowerCase().trim();
-    const chain=(interaction.options.getString('chain')||'ethereum').toLowerCase().trim();
-    const channelId=interaction.channelId; // use the channel this command was run in
-    setConfig(guildId,{channelId,slug:slug.toLowerCase().trim(),contract,chain,salesFilters:{},listingFilters:{},paused:false});
-    await interaction.reply({embeds:[new EmbedBuilder().setTitle('Sales Bot Configured!')
-      .setColor(0x2dd4bf)
-      .addFields(
-        {name:'Sales Channel',value:`<#${channelId}> (this channel)`,inline:true},
-        {name:'Collection',   value:slug,                              inline:true},
-        {name:'Contract',     value:contract||'not set',              inline:true},
-      )
-      .setDescription('Sales will post to **this channel** automatically.\nRun `/setlistingshere` in your listings channel to enable listing alerts.')
-    ]});
-    return;
-  }
+  const ctx = buildCtx(interaction, guildId, config, isAdmin);
 
-  // /setlistingshere — mobile-friendly listings setup, uses current channel
-  if(commandName==='setlistingshere'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const channelId=interaction.channelId;
-    setConfig(guildId,{listingsChannelId:channelId});
-    await interaction.reply({content:`Listings channel set to this channel <#${channelId}>. New listings will post here automatically.`});
-    return;
-  }
-
-  // /setupburn — set burn alert channel (optional channel param, defaults to current)
-  if(commandName==='setupburn'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const channelOption = interaction.options.getChannel('channel');
-    const channelId = channelOption ? channelOption.id : interaction.channelId;
-    const latestBurnConfig = await dbLoad('burn_config') || {};
-    burnConfig = { ...latestBurnConfig };
-    burnConfig[guildId] = { ...(latestBurnConfig[guildId] || {}) };
-    burnConfig[guildId].burnAlertChannelId = channelId;
-    burnConfig[guildId].channelId = channelId; // legacy compatibility for older saved configs/tools
-    await saveBurnConfig();
-    console.log(`[Burn] Config saved guild=${guildId} channel=${channelId} totalGuilds=${Object.keys(burnConfig || {}).length}`);
-    await interaction.reply({embeds:[new EmbedBuilder()
-      .setTitle('Burn Alerts Configured')
-      .setColor(BURN_COLORS.FIRE)
-      .setDescription(`Burn alerts will post to <#${channelId}>.\nThe bot will automatically detect OCAS Burn Machine events and post there.`)
-    ], flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /setlistings
-  if(commandName==='setlistings'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const channel=interaction.options.getChannel('channel');
-    setConfig(guildId,{listingsChannelId:channel.id});
-    await interaction.reply({content:`Listings channel set to <#${channel.id}>. New listings will post there automatically.`});
-    return;
-  }
-
-  // /setchannel
-  if(commandName==='setchannel'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const channel=interaction.options.getChannel('channel');
-    setConfig(guildId,{channelId:channel.id});
-    await interaction.reply({content:`Sales channel updated to <#${channel.id}>`, flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /setcollection
-  if(commandName==='setcollection'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const slug=interaction.options.getString('slug').toLowerCase().trim();
-    const contract=(interaction.options.getString('contract')||'').toLowerCase().trim();
-    setConfig(guildId,{slug,contract,salesFilters:{},listingFilters:{}});
-    await interaction.reply({content:`Collection set to **${slug}**`, flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /salesfilter
-  if(commandName==='salesfilter'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const trait=interaction.options.getString('trait').toLowerCase().trim();
-    const value=interaction.options.getString('value').toLowerCase().trim();
-    const existing=config.salesFilters||{};
-    const current=existing[trait];
-    // Stack multiple values for same trait into an array (OR logic)
-    let newVal;
-    if(!current) newVal=value;
-    else if(Array.isArray(current)) newVal=current.includes(value)?current:[...current,value];
-    else newVal=current===value?current:[current,value];
-    const filters={...existing,[trait]:newVal};
-    setConfig(guildId,{salesFilters:filters});
-    const display=Array.isArray(newVal)?newVal.join(' OR '):newVal;
-    await interaction.reply({content:`Sales filter updated: **${trait}** = ${display}\nUse \`/clearfilters\` to remove all.`, flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /listingfilter
-  if(commandName==='traitlistingfilter'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const trait=interaction.options.getString('trait').toLowerCase().trim();
-    const value=interaction.options.getString('value').toLowerCase().trim();
-    const existing=config.listingFilters||{};
-    const current=existing[trait];
-    let newVal;
-    if(!current) newVal=value;
-    else if(Array.isArray(current)) newVal=current.includes(value)?current:[...current,value];
-    else newVal=current===value?current:[current,value];
-    const filters={...existing,[trait]:newVal};
-    setConfig(guildId,{listingFilters:filters});
-    const display=Array.isArray(newVal)?newVal.join(' OR '):newVal;
-    await interaction.reply({content:`Listing filter updated: **${trait}** = ${display}\nUse \`/clearfilters\` to remove all.`, flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /clearfilters
-  // /setrankalert — configure rank-based listing alerts (admin)
-  if(commandName==='ranklistingfilter'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const rankMin  = interaction.options.getInteger('min') ?? 1;
-    const rankMax  = interaction.options.getInteger('max') ?? 100;
-    const rankType = interaction.options.getString('rank_type') || 'os';
-    const channel  = interaction.options.getChannel('channel');
-    setConfig(guildId, { rankAlert: {
-      min: rankMin, max: rankMax,
-      rankType,
-      channelId: channel?.id || null
-    }});
-    const rankLabel = rankType === 'obs' ? 'TraitView' : 'OpenSea';
-    await interaction.reply({
-      embeds:[new EmbedBuilder()
-        .setTitle('🏆 Rank Alert Set')
-        .setColor(0xf59e0b)
-        .setDescription(`Will alert when a token with **${rankLabel} rank #${rankMin}–#${rankMax}** gets listed.`)
-        .addFields(
-          { name:'Rank Range', value:`#${rankMin} – #${rankMax}`, inline:true },
-          { name:'Rank System', value:rankLabel, inline:true },
-          { name:'Alert Channel', value: channel ? `<#${channel.id}>` : 'Same as listings', inline:true }
-        )]
-    });
-    return;
-  }
-
-  // /clearrankalert — remove rank alert config
-  if(commandName==='removerankfilter'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    setConfig(guildId, { rankAlert: null });
-    await interaction.reply({ content:'Rank alert cleared.', flags: MessageFlags.Ephemeral });
-    return;
-  }
-
-    if(commandName==='clearallfilters'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    setConfig(guildId,{salesFilters:{}, listingFilters:{}, rankAlert: null});
-    await interaction.reply({content:'All filters cleared (trait filters + rank alert).', flags:MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /removefilter — remove a single value from an existing filter
-  if(commandName==='removetraitfilter'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const filterType=interaction.options.getString('type'); // 'sales' or 'listings'
-    const trait=interaction.options.getString('trait').toLowerCase().trim();
-    const value=interaction.options.getString('value').toLowerCase().trim();
-    const key=filterType==='sales'?'salesFilters':'listingFilters';
-    const existing={...(config[key]||{})};
-    if(!existing[trait]){
-      await interaction.reply({content:`No filter found for **${trait}**.`, flags: MessageFlags.Ephemeral}); return;
+  if(ADMIN_COMMANDS.has(commandName))   return handleAdminCommand(commandName, ctx);
+  if(MARKET_COMMANDS.has(commandName))  return handleMarketCommand(commandName, ctx);
+  if(OCAS_COMMANDS.has(commandName))    return handleOcasCommand(commandName, ctx);
+  if(TOKEN_COMMANDS.has(commandName))   return handleTokenCommand(commandName, ctx);
+  if(BURN_COMMANDS.has(commandName))    return handleBurnCommand(commandName, ctx);
+  if(GIVEAWAY_COMMANDS.has(commandName)) return handleGiveawayCommand(interaction, ctx);
+  if(SETUP_COMMANDS.has(commandName))    return handleSetupCommand(interaction, ctx);
+  if(CONFIG_COMMANDS.has(commandName))   return handleConfigCommand(interaction, { pgPool, getConfig, setConfig });
+  if(LOTTERIES_COMMANDS.has(commandName)) return handleLotteriesCommand(interaction, { pgPool, getConfig });
+  if(MISC_COMMANDS.has(commandName))    return handleMiscCommand(commandName, ctx);
+  // ── /synctraits (manual trigger) ─────────────────────────────────────────────
+  if(commandName==='resetverify'){
+    if(!isAdmin) return interaction.reply({flags:64, content:'❌ Admin only.'});
+    await interaction.deferReply({flags:64});
+    const target = interaction.options.getUser('user') || interaction.user;
+    const wantsGlobal = interaction.options.getBoolean('global') || false;
+    const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+    if(wantsGlobal && !isOwner){
+      return interaction.editReply({content:'❌ The `global` option is restricted to the bot owner only.'});
     }
-    const current=existing[trait];
-    if(Array.isArray(current)){
-      const updated=current.filter(v=>v!==value);
-      if(updated.length===0) delete existing[trait];
-      else if(updated.length===1) existing[trait]=updated[0];
-      else existing[trait]=updated;
-    } else {
-      delete existing[trait];
-    }
-    setConfig(guildId,{[key]:existing});
-    const remaining=Object.keys(existing).length===0?'none':Object.entries(existing).map(([k,v])=>`${k}=${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
-    await interaction.reply({content:`Removed **${value}** from ${filterType} filter for **${trait}**.
-Remaining ${filterType} filters: ${remaining}`, flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /pause
-  if(commandName==='pause'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    setConfig(guildId,{paused:true});
-    await interaction.reply({content:'Paused. Use `/resume` to restart.', flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /resume
-  if(commandName==='resume'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    setConfig(guildId,{paused:false});
-    await interaction.reply({content:'Resumed!', flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /status
-  if(commandName==='status'){
-    const fmtFilter=f=>Object.keys(f||{}).length===0?'none':Object.entries(f).map(([k,v])=>`${k}=${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
-    const sf  = fmtFilter(config.salesFilters);
-    const lf  = fmtFilter(config.listingFilters);
-    const ra  = config.rankAlert
-      ? `⬥ OS Rank #${config.rankAlert.min}–#${config.rankAlert.max}${config.rankAlert.channelId ? ` → <#${config.rankAlert.channelId}>` : ''}`
-      : 'none';
-    const burnCfg = getBurnConfig(guildId);
-    const burnChannelId = getConfiguredBurnChannelId(burnCfg);
-    await interaction.reply({embeds:[new EmbedBuilder().setTitle('Bot Status').setColor(0x7aa2ff)
-      .addFields(
-        {name:'Collection',        value:config.slug||'not set',                                            inline:true},
-        {name:'Paused',            value:config.paused?'Yes':'No',                                          inline:true},
-        {name:'​',            value:'​',                                                           inline:true},
-        {name:'Sales Channel',     value:config.channelId?`<#${config.channelId}>`:'not set',               inline:true},
-        {name:'Listings Channel',  value:config.listingsChannelId?`<#${config.listingsChannelId}>`:'not set', inline:true},
-        {name:'Burn Alerts',       value:burnChannelId?`<#${burnChannelId}>`:'not set',                    inline:true},
-        {name:'Sales Filters',     value:sf,                                                                 inline:true},
-        {name:'Listing Filters',   value:lf,                                                                 inline:true},
-        {name:'Rank Alert',        value:ra,                                                                 inline:true},
-      )], flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /lastsale
-  if(commandName==='lastsale'){
-    const slug=interaction.options.getString('collection')||config.slug;
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    await interaction.deferReply();
     try{
-      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=sale&limit=1`,{headers:osHeaders()});
-      if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
-      const sales=(await r.json()).asset_events||[];
-      if(!sales.length){await interaction.editReply('No sales found.');return;}
-      const embed=await buildSaleEmbed(sales[0],{...config,slug});
-      const ir=embed._imageResult;delete embed._imageResult;
-      if(ir?.type==='buffer'){const att=new AttachmentBuilder(ir.buffer,{name:ir.filename});embed.setThumbnail(`attachment://${ir.filename}`);await interaction.editReply({embeds:[embed],files:[att]});}
-      else{if(ir?.type==='url')embed.setThumbnail(ir.url);await interaction.editReply({embeds:[embed]});}
-    }catch(e){await interaction.editReply('Error: '+e.message);}
-    return;
-  }
-
-  // /recentsales
-  if(commandName==='recentsales'){
-    const slug=interaction.options.getString('collection')||config.slug;
-    const count=Math.min(interaction.options.getInteger('count')||5,20);
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    await interaction.deferReply();
-    try{
-      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=sale&limit=${count}`,{headers:osHeaders()});
-      if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
-      const sales=(await r.json()).asset_events||[];
-      if(!sales.length){await interaction.editReply('No sales found.');return;}
-      const cfg={...config,slug};
-      const embeds=await Promise.all(sales.reverse().map(s=>buildSaleEmbed(s,cfg).catch(()=>null)));
-      await postEmbeds(interaction, embeds.filter(Boolean), `Last ${sales.length} sales for **${slug}**:`);
-    }catch(e){await interaction.editReply('Error: '+e.message);}
-    return;
-  }
-
-  // /sale token:ID
-  if(commandName==='sale'){
-    const tokenId=interaction.options.getString('token').replace('#','');
-    const slug=interaction.options.getString('collection')||config.slug;
-    const contract=config.contract||'';
-    if(!slug) return interaction.reply({content:'Run `/setup` first.', flags: MessageFlags.Ephemeral});
-    if(!contract) return interaction.reply({content:'Set a contract with `/setcollection`.', flags: MessageFlags.Ephemeral});
-    await interaction.deferReply();
-    try{
-      const chainForSale=config.chain||'ethereum';
-      const r=await fetch(`https://api.opensea.io/api/v2/events/chain/${chainForSale}/contract/${contract}/nfts/${tokenId}?event_type=sale&limit=1`,{headers:osHeaders()});
-      if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
-      const sales=(await r.json()).asset_events||[];
-      if(!sales.length){await interaction.editReply(`No sales found for #${tokenId}.`);return;}
-      const embed=await buildSaleEmbed(sales[0],config);
-      const ir=embed._imageResult;delete embed._imageResult;
-      if(ir?.type==='buffer'){const att=new AttachmentBuilder(ir.buffer,{name:ir.filename});embed.setThumbnail(`attachment://${ir.filename}`);await interaction.editReply({embeds:[embed],files:[att]});}
-      else{if(ir?.type==='url')embed.setThumbnail(ir.url);await interaction.editReply({embeds:[embed]});}
-    }catch(e){await interaction.editReply('Error: '+e.message);}
-    return;
-  }
-
-  // /traitfind - token search by default; add "listings" or "sales" for those modes.
-  if(commandName==='traitfind'){
-    const _tfCool = checkCommandCooldown(interaction.user.id, 'traitfind');
-    if(_tfCool) return interaction.reply({content:`⏳ Please wait **${_tfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
-    const slug       = interaction.options.getString('collection') || config.slug;
-    const rawSearch  = (interaction.options.getString('search') || '').trim();
-    const RAILWAY_URL = getRailwayApiUrl();
-    const API_SECRET  = process.env.API_SECRET;
-
-    // Detect mode: tokens default, or explicit listings/sales.
-    const wantListings = /\blistings?\b/i.test(rawSearch);
-    const wantSales    = /\bsales?\b/i.test(rawSearch);
-    let workingSearch = rawSearch.replace(/\b(listings?|sales?)\b/gi, ' ').trim();
-
-    // Parse count: first standalone number (default 10, max 20)
-    let want = 10;
-    const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
-    if(numMatch){ const n=parseInt(numMatch[1]); if(n>0&&n<=20){ want=n; workingSearch=workingSearch.replace(numMatch[0],' ').trim(); } }
-
-    // Resolve trait name+value using phrase-aware parser.
-    let trait = '', value = '', groups = [], unmatched = [], traitParseError = null;
-    if(workingSearch && RAILWAY_URL){
-      try{
-        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
-        const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
-        groups = resolved.groups || [];
-        unmatched = resolved.unmatched || [];
-        if(groups.length){ trait = groups[0][0].trait_name; value = groups[0][0].trait_value; }
-      }catch(e){ traitParseError = e; console.warn('[traitfind] parser error:', e.message); }
-    }
-    if(!trait && workingSearch){ value=workingSearch; }
-    const matchLabel = traitGroupsLabel(groups, value || workingSearch);
-
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    if(!workingSearch) return interaction.reply({content:'Provide a trait to search. e.g. `/traitfind search:zombie`, `/traitfind search:zombie listings`, or `/traitfind search:zombie sales`', flags: MessageFlags.Ephemeral});
-    if(!RAILWAY_URL) return interaction.reply({content:'Trait search needs the internal TraitView API URL so it can read the token DB/cache. Set `RAILWAY_API_URL` in this Railway service.', flags: MessageFlags.Ephemeral});
-    if(traitParseError) return interaction.reply({content:`I could not load the trait index from the TraitView API. ${traitParseError.message}`, flags: MessageFlags.Ephemeral});
-    if(!groups.length){
-      const extra = unmatched.length ? ` Unmatched words: ${unmatched.join(', ')}.` : '';
-      return interaction.reply({content:`I could not match **${workingSearch}** to known OCAS traits.${extra} Try an exact trait/value like \`zombie\`, \`gold chain\`, or \`alien epic bear\`.`, flags: MessageFlags.Ephemeral});
-    }
-    await interaction.deferReply();
-
-    try{
-      // Token search is the default. "listings" narrows the same trait search
-      // to active listings. "sales" keeps the existing sales-history behavior.
-      if(wantListings || !wantSales){
-        const listedOnly = wantListings;
-        await interaction.editReply(`Searching ${listedOnly ? 'listed tokens' : 'OCAS tokens'} matching **${matchLabel}**...`);
-        const qs = new URLSearchParams({ limit: String(want), key: API_SECRET||'' });
-        qs.set('groups', JSON.stringify(groups));
-        if(listedOnly) qs.set('listed', '1');
-        const label = listedOnly ? '/db/multi-trait-tokens listings API' : '/db/multi-trait-tokens token API';
-        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, label);
-        const tokens = j.tokens || [];
-        if(!tokens.length){
-          await interaction.editReply(`No ${listedOnly ? 'active listings' : 'OCAS tokens'} found matching **${matchLabel}**.`);
-          return;
-        }
-        const cfg = {...config, slug};
-        const embeds = await Promise.all(tokens.map(async t => {
-          const tokenId = t.token_id ?? t.id ?? t.identifier;
-          const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-          if(listedOnly){
-            const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
-            const fakeListingObj = {
-              token_id: tokenId,
-              asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
-                       traits: dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [] },
-              payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
-              maker: t.seller || '',
-              url: t.url || null,
-              os_rank: t.os_rank || null,
-              _dbToken: dbMeta,
-            };
-            return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
-          }
-          return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
-        }));
-        await postEmbeds(interaction, embeds.filter(Boolean),
-          `Found **${tokens.length}** ${listedOnly ? 'listing' : 'token'}${tokens.length===1?'':'s'} matching **${matchLabel}**${listedOnly ? ' (cheapest first)' : ''}:`);
-        return;
-      }
-
-      // ── Listings mode ──────────────────────────────────────────────────────
-      if(wantListings && RAILWAY_URL){
-        await interaction.editReply(`🔍 Searching listed tokens with **${trait ? trait+': ' : ''}${value}**...`);
-        // Use multi-trait-tokens with listed=1 — build a single-group filter
-        const groups = [[{ trait_name: trait || '_any', trait_value: value }]];
-        // For single known trait, use groups param; otherwise fall back to trait-sales endpoint
-        const qs = new URLSearchParams({ listed:'1', limit: String(want), key: API_SECRET||'' });
-        if(trait) qs.set('groups', JSON.stringify([[{ trait_name: trait, trait_value: value }]]));
-        const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
-        if(r.ok){
-          const j = await r.json();
-          if(!j.ok) throw new Error(j.error || 'API error');
-          const tokens = j.tokens || [];
-          if(!tokens.length){ await interaction.editReply(`No listed tokens found with **${trait ? trait+': ' : ''}${value}**.`); return; }
-          const contract = config.contract || '';
-          const listEmbeds = await Promise.all(tokens.map(async t => {
-            const tokenId = t.token_id ?? t.id ?? t.identifier;
-            const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-            const priceWei = t.price_eth != null ? String(BigInt(Math.round(t.price_eth * 1e18))) : '0';
-            const fakeListingObj = {
-              token_id: tokenId,
-              asset: { token_id: String(tokenId), identifier: String(tokenId), name: '#'+tokenId,
-                       traits: dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [] },
-              payment: { quantity: priceWei, decimals: 18, symbol: 'ETH', token_address: '' },
-              maker: t.seller || '',
-              url: t.url || null,
-              _dbToken: dbMeta,
-            };
-            return buildListingEmbed(fakeListingObj, {...config, slug}).catch(()=>null);
-          }));
-          await postEmbeds(interaction, listEmbeds.filter(Boolean),
-            `Found **${tokens.length}** listing${tokens.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (cheapest first):`);
-          return;
-        }
-      }
-
-      // ── Sales mode (default) ───────────────────────────────────────────────
-      if(RAILWAY_URL){
-        await interaction.editReply(`🔍 Searching **${trait ? trait+': ' : ''}${value}** in full sales history...`);
-        const qs = new URLSearchParams({ trait, value, limit: String(Math.min(want, 200)), sort: 'desc' });
-        if(API_SECRET) qs.set('key', API_SECRET);
-        const r = await fetch(`${RAILWAY_URL}/db/trait-sales?${qs}`);
-        if(r.ok){
-          const j = await r.json();
-          if(!j.ok) throw new Error(j.error || 'DB error');
-          const sales = j.sales || [];
-          if(!sales.length){ await interaction.editReply(`No sales found for **${trait ? trait+': ' : ''}${value}** (searched ${j.count ?? 'all'} records).`); return; }
-          const cfg = {...config, slug};
-          const toShow = sales.slice(0, want);
-          const saleEmbeds = await Promise.all(toShow.map(async sale => {
-            const dbMeta = await fetchTokenMetaFromDb(sale.token_id).catch(()=>null);
-            const tokenTraits = dbMeta?.traits ? traitObjectToArray(dbMeta.traits) : [];
-            const syntheticSale = {
-              nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits },
-              buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
-              payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH'?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
-              event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
-            };
-            return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
-          }));
-          const totalNote = j.count > want ? ` (showing ${want} of ${j.count} total)` : '';
-          await postEmbeds(interaction, saleEmbeds.filter(Boolean),
-            `Found **${j.count}** sale${j.count===1?'':'s'} with **${trait ? trait+': ' : ''}${value}**${totalNote}:`);
-          return;
-        }
-        console.warn('[traitfind] Railway DB call failed, falling back to OpenSea');
-      }
-
-      // ── Contract fallback — fetch traits for matched tokens directly from chain ─
-      // Only fires when Railway DB is unavailable. Contract is always authoritative.
-      if(groups.length){
-        try{
-          await interaction.editReply(`🔍 Fetching on-chain traits for **${matchLabel}**...`);
-          // We don't have token IDs without the DB, so this is a best-effort single-token lookup
-          // using the trait search term to at least surface what we can from the contract.
-          console.log('[traitfind] contract fallback triggered for groups:', JSON.stringify(groups));
-        }catch(e){ console.warn('[traitfind] contract fallback error:', e.message); }
-      }
-
-      // ── OpenSea fallback (sales only) ──────────────────────────────────────
-      await interaction.editReply(`🔍 Searching OpenSea sales for **${trait ? trait+': ' : ''}${value}**...`);
-      const traitLow=trait.toLowerCase(), valueLow=value.toLowerCase();
-      const matched=[];let cursor=null;let pages=0;
-      while(matched.length<want&&pages<15){
-        const qs=new URLSearchParams({event_type:'sale',limit:'100'});
-        if(cursor) qs.set('next',cursor);
-        const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?${qs}`,{headers:osHeaders()});
-        if(!r.ok) break;
-        const j=await r.json();const sales=j.asset_events||[];if(!sales.length) break;
-        for(const sale of sales){
-          if(matched.length>=want) break;
-          const lookup={};
-          for(const t of (sale.nft?.traits||[])) lookup[t.trait_type?.toLowerCase()]=String(t.value).toLowerCase();
-          if(lookup[traitLow]===valueLow) matched.push(sale);
-        }
-        cursor=j.next||null;if(!cursor) break;pages++;
-      }
-      if(!matched.length){ await interaction.editReply(`No sales found with **${trait ? trait+': ' : ''}${value}** in the last ~${pages*100} sales.`); return; }
-      const cfg={...config,slug};
-      await interaction.editReply(`Found **${matched.length}** sale${matched.length===1?'':'s'} with **${trait ? trait+': ' : ''}${value}** (OpenSea, last ~${pages*100}):`);
-      for(const sale of matched){const embed=await buildSaleEmbed(sale,cfg);await sendEmbed(interaction.channel,embed);await new Promise(r=>setTimeout(r,800));}
-    }catch(e){
-      console.warn('[traitfind]', e.message);
-      await interaction.editReply(`I could not load trait results from the TraitView API. ${e.message}`);
-    }
-    return;
-  }
-
-  // /listings
-  if(commandName==='listings'){
-    const slug=interaction.options.getString('collection')||config.slug;
-    const count=Math.min(interaction.options.getInteger('count')||5,20);
-    if(!slug) return interaction.reply({content:'Run `/setup` first or provide a collection.', flags: MessageFlags.Ephemeral});
-    await interaction.deferReply();
-    try{
-      const r=await fetch(`https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}?event_type=listing&limit=${count}`,{headers:osHeaders()});
-      if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
-      const listings=(await r.json()).asset_events||[];
-      if(!listings.length){await interaction.editReply('No listings found.');return;}
-      const cfg={...config,slug};
-      const embeds=await Promise.all(listings.reverse().map(l=>buildListingEmbed(l,cfg).catch(()=>null)));
-      await postEmbeds(interaction, embeds.filter(Boolean), `${listings.length} recent listings for **${slug}**:`);
-    }catch(e){await interaction.editReply('Error: '+e.message);}
-    return;
-  }
-
-  // /debuglisting — show raw listing event to diagnose parsing issues
-  if(commandName==='debuglisting'){
-    const slug=interaction.options.getString('collection')||config.slug;
-    if(!slug) return interaction.reply({content:'Provide a collection.', flags: MessageFlags.Ephemeral});
-    await interaction.deferReply({ephemeral:true});
-    try{
-      const r=await fetch('https://api.opensea.io/api/v2/events/collection/'+encodeURIComponent(slug)+'?event_type=listing&limit=1',{headers:osHeaders()});
-      if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
-      const j=await r.json();
-      const events=j.asset_events||[];
-      if(!events.length){await interaction.editReply('No listings found.');return;}
-      const ev=events[0];
-      const lines=[];
-      lines.push('**Top-level keys:** '+JSON.stringify(Object.keys(ev)));
-      lines.push('**event_type:** '+ev.event_type);
-      lines.push('**nft keys:** '+(ev.nft?JSON.stringify(Object.keys(ev.nft)):'null'));
-      lines.push('**nft.identifier:** '+(ev.nft?.identifier||'null'));
-      lines.push('**nft.name:** '+(ev.nft?.name||'null'));
-      lines.push('**nft.image_url:** '+(ev.nft?.image_url||'null'));
-      lines.push('**price:** '+JSON.stringify(ev.price||null));
-      lines.push('**payment:** '+JSON.stringify(ev.payment||null));
-      lines.push('**base_price:** '+(ev.base_price||'null'));
-      lines.push('**maker:** '+JSON.stringify(ev.maker||null));
-      lines.push('**seller:** '+(ev.seller||'null'));
-      lines.push('**item keys:** '+(ev.item?JSON.stringify(Object.keys(ev.item)):'null'));
-      await interaction.editReply(lines.join('\n').slice(0,1900));
-    }catch(err){await interaction.editReply('Error: '+err.message);}
-    return;
-  }
-
-    // /myalert — personal DM alert setup
-  if(commandName==='myalert'){
-    const trait=interaction.options.getString('trait')?.toLowerCase().trim();
-    const value=interaction.options.getString('value')?.toLowerCase().trim();
-    const alertSales=interaction.options.getBoolean('sales')??true;
-    const alertListings=interaction.options.getBoolean('listings')??true;
-    const slug=interaction.options.getString('collection')||config.slug;
-    if(!slug) return interaction.reply({content:'Provide a collection or run `/setup` in a configured server first.', flags: MessageFlags.Ephemeral});
-
-    const existing=getAlert(interaction.user.id)||{};
-    const filters={...(existing.traitFilters||{})};
-
-    // Stack multiple values for same trait (OR logic) — same as server filters
-    if(trait&&value){
-      const current=filters[trait];
-      if(!current) filters[trait]=value;
-      else if(Array.isArray(current)) filters[trait]=current.includes(value)?current:[...current,value];
-      else filters[trait]=current===value?current:[current,value];
-    }
-
-    setAlert(interaction.user.id,{slug,traitFilters:filters,alertSales,alertListings});
-
-    const fmtF=f=>Object.keys(f||{}).length===0?'none (all)':Object.entries(f).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
-    const filterStr=fmtF(filters);
-    const lines=[
-      `Personal alert set for **${slug}**!`,
-      `Filters: ${filterStr}`,
-      `Sales DMs: ${alertSales?'on':'off'}`,
-      `Listing DMs: ${alertListings?'on':'off'}`,
-      '',
-      'You will receive DMs when matching events happen.',
-      'Use `/myalert` again to add more trait filters.',
-      'Use `/myalertclear` to remove your alert.'
-    ].join('\n');
-
-    await interaction.reply({content:lines, flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /myalertclear
-  if(commandName==='myalertclear'){
-    const trait=interaction.options.getString('trait');
-    const value=interaction.options.getString('value');
-    if(trait){
-      // Remove just one trait/value from the alert
-      const alert=getAlert(interaction.user.id);
-      if(!alert){ await interaction.reply({content:'You have no alert set.', flags: MessageFlags.Ephemeral}); return; }
-      const filters={...(alert.traitFilters||{})};
-      if(value&&filters[trait]){
-        const current=filters[trait];
-        if(Array.isArray(current)){
-          const updated=current.filter(v=>v!==value.toLowerCase().trim());
-          if(updated.length===0) delete filters[trait];
-          else if(updated.length===1) filters[trait]=updated[0];
-          else filters[trait]=updated;
-        } else { delete filters[trait]; }
-      } else { delete filters[trait]; }
-      setAlert(interaction.user.id,{...alert,traitFilters:filters});
-      const remaining=Object.keys(filters).length===0?'none':Object.entries(filters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join(', ');
-      await interaction.reply({content:`Removed filter. Remaining: ${remaining}`, flags: MessageFlags.Ephemeral});
-    } else {
-      deleteAlert(interaction.user.id);
-      await interaction.reply({content:'Your personal alert has been fully removed.', flags: MessageFlags.Ephemeral});
-    }
-    return;
-  }
-
-  // /myalertstatus
-  if(commandName==='myalertstatus'){
-    const alert=getAlert(interaction.user.id);
-    if(!alert){await interaction.reply({content:'You have no personal alert set. Use `/myalert` to create one.', flags: MessageFlags.Ephemeral});return;}
-    const filterStr=alert.traitFilters&&Object.keys(alert.traitFilters).length>0?Object.entries(alert.traitFilters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n'):'none (all events)';
-    const lines=[
-      `Collection: **${alert.slug||'any'}**`,
-      `Sales DMs: ${alert.alertSales?'on':'off'}`,
-      `Listing DMs: ${alert.alertListings?'on':'off'}`,
-      `Filters:\n${filterStr}`
-    ].join('\n');
-    await interaction.reply({content:lines, flags: MessageFlags.Ephemeral});
-    return;
-  }
-
-  // /help
-  // /rankfilter — show currently listed tokens filtered by OS rank range
-  if(commandName==='rankfind'){
-    const _rfCool = checkCommandCooldown(interaction.user.id, 'rankfind');
-    if(_rfCool) return interaction.reply({content:`⏳ Please wait **${_rfCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
-    const rawSearch  = (interaction.options.getString('search') || '').trim();
-    const RAILWAY_URL = getRailwayApiUrl();
-    const API_SECRET  = process.env.API_SECRET;
-
-    // Detect mode: sales or listings (default)
-    const wantSales    = /\bsales?\b/i.test(rawSearch);
-    const wantListings = !wantSales;
-    let workingSearch = rawSearch.replace(/\b(listings?|sales?)\b/gi, ' ').trim();
-
-    // Parse range: "1-100", "1 to 100"
-    let rankMin = 1, rankMax = 100;
-    const rangeMatch = workingSearch.match(/(\d+)\s*(?:-|to|–)\s*(\d+)/);
-    if(rangeMatch){ rankMin = parseInt(rangeMatch[1]); rankMax = parseInt(rangeMatch[2]); }
-    else { const numMatch = workingSearch.match(/(\d+)/); if(numMatch) rankMax = parseInt(numMatch[1]); }
-
-    // Parse sort for listings mode: 'rank'/'best' or default 'price'/'cheapest'
-    const sortBy = /\b(rank|best)\b/i.test(workingSearch) ? 'rank' : 'price';
-
-    if(!RAILWAY_URL) return interaction.reply({ content: 'RAILWAY_API_URL not configured. Set it to your internal/public TraitView API URL in this Railway service.', flags: MessageFlags.Ephemeral });
-    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. Try: "1-100" or "1-500 rank"', flags: MessageFlags.Ephemeral });
-
-    await interaction.deferReply();
-    const contract = config.contract || '';
-    try{
-
-      // ── Sales mode ─────────────────────────────────────────────────────────
-      if(wantSales){
-        const qs = new URLSearchParams({ rank_min: rankMin, rank_max: rankMax, limit: '20', sort: 'desc' });
-        if(API_SECRET) qs.set('key', API_SECRET);
-        const j = await fetchBotApiJson(`${RAILWAY_URL}/db/rank-sales?${qs}`, '/db/rank-sales API');
-        const sales = j.sales || [];
-        if(!sales.length){ await interaction.editReply(`No sales found for OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
-        const cfg = {...config};
-        const saleEmbeds = await Promise.all(sales.map(async sale => {
-          const tokenTraits = sale.traits && typeof sale.traits==='object'
-            ? traitObjectToArray(sale.traits)
-            : [];
-          const isWethSale = (sale.currency||'ETH').toUpperCase() === 'WETH';
-          const syntheticSale = {
-            nft: { identifier: String(sale.token_id), name: `#${sale.token_id}`, traits: tokenTraits, os_rank: sale.os_rank },
-            buyer: sale.buyer||'unknown', seller: sale.seller||'unknown',
-            payment: { symbol: (sale.currency||'ETH'), token_address: isWethSale?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
-            event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
-          };
-          return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
-        }));
-        await postEmbeds(interaction, saleEmbeds.filter(Boolean),
-          `📊 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${sales.length} recent sale${sales.length===1?'':'s'}:`);
-        return;
-      }
-
-      // ── Listings mode (default) ────────────────────────────────────────────
-      const qs = new URLSearchParams({ listed: '1', rank_min: rankMin, rank_max: rankMax, rank_type: 'os', limit: '20' });
-      if(API_SECRET) qs.set('key', API_SECRET);
-      const j = await fetchBotApiJson(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`, '/db/multi-trait-tokens rank listings API');
-      let listings = j.tokens || [];
-      if(!listings.length){ await interaction.editReply(`No listings found with OS rank **⬥ #${rankMin}–#${rankMax}**.`); return; }
-      if(sortBy === 'rank') listings.sort((a,b) => (a.os_rank??9999) - (b.os_rank??9999));
-      const rankEmbeds = await Promise.all(listings.map(async l => {
-        const tokenId = l.token_id ?? l.id ?? l.identifier;
-        const dbMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-        const tokenTraits = dbMeta?.traits
-          ? traitObjectToArray(dbMeta.traits)
-          : (l.traits && typeof l.traits==='object' ? traitObjectToArray(l.traits) : []);
-        const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
-        const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
-        const listingUrl = l.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
-        const tvUrl = `https://traitview.com/?jump=${tokenId}`;
-        const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
-        const embed = new EmbedBuilder()
-          .setColor(rankColor)
-          .setTitle(`${priceStr} ETH • #${tokenId}${rankBadge} • Listed`)
-          .setURL(listingUrl)
-          .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
-          .setTimestamp();
-        const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
-        if(tokenTraits.length){
-          embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
-        } else { embed.setDescription('**Links**\n' + tvLink); }
-        try{ embed._imageResult = await resolveImage({ identifier: String(tokenId) }, contract, 'ethereum'); }catch(e){}
-        return embed;
-      }));
-      const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
-      await postEmbeds(interaction, rankEmbeds.filter(Boolean),
-        `🏆 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${listings.length} listing${listings.length===1?'':'s'} (${sortLabel}):`);
-    }catch(e){
-      console.warn('[rankfind]', e.message);
-      await interaction.editReply(`I could not load rank results from the TraitView API. ${e.message}`);
-    }
-    return;
-  }
-
-
-  // /ocas — smart search (random, token ID, rank, trait count, or phrase-aware trait combos)
-  if(commandName==='ocas'){
-    const tokenInput = interaction.options.getInteger('token');
-    const rawSearch  = (interaction.options.getString('search') || '').trim();
-    const contract   = config.contract || '';
-    const RAILWAY_URL = getRailwayApiUrl();
-    const API_SECRET  = process.env.API_SECRET;
-
-    await interaction.deferReply();
-    try{
-      // normalizePhrase / getTraitIndex / chooseTraitGroupsFromQuery
-      // are hoisted to module scope — shared with /sweep.
-      let tokenId    = tokenInput || null;
-      let traitCount = null;
-      let rankMin    = null, rankMax = null;
-      let floorPrice  = null;
-      let matchedGroups = [];
-      let searchForTraits = '';
-
-      // Detect floor anywhere: "zombie floor", "floor zombie", "gold chain floor"
-      const wantFloor = /(?:^|\s)floor(?:\s|$)/i.test(rawSearch);
-      let workingSearch = rawSearch.replace(/(?:^|\s)floor(?:\s|$)/gi, ' ').trim();
-
-      // Extract trait count but keep any remaining trait words, e.g. "zombie 15 traits".
-      const countMatch = workingSearch.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
-      if(countMatch){
-        traitCount = parseInt(countMatch[1] || countMatch[2]);
-        workingSearch = workingSearch.replace(countMatch[0], ' ').trim();
-      }
-
-      // Extract rank range but keep any remaining trait words, e.g. "zombie hoodie rank 1-500".
-      const lowerWorking = workingSearch.toLowerCase();
-      const rangeMatch = lowerWorking.match(/rank\s*(\d+)\s*(?:-|–|to)\s*(\d+)/i) || lowerWorking.match(/(\d+)\s*(?:-|–|to)\s*(\d+)\s*rank/i);
-      const topMatch = lowerWorking.match(/top\s*(\d+)/i);
-      const singleRankMatch = lowerWorking.match(/rank\s*(\d+)/i);
-      if(rangeMatch){
-        rankMin = parseInt(rangeMatch[1]); rankMax = parseInt(rangeMatch[2]);
-        workingSearch = workingSearch.replace(new RegExp(rangeMatch[0].replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'i'), ' ').trim();
-      } else if(topMatch){
-        rankMin = 1; rankMax = parseInt(topMatch[1]);
-        workingSearch = workingSearch.replace(new RegExp(topMatch[0].replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'i'), ' ').trim();
-      } else if(singleRankMatch){
-        rankMin = 1; rankMax = parseInt(singleRankMatch[1]);
-        workingSearch = workingSearch.replace(new RegExp(singleRankMatch[0].replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'i'), ' ').trim();
-      }
-
-      // Pure token ID, but only when no other filters were supplied.
-      if(!tokenId && /^\d+$/.test(workingSearch.trim()) && +workingSearch >= 1 && +workingSearch <= 10000 && traitCount === null && !rankMin){
-        tokenId = +workingSearch.trim();
-        workingSearch = '';
-      }
-
-      searchForTraits = workingSearch
-        .replace(/[,+]/g, ' ')
-        .replace(/\b(and|with|plus)\b/gi, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      // Resolve phrase-aware multi-trait search. Longest trait values win:
-      // "gold chain diamond choker" → "Gold Chain" + "Diamond Choker".
-      if(!tokenId && searchForTraits && RAILWAY_URL){
-        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
-        const resolved = chooseTraitGroupsFromQuery(searchForTraits, traitIndex);
-        matchedGroups = resolved.groups;
-
-        if(!matchedGroups.length){
-          await interaction.editReply(`I couldn't match **"${searchForTraits}"** to any known OCAS trait value. Try a more exact trait value like **Zombie**, **Gold Chain**, or **Diamond Choker**.`);
-          return;
-        }
-        if(resolved.unmatched.length){
-          await interaction.editReply(`I matched **${matchedLabel(matchedGroups)}**, but couldn't understand: **${resolved.unmatched.join(' ')}**. Try the exact trait phrase, like **gold chain diamond choker**.`);
-          return;
-        }
-      }
-
-      // ── Combined trait/rank/trait-count search through Railway/Postgres ───
-      if(!tokenId && RAILWAY_URL && (matchedGroups.length || traitCount !== null || (rankMin && rankMax))){
-        const qs = new URLSearchParams({ key: API_SECRET || '' });
-        if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
-        if(traitCount !== null) qs.set('trait_count', String(traitCount));
-        if(rankMin && rankMax){ qs.set('rank_min', String(rankMin)); qs.set('rank_max', String(rankMax)); qs.set('rank_type', 'os'); }
-
-        if(wantFloor){
-          const r = await fetch(`${RAILWAY_URL}/db/multi-trait-floor?${qs}`);
-          if(!r.ok) throw new Error(`multi-trait-floor API HTTP ${r.status}`);
-          const j = await r.json();
-          if(!j.ok) throw new Error(j.error || 'multi-trait-floor API error');
-          if(!j.floor){
-            const label = matchedGroups.length ? matchedLabel(matchedGroups) : `${traitCount} traits`;
-            await interaction.editReply(`No listed OCAS found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
-            return;
-          }
-          tokenId = j.floor.token_id;
-          floorPrice = j.floor.price_eth;
-        } else {
-          qs.set('limit', '10000');
-          const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
-          if(!r.ok) throw new Error(`multi-trait-tokens API HTTP ${r.status}`);
-          const j = await r.json();
-          if(!j.ok) throw new Error(j.error || 'multi-trait-tokens API error');
-          const tokens = j.tokens || [];
-          if(!tokens.length){
-            const label = matchedGroups.length ? matchedLabel(matchedGroups) : `${traitCount} traits`;
-            await interaction.editReply(`No OCAS tokens found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
-            return;
-          }
-          const picked = tokens[Math.floor(Math.random() * tokens.length)];
-          tokenId = picked.id;
-        }
-      }
-
-      // ── Random fallback ───────────────────────────────────────────────────
-      if(!tokenId) tokenId = Math.floor(Math.random()*10000)+1;
-
-      // ── Fetch + post image ────────────────────────────────────────────────
-      let imgResult = getCachedImage(`${contract}:${tokenId}`);
-      if(!imgResult){
-        imgResult = await resolveImage({identifier:String(tokenId)}, contract, 'ethereum');
-        if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
-      }
-      const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
-      const tvUrl = `https://traitview.com/?token=${tokenId}`;
-
-      // Description: trait values + count + rank only, no category labels
-      const descParts = [];
-      if(matchedGroups.length){
-        const vals = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
-        descParts.push(vals.join(' · '));
-      }
-      if(traitCount !== null) descParts.push(`${traitCount} traits`);
-      if(rankMin && rankMax) descParts.push(`rank #${rankMin}–#${rankMax}`);
-
-      const priceLine   = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${floorPrice >= 1 ? floorPrice.toFixed(3) : floorPrice.toFixed(4)}\n` : '';
-      const contextLine = descParts.length ? `${descParts.join(' · ')}\n` : '';
-
-      // Fetch OS rank for title badge + rank-tier sidebar color
-      const dbMeta  = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-      const osRank  = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
-      const rankBadge = osRank ? ` ⬥${osRank.toLocaleString()}` : '';
-      const ocasColor = getRankTierColor(osRank) ?? COLORS.OCAS_BG;
-
-      const traitsRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`ocas_traits:${tokenId}`)
-          .setLabel('Show Traits')
-          .setStyle(ButtonStyle.Secondary)
-      );
-
-      const embed = new EmbedBuilder()
-        .setTitle(`OCAS #${tokenId}${rankBadge}`)
-        .setColor(ocasColor)
-        .setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
-
-      if(imgResult?.type==='buffer'){
-        const att=new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename});
-        embed.setImage(`attachment://${imgResult.filename}`);
-        await interaction.editReply({embeds:[embed],files:[att],components:[traitsRow]});
-      } else if(imgResult?.type==='url'){
-        embed.setImage(imgResult.url);
-        await interaction.editReply({embeds:[embed],components:[traitsRow]});
+      if(wantsGlobal){
+        // Owner-only, and only when explicitly requested -- this clears the
+        // cross-server shortcut too (every registration row for this user,
+        // not just this guild's), so a from-scratch re-verify can actually
+        // be tested end-to-end. Regular /resetverify intentionally leaves
+        // this alone so the shortcut keeps working for everyone else.
+        await pgPool.query('DELETE FROM user_registrations WHERE discord_id=$1', [target.id]);
       } else {
-        embed.setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})\n_Image unavailable_`);
-        await interaction.editReply({embeds:[embed],components:[traitsRow]});
-      }
-    }catch(e){ await interaction.editReply('Error: '+e.message); }
-    return;
-  }
-
-  // ── /sweep ──────────────────────────────────────────────────────────────
-  if(commandName==='sweep'){
-    const RAILWAY_URL = getRailwayApiUrl();
-    const API_SECRET  = process.env.API_SECRET;
-    const rawSearch   = (interaction.options.getString('search')||'').trim();
-    console.log('[/sweep] RAILWAY_URL set:', !!RAILWAY_URL, 'search:', rawSearch);
-    await interaction.deferReply();
-    try{
-
-      // ── Parse sweep mode ──────────────────────────────────────────────────
-      let sweepMode   = 'count';
-      let sweepCount  = 10;
-      let budget      = null;
-      let targetFloor = null;
-      let workingSearch = rawSearch;
-
-      // Budget mode: "2eth", "1eth zombie", "0.5eth zombie hoodie"
-      const budgetMatch = workingSearch.match(/(?:^|\s)([\d.]+)\s*eth(?=\s|$)/i);
-      if(budgetMatch){
-        sweepMode = 'budget';
-        budget = parseFloat(budgetMatch[1]);
-        workingSearch = workingSearch.replace(budgetMatch[0], ' ').trim();
-      }
-
-      // Target-floor mode: "0.05 floor", "0.1 floor zombie"
-      if(sweepMode === 'count'){
-        const floorNumMatch = workingSearch.match(/(?:^|\s)([\d.]+)\s+floor(?=\s|$)/i);
-        if(floorNumMatch){
-          sweepMode   = 'floor';
-          targetFloor = parseFloat(floorNumMatch[1]);
-          workingSearch = workingSearch.replace(floorNumMatch[0], ' ').trim();
-        } else {
-          // Strip stray "floor" keyword if no number preceded it
-          workingSearch = workingSearch.replace(/(?:^|\s)floor(?=\s|$)/gi, ' ').trim();
-        }
-      }
-
-      // Count mode: extract standalone integer
-      if(sweepMode === 'count'){
-        const numMatch = workingSearch.match(/(?:^|\s)(\d+)(?=\s|$)/);
-        if(numMatch){
-          const n = parseInt(numMatch[1]);
-          if(n > 0 && n <= 500){ sweepCount = n; workingSearch = workingSearch.replace(numMatch[0], ' ').trim(); }
-        }
-      }
-
-      // ── Extract trait count e.g. "15 traits" ──────────────────────────────
-      let traitCount = null;
-      const tcMatch = workingSearch.match(/(?:trait\s*count\s*:?\s*(\d+)|(\d+)\s*traits?)/i);
-      if(tcMatch){
-        traitCount = parseInt(tcMatch[1] || tcMatch[2]);
-        workingSearch = workingSearch.replace(tcMatch[0], ' ').trim();
-      }
-
-      // ── Simple depluralize ────────────────────────────────────────────────
-      const PLURAL_OVERRIDES = {
-        zombies: 'zombie', hoodies: 'hoodie', skeletons: 'skeleton',
-        apes: 'ape', aliens: 'alien', robots: 'robot'
-      };
-      const SKIP_DEPLURAL = new Set(['teeth','tattoos','traits','clothes','glasses']);
-      workingSearch = workingSearch.split(' ').map(w => {
-        const lw = w.toLowerCase();
-        if(PLURAL_OVERRIDES[lw]) return PLURAL_OVERRIDES[lw];
-        if(SKIP_DEPLURAL.has(lw)) return w;
-        if(lw.endsWith('ies') && lw.length > 4) return w.slice(0,-3)+'y';
-        if(lw.endsWith('s') && lw.length > 3) return w.slice(0,-1);
-        return w;
-      }).join(' ').trim();
-
-      // ── Phrase-aware trait matching ────────────────────────────────────────
-      let matchedGroups = [];
-      workingSearch = workingSearch.replace(/[,+]/g,' ').replace(/\b(and|with|plus)\b/gi,' ').replace(/\s+/g,' ').trim();
-
-      if(workingSearch && RAILWAY_URL){
-        const traitIndex = await getTraitIndex(RAILWAY_URL, API_SECRET);
-        const resolved = chooseTraitGroupsFromQuery(workingSearch, traitIndex);
-        matchedGroups = resolved.groups;
-        if(resolved.unmatched.length && !matchedGroups.length){
-          await interaction.editReply(`I couldn't match **"${workingSearch}"** to any known trait. Try: "zombie", "gold chain", "15 traits".`);
-          return;
-        }
-        if(resolved.unmatched.length){
-          await interaction.editReply(`I matched some traits but couldn't understand: **${resolved.unmatched.join(' ')}**. Try exact trait phrases.`);
-          return;
-        }
-      }
-
-      // ── Build label + title ────────────────────────────────────────────────
-      const labelParts = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
-      if(traitCount !== null) labelParts.push(traitCount + ' traits');
-      const traitLabel = labelParts.length ? labelParts.join(' · ') : 'OCAS';
-
-      let modeTitle;
-      if(sweepMode === 'budget') modeTitle = `Budget Sweep Ξ${budget} · ${traitLabel}`;
-      else if(sweepMode === 'floor') modeTitle = `Floor Sweep Ξ${targetFloor} · ${traitLabel}`;
-      else modeTitle = `Sweep ${sweepCount} · ${traitLabel}`;
-
-      // ── Determine fetch limit ──────────────────────────────────────────────
-      const fetchLimit = (sweepMode === 'count') ? sweepCount + 1 : 1000;
-
-      // ── Fetch listings from DB ─────────────────────────────────────────────
-      let allFetched = [];
-      if(!matchedGroups.length && traitCount === null){
-        console.log('[/sweep] plain sweep from DB, mode:', sweepMode);
-        const dbRes = await pgPool.query(
-          `SELECT l.token_id, l.price_eth, l.url, t.os_rank, t.obs_rank, t.trait_count
-           FROM listings l
-           LEFT JOIN tokens t ON t.id = l.token_id
-           ORDER BY l.price_eth ASC
-           LIMIT $1`,
-          [fetchLimit]
-        );
-        allFetched = dbRes.rows.map(r => ({
-          token_id: parseInt(r.token_id),
-          price_eth: parseFloat(r.price_eth),
-          url: r.url,
-          os_rank: r.os_rank ? parseInt(r.os_rank) : null,
-          obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
-          trait_count: r.trait_count ? parseInt(r.trait_count) : null
-        }));
-        console.log('[/sweep] plain sweep tokens returned:', allFetched.length);
-      } else {
-        if(!RAILWAY_URL) throw new Error('RAILWAY_API_URL is required for trait/count sweeps.');
-        const qs = new URLSearchParams({ listed:'1', limit: String(fetchLimit), key: API_SECRET||'' });
-        if(matchedGroups.length) qs.set('groups', JSON.stringify(matchedGroups));
-        if(traitCount !== null) qs.set('trait_count', String(traitCount));
-        console.log('[/sweep] fetching multi-trait-tokens, mode:', sweepMode, 'groups:', matchedGroups.length, 'traitCount:', traitCount);
-        const r = await fetch(`${RAILWAY_URL}/db/multi-trait-tokens?${qs}`);
-        console.log('[/sweep] response status:', r.status);
-        if(!r.ok){ const txt = await r.text(); throw new Error('multi-trait-tokens HTTP ' + r.status + ': ' + txt.slice(0,200)); }
-        const j = await r.json();
-        console.log('[/sweep] tokens returned:', j.tokens?.length);
-        if(!j.ok) throw new Error(j.error||'API error');
-        allFetched = (j.tokens||[]).map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
-      }
-
-      if(!allFetched.length){
-        await interaction.editReply('No listed tokens found for **' + traitLabel + '**.');
-        return;
-      }
-
-      // ── Apply mode logic ───────────────────────────────────────────────────
-      let sweepListings = [];
-      let postSweepToken = null;
-      const fmt = n => n.toFixed(4);
-
-      if(sweepMode === 'budget'){
-        let running = 0;
-        for(const t of allFetched){
-          if(running + t.price_eth <= budget){ sweepListings.push(t); running += t.price_eth; }
-          else { postSweepToken = postSweepToken || t; break; }
-        }
-        if(!sweepListings.length){
-          await interaction.editReply(`No listings fit within that budget of **Ξ${budget}** for **${traitLabel}**.\nCheapest available: Ξ${fmt(allFetched[0].price_eth)}`);
-          return;
-        }
-      } else if(sweepMode === 'floor'){
-        for(const t of allFetched){
-          if(t.price_eth < targetFloor) sweepListings.push(t);
-          else { postSweepToken = postSweepToken || t; break; }
-        }
-        if(!sweepListings.length){
-          await interaction.editReply(`No listings below target floor of **Ξ${targetFloor}** for **${traitLabel}**.\nCheapest available: Ξ${fmt(allFetched[0].price_eth)}`);
-          return;
-        }
-      } else {
-        sweepListings  = allFetched.slice(0, sweepCount);
-        postSweepToken = allFetched[sweepCount] || null;
-      }
-
-      // ── Compute stats ──────────────────────────────────────────────────────
-      const available  = sweepListings.length;
-      const short      = sweepMode === 'count' && available < sweepCount;
-      const prices     = sweepListings.map(t => parseFloat(t.price_eth));
-      const totalEth   = prices.reduce((a,b)=>a+b,0);
-      const avgEth     = totalEth / prices.length;
-      const cheapest   = prices[0];
-      const highest    = prices[prices.length-1];
-      const floorAfter = postSweepToken ? parseFloat(postSweepToken.price_eth) : null;
-
-      // ── Build embed description ────────────────────────────────────────────
-      let desc = '';
-      if(sweepMode === 'budget'){
-        const remaining = budget - totalEth;
-        desc += `**Budget:** Ξ ${fmt(budget)}\n`;
-        desc += `**Tokens swept:** ${available}\n`;
-        desc += `**Total ETH:** Ξ ${fmt(totalEth)}\n`;
-        desc += `**ETH left:** Ξ ${fmt(remaining)}\n`;
-        desc += `**Average price:** Ξ ${fmt(avgEth)}\n`;
-        desc += `**Cheapest included:** Ξ ${fmt(cheapest)}\n`;
-        desc += `**Highest included:** Ξ ${fmt(highest)}\n`;
-        if(floorAfter) desc += `**New floor after sweep:** Ξ ${fmt(floorAfter)}\n`;
-      } else if(sweepMode === 'floor'){
-        desc += `**Target floor:** Ξ ${targetFloor.toFixed(4)}\n`;
-        desc += `**Tokens swept:** ${available}\n`;
-        desc += `**Total ETH:** Ξ ${fmt(totalEth)}\n`;
-        desc += `**Average price:** Ξ ${fmt(avgEth)}\n`;
-        desc += `**Cheapest included:** Ξ ${fmt(cheapest)}\n`;
-        desc += `**Highest included:** Ξ ${fmt(highest)}\n`;
-        if(floorAfter) desc += `**New floor after sweep:** Ξ ${fmt(floorAfter)}\n`;
-      } else {
-        if(short) desc += '⚠️ Only ' + available + ' listed\n\n';
-        desc += '**Total:** Ξ ' + fmt(totalEth) + '\n';
-        desc += '**Average:** Ξ ' + fmt(avgEth) + '\n';
-        desc += '**Cheapest:** Ξ ' + fmt(cheapest) + '\n';
-        desc += '**Highest included:** Ξ ' + fmt(highest) + '\n';
-        if(floorAfter) desc += '**New floor after sweep:** Ξ ' + fmt(floorAfter) + '\n';
-      }
-
-      const embed = new EmbedBuilder()
-        .setTitle(modeTitle)
-        .setColor(COLORS.OCAS_GREEN)
-        .setDescription(desc.slice(0, 4090));
-
-      // ── All tokens behind private Show All Tokens button ──────────────────
-      const components = [];
-      const sessionId = interaction.id;
-      const cleanSweepListings = sweepListings.map(normalizeSweepListing).filter(t => t.token_id && t.price_eth != null);
-      // Cap total concurrent sweep sessions to prevent unbounded memory growth
-      if(sweepSessions.size >= 100){
-        const oldest = sweepSessions.keys().next().value;
-        sweepSessions.delete(oldest);
-      }
-      sweepSessions.set(sessionId, { listings: cleanSweepListings, page: 0 });
-      setTimeout(() => sweepSessions.delete(sessionId), 30 * 60 * 1000);
-      components.push(new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('sweep:showall:' + sessionId).setLabel('Show All Tokens').setStyle(ButtonStyle.Secondary)
-      ));
-
-      await interaction.editReply({ embeds: [embed], components });
-
-    }catch(e){
-      console.error('[/sweep] ERROR:', e.message, e.stack);
-      try{ await interaction.editReply('Error: ' + e.message); }catch(_){}
-    }
-    return;
-  }
-
-  // /burnlatest
-  if(commandName==='burnlatest'){
-    await interaction.deferReply();
-    try{
-      const count = Math.max(1, Math.min(interaction.options.getInteger('count') || 1, 10));
-      const r = await pgPool.query(`
-        SELECT be.id, be.tx_hash, be.block_number, be.burner_wallet, be.survivor_token_id,
-               be.result_body_type, be.result_is_angel, be.points_used, be.burned_at, be.log_index,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids,
-               EXISTS (
-                 SELECT 1 FROM burn_alert_posts bap
-                 WHERE bap.tx_hash = be.tx_hash AND bap.log_index = be.log_index
-               ) AS already_posted
-        FROM burn_events be
-        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-        GROUP BY be.id
-        ORDER BY be.block_number DESC, be.log_index DESC
-        LIMIT $1
-      `, [count]);
-      if(!r.rows.length){ await interaction.editReply('No burn events recorded yet.'); return; }
-      const embeds = await Promise.all(r.rows.map(async row => {
-        const finalEvent = { survivorTokenId: row.survivor_token_id, resultBodyType: row.result_body_type,
-          resultIsAngel: row.result_is_angel, points: row.points_used, txHash: row.tx_hash,
-          blockNumber: row.block_number, logIndex: row.log_index, burnEventId: row.id };
-        const startEvent = { owner: row.burner_wallet, tokenIds: (row.burned_ids||[]).filter(Boolean) };
-        // Burn commands should always prefer the contract tokenURI for survivor/created tokens.
-        // DB is only a final fallback because it may contain pre-burn traits.
-        const freshTraits = await fetchBurnDisplayTraits(row.survivor_token_id).catch(()=>null);
-        return buildBurnEmbed(finalEvent, startEvent, freshTraits || undefined);
-      }));
-
-      if(count === 1){
-        await interaction.editReply(buildEmbedPayload(embeds[0]));
-      } else {
-        await postEmbeds(interaction, embeds, `Showing latest ${embeds.length} OCAS burn${embeds.length===1?'':'s'}:`);
-      }
-    }catch(e){ await interaction.editReply('Error: '+e.message); }
-    return;
-  }
-
-  // /burnstats
-  if(commandName==='burnstats'){
-    await interaction.deferReply();
-    try{
-      const [statsRes, latestRes] = await Promise.all([
-        pgPool.query(`
-          SELECT
-            (SELECT COUNT(*)::int FROM burn_events) AS total_burns,
-            (
-              SELECT COUNT(DISTINCT bei.burned_token_id)::int
-              FROM burn_event_inputs bei
-              JOIN burn_events be ON be.id = bei.burn_event_id
-              WHERE bei.burned_token_id != be.survivor_token_id
-            ) AS total_burned,
-            (SELECT COUNT(*)::int FROM burn_events) AS total_created,
-            (
-              SELECT COUNT(*)::int
-              FROM burn_events be
-              WHERE NOT EXISTS (
-                SELECT 1 FROM burn_event_inputs bei WHERE bei.burn_event_id = be.id
-              )
-            ) AS missing_input_burns
-        `),
-        pgPool.query(`
-          SELECT be.survivor_token_id, be.result_body_type, be.result_is_angel,
-                 be.points_used, be.burned_at, be.burner_wallet,
-                 COUNT(bei.id)::int AS burned_count
-          FROM burn_events be
-          LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-          GROUP BY be.id ORDER BY be.burned_at DESC LIMIT 1
-        `),
-      ]);
-      const stats   = statsRes.rows[0];
-      const latest  = latestRes.rows[0];
-      const burned  = stats.total_burned || 0;
-      const created = stats.total_created || 0;
-      const estimatedSupply = 10000 - burned;
-
-      const tokensUsed = burned + created;
-      const embed = new EmbedBuilder()
-        .setTitle('OCAS Burn Machine Stats')
-        .setColor(BURN_COLORS.FIRE)
-        .addFields(
-          { name:'OCAS Burned',  value:String(burned),               inline:true },
-          { name:'Total Burns',  value:String(stats.total_burns||0), inline:true },
-          { name:'Tokens Used',  value:String(tokensUsed),           inline:true },
-          { name:'Est. Supply',  value:String(estimatedSupply),      inline:false },
-          { name:'Links',        value:`[Burn Machine](https://www.onchainallstars.xyz/burn-machine) | [TraitView](https://traitview.com/) | [Etherscan](https://etherscan.io/address/${BURN_CONTRACT})`, inline:false },
-        );
-      if(latest){
-        const ago       = latest.burned_at ? timeSince(Math.floor(new Date(latest.burned_at).getTime()/1000)) : '?';
-        const typeLabel = burnTypeLabel(latest.result_body_type, latest.result_is_angel);
-        embed.addFields({ name:'Latest Burn',
-          value:`[#${latest.survivor_token_id}](https://opensea.io/assets/ethereum/${OCAS_CONTRACT}/${latest.survivor_token_id}) · ${typeLabel} · ${latest.burned_count || '?'} tokens used · ${ago}`,
-          inline:false });
-      }
-      embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
-      await interaction.editReply({ embeds:[embed] });
-    }catch(e){ await interaction.editReply('Error: '+e.message); }
-    return;
-  }
-
-  // /burn token:ID
-  if(commandName==='burn'){
-    const _burnCool = checkCommandCooldown(interaction.user.id, 'burn');
-    if(_burnCool) return interaction.reply({content:`⏳ Please wait **${_burnCool}s** before using this command again.`, flags:MessageFlags.Ephemeral});
-    const tokenInput = interaction.options.getInteger('token');
-    if(!tokenInput) return interaction.reply({ content:'Provide a token ID.', flags: MessageFlags.Ephemeral });
-    await interaction.deferReply();
-    try{
-      const contract = OCAS_CONTRACT;
-      const osUrl  = `https://opensea.io/assets/ethereum/${contract}/${tokenInput}`;
-      const tvUrl  = `https://traitview.com/?token=${tokenInput}`;
-      const ethUrl = `https://etherscan.io/token/${contract}?a=${tokenInput}`;
-
-      // Helper: fetch thumbnail for any token ID
-      // Priority: 1) contract tokenURI image field (fastest, always current)
-      //           2) resolveImage via OpenSea (fallback)
-      async function fetchThumbForToken(tid, opts = {}){
-        try{
-          // Burned/consumed tokens may no longer have valid contract metadata.
-          // For those, prefer the historical snapshot captured at BurnStarted.
-          if(opts.historicalFromDb){
-            const snap = await fetchSnapshotImageForToken(tid);
-            if(snap) return snap;
-            return null;
-          }
-          // Bust image cache so stale pre-burn images never get served for survivor/current tokens
-          imageCache?.delete?.(`${contract}:${tid}`);
-          const contractTraits = await fetchTokenUriFromContract(tid).catch(()=>null);
-          if(contractTraits?.__image){
-            const imgSrc = contractTraits.__image;
-            if(imgSrc.startsWith('<svg') || imgSrc.startsWith('data:image/svg') || imgSrc.toLowerCase().includes('image/svg')){
-              try{
-                const buf = await extractPngFromSvg(imgSrc);
-                if(buf) return { type:'buffer', buffer:buf, filename:`token-${tid}.png` };
-              }catch(_){}
-            }
-            if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)) return { type:'url', url:imgSrc };
-          }
-          return await resolveImage({ identifier: String(tid) }, contract, 'ethereum');
-        }catch(e){ return null; }
-      }
-
-      async function replyWithEmbed(embed, tid, opts = {}){
-        const ir = await fetchThumbForToken(tid, opts);
-        if(ir?.type==='buffer'){
-          const att = new AttachmentBuilder(ir.buffer, { name:`token-${tid}.png` });
-          embed.setThumbnail(`attachment://token-${tid}.png`);
-          await interaction.editReply({ embeds:[embed], files:[att] });
-        } else {
-          if(ir?.type==='url') embed.setThumbnail(ir.url);
-          await interaction.editReply({ embeds:[embed] });
-        }
-      }
-
-      // Check if this token was consumed in a burn
-      const consumedRes = await pgPool.query(`
-        SELECT be.survivor_token_id, be.burner_wallet, be.burned_at,
-               be.points_used, be.tx_hash,
-               array_agg(bei2.burned_token_id ORDER BY bei2.burned_token_id) AS burned_ids
-        FROM burn_event_inputs bei
-        JOIN burn_events be ON be.id = bei.burn_event_id
-        LEFT JOIN burn_event_inputs bei2 ON bei2.burn_event_id = be.id
-        WHERE bei.burned_token_id = $1
-        GROUP BY be.id
-        LIMIT 1
-      `, [tokenInput]);
-
-      // Check if this token was ever a survivor
-      const survivorCheckRes = await pgPool.query(
-        `SELECT COUNT(*)::int AS cnt FROM burn_events WHERE survivor_token_id=$1`, [tokenInput]
-      );
-      const isSurvivor = (survivorCheckRes.rows[0]?.cnt || 0) > 0;
-
-      if(!consumedRes.rows.length && !isSurvivor){
-        const embed = new EmbedBuilder()
-          .setColor(BURN_COLORS.FIRE)
-          .setTitle(`#${tokenInput} — no burn activity`)
-          .setDescription(`This token has not been burned and was not created via the burn machine.`)
-          .addFields({ name:'Links', value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl})`, inline:false })
-          .setURL(osUrl)
-          .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
-        await replyWithEmbed(embed, tokenInput);
-        return;
-      }
-
-      if(consumedRes.rows.length && !isSurvivor){
-        // Token was consumed — show the single burn it was part of + pointer to survivor chain
-        const b = consumedRes.rows[0];
-        const survivorId  = b.survivor_token_id;
-        const survivorUrl = `https://opensea.io/assets/ethereum/${contract}/${survivorId}`;
-        const ago         = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-        const burnedIds   = (b.burned_ids||[]).filter(Boolean);
-        const tokensStr   = burnedIds.length ? burnedIds.map(id=>`#${id}`).join(', ') : '?';
-        const embed = new EmbedBuilder()
-          .setColor(BURN_COLORS.FIRE)
-          .setTitle(`#${tokenInput} — burned`)
-          .setDescription(`This token was burned **${ago}** and helped create [#${survivorId}](${survivorUrl}).`)
-          .addFields(
-            { name:'Burner',           value:`[${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`, inline:true },
-            { name:'Created',          value:`[#${survivorId}](${survivorUrl})`, inline:true },
-            { name:'Tokens burned',    value:String(burnedIds.length || '?'), inline:true },
-            { name:'Points used',      value:String(b.points_used || 0), inline:true },
-            { name:'All tokens',       value:tokensStr.length > 1024 ? tokensStr.slice(0,1021)+'...' : tokensStr, inline:false },
-            { name:'See full history', value:`\`/burn token:${survivorId}\``, inline:false },
-            { name:'Links',            value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl}) | [Etherscan](https://etherscan.io/tx/${b.tx_hash||''})`, inline:false },
-          )
-          .setURL(osUrl)
-          .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
-        await replyWithEmbed(embed, tokenInput, { historicalFromDb:true });
-        return;
-      }
-
-      // Token is a survivor — fetch full burn chain
-      const chainRes = await pgPool.query(`
-        SELECT be.id, be.tx_hash, be.burner_wallet, be.burned_at, be.points_used,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
-        FROM burn_events be
-        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-        WHERE be.survivor_token_id = $1
-        GROUP BY be.id
-        ORDER BY be.burned_at ASC NULLS LAST
-      `, [tokenInput]);
-
-      const burns            = chainRes.rows;
-      const totalPts         = burns.reduce((s,r)=>s+(r.points_used||0), 0);
-      // Subtract 1 per burn for the survivor token — it upgrades itself and is never actually consumed.
-      const totalTokensBurned = burns.reduce((s,r)=>s+Math.max(0,(r.burned_ids||[]).filter(Boolean).length - 1), 0);
-
-      const embed = new EmbedBuilder()
-        .setColor(BURN_COLORS.FIRE)
-        .setTitle(`🔥 #${tokenInput} burn history`)
-        .setDescription(
-          `Burned **${burns.length} time${burns.length===1?"":"s"}** · **${totalTokensBurned} tokens** burned · **${totalPts} pts** total`
-        )
-        .setURL(osUrl)
-        .setFooter({ text:'OCAS Burn Machine • on-chain-all-stars' });
-
-      // Oldest first (Burn 1 → Burn N), up to 10 most recent
-      const displayBurns = burns.length > 10 ? burns.slice(burns.length - 10) : [...burns];
-
-      for(let i = 0; i < displayBurns.length; i++){
-        const b = displayBurns[i];
-        // burnNum is the actual position in the full chain, not just the display slice
-        const burnNum = burns.indexOf(b) + 1;
-        const ago      = b.burned_at ? timeSince(Math.floor(new Date(b.burned_at).getTime()/1000)) : '?';
-        const ids      = (b.burned_ids||[]).filter(Boolean);
-        const tokensStr = await burnTypeBreakdown(ids, b.id).catch(()=>String(ids.length || '?'));
-        // For burn 1 in the full chain, show original mint type
-        let preBurnNote = '';
-        if(burnNum === 1){
-          try{
-            const snapRow = await pgPool.query(
-              `SELECT traits_json->'Type' as type FROM token_original_snapshots
-               WHERE token_id=$1`,
-              [tokenInput]
-            );
-            if(snapRow.rows[0]?.type){
-              const raw = typeof snapRow.rows[0].type === 'string'
-                ? snapRow.rows[0].type.replace(/^"|"$/g,'')
-                : String(snapRow.rows[0].type);
-              preBurnNote = ` · was ${normalizeOcasType(raw)}`;
-            }
-          }catch(_){}
-        }
-        const fieldVal = [
-          `**Burner:** [${shortAddr(b.burner_wallet)}](https://opensea.io/${b.burner_wallet})`,
-          `**Tokens:** ${tokensStr}`,
-          `**Points:** ${b.points_used||0}${preBurnNote}`,
-        ].join('\n');
-        embed.addFields({ name:`Burn ${burnNum} — ${ago}`, value:fieldVal, inline:true });
-      }
-
-      if(burns.length > 10){
-        embed.addFields({ name:`+${burns.length-10} earlier burns`, value:'Only the 10 most recent burns are shown.', inline:false });
-      }
-
-      embed.addFields({
-        name:'Links',
-        value:`[OpenSea](${osUrl}) | [TraitView](${tvUrl}) | [Etherscan](${ethUrl})`,
-        inline:false
-      });
-
-
-      // Two buttons: Show all burned tokens + Show Pre-Burn History slideshow
-      const actionRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`burn_all_tokens:${tokenInput}`)
-          .setLabel('Show All Burned Tokens')
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId(`burn_preburn:${tokenInput}`)
-          .setLabel('Pre-Burn History')
-          .setStyle(ButtonStyle.Primary),
-      );
-
-      // Current state as thumbnail only — no large image
-      const ir = await fetchThumbForToken(tokenInput);
-      const files = [];
-      if(ir?.type==='buffer'){
-        const att = new AttachmentBuilder(ir.buffer, { name:`token-${tokenInput}.png` });
-        embed.setThumbnail(`attachment://token-${tokenInput}.png`);
-        files.push(att);
-      } else if(ir?.type==='url'){
-        embed.setThumbnail(ir.url);
-      }
-
-      await interaction.editReply({ embeds:[embed], files, components:[actionRow] });
-    }catch(e){ await interaction.editReply('Error: '+e.message); }
-    return;
-  }
-
-  // /burnwallet wallet:ADDRESS
-  if(commandName==='burnwallet'){
-    const walletAddr = (interaction.options.getString('wallet')||'').trim().toLowerCase();
-    if(!/^0x[a-f0-9]{40}$/.test(walletAddr))
-      return interaction.reply({ content:'Invalid wallet address. Use format: 0x...', flags: MessageFlags.Ephemeral });
-    await interaction.deferReply();
-    try{
-      const contract = OCAS_CONTRACT;
-      const r = await pgPool.query(`
-        SELECT be.id, be.survivor_token_id, be.result_body_type, be.result_is_angel,
-               be.points_used, be.burned_at,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
-        FROM burn_events be
-        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-        WHERE LOWER(be.burner_wallet) = $1
-        GROUP BY be.id
-        ORDER BY be.burned_at DESC
-        LIMIT 10
-      `, [walletAddr]);
-      if(!r.rows.length){
-        await interaction.editReply(`No burn activity found for \`${shortAddr(walletAddr)}\`.`);
-        return;
-      }
-      const totalBurned  = r.rows.reduce((s,row)=>(s + (row.burned_ids||[]).filter(Boolean).length), 0);
-      const totalCreated = r.rows.length;
-      const totalPoints  = r.rows.reduce((s,row)=>s + (parseInt(row.points_used)||0), 0);
-      // Best created token by type rarity: Radioactive > Zombie > Skeleton > Human
-      const typeOrder = { 3:0, 1:1, 2:2, 0:3 };
-      const best = r.rows.sort((a,b)=>(typeOrder[a.result_body_type]??4)-(typeOrder[b.result_body_type]??4))[0];
-      const embed = new EmbedBuilder()
-        .setTitle(`Burn History: ${shortAddr(walletAddr)}`)
-        .setColor(BURN_COLORS.FIRE)
-        .setURL(`https://opensea.io/${walletAddr}`)
-        .addFields(
-          { name:'Tokens Burned',   value:String(totalBurned),  inline:true },
-          { name:'Tokens Created',  value:String(totalCreated), inline:true },
-          { name:'Total Points',    value:String(totalPoints),  inline:true },
-          { name:'Best Created',    value:`[#${best.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${best.survivor_token_id})`, inline:false },
-        );
-      const recentLines = r.rows.slice(0,5).map(row=>{
-        const ids = (row.burned_ids||[]).filter(Boolean);
-        const ago = row.burned_at ? timeSince(Math.floor(new Date(row.burned_at).getTime()/1000)) : '?';
-        return `[#${row.survivor_token_id}](https://opensea.io/assets/ethereum/${contract}/${row.survivor_token_id}) - ${ids.length} burned - ${ago}`;
-      });
-      embed.addFields({ name:'Recent Burns (up to 5)', value:recentLines.join('\n'), inline:false });
-      embed.setFooter({ text:'OCAS Burn Machine' }).setTimestamp();
-      await interaction.editReply({ embeds:[embed] });
-    }catch(e){ await interaction.editReply('Error: '+e.message); }
-    return;
-  }
-
-  // /burnleaderboard
-  if(commandName==='burnleaderboard'){
-    await interaction.deferReply();
-    try{
-      const contract = OCAS_CONTRACT;
-      const r = await pgPool.query(`
-        SELECT be.burner_wallet,
-               COUNT(be.id)::int AS total_burns,
-               SUM(array_length(ARRAY(SELECT bei2.burned_token_id FROM burn_event_inputs bei2 WHERE bei2.burn_event_id = be.id), 1))::int AS total_burned,
-               SUM(be.points_used)::int AS total_points
-        FROM burn_events be
-        GROUP BY be.burner_wallet
-        ORDER BY total_burned DESC
-        LIMIT 10
-      `);
-      if(!r.rows.length){ await interaction.editReply('No burn data yet.'); return; }
-      const lines = r.rows.map((row,i)=>{
-        const wallet = `[${shortAddr(row.burner_wallet)}](https://opensea.io/${row.burner_wallet})`;
-        return `**${i+1}.** ${wallet} - ${row.total_burned} burned - ${row.total_burns} burns - ${row.total_points||0} pts`;
-      });
-      const embed = new EmbedBuilder()
-        .setTitle('OCAS Burn Leaderboard')
-        .setColor(BURN_COLORS.FIRE)
-        .setDescription(lines.join('\n'))
-        .setFooter({ text:'Ranked by total tokens burned' })
-        .setTimestamp();
-      await interaction.editReply({ embeds:[embed] });
-    }catch(e){ await interaction.editReply('Error: '+e.message); }
-    return;
-  }
-
-  // /burnrefresh token:ID — community command to re-queue a burn alert with fresh metadata
-  if(commandName==='burnrefresh'){
-    const tokenId = interaction.options.getInteger('token');
-    if(!tokenId) return interaction.reply({ content:'Provide a token ID.', flags: MessageFlags.Ephemeral });
-
-    // Rate limit: 1 use per user per token per 5 minutes
-    const COOLDOWN_MS = 5 * 60 * 1000;
-    const rlKey = `${interaction.user.id}:${tokenId}`;
-    const lastUsed = burnRefreshCooldowns.get(rlKey);
-    if(lastUsed && Date.now() - lastUsed < COOLDOWN_MS){
-      const secsLeft = Math.ceil((COOLDOWN_MS - (Date.now() - lastUsed)) / 1000);
-      return interaction.reply({
-        content: `You can use this command again for #${tokenId} in **${secsLeft}s**.`,
-        flags: MessageFlags.Ephemeral,
-      });
-    }
-    burnRefreshCooldowns.set(rlKey, Date.now());
-    // Prune old entries
-    if(burnRefreshCooldowns.size > 1000){
-      const cutoff = Date.now() - COOLDOWN_MS;
-      for(const [k,v] of burnRefreshCooldowns) if(v < cutoff) burnRefreshCooldowns.delete(k);
-    }
-
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    try{
-      // Look up the burn event from DB
-      const r = await pgPool.query(`
-        SELECT be.id, be.tx_hash, be.block_number, be.burner_wallet, be.survivor_token_id,
-               be.result_body_type, be.result_is_angel, be.points_used, be.log_index,
-               array_agg(bei.burned_token_id ORDER BY bei.burned_token_id) AS burned_ids
-        FROM burn_events be
-        LEFT JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-        WHERE be.survivor_token_id = $1
-        GROUP BY be.id
-        ORDER BY be.block_number DESC, be.log_index DESC
-        LIMIT 1
-      `, [tokenId]);
-
-      if(!r.rows.length){
-        await interaction.editReply(`No burn event found for #${tokenId}. Only the created/survivor token ID can be refreshed.`);
-        return;
-      }
-
-      const row = r.rows[0];
-      const finalEvent = {
-        survivorTokenId: row.survivor_token_id,
-        resultBodyType:  row.result_body_type,
-        resultIsAngel:   row.result_is_angel,
-        points:          row.points_used,
-        txHash:          row.tx_hash,
-        blockNumber:     row.block_number,
-        logIndex:        row.log_index,
-        burnEventId:     row.id,
-      };
-      const startEvent = {
-        owner:    row.burner_wallet,
-        tokenIds: (row.burned_ids || []).filter(Boolean),
-      };
-
-      // Snapshot current DB traits to compare against after refresh
-      const snapMeta = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-      const preBurnTraits = snapMeta?.traits ? { ...snapMeta.traits } : null;
-      if(preBurnTraits){
-        const snapType = preBurnTraits.Type || preBurnTraits.type || '?';
-        console.log(`[BurnRefresh] DB snapshot for #${tokenId}: Type=${snapType}`);
-      } else {
-        console.log(`[BurnRefresh] No DB snapshot for #${tokenId} — will use 90s minimum wait`);
-      }
-
-      // Queue to pending alert system (skip if already pending, but always re-trigger refresh)
-      const alertKey = String(tokenId);
-      const alreadyPending = pendingBurnAlerts.has(alertKey);
-      if(!alreadyPending){
-        pendingBurnAlerts.set(alertKey, {
-          finalEvent,
-          startEvent,
-          preBurnTraits, // snapshot for comparison — if null, 90s minimum wait applies
-          addedAt:  Date.now(),
-          attempts: 0,
-          slowMode: false,
-        });
-      } else {
-        // Already pending — update the snapshot and reset the timer so 90s wait applies fresh
-        const existing = pendingBurnAlerts.get(alertKey);
-        if(preBurnTraits) existing.preBurnTraits = preBurnTraits;
-        existing.addedAt = Date.now();
-        existing.attempts = 0;
-        existing.slowMode = false;
-        existing.lastChecked = null;
-      }
-
-      // Trigger OS metadata refresh regardless — this is the whole point of the command
-      const refreshEnabled = BURN_METADATA_REFRESH_ENABLED;
-      if(refreshEnabled){
-        triggerOsMetadataRefresh(tokenId); // fire-and-forget
-      }
-
-      const statusMsg = alreadyPending
-        ? `#${tokenId} is already queued — metadata refresh triggered again. Alert will post once traits update.`
-        : `Queued burn alert for #${tokenId}. Metadata refresh triggered${refreshEnabled ? '' : ' (BURN_METADATA_REFRESH_ENABLED is off)'}. Alert will post once OS updates the traits — usually within 1–5 minutes.`;
-
-      console.log(`[BurnRefresh] user=${interaction.user.id} token=#${tokenId} guild=${guildId} alreadyPending=${alreadyPending}`);
-      await interaction.editReply(statusMsg);
-    }catch(e){
-      console.error('[BurnRefresh]', e.message);
-      await interaction.editReply('Error: ' + e.message);
-    }
-    return;
-  }
-
-
-  if(commandName==='burnlottery'){
-    if(!isAdmin) return interaction.reply({content:'Need Manage Server permission.', flags: MessageFlags.Ephemeral});
-    const sub = interaction.options.getSubcommand(false) || 'draw';
-    try{
-      await interaction.deferReply();
-      if(sub==='start'){
-        const mode = interaction.options.getString('mode') || 'wallet';
-        const windowText = interaction.options.getString('window');
-        const timezoneInput = interaction.options.getString('timezone');
-        const resolved = resolveLotteryWindow({
-          windowText,
-          startText: interaction.options.getString('start') || 'now',
-          endText: interaction.options.getString('end'),
-          hours: interaction.options.getInteger('hours') || 24,
-          timezone: timezoneInput || DEFAULT_LOTTERY_TIMEZONE
-        });
-        const { start, end, hours, timeZone } = resolved;
-        const customSeed = interaction.options.getString('seed');
-        const seed = customSeed || pendingDrawSeed();
-        const title = interaction.options.getString('title') || 'OCAS Burn Lottery';
-        const prize = interaction.options.getString('prize') || null;
-        const channel = interaction.options.getChannel('channel') || interaction.channel;
-        if(end <= start) return interaction.editReply('End time must be after start time.');
-        const r = await pgPool.query(`INSERT INTO burn_lotteries (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status, timezone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10) RETURNING *`, [guildId, channel.id, interaction.user.id, title, prize, mode, start, end, seed, timeZone]);
-        const row = r.rows[0];
-        const burnStartMsg = await interaction.editReply({ embeds:[new EmbedBuilder()
-          .setTitle('🎟️ Burn lottery scheduled')
-          .setColor(COLORS.OCAS_GREEN)
-          .addFields(
-            {name:'ID',value:String(row.id),inline:true},
-            {name:'Window',value:formatBurnLotteryWindow(start, end, timeZone),inline:false},
-            {name:'Mode',value:mode === 'burn' ? 'One entry per burn' : 'One entry per wallet',inline:true},
-            {name:'Draw Seed',value:customSeed ? `Custom seed set: \`${String(customSeed).slice(0,256)}\`` : 'Generated automatically at draw time after the entry window closes.',inline:false}
-          )
-          .setTimestamp()], components:buildActiveBurnLotteryComponents(row.id) });
-        await pgPool.query('UPDATE burn_lotteries SET message_id=$1 WHERE id=$2', [burnStartMsg.id, row.id]).catch(() => {});
-        console.log(`[BurnLottery #${row.id}] Scheduled window=${formatBurnLotteryWindow(start, end, timeZone)} guild=${guildId}`);
-        return;
-      }
-      if(sub==='status'){
-        const id = interaction.options.getInteger('id');
-        const r = id ? await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]) : await pgPool.query("SELECT * FROM burn_lotteries WHERE guild_id=$1 ORDER BY id DESC LIMIT 10",[guildId]);
-        if(!r.rows.length) return interaction.editReply('No burn lotteries found.');
-        let lines = r.rows.map(x=>{
-          const tz = x.timezone || DEFAULT_LOTTERY_TIMEZONE;
-          return `#${x.id} · ${x.status} · ${formatZonedLotteryTime(x.start_time, tz)} → ${formatZonedLotteryTime(x.end_time, tz)} (${tz})${x.winner_wallet?' · winner '+shortAddr(x.winner_wallet):''}`;
-        });
-        lines = r.rows.map(x=>burnLotteryWindowStatusLine(x));
-        return interaction.editReply(lines.join('\n').slice(0,1900));
-      }
-      if(sub==='cancel'){
-        const id = interaction.options.getInteger('id');
-        const r = await pgPool.query("UPDATE burn_lotteries SET status='cancelled' WHERE id=$1 AND guild_id=$2 AND status='active' RETURNING id",[id,guildId]);
-        return interaction.editReply(r.rows.length ? `Cancelled burn lottery #${id}.` : `No active lottery #${id} found.`);
-      }
-      const id = interaction.options.getInteger('id');
-      if(id){
-        const r = await pgPool.query('SELECT * FROM burn_lotteries WHERE id=$1 AND guild_id=$2',[id,guildId]);
-        if(!r.rows.length) return interaction.editReply('Lottery not found.');
-        const lotteryRow = r.rows[0];
-        if(lotteryRow.status === 'completed') return interaction.editReply(`Lottery #${id} is already completed.`);
-
-        // Show full lottery details embed with ⏳ fetching state
-        const drawStart = new Date(lotteryRow.start_time), drawEnd = new Date(lotteryRow.end_time);
-        const drawTz = lotteryRow.timezone || DEFAULT_LOTTERY_TIMEZONE;
-        const { entries: preEntries, wallets: preWallets, burns: preBurns } = await getBurnLotteryEntries(drawStart, drawEnd, lotteryRow.mode);
-        const fetchingEmbed = buildBurnLotteryEmbed({
-          title: lotteryRow.title || 'OCAS Burn Lottery',
-          prize: lotteryRow.prize,
-          mode: lotteryRow.mode,
-          start: drawStart, end: drawEnd,
-          seed: null, entries: preEntries, wallets: preWallets, burns: preBurns,
-          pick: null, lotteryId: lotteryRow.id, timezone: drawTz
-        }).setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
-        await interaction.editReply({ embeds:[fetchingEmbed], components:buildActiveBurnLotteryComponents(lotteryRow.id) });
-
-        await drawAndPostBurnLottery(lotteryRow);
-
-        // drawAndPostBurnLottery edits the original scheduled message to the full result.
-        // Update the interaction reply to confirm draw is done.
-        const doneEmbed = EmbedBuilder.from(fetchingEmbed).setDescription('✅ Draw complete.');
-        return interaction.editReply({ embeds:[doneEmbed], components:[] });
-      }
-      const mode = interaction.options.getString('mode') || 'wallet';
-      const timezoneInput = interaction.options.getString('timezone');
-      const resolved = resolveLotteryWindow({
-        windowText: interaction.options.getString('window'),
-        startText: interaction.options.getString('start'),
-        endText: interaction.options.getString('end'),
-        hours: interaction.options.getInteger('hours') || 24,
-        timezone: timezoneInput || DEFAULT_LOTTERY_TIMEZONE
-      });
-      const { start, end, timeZone } = resolved;
-      const customSeed = interaction.options.getString('seed') || null;
-      const { entries, wallets, burns } = await getBurnLotteryEntries(start, end, mode);
-      if(!entries.length) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
-
-      // Insert lottery record early so we have an ID for the Show Current Entries button
-      const preInsert = await pgPool.query(
-        `INSERT INTO burn_lotteries
-           (guild_id, channel_id, created_by, title, prize, mode, start_time, end_time, seed, status, timezone)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'processing',$10) RETURNING id`,
-        [guildId, interaction.channel.id, interaction.user.id, 'OCAS Burn Lottery', null, mode, start, end, pendingDrawSeed(), timeZone]
-      );
-      const instantLotteryId = preInsert.rows[0]?.id;
-
-      // Show full details embed with ⏳ while fetching ETH seed
-      const instantFetchEmbed = buildBurnLotteryEmbed({
-        title: 'OCAS Burn Lottery', mode, start, end,
-        seed: null, entries, wallets, burns,
-        pick: null, lotteryId: instantLotteryId, timezone: timeZone
-      }).setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
-      await interaction.editReply({ embeds:[instantFetchEmbed], components:buildActiveBurnLotteryComponents(instantLotteryId) });
-
-      // Use ETH block hash as seed unless admin supplied a custom seed
-      let drawSeed, seedMeta = {};
-      if(customSeed){
-        drawSeed = customSeed;
-        seedMeta = { seed_type: 'admin_supplied' };
-      } else {
-        try{
-          const rpcUrl2 = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-            `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-          const latestBlock2 = parseInt(await burnRpc(rpcUrl2, 'eth_blockNumber', []), 16);
-          const targetBlock2 = latestBlock2 + 5;
-          console.log(`[BurnLottery instant] Waiting for Ethereum block #${targetBlock2} (current: ${latestBlock2})...`);
-          const arrived2 = await waitForEthBlock(targetBlock2);
-          if(arrived2){
-            const { hash: bHash, blockNumber: bNum } = await fetchEthBlockHashSeed(targetBlock2);
-            drawSeed = bHash;
-            seedMeta = { seed_type: 'eth_block_hash', block_number: bNum, block_hash: bHash };
-            console.log(`[BurnLottery instant] Seed: block #${bNum} hash ${bHash}`);
-          } else {
-            drawSeed = randomLotterySeed();
-            seedMeta = { seed_type: 'random_fallback', reason: 'eth_block_timeout' };
-            console.warn('[BurnLottery instant] ETH block timeout — falling back to random seed');
-          }
-        }catch(ethErr){
-          drawSeed = randomLotterySeed();
-          seedMeta = { seed_type: 'random_fallback', reason: ethErr.message };
-          console.warn(`[BurnLottery instant] ETH block fetch failed: ${ethErr.message} — falling back to random seed`);
-          sendErrorWebhook('BurnLottery Instant ETH Seed Failed', ethErr, `guild=${guildId}`);
-        }
-      }
-
-      const pick = lotteryPick(entries, drawSeed);
-      if(!pick) return interaction.editReply(`No qualifying burn entries found for that window.\nWindow: ${formatBurnLotteryWindow(start, end, timeZone)}\nTimezone: ${timeZone}`);
-      await pgPool.query(
-        `UPDATE burn_lotteries
-           SET seed=$1, status='completed', winner_wallet=$2, qualified_wallets=$3,
-               total_burns=$4, result_json=$5, completed_at=NOW()
-         WHERE id=$6`,
-        [drawSeed, pick.winner, wallets.length, burns.length,
-         JSON.stringify({entries:entries.length, proof:pick.proof||null, winner_index:pick.index ?? null, winner_position:pick.position ?? null, ...seedMeta}),
-         instantLotteryId]
-      );
-      const lotteryId = instantLotteryId;
-      await interaction.editReply({
-        content: null,
-        embeds:[buildBurnLotteryEmbed({mode,start,end,seed:drawSeed,entries,wallets,burns,pick,lotteryId,timezone:timeZone,seedMeta})],
-        components:buildBurnLotteryComponents(lotteryId)
-      });
-      await interaction.channel?.send({
-        embeds:[buildBurnLotteryWinnerEmbed({title:'OCAS Burn Lottery Winner', entries, wallets, burns, pick, lotteryId, seedMeta})],
-        components:buildBurnLotteryComponents(lotteryId)
-      }).catch(() => {});
-      return;
-    }catch(e){
-      console.error('[/burnlottery]', e); sendErrorWebhook('/burnlottery Error', e, `guild=${guildId}`);
-      const msg = String(e.message || '');
-      if(/could not parse|invalid .*date|could not parse time|invalid .*time/i.test(msg)){
-        return interaction.editReply(`${burnLotteryParseErrorMessage()}\n\n${msg}`);
-      }
-      return interaction.editReply('Burn lottery error: '+e.message);
-    }
-  }
-
-  if(commandName==='lottery'){
-    const sub = interaction.options.getSubcommand(false) || 'instant';
-    const adminOnly = ['start','draw','cancel','instant'].includes(sub);
-    if(adminOnly && !isAdmin) return interaction.reply({ content:'Need Manage Server permission.', flags:MessageFlags.Ephemeral });
-
-    try{
-
-      // ── /lottery instant — quick one-off draw from a list or number range ──
-      if(sub === 'instant'){
-        await interaction.deferReply();
-        const entriesRaw = interaction.options.getString('entries') || '';
-        const min        = interaction.options.getInteger('min');
-        const max        = interaction.options.getInteger('max');
-        const customSeed = interaction.options.getString('seed') || null;
-        const title      = interaction.options.getString('title') || 'Instant Lottery';
-
-        let entries = entriesRaw ? entriesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
-        if(!entries.length && min != null && max != null){
-          for(let i = Math.min(min, max); i <= Math.max(min, max); i++) entries.push(String(i));
-        }
-        if(entries.length < 2) return interaction.editReply('Add at least 2 entries, or set min and max numbers.');
-
-        // Insert record early so we have an ID for the Show Entries button
-        const preInsert = await pgPool.query(
-          `INSERT INTO generic_lotteries
-             (guild_id, channel_id, created_by, title, type, start_time, end_time, seed, status, min_number, max_number)
-           VALUES ($1,$2,$3,$4,'giveaway',NOW(),NOW(),$5,'processing',$6,$7) RETURNING id`,
-          [guildId, interaction.channel.id, interaction.user.id, title, pendingDrawSeed(),
-           min ?? null, max ?? null]
-        );
-        const lotteryId = preInsert.rows[0]?.id;
-
-        // Store entries in DB — use positional key (name:index) so duplicates are preserved for weighted draws
-        for(let i = 0; i < entries.length; i++){
-          await pgPool.query(
-            `INSERT INTO generic_lottery_entries (lottery_id, user_id, username)
-             VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-            [lotteryId, `${entries[i]}:${i}`, entries[i]]
-          ).catch(()=>{});
-        }
-
-        // Show details embed with ⏳ while fetching ETH seed
-        const instantEmbed = new EmbedBuilder()
-          .setTitle(`🎲 ${title}`)
-          .setColor(COLORS.OCAS_GREEN)
-          .setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...')
-          .addFields(
-            { name:'ID',      value:String(lotteryId), inline:true },
-            { name:'Type',    value:'Instant draw',    inline:true },
-            { name:'Entries', value:String(entries.length), inline:true },
-          )
-          .setFooter({ text:`Lottery ID ${lotteryId}` })
-          .setTimestamp();
-        await interaction.editReply({ embeds:[instantEmbed], components:[
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`generic_lottery_entries:${lotteryId}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary)
-          )
-        ] });
-
-        // Fetch ETH block hash seed
-        let ethSeed = null, ethBlockNumber = null;
-        if(!customSeed){
-          try{
-            const rpcUrl = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://','https://') ||
-              `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-            const latestBlock   = parseInt(await burnRpc(rpcUrl, 'eth_blockNumber', []), 16);
-            const targetBlock   = latestBlock + 5;
-            const arrived       = await waitForEthBlock(targetBlock);
-            if(arrived){
-              const { hash } = await fetchEthBlockHashSeed(targetBlock);
-              ethSeed        = hash;
-              ethBlockNumber = targetBlock;
-            }
-          }catch(_){}
-        }
-
-        const activeSeed = customSeed || ethSeed || randomLotterySeed();
-        const pick       = lotteryPick(entries, activeSeed);
-
-        // Update DB record with result
+        // Delete guild-specific record only — keep global so instant re-verify works on other servers
         await pgPool.query(
-          `UPDATE generic_lotteries SET seed=$1, status='completed', result_json=$2, completed_at=NOW() WHERE id=$3`,
-          [activeSeed, JSON.stringify({ proof: pick.proof||null, winner_index: pick.index??null, winner_position: pick.position??null, block_number: ethBlockNumber||null }), lotteryId]
-        ).catch(()=>{});
-
-        // Build result row for embed
-        // winner_display stores the raw entry value (name or number) for instant draws
-        const resultRow = { id: lotteryId, title, type:'giveaway', seed: activeSeed,
-          winner_display: String(pick.winner),
-          result_json: { proof: pick.proof||null, winner_index: pick.index??null, winner_position: pick.position??null, block_number: ethBlockNumber||null } };
-        const resultEmbed = buildGenericLotteryResultEmbed(resultRow, entries.map(e=>({ username:e, user_id:e })), pick);
-        const resultComponents = buildGenericLotteryComponents(lotteryId, 'giveaway', false);
-
-        await interaction.editReply({ embeds:[resultEmbed], components:resultComponents });
-        await interaction.channel?.send({ embeds:[buildGenericLotteryWinnerEmbed(resultRow, entries.map(e=>({ username:e, user_id:e })), pick)], components:resultComponents }).catch(() => {});
-        return;
+          'DELETE FROM user_registrations WHERE discord_id=$1 AND guild_id=$2',
+          [target.id, guildId]
+        );
       }
+      await pgPool.query('DELETE FROM verification_codes WHERE discord_id=$1', [target.id]);
 
-      // ── /lottery start — create a new scheduled giveaway or guess lottery ──
-      if(sub === 'start'){
-        await interaction.deferReply();
-
-        const type       = interaction.options.getString('type');
-        const minutes    = Math.max(1, Math.min(10080, interaction.options.getInteger('minutes') || 10));
-        const start      = new Date();
-        const end        = new Date(start.getTime() + minutes * 60000);
-        // Giveaway seeds are pending until draw time (ETH block hash assigned after window closes).
-        // Guess lotteries use a fixed seed so the winning number can be pre-committed.
-        const adminSeed  = interaction.options.getString('seed');
-        const seed       = adminSeed || (type === 'giveaway' ? pendingDrawSeed() : require('crypto').randomBytes(12).toString('hex'));
-        const channel    = interaction.options.getChannel('channel') || interaction.channel;
-        const title      = interaction.options.getString('title') || (type === 'guess' ? 'Guess the Number' : 'Giveaway Lottery');
-        const prize      = interaction.options.getString('prize') || null;
-
-        let minN = interaction.options.getInteger('min') ?? 1;
-        let maxN = interaction.options.getInteger('max') ?? 100;
-        let winnerMode = interaction.options.getString('winner') || 'closest';
-        let winning = null;
-
-        if(type === 'guess'){
-          if(minN === maxN) return interaction.editReply('Min and max cannot match.');
-          const lo = Math.min(minN, maxN), hi = Math.max(minN, maxN);
-          minN = lo; maxN = hi;
-          winning = lotteryNumberFromSeed(`${seed}:winning-number`, minN, maxN);
-        } else {
-          minN = null; maxN = null; winnerMode = 'random';
+      // Remove all verification-related Discord roles
+      const member = await interaction.guild.members.fetch(target.id).catch(()=>null);
+      if(member){
+        // Remove verified + holder roles from verification_panels
+        const panelR = await pgPool.query(
+          'SELECT role_id, holder_role_id FROM verification_panels WHERE guild_id=$1', [guildId]
+        ).catch(()=>({rows:[]}));
+        if(panelR.rows[0]){
+          const { role_id, holder_role_id } = panelR.rows[0];
+          if(role_id && member.roles.cache.has(role_id))
+            await member.roles.remove(role_id).catch(e=>console.error('[ResetVerify] remove verified role:', e.message));
+          if(holder_role_id && member.roles.cache.has(holder_role_id))
+            await member.roles.remove(holder_role_id).catch(e=>console.error('[ResetVerify] remove holder role:', e.message));
         }
-
-        const r = await pgPool.query(
-          `INSERT INTO generic_lotteries
-             (guild_id, channel_id, created_by, title, prize, type, min_number, max_number,
-              winner_mode, winning_number, start_time, end_time, seed, status)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'active') RETURNING *`,
-          [guildId, channel.id, interaction.user.id, title, prize, type,
-           minN, maxN, winnerMode, winning, start, end, seed]
-        );
-        const row = r.rows[0];
-        const components = buildGenericLotteryComponents(row.id, type, true);
-        const msg = await interaction.editReply({ embeds:[buildGenericLotteryStartEmbed(row, 0)], components });
-        await pgPool.query('UPDATE generic_lotteries SET message_id=$1 WHERE id=$2', [msg.id, row.id]).catch(() => {});
-        console.log(`[Lottery #${row.id}] Started type=${type} minutes=${minutes} guild=${guildId}`);
-        return;
-      }
-
-      // ── /lottery enter — enter an active giveaway ──
-      if(sub === 'enter'){
-        const id = interaction.options.getInteger('id');
-        const row = id
-          ? (await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2', [id, guildId])).rows[0]
-          : await findActiveGenericLottery(guildId, 'giveaway');
-
-        if(!row) return interaction.reply({ content:'No active giveaway found.', flags:MessageFlags.Ephemeral });
-        if(row.status !== 'active' || new Date(row.end_time) <= new Date())
-          return interaction.reply({ content:'This giveaway is closed.', flags:MessageFlags.Ephemeral });
-
-        const username = interaction.member?.displayName || interaction.user?.globalName || interaction.user?.username || interaction.user.id;
-        await pgPool.query(
-          `INSERT INTO generic_lottery_entries (lottery_id, user_id, username)
-           VALUES ($1,$2,$3) ON CONFLICT (lottery_id, user_id) DO UPDATE SET username=EXCLUDED.username`,
-          [row.id, interaction.user.id, username]
-        );
-        const count = await getGenericLotteryEntryCount(row.id);
-        return interaction.reply({ content:`You are entered in lottery #${row.id}. Current entries: ${count}.`, flags:MessageFlags.Ephemeral });
-      }
-
-      // ── /lottery guess — submit a guess for a guess-type lottery ──
-      if(sub === 'guess'){
-        const number = interaction.options.getInteger('number');
-        const id = interaction.options.getInteger('id');
-        const row = id
-          ? (await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2', [id, guildId])).rows[0]
-          : await findActiveGenericLottery(guildId, 'guess');
-
-        if(!row) return interaction.reply({ content:'No active guess lottery found.', flags:MessageFlags.Ephemeral });
-        if(row.status !== 'active' || new Date(row.end_time) <= new Date())
-          return interaction.reply({ content:'This guess event is closed.', flags:MessageFlags.Ephemeral });
-        if(number < row.min_number || number > row.max_number)
-          return interaction.reply({ content:`Guess must be between ${row.min_number} and ${row.max_number}.`, flags:MessageFlags.Ephemeral });
-
-        const username = interaction.member?.displayName || interaction.user?.globalName || interaction.user?.username || interaction.user.id;
-        await pgPool.query(
-          `INSERT INTO generic_lottery_entries (lottery_id, user_id, username, guess_number)
-           VALUES ($1,$2,$3,$4)
-           ON CONFLICT (lottery_id, user_id) DO UPDATE SET
-             username=EXCLUDED.username, guess_number=EXCLUDED.guess_number, entered_at=NOW()`,
-          [row.id, interaction.user.id, username, number]
-        );
-        return interaction.reply({ content:`Your guess for lottery #${row.id} is **${number}**.`, flags:MessageFlags.Ephemeral });
-      }
-
-      // ── /lottery status — show active or recent lotteries ──
-      if(sub === 'status'){
-        const id = interaction.options.getInteger('id');
-        const r = id
-          ? await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2', [id, guildId])
-          : await pgPool.query('SELECT * FROM generic_lotteries WHERE guild_id=$1 ORDER BY id DESC LIMIT 10', [guildId]);
-
-        if(!r.rows.length) return interaction.reply({ content:'No lotteries found.', flags:MessageFlags.Ephemeral });
-
-        const lines = [];
-        for(const x of r.rows){
-          const c = await getGenericLotteryEntryCount(x.id);
-          lines.push(
-            `#${x.id} · ${x.type} · ${x.status} · entries ${c} · ` +
-            `${lotteryTime(x.start_time)} → ${lotteryTime(x.end_time)}` +
-            (x.winner_user_id ? ` · winner <@${x.winner_user_id}>` : '')
-          );
+        // Remove all trait roles configured for this guild
+        const traitR = await pgPool.query(
+          'SELECT DISTINCT role_id FROM trait_roles WHERE guild_id=$1', [guildId]
+        ).catch(()=>({rows:[]}));
+        for(const row of traitR.rows){
+          if(member.roles.cache.has(row.role_id))
+            await member.roles.remove(row.role_id).catch(e=>console.error('[ResetVerify] remove trait role:', e.message));
         }
-        return interaction.reply(lines.join('\n').slice(0, 1900));
       }
 
-      // ── /lottery draw — manually draw a winner with ETH block hash seed ──
-      if(sub === 'draw'){
-        await interaction.deferReply();
-
-        const id = interaction.options.getInteger('id');
-        const r = await pgPool.query('SELECT * FROM generic_lotteries WHERE id=$1 AND guild_id=$2', [id, guildId]);
-        const row = r.rows[0];
-        if(!row) return interaction.editReply('Lottery not found.');
-        if(row.status !== 'active') return interaction.editReply('Lottery is not active.');
-
-        // Show full lottery details with ⏳ while fetching ETH seed
-        const entryCount = (await pgPool.query('SELECT COUNT(*) FROM generic_lottery_entries WHERE lottery_id=$1', [id])).rows[0]?.count || 0;
-        const drawFetchEmbed = buildGenericLotteryStartEmbed({ ...row, _entry_count: parseInt(entryCount) }, parseInt(entryCount))
-          .setDescription('⏳ Fetching Ethereum block hash for tamper-proof seed...');
-        await interaction.editReply({ embeds:[drawFetchEmbed], components:[
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`generic_lottery_entries:${row.id}`).setLabel('Show Entries').setStyle(ButtonStyle.Secondary)
-          )
-        ] });
-
-        let ethSeed = null, ethBlockNumber = null;
-        try{
-          const rpcUrlG = process.env.ALCHEMY_WEBSOCKET_URL?.replace('wss://', 'https://') ||
-            `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-          const latestBlockG  = parseInt(await burnRpc(rpcUrlG, 'eth_blockNumber', []), 16);
-          const targetBlockG  = latestBlockG + 5;
-          const arrivedG      = await waitForEthBlock(targetBlockG);
-          if(arrivedG){
-            const { hash: bHashG } = await fetchEthBlockHashSeed(targetBlockG);
-            ethSeed        = bHashG;
-            ethBlockNumber = targetBlockG;
-          }
-        }catch(_){}
-
-        const out = await drawGenericLottery(row, false, ethSeed, ethBlockNumber, true);
-        if(out?.embed){
-          await interaction.channel?.send({
-            embeds:[buildGenericLotteryWinnerEmbed(row, out.entries, out.result)],
-            components:out.components
-          }).catch(() => {});
-        }
-
-        // Update interaction reply to ✅ done — result posted via drawGenericLottery
-        const doneEmbed = EmbedBuilder.from(drawFetchEmbed).setDescription('✅ Draw complete.');
-        return interaction.editReply({ embeds:[doneEmbed], components:[] });
-      }
-
-      // ── /lottery cancel — cancel an active lottery ──
-      if(sub === 'cancel'){
-        const id = interaction.options.getInteger('id');
-        const r = await pgPool.query(
-          "UPDATE generic_lotteries SET status='cancelled' WHERE id=$1 AND guild_id=$2 AND status='active' RETURNING id",
-          [id, guildId]
-        );
-        return interaction.reply(r.rows.length ? `Cancelled lottery #${id}.` : `No active lottery #${id} found.`);
-      }
-
+      return interaction.editReply({content:`✅ Verification reset for ${target.tag}${wantsGlobal ? ' (including the cross-server shortcut)' : ''} — DB records and all verification roles removed. They can verify fresh.`});
     }catch(e){
-      console.error('[/lottery]', e);
-      sendErrorWebhook('/lottery Error', e, `guild=${guildId} sub=${sub}`);
-      const msg = 'Lottery error: ' + e.message;
-      return interaction.deferred ? interaction.editReply(msg) : interaction.reply({ content:msg, flags:MessageFlags.Ephemeral });
+      return interaction.editReply({content:'❌ Error: '+e.message});
     }
   }
 
-  if(commandName==='help'){
-    const marketCmds=[
-      '`/ocas search:zombie hoodie` — Random or searched OCAS token',
-      '`/ocas search:gold chain floor` — Cheapest listed with that trait',
-      '`/sweep search:10` — Cost to sweep 10 cheapest listed',
-      '`/sweep search:2eth zombie` — Budget sweep with trait filter',
-      '`/sweep search:0.05 floor zombie` — Clear below target floor',
-      '`/traitfind search:zombie` — Tokens matching a trait',
-      '`/traitfind search:zombie listings` — Currently listed with that trait',
-      '`/traitfind search:zombie sales` — Sales history for that trait',
-      '`/rankfind search:1-100` — Listed tokens by OS rank range',
-      '`/rankfind search:1-100 sales` — Sales history by OS rank range',
-    ].join('\n');
-    const salesCmds=[
-      '`/lastsale` — Most recent sale',
-      '`/recentsales count:10` — Last N sales',
-      '`/sale token:1234` — Last sale for a specific token',
-      '`/listings count:5` — Recent new listings',
-    ].join('\n');
-    const burnCmds=[
-      '`/burnstats` — Total burned, created, estimated supply',
-      '`/burnlatest` — Most recent finalized burn',
-      '`/burn token:1234` — Token burn status and lineage',
-      '`/burnwallet wallet:0x...` — Wallet burn history',
-      '`/burnleaderboard` — Top burners by tokens burned',
-      '`/burnrefresh token:1234` — Refresh metadata + re-post burn alert (5 min cooldown)',
-    ].join('\n');
-    const alertCmds=[
-      '`/myalert trait:Type value:Zombie` — DM when a Zombie sells or lists',
-      '`/myalertstatus` — See your current alert settings',
-      '`/myalertclear` — Remove your DM alert',
-    ].join('\n');
-    const adminCmds=[
-      '`/setuphere` — Set sales channel to this channel',
-      '`/setlistingshere` — Set listings channel to this channel',
-      '`/setupburn` — Set burn alerts channel to this channel',
-      '`/salesfilter` — Filter auto-posted sales by trait',
-      '`/traitlistingfilter` — Filter auto-posted listings by trait',
-      '`/ranklistingfilter min:1 max:100` — Alert when top-rank token lists',
-      '`/clearallfilters` — Clear all server filters',
-      '`/pause` / `/resume` — Pause/resume auto-posts',
-      '`/status` — Show server config',
-    ].join('\n');
-    await interaction.reply({embeds:[new EmbedBuilder()
-      .setTitle('OCAS Sales Bot')
-      .setColor(COLORS.OCAS_GREEN)
-      .setDescription('Your OCAS market assistant — search tokens, track sales, sweep floors, monitor burns, and set personal alerts.')
-      .addFields(
-        {name:'🔍 Market & Search',         value:marketCmds, inline:false},
-        {name:'📈 Sales & Listings',         value:salesCmds,  inline:false},
-        {name:'🔥 Burn Machine',             value:burnCmds,   inline:false},
-        {name:'🔔 Personal DM Alerts',       value:alertCmds,  inline:false},
-        {name:'⚙️ Admin (Manage Server)',    value:adminCmds,  inline:false},
-      )], flags: MessageFlags.Ephemeral});
-    return;
+  if(commandName==='synctraits'){
+    await interaction.deferReply({flags:64});
+    if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
+      return interaction.editReply({content:'❌ You need Manage Server permission.'});
+    await interaction.editReply({content:'⏳ Syncing trait roles for all verified members... This may take a moment.'});
+    const guildId = interaction.guildId;
+    try{
+      const regs = await pgPool.query(
+        'SELECT discord_id, wallet FROM user_registrations WHERE guild_id=$1 AND verified=true',
+        [guildId]
+      );
+      for(const reg of regs.rows){
+        await syncTraitRoles(interaction.guild, reg.discord_id, reg.wallet);
+        await new Promise(r=>setTimeout(r,500));
+      }
+      return interaction.editReply({content:'✅ Trait roles synced for '+regs.rows.length+' verified member'+(regs.rows.length!==1?'s':'')+'.'});
+    }catch(e){
+      console.error('[SyncTraits]', e.message);
+      return interaction.editReply({content:'❌ Sync failed: '+e.message});
+    }
   }
+
+
+
+
+    if(DOWNLOAD_COMMANDS.has(commandName)) return handleDownloadCommand(interaction, { getConfig, osHeaders });
 });
 
+// ── Welcome message on server join ───────────────────────────────────────────
 // ── Welcome message on server join ────────────────────────────────────────────
 client.on('guildCreate', async (guild)=>{
   try{
@@ -6325,78 +2142,29 @@ client.on('guildCreate', async (guild)=>{
     const target = owner?.user || null;
     if(!target) return;
 
-    const desc=[
-      'I post NFT **sales** and **listings** alerts with token images, price, traits, buyer/seller links, and more.',
-      '',
-      'Works with **any OpenSea collection**. Each server configures independently.'
-    ].join('\n');
-
-    const setup=[
-      '**Step 1 - Find your collection slug:**',
-      'Go to your collection on OpenSea and look at the URL:',
-      '`opensea.io/collection/` **your-slug-is-here**',
-      'Copy exactly as shown - lowercase, dashes not spaces.',
-      '',
-      '**Step 2 - Sales channel (go to your sales channel and run):****',
-      '`/setuphere collection:your-slug contract:0x...`',
-      '',
-      '**Step 3 - Listings channel (go to your listings channel and run):**',
-      '`/setlistingshere`',
-      '',
-      '**Step 4 - Test it:**',
-      '`/lastsale` and `/listings`',
-      '',
-      'Works on mobile and desktop!',
-      'Tip: `/setup` also works on desktop if you prefer.'
-    ].join('\n');
-
-    const channelTip=[
-      'Recommended 4-channel setup:',
-      '',
-      '**#all-sales** — auto-posts every sale (make read-only for members)',
-      '**#all-listings** — auto-posts every listing (make read-only for members)',
-      '**#market** — members use `/ocas`, `/sweep`, `/traitfind`, `/rankfind`',
-      '**#sales-history** — members use `/recentsales`, `/sale`, `/lastsale`',
-      '',
-      'To make a channel read-only: Channel Settings > Permissions > @everyone > disable Send Messages'
-    ].join('\n');
-
-    const personalAlerts=[
-      'Anyone can set personal DM alerts with `/myalert`.',
-      'You get a private DM when a matching sale or listing happens.',
-      '',
-      '`/myalert trait:Type value:Zombie` — DM when any Zombie sells or lists',
-      '`/myalert rank_min:1 rank_max:100` — DM when a top-100 token gets listed',
-      '',
-      '`/myalertclear` — Remove your alert',
-      '`/myalertstatus` — See your current alert'
-    ].join('\n');
-
-    const serverFilters=[
-      'Admins can filter what auto-posts to each channel:',
-      '',
-      '`/salesfilter trait:Type value:Zombie` — Only post Zombie sales',
-      '`/traitlistingfilter trait:Type value:Zombie` — Only post Zombie listings',
-      '`/ranklistings min:1 max:100` — Auto-post when top-100 tokens list',
-      '',
-      '`/clearallfilters` — Remove all server filters',
-      '`/status` — See current configuration'
-    ].join('\n');
-
     const embed = new EmbedBuilder()
-      .setTitle('Thanks for adding OCAS Sales Bot!')
-      .setColor(COLORS.OCAS_GREEN)
-      .setDescription(desc)
-      .addFields(
-        {name:'Quick Setup (2 minutes)', value:setup, inline:false},
-        {name:'Recommended Channel Layout', value:channelTip, inline:false},
-        {name:'Personal DM Alerts (anyone can use)', value:personalAlerts, inline:false},
-        {name:'Server-Wide Filters (admin only)', value:serverFilters, inline:false}
+      .setColor(0x5865F2)
+      .setTitle('👋 Thanks for adding me!')
+      .setThumbnail(guild.iconURL({ dynamic: true }) || null)
+      .setDescription(
+        'I post NFT **sales & listings** alerts, verify holder wallets, and auto-assign trait roles — for any OpenSea collection.\n\n' +
+        '**Get started in 2 minutes:**\n' +
+        '→ Run `/setup` to configure channels, collection, and roles\n' +
+        '→ Use `/config` anytime to manage settings\n\n' +
+        '**Key commands:**\n' +
+        '`/setup` — initial configuration wizard\n' +
+        '`/config` — manage channels, roles & listing filters\n' +
+        '`/synctraits` — manually sync holder trait roles\n' +
+        '`/lotteries` — manage burn lotteries & giveaways\n' +
+        '`/help` — full command list\n\n' +
+        '**Recommended channel setup:**\n' +
+        '`#sales` — auto-posts every sale\n' +
+        '`#listings` — auto-posts new listings\n' +
+        '`#burns` — burn machine alerts\n' +
+        '`#owner-verification` — wallet verification panel\n\n' +
+        '*This bot will never DM members or ask for seed phrases.*'
       )
-      .addFields({name:'🔥 Burn Machine Alerts (optional)',
-        value:'Run `/setupburn` in the channel where you want burn events posted.\nTracks every OCAS burn finalization automatically.',
-        inline:false})
-      .setFooter({text:'Use /help anytime to see all commands'});
+      .setFooter({ text: 'Run /setup to get started · /config to manage settings' });
 
     // Try DM to owner first — if DMs are off, post in first available channel
     let sent = false;
@@ -6425,19 +2193,63 @@ client.on('guildCreate', async (guild)=>{
   }catch(e){ console.warn('[Welcome]',guild.name,e.message); }
 });
 
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
 // ── Boot ──────────────────────────────────────────────────────────────────────
 client.once('clientReady', async ()=>{
   console.log('Bot online as '+client.user.tag);
   checkStartupEnvVars();
   console.log('OpenSea key: '+(OPENSEA_KEY?'set':'NOT SET'));
   // Init Railway DB table, then load all persisted state
-  await ensureBotStateTable();
+  await runMigrations();
   await loadAllConfigs();
+  await migrateMarketCollectionsToServerConfigs();
+  await loadBurnConfig();
+  await syncBurnConfigFromServerConfigs();
+  console.log('[Startup] burnConfig synced from server_configs');
   await loadAllAlerts();
   await loadSaleCursors();
   await loadListingCursors();
-  await loadBurnConfig();
-  console.log('Servers configured: '+Object.keys(serverConfigs).length);
+  // ── Memory logging — diagnostic only, remove after crash cause confirmed ──
+  const _mb = v => Math.round(v / 1024 / 1024);
+  const _sz = x => {
+    if(!x) return 0;
+    if(typeof x.size === 'number') return x.size;      // Map/Set
+    if(Array.isArray(x)) return x.length;
+    if(typeof x === 'object') return Object.keys(x).length; // plain object
+    return 0;
+  };
+  setInterval(() => {
+    const m = process.memoryUsage();
+    console.log(`[Memory] heapUsed=${_mb(m.heapUsed)}MB heapTotal=${_mb(m.heapTotal)}MB rss=${_mb(m.rss)}MB external=${_mb(m.external)}MB`);
+    const caches = {
+      imageCache: _sz(imageCache),
+      ocasTraitsCache: _sz(ocasTraitsCache),
+      sweepSessions: _sz(sweepSessions),
+      slideshowSessions: _sz(slideshowSessions),
+      recentChannelPosts: _sz(recentChannelPosts),
+      alertedEventIds: _sz(alertedEventIds),
+      commandCooldowns: _sz(commandCooldowns),
+      cachedFloors: _sz(cachedFloors),
+      pendingBurns: [...pendingBurns.values()].reduce((sum, q) => sum + (Array.isArray(q) ? q.length : 1), 0),
+      pendingBurnAlerts: _sz(pendingBurnAlerts),
+      burnBlockTimestampCache: _sz(burnBlockTimestampCache),
+      rankSyncQueue: _sz(rankSyncQueue),
+      lastSaleIds: _sz(lastSaleIds),
+      lastListingIds: _sz(lastListingIds),
+      tokenMetaCache_embeds: _sz(embedsTokenMetaCache),
+      tokenMetaCache_images: _sz(imagesTokenMetaCache),
+      tokenMetaCache_burnPoller_dead: _sz(burnPollerTokenMetaCache),
+      roleConflictCache: _sz(_roleConflictCache),
+      traitIndexCache: _sz(_traitIndexCache),
+      serverConfigs: getAllConfigs().length,
+      userAlerts: Object.keys(getUserAlerts() || {}).length,
+    };
+    console.log(`[MemoryDetail] ${JSON.stringify(caches)}`);
+  }, 60_000);
+
+  // Listing poller re-enabled with fix: caps fetch at 50 listings to prevent
+  // loading 500-listing bursts into memory on restart (confirmed OOM cause).
   pollSales();
   pollListings();
   setInterval(pollSales, POLL_MS);
@@ -6467,8 +2279,107 @@ client.once('clientReady', async ()=>{
   setInterval(processDueBurnLotteries, 60_000);
   processDueGenericLotteries();
   setInterval(processDueGenericLotteries, 15_000);
+  setTimeout(()=>{ runDailyTraitSync(); setInterval(runDailyTraitSync, 24*60*60*1000); }, 5*60*1000);
 });
 
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
 process.on('unhandledRejection',e=>{ console.error('[Bot]',e); sendErrorWebhook('Unhandled Rejection', e); });
+
+async function syncBurnConfigFromServerConfigs(){
+  try{
+    for(const [guildId, cfg] of getAllConfigs()){
+      if(cfg.burnChannel || cfg.burnAlertChannelId){
+        const existing = getBurnConfig(guildId) || {};
+        burnConfig[guildId] = { ...existing, burnAlertChannelId: cfg.burnChannel || cfg.burnAlertChannelId };
+      }
+    }
+    await saveBurnConfig();
+  }catch(e){ console.error('[BurnSync]', e.message); }
+}
+
+
+// ── Migrate market_collections_v1 -> server_configs ──────────────────────────
+// One-time migration: copies extra collections from the old /market add system
+// into server_configs.collections[] so they appear in /config
+async function migrateMarketCollectionsToServerConfigs(){
+  try{
+    const marketData = await dbLoad('market_collections_v1');
+    if(!marketData){ console.log('[Migration] market_collections_v1: no data'); return; }
+    let migrated = 0;
+    for(const [guildId, guildData] of Object.entries(marketData)){
+      const collections = guildData?.collections || {};
+      const extraCols = Object.entries(collections)
+        .filter(([alias]) => alias !== 'ocas')
+        .map(([alias, col]) => ({
+          name: col.name || alias,
+          slug: col.slug || alias,
+          contract: col.contract || null,
+          salesChannel: col.salesChannel || col.channelId || null,
+          listingsChannel: col.listingsChannel || col.listingsChannelId || null,
+          listingFilters: col.listingFilters || {},
+        }));
+      if(!extraCols.length) continue;
+      const cfg = getConfig(guildId) || {};
+      const existing = cfg.collections || [];
+      const existingSlugs = new Set(existing.map(c => c.slug));
+      const toAdd = extraCols.filter(c => c.slug && !existingSlugs.has(c.slug));
+      if(!toAdd.length) continue;
+      cfg.collections = [...existing, ...toAdd];
+      await setConfig(guildId, cfg);
+      migrated += toAdd.length;
+      console.log('[Migration] guild=' + guildId + ' added ' + toAdd.length + ' collections from market_collections_v1');
+    }
+    console.log('[Migration] market_collections_v1 -> server_configs: ' + migrated + ' collections migrated');
+    // Clear source data so deleted collections never get restored on restart
+    if(migrated > 0){
+      await pgPool.query(`DELETE FROM bot_state WHERE key='market_collections_v1'`).catch(()=>{});
+      console.log('[Migration] market_collections_v1 source data cleared — collections will no longer be restored on restart');
+    }
+  }catch(e){
+    console.error('[Migration] market_collections_v1 failed:', e.message);
+  }
+}
+
 client.login(DISCORD_TOKEN);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

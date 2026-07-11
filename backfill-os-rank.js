@@ -25,13 +25,29 @@ const fetch     = require('node-fetch');
 const fs        = require('fs');
 const path      = require('path');
 
+// ── Environment selection ────────────────────────────────────────────────────
+// Same convention as register-commands.js: `node backfill-os-rank.js staging`
+// or `node backfill-os-rank.js production` explicitly picks the right DB
+// instead of silently falling back to whatever's in the bare .env file.
+const envArgIdx = process.argv.findIndex(a => a === 'staging' || a === 'production' || a === 'prod');
+const envName = envArgIdx !== -1 ? process.argv[envArgIdx] : '';
+if(envName){
+  const envFile = (envName === 'staging') ? '.env.staging' : '.env.production';
+  require('dotenv').config({ path: path.join(__dirname, envFile), override: true });
+  console.log(`Using environment file: ${envFile}`);
+} else {
+  console.log('No environment specified (staging/production) — using bare .env. Pass one explicitly to avoid ambiguity, e.g.:');
+  console.log('  node backfill-os-rank.js staging --start 1');
+}
+
 const CONTRACT      = '0x078be86f3104a32313a47815792230a3808642cc';
 const TOTAL_TOKENS  = 10000;
 const DELAY_MS      = 500;   // ms between normal requests
 const CHECKPOINT_FILE = path.join(__dirname, 'backfill-progress.json');
 
 const OPENSEA_KEY   = process.env.OPENSEA_KEY || process.env.OPENSEA_API_KEY;
-const DATABASE_URL  = process.env.DATABASE_URL;
+const dbUrlArgIdx   = process.argv.indexOf('--db-url');
+const DATABASE_URL  = dbUrlArgIdx !== -1 ? process.argv[dbUrlArgIdx + 1] : process.env.DATABASE_URL;
 const DRY_RUN       = process.argv.includes('--dry-run');
 const START_ARG     = process.argv.indexOf('--start');
 const START_FROM    = START_ARG !== -1 ? parseInt(process.argv[START_ARG + 1]) : null;
@@ -122,7 +138,7 @@ async function writeBatch(rows) {
     await client.query('BEGIN');
     for (const { tokenId, rank, score } of rows) {
       await client.query(
-        `UPDATE tokens SET os_rank=$1, os_score=$2 WHERE id=$3`,
+        `UPDATE tokens SET os_rank=$1, os_score=$2 WHERE id=$3 AND collection_slug='on-chain-all-stars'`,
         [rank, score, tokenId]
       );
     }

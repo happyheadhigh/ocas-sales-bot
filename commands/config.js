@@ -11,7 +11,8 @@ const {
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
 const { isPaidFeature } = require('./market');
-const { buildRolePickerRows, parseRolePagerCustomId } = require('../lib/role-picker');
+const { buildRolePickerRows } = require('../lib/role-picker');
+const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
 
 // ── Access control ────────────────────────────────────────────────────────────
 // /config is gated to: server members with Manage Server permission, OR a
@@ -326,14 +327,18 @@ function rankAlertRow(col, colId){
 
 
 // ── Roles screen ──────────────────────────────────────────────────────────────
+function traitRuleLabel(r){
+  if(r.trait_type === '_count') return `Own ${r.minimum_count}+ tokens`;
+  if(r.trait_type === '_totalburns') return `${r.minimum_count}+ burn transactions, ever`;
+  if(r.trait_type === '_maxburn') return `${r.minimum_count}+ tokens in a single burn`;
+  return `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`;
+}
+
 function buildRolesEmbed(traitRoles, collectionLabel){
   const list = traitRoles.length === 0
     ? '*No trait roles configured yet.*'
     : traitRoles.map((r, i) =>
-        `**${i+1}.** ${r.role_id ? `<@&${r.role_id}>` : 'Unknown Role'} — ` +
-        (r.trait_type === '_count'
-          ? `Own ${r.minimum_count}+ tokens`
-          : `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`)
+        `**${i+1}.** ${r.role_id ? `<@&${r.role_id}>` : 'Unknown Role'} — ${traitRuleLabel(r)}`
       ).join('\n');
 
   return new EmbedBuilder()
@@ -360,7 +365,7 @@ function rolesRow(traitRoles, colId){
   if(traitRoles.length > 0){
     const options = traitRoles.slice(0, 25).map((r, i) =>
       new StringSelectMenuOptionBuilder()
-        .setLabel(`${i+1}. ${r.trait_type === '_count' ? `Own ${r.minimum_count}+ tokens` : `${r.trait_type}: ${r.trait_value || 'any'}`}`)
+        .setLabel(`${i+1}. ${traitRuleLabel(r)}`)
         .setDescription(`Role: ${r.role_id ? `<@&${r.role_id}>` : 'Unknown'}`)
         .setValue(`${r.id}`)
     );
@@ -586,24 +591,33 @@ async function showFilterCategoryPicker(interaction, cfg, colId, kind){
     });
   }
 
-  const catOptions = categories.slice(0, 25).map(c =>
-    new StringSelectMenuOptionBuilder().setLabel(c).setValue(c)
-  );
-
-  const catMenu = new StringSelectMenuBuilder()
-    .setCustomId(`cfg_filtertrait:catsel:${kind}:${colId}`)
-    .setPlaceholder('Step 1 of 2 — Pick a trait category...')
-    .addOptions(catOptions);
+  // Up to 4 stacked menus (100 categories) + 1 row for Cancel, comfortably
+  // covering any realistic trait-category count -- this is a single-select
+  // (pick one category, not several), so unlike the value pickers there's
+  // no accumulation needed at all: whichever menu the user actually uses
+  // fires the existing cfg_filtertrait:catsel: handler completely
+  // unchanged, same as how lib/role-picker.js's paginated role menus work.
+  const CAT_CHUNK = 25;
+  const catMenuCount = Math.min(4, Math.ceil(categories.length / CAT_CHUNK));
+  const catRows = [];
+  for(let i = 0; i < catMenuCount; i++){
+    const slice = categories.slice(i * CAT_CHUNK, (i + 1) * CAT_CHUNK);
+    if(!slice.length) break;
+    const opts = slice.map(c => new StringSelectMenuOptionBuilder().setLabel(c).setValue(c));
+    const m = new StringSelectMenuBuilder()
+      .setCustomId(`cfg_filtertrait:catsel:${kind}:${colId}:${i}`)
+      .setPlaceholder(catMenuCount > 1 ? `Categories ${i * CAT_CHUNK + 1}-${i * CAT_CHUNK + slice.length} of ${categories.length}` : 'Step 1 of 2 — Pick a trait category...')
+      .addOptions(opts);
+    catRows.push(new ActionRowBuilder().addComponents(m));
+  }
+  catRows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+  ));
 
   return interaction.editReply({
     content: `**Adding ${kindLabel} Filter**\n\nStep 1 of 2 — Pick the trait category:`,
     embeds: [],
-    components: [
-      new ActionRowBuilder().addComponents(catMenu),
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
-      ),
-    ],
+    components: catRows,
   });
 }
 
@@ -658,6 +672,8 @@ async function handleConfigButton(interaction, ctx){
                   tzCustomPicked ||
                   customId.startsWith('cfg:rank:set:') ||
                   customId.startsWith('cfg_traitrole:manual:') ||
+                  customId.startsWith('cfg_traitrole:quickmodal:') ||
+                  (customId.startsWith('vpick:traitrole:') && customId.endsWith(':setcount')) ||
                   customId.startsWith('cfg_filtertrait:manual:') ||
                   customId.startsWith('cfg:col:name:') ||
                   customId.startsWith('cfg:col:contract:') || customId.startsWith('cfg:col:slug:');
@@ -961,6 +977,178 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // ── Filter category selected → show value multi-select ─────────────────
+  // ── Shared paginated multi-select value picker (page/sel/done) ──────────────
+  // Handles Prev/Next navigation and selection-accumulation generically for
+  // ANY flow that hit the >25-values case, then branches only for the final
+  // Done action, since each flow saves its picks differently.
+  if(customId.startsWith('vpick:')){
+   try{
+    const parsed = parseValuePickerCustomId(customId);
+    if(!parsed){
+      return interaction.editReply({ content: '❌ Something went wrong with this picker. Please start over.', embeds:[], components:[] });
+    }
+    const { action, customIdPrefix } = parsed;
+    const prefixParts = customIdPrefix.split(':');
+    const flow = prefixParts[0]; // 'filtertrait' or 'traitrole'
+
+    // Reconstruct the same sessionKey used when this picker was first opened.
+    let sessionKey, cancelId, placeholder, category, kind, colId, roleId, catColId, valColId;
+    if(flow === 'filtertrait'){
+      [, kind, colId] = prefixParts;
+      category = decodeURIComponent(prefixParts[3]);
+      sessionKey = `${interaction.user.id}:filtertrait:${kind}:${colId}:${category}`;
+      cancelId = kind === 'sales' ? `cfg:col:salesfilters:${colId}` : `cfg:col:filters:${colId}`;
+      placeholder = 'Pick one or more values...';
+    } else if(flow === 'traitrole'){
+      [, roleId, catColId] = prefixParts;
+      category = decodeURIComponent(prefixParts[3]);
+      valColId = (catColId && catColId !== '_') ? catColId : '';
+      sessionKey = `${interaction.user.id}:traitrole:${roleId}${valColId ? ':'+valColId : ''}:${category}`;
+      cancelId = valColId ? `cfg:col:traitroles:${valColId}` : 'cfg:cat:roles';
+      placeholder = 'Pick one or more values...';
+    } else {
+      return interaction.editReply({ content: '❌ Unknown picker type. Please start over.', embeds:[], components:[] });
+    }
+
+    const session = getValuePickerSession(sessionKey);
+    if(!session){
+      return interaction.editReply({ content: '❌ This picker session expired (likely a bot restart mid-flow). Please start over.', embeds:[], components:[] });
+    }
+
+    if(action === 'sel'){
+      const newValues = interaction.values || [];
+      recordMenuSelection(sessionKey, parsed.menuIndex, newValues);
+
+      if(newValues.length && flow === 'filtertrait'){
+        // Additive by design (adding new values never removes ones saved
+        // from a different menu earlier in this same session), so filters
+        // still apply immediately -- no minimum-count concept here at all,
+        // nothing to wait for.
+        const catKey = category.toLowerCase();
+        const lowerValues = newValues.map(v => v.toLowerCase());
+        const fieldKey = kind === 'sales' ? 'salesFilters' : 'listingFilters';
+        const isPrimary = colId === 'primary';
+        if(isPrimary){
+          if(!cfg[fieldKey]) cfg[fieldKey] = {};
+          const existing = cfg[fieldKey][catKey] || [];
+          cfg[fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
+        } else {
+          const cols = cfg.collections || [];
+          const idx = parseInt(colId);
+          if(cols[idx]){
+            if(!cols[idx][fieldKey]) cols[idx][fieldKey] = {};
+            const existing = cols[idx][fieldKey][catKey] || [];
+            cols[idx][fieldKey][catKey] = [...new Set([...existing, ...lowerValues])];
+            cfg.collections = cols;
+          }
+        }
+        await setConfig(guildId, cfg);
+      }
+      // traitrole: just record the pick in the session -- nothing saves to
+      // trait_roles until Done, since a minimum-count modal happens next
+      // and the count needs to be known before any row is written.
+
+      const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, { placeholder, cancelId, countButton: flow === 'traitrole' });
+      const doneHint = flow === 'traitrole'
+        ? `pick from as many of the menus below as you want, then Done to finish (defaults to needing 1), or Set Count first if you want a different minimum.`
+        : `Picks save as soon as you make them — pick from as many of the menus below as you want, then Done when finished.`;
+      return interaction.editReply({
+        content: `**${category}**${truncatedNote}\n\n${doneHint}`,
+        embeds: [],
+        components: rows,
+      });
+    }
+
+    if(action === 'setcount'){
+      if(flow !== 'traitrole'){
+        return interaction.editReply({ content: '❌ Not applicable here.', embeds:[], components:[] });
+      }
+      // Don't clear the session or save anything yet -- need the count
+      // first. showModal must be this interaction's first response, so
+      // this branch is listed in the isModal skip-defer check up top.
+      if(!session.selected.size){
+        return interaction.editReply({ content: 'No values were selected. Please pick at least one value first.', embeds:[], components:[] });
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`cfg_modal:trcount:${roleId}:${valColId || '_'}:${encodeURIComponent(category)}`)
+        .setTitle(`${category}`.slice(0, 45));
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_count_min')
+            .setLabel('How many needed? (default: 1)')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. 1, 3, 5')
+            .setRequired(false)
+        ),
+      );
+      return interaction.showModal(modal);
+    }
+
+    if(action === 'done'){
+      const selectedValues = [...session.selected];
+      clearValuePicker(sessionKey);
+
+      if(flow === 'filtertrait'){
+        const col = colId === 'primary' ? { ...cfg, [kind === 'sales' ? 'salesFilters' : 'listingFilters']: cfg[kind === 'sales' ? 'salesFilters' : 'listingFilters']||{} } : (cfg.collections||[])[parseInt(colId)] || {};
+        const embedFn = kind === 'sales' ? buildColSalesFiltersEmbed : buildColFiltersEmbed;
+        const rowFn = kind === 'sales' ? colSalesFiltersRow : colFiltersRow;
+        return interaction.editReply({
+          content: selectedValues.length
+            ? `✅ Added **${selectedValues.length}** value${selectedValues.length>1?'s':''} for **${category}**.`
+            : `No values were selected for **${category}** — nothing added.`,
+          embeds: [embedFn(col, colId)],
+          components: rowFn(col, colId),
+        });
+      }
+
+      if(flow === 'traitrole'){
+        // Done is the one-click "just finish, default to needing 1" path --
+        // Set Count (a separate button, see the 'setcount' action above) is
+        // where an actual custom minimum gets collected. Nothing here waits
+        // on user input, so this saves immediately at count=1, same as
+        // before the count feature existed at all.
+        if(!selectedValues.length){
+          return interaction.editReply({ content: `No values were selected — nothing added.`, embeds:[], components:[] });
+        }
+        let collectionSlugForSave = null;
+        let colLabel;
+        if(valColId && valColId !== 'primary'){
+          const col = (cfg.collections||[])[parseInt(valColId)];
+          collectionSlugForSave = col?.slug || null;
+          colLabel = col?.name || col?.slug;
+        }
+        for(const val of selectedValues){
+          await pgPool.query(
+            `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+             VALUES ($1,$2,$3,$4,1,$5)
+             ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
+            [guildId, roleId, category, val, collectionSlugForSave]
+          ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+        }
+        const trRes = valColId
+          ? await pgPool.query(
+              collectionSlugForSave
+                ? 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug=$2 ORDER BY trait_type, trait_value'
+                : 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug IS NULL ORDER BY trait_type, trait_value',
+              collectionSlugForSave ? [guildId, collectionSlugForSave] : [guildId]
+            ).catch(()=>({ rows:[] }))
+          : await pgPool.query(
+              'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
+              [guildId]
+            ).catch(()=>({ rows:[] }));
+        return interaction.editReply({
+          content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}>:\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
+          embeds: [buildRolesEmbed(trRes.rows, colLabel)],
+          components: rolesRow(trRes.rows, valColId || undefined),
+        });
+      }
+    }
+   }catch(e){
+     console.error('[Config] vpick dispatcher error:', e);
+     return interaction.editReply({ content: `❌ Something went wrong saving your picks: ${e.message || 'unknown error'}. Please try again or start over.`, embeds:[], components:[] }).catch(()=>{});
+   }
+  }
+
   if(customId.startsWith('cfg_filtertrait:catsel:')){
     const parts = customId.split(':');
     const kind  = parts[2];
@@ -984,15 +1172,17 @@ async function handleConfigButton(interaction, ctx){
     }
 
     if(values.length > 25){
+      const sessionKey = `${interaction.user.id}:filtertrait:${kind}:${colId}:${category}`;
+      initValuePicker(sessionKey, values);
+      const customIdPrefix = `filtertrait:${kind}:${colId}:${encodeURIComponent(category)}`;
+      const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
+        placeholder: 'Pick one or more values...',
+        cancelId: backId,
+      });
       return interaction.editReply({
-        content: `**${category}** has ${values.length} values — too many to list in a dropdown.\n\nClick below to enter the value(s) manually.\nExamples: ${values.slice(0,3).join(', ')}...`,
+        content: `**Adding ${kind === 'sales' ? '💰 Sales' : '🔍 Listing'} Filter**\n\nCategory: **${category}**\nStep 2 of 2 — Pick the trait value(s) to filter by${truncatedNote}\n\nPicks save as soon as you make them — pick from as many of the menus below as you want.`,
         embeds: [],
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_filtertrait:manual:${kind}:${colId}:${encodeURIComponent(category)}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(backId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
-          ),
-        ],
+        components: rows,
       });
     }
 
@@ -1385,7 +1575,7 @@ async function handleConfigButton(interaction, ctx){
   }
 
   if(customId === 'cfg:access:set'){
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:botmanager', 0, 'cfg:cat:access', 'Pick the Bot Manager role');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:botmanager', 'cfg:cat:access', 'Pick the Bot Manager role');
     return interaction.editReply({ content:'**Select the role that should be able to use `/config`** (in addition to Manage Server admins):'+pageLabel, embeds:[], components: rows });
   }
 
@@ -1547,11 +1737,11 @@ async function handleConfigButton(interaction, ctx){
     ]});
   }
   if(customId === 'cfg:ver:role'){
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:verify', 0, 'cfg:cat:verification', 'Pick the ✅ Verified Wallet role');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:verify', 'cfg:cat:verification', 'Pick the ✅ Verified Wallet role');
     return interaction.editReply({ content:'**Select the ✅ Verified Wallet role:**'+pageLabel, embeds:[], components: rows });
   }
   if(customId === 'cfg:ver:holder'){
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:holder', 0, 'cfg:cat:verification', 'Pick the 🏆 Holder role');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'cfg_rolesel:holder', 'cfg:cat:verification', 'Pick the 🏆 Holder role');
     return interaction.editReply({ content:'**Select the 🏆 Holder role:**'+pageLabel, embeds:[], components: rows });
   }
   if(customId === 'cfg:ver:deploy'){
@@ -1598,19 +1788,12 @@ async function handleConfigButton(interaction, ctx){
     const addColId = customId.startsWith('cfg:role:add:') ? customId.split(':')[3] : '';
     const targetId = addColId ? `cfg_traitrole:rolesel:${addColId}` : 'cfg_traitrole:rolesel';
     const cancelId = addColId ? `cfg:col:traitroles:${addColId}` : 'cfg:cat:roles';
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, targetId, 0, cancelId, 'Pick a role to assign...');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, targetId, cancelId, 'Pick a role to assign...');
     return interaction.editReply({
       content: '**Step 1 of 3 — Pick the Discord role to assign:**'+pageLabel,
       embeds: [],
       components: rows,
     });
-  }
-
-  // ── role picker: page navigation ─────────────────────────────────────────
-  if(customId.startsWith('rolepg:')){
-    const parsed = parseRolePagerCustomId(customId);
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, parsed.targetCustomId, parsed.page, parsed.cancelId, 'Pick a role...');
-    return interaction.editReply({ content:'**Select a role:**'+pageLabel, embeds:[], components: rows });
   }
 
   if(customId.startsWith('cfg_traitrole:manual:')){
@@ -1624,9 +1807,9 @@ async function handleConfigButton(interaction, ctx){
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId('tr_trait_type')
-          .setLabel('Trait Category  (use "_count" for token count)')
+          .setLabel('Trait Category (or _count etc.)')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. Type   or   Background   or   _count')
+          .setPlaceholder('e.g. Type, _count, _totalburns, or _maxburn')
           .setRequired(true)
       ),
       new ActionRowBuilder().addComponents(
@@ -1641,6 +1824,34 @@ async function handleConfigButton(interaction, ctx){
           .setLabel('How many tokens needed?  (default: 1)')
           .setStyle(TextInputStyle.Short)
           .setPlaceholder('1 = own at least one · 5 = own five or more')
+          .setRequired(false)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
+  // ── Quick modal for _count/_totalburns/_maxburn — number field only, the
+  // category is already known from the dropdown pick, no need to retype it ──
+  if(customId.startsWith('cfg_traitrole:quickmodal:')){
+    const qParts   = customId.split(':');
+    const roleId   = qParts[2];
+    const qColId   = qParts[3];
+    const category = qParts[4];
+    const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    const fieldLabels = {
+      _count:      'Minimum tokens owned (default: 1)',
+      _totalburns: 'Minimum burn transactions (default: 1)',
+      _maxburn:    'Minimum tokens in one burn (default: 1)',
+    };
+    const modal = new ModalBuilder()
+      .setCustomId(`cfg_modal:trquick:${roleId}:${qColId}:${category}`)
+      .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('tr_quick_count')
+          .setLabel((fieldLabels[category] || 'Minimum count').slice(0, 45))
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. 1, 5, 10')
           .setRequired(false)
       ),
     );
@@ -1689,33 +1900,61 @@ async function handleConfigButton(interaction, ctx){
       });
     }
 
-    // Build category dropdown (cap at 25)
-    const catOptions = categories.slice(0, 24).map(c =>
-      new StringSelectMenuOptionBuilder().setLabel(c).setValue(c)
-    );
-    // Always include token count option
-    catOptions.unshift(new StringSelectMenuOptionBuilder()
-      .setLabel('🪙 Token Count (own N or more)')
-      .setValue('_count')
-      .setDescription('Assign role based on how many tokens the user holds')
-    );
-
-    const catMenu = new StringSelectMenuBuilder()
-      .setCustomId(`cfg_traitrole:catsel:${roleId}${suffix}`)
-      .setPlaceholder('Step 2 of 3 — Pick a trait category...')
-      .addOptions(catOptions.slice(0, 25));
+    // Build category dropdown(s) -- stacked if more than fit in one menu.
+    // Special options (Token Count + burn-based, when this is OCAS) always
+    // go first, on menu 0 only. Burns are inherently OCAS-only (this bot's
+    // burn tracking never applied to any other collection), so those two
+    // options only show up when configuring the OCAS collection specifically.
+    const isOcasSlug = slug === OCAS_SLUG;
+    const specialCount = isOcasSlug ? 3 : 1;
+    const CAT_CHUNK = 25;
+    const catMenuCount = Math.min(4, Math.ceil((categories.length + specialCount) / CAT_CHUNK));
+    const catRows = [];
+    for(let i = 0; i < catMenuCount; i++){
+      const startIdx = i === 0 ? 0 : i * CAT_CHUNK - specialCount;
+      const roomLeft = i === 0 ? CAT_CHUNK - specialCount : CAT_CHUNK;
+      const slice = categories.slice(startIdx, startIdx + roomLeft);
+      if(!slice.length && i > 0) break;
+      const opts = slice.map(c => new StringSelectMenuOptionBuilder().setLabel(c).setValue(c));
+      if(i === 0){
+        opts.unshift(new StringSelectMenuOptionBuilder()
+          .setLabel('🪙 Token Count')
+          .setValue('_count')
+          .setDescription('Assign role based on how many tokens the user holds')
+        );
+        if(isOcasSlug){
+          opts.unshift(new StringSelectMenuOptionBuilder()
+            .setLabel('🔥 Total Burns')
+            .setValue('_totalburns')
+            .setDescription('Number of separate burn transactions this wallet has ever participated in')
+          );
+          opts.unshift(new StringSelectMenuOptionBuilder()
+            .setLabel('💥 Biggest Single Burn')
+            .setValue('_maxburn')
+            .setDescription('Largest number of tokens fed into any ONE burn transaction')
+          );
+        }
+      }
+      // Fixed-position placeholder ('_' for "no collection id") rather than
+      // conditionally omitting the segment -- appending a chunk index after
+      // a sometimes-present, sometimes-absent suffix would shift what the
+      // handler reads at each position depending on which case applied.
+      const m = new StringSelectMenuBuilder()
+        .setCustomId(`cfg_traitrole:catsel:${roleId}:${rsColId || '_'}:${i}`)
+        .setPlaceholder(catMenuCount > 1 ? `Categories (menu ${i + 1} of ${catMenuCount})` : 'Step 2 of 3 — Pick a trait category...')
+        .addOptions(opts.slice(0, 25));
+      catRows.push(new ActionRowBuilder().addComponents(m));
+    }
+    catRows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+    ));
 
     return interaction.editReply({
       content: `**Adding trait role for ${role?.name || 'role'}**
 
 Step 2 of 3 — Pick the trait category:`,
       embeds: [],
-      components: [
-        new ActionRowBuilder().addComponents(catMenu),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
-        ),
-      ],
+      components: catRows,
     });
   }
 
@@ -1723,19 +1962,24 @@ Step 2 of 3 — Pick the trait category:`,
   if(customId.startsWith('cfg_traitrole:catsel:')){
     const parts  = customId.split(':');
     const roleId = parts[2];
-    const catColId = parts[3] || '';
+    const catColId = (parts[3] && parts[3] !== '_') ? parts[3] : '';
     const category = interaction.values[0];
     const cancelId = catColId ? `cfg:col:traitroles:${catColId}` : 'cfg:cat:roles';
     const suffix = catColId ? `:${catColId}` : '';
 
-    // Token count shortcut — already deferred, so show a button that opens the modal next click
-    if(category === '_count'){
+    // Token count / burn-based shortcuts — already deferred, so show a button that opens the modal next click
+    if(category === '_count' || category === '_totalburns' || category === '_maxburn'){
+      const labels = {
+        _count: ['Token Count Rule', 'Set Token Count', 'the minimum token count'],
+        _totalburns: ['Total Burns Rule', 'Set Total Burns', 'the minimum number of burn transactions this wallet has ever done'],
+        _maxburn: ['Biggest Single Burn Rule', 'Set Burn Size', 'the minimum tokens in any ONE burn transaction'],
+      }[category];
       return interaction.editReply({
-        content: `**Token Count Rule**\n\nClick below to set the minimum token count for this role.`,
+        content: `**${labels[0]}**\n\nClick below to set ${labels[2]} for this role.`,
         embeds: [],
         components: [
           new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}${suffix}`).setLabel('✏️ Set Token Count').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`cfg_traitrole:quickmodal:${roleId}:${catColId||'_'}:${category}`).setLabel(`✏️ ${labels[1]}`).setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
           ),
         ],
@@ -1766,43 +2010,22 @@ Step 2 of 3 — Pick the trait category:`,
       return interaction.editReply({ content: `❌ No trait values found for category **${category}**. Try again.`, embeds:[], components:[] });
     }
 
-    // If more than 25 values, fall back to manual entry — Discord select menus cap at 25
-    if(values.length > 25){
-      return interaction.editReply({
-        content: `**${category}** has ${values.length} values — too many to list in a dropdown.\n\nClick below to enter the trait value manually.\nExamples: ${values.slice(0,3).join(', ')}...`,
-        embeds: [],
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cfg_traitrole:manual:${roleId}${suffix}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
-          ),
-        ],
-      });
-    }
-
-    const valOptions = values.map(v =>
-      new StringSelectMenuOptionBuilder().setLabel(v).setValue(v)
-    );
-
-    const valMenu = new StringSelectMenuBuilder()
-      .setCustomId(`cfg_traitrole:valsel:${roleId}:${encodeURIComponent(category)}${suffix}`)
-      .setPlaceholder('Step 3 of 3 — Pick one or more values...')
-      .setMinValues(1)
-      .setMaxValues(valOptions.length)
-      .addOptions(valOptions);
-
+    // Always use the stacked/session picker now, regardless of value count --
+    // a minimum-count step needs to happen after Done either way (see the
+    // vpick: 'done' handler below), so there's no longer a reason for a
+    // separate direct-menu path only for small categories.
+    const sessionKey = `${interaction.user.id}:traitrole:${roleId}${suffix}:${category}`;
+    initValuePicker(sessionKey, values);
+    const customIdPrefix = `traitrole:${roleId}:${catColId || '_'}:${encodeURIComponent(category)}`;
+    const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
+      placeholder: 'Pick one or more values...',
+      cancelId,
+      countButton: true,
+    });
     return interaction.editReply({
-      content: `**Adding trait role**
-
-Category: **${category}**
-Step 3 of 3 — Pick the trait value(s) that qualify for this role:`,
+      content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify for this role${truncatedNote}\n\nPick from as many of the menus below as you want, then Done to finish (defaults to needing 1), or Set Count first if you want a different minimum.`,
       embeds: [],
-      components: [
-        new ActionRowBuilder().addComponents(valMenu),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(cancelId).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
-        ),
-      ],
+      components: rows,
     });
   }
 
@@ -2329,6 +2552,102 @@ async function handleConfigModal(interaction, ctx){
         ).catch(()=>({ rows:[] }));
 
     return interaction.editReply({ content:'✅ Trait role added.', embeds:[buildRolesEmbed(trRes.rows, modColLabel)], components:rolesRow(trRes.rows, modColId || undefined) });
+  }
+
+  // ── Quick modal submit — category already known from the button, just the number ──
+  if(customId.startsWith('cfg_modal:trquick:')){
+    const qParts   = customId.split(':');
+    const roleId   = qParts[2];
+    const qColId   = qParts[3];
+    const category = qParts[4];
+    const minCount = parseInt(interaction.fields.getTextInputValue('tr_quick_count').trim()) || 1;
+
+    const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    if(!role)
+      return interaction.editReply({ content:'❌ Role not found. Please try again.' });
+
+    const modColId = (qColId && qColId !== '_') ? qColId : '';
+    let modCollectionSlug = null;
+    let modColLabel;
+    if(modColId && modColId !== 'primary'){
+      const col = (cfg.collections||[])[parseInt(modColId)];
+      modCollectionSlug = col?.slug || null;
+      modColLabel = col?.name || col?.slug;
+    }
+
+    await pgPool.query(
+      `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+       VALUES ($1,$2,$3,'',$4,$5)
+       ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
+      [guildId, roleId, category, minCount, modCollectionSlug]
+    ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+
+    const trRes = modColId
+      ? await pgPool.query(
+          modCollectionSlug
+            ? 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug=$2 ORDER BY trait_type, trait_value'
+            : 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug IS NULL ORDER BY trait_type, trait_value',
+          modCollectionSlug ? [guildId, modCollectionSlug] : [guildId]
+        ).catch(()=>({ rows:[] }))
+      : await pgPool.query(
+          'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
+          [guildId]
+        ).catch(()=>({ rows:[] }));
+
+    return interaction.editReply({ content:'✅ Trait role added.', embeds:[buildRolesEmbed(trRes.rows, modColLabel)], components:rolesRow(trRes.rows, modColId || undefined) });
+  }
+
+  // ── Trait role count modal — finalize the session with the chosen minimum ──
+  if(customId.startsWith('cfg_modal:trcount:')){
+    const tcParts   = customId.split(':');
+    const roleId    = tcParts[2];
+    const tcColId   = tcParts[3];
+    const category  = decodeURIComponent(tcParts[4]);
+    const valColId  = (tcColId && tcColId !== '_') ? tcColId : '';
+    const minCount  = parseInt(interaction.fields.getTextInputValue('tr_count_min').trim()) || 1;
+
+    const suffix = valColId ? `:${valColId}` : '';
+    const sessionKey = `${interaction.user.id}:traitrole:${roleId}${suffix}:${category}`;
+    const session = getValuePickerSession(sessionKey);
+    if(!session || !session.selected.size){
+      return interaction.editReply({ content: '❌ This session expired before you set a count. Please pick the value(s) again.', embeds:[], components:[] });
+    }
+    const selectedValues = [...session.selected];
+    clearValuePicker(sessionKey);
+
+    let collectionSlugForSave = null;
+    let colLabel;
+    if(valColId && valColId !== 'primary'){
+      const col = (cfg.collections||[])[parseInt(valColId)];
+      collectionSlugForSave = col?.slug || null;
+      colLabel = col?.name || col?.slug;
+    }
+
+    for(const val of selectedValues){
+      await pgPool.query(
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$6`,
+        [guildId, roleId, category, val, minCount, collectionSlugForSave]
+      ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+    }
+
+    const trRes = valColId
+      ? await pgPool.query(
+          collectionSlugForSave
+            ? 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug=$2 ORDER BY trait_type, trait_value'
+            : 'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 AND collection_slug IS NULL ORDER BY trait_type, trait_value',
+          collectionSlugForSave ? [guildId, collectionSlugForSave] : [guildId]
+        ).catch(()=>({ rows:[] }))
+      : await pgPool.query(
+          'SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles WHERE guild_id=$1 ORDER BY trait_type, trait_value',
+          [guildId]
+        ).catch(()=>({ rows:[] }));
+    return interaction.editReply({
+      content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}> (need ${minCount}+):\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
+      embeds: [buildRolesEmbed(trRes.rows, colLabel)],
+      components: rolesRow(trRes.rows, valColId || undefined),
+    });
   }
 }
 

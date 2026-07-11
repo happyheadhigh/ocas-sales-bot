@@ -8,7 +8,7 @@ const {
 } = require('discord.js');
 
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
-const { buildRolePickerRows, parseRolePagerCustomId } = require('../lib/role-picker');
+const { buildRolePickerRows } = require('../lib/role-picker');
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 
@@ -332,7 +332,7 @@ async function handleSetupButton(interaction, ctx){
 
   // Defer immediately — must happen within 3s or Discord kills the interaction
   // Modals are exempt (showModal is its own response), handle those below
-  const isModal = customId === 'setup:contract' || customId === 'setup_traitrole:rolesel';
+  const isModal = customId === 'setup:contract' || customId.startsWith('setup_traitrole:rolesel');
   if(!isModal) await interaction.deferUpdate();
 
   const state = await loadState(guildId, pgPool);
@@ -431,12 +431,12 @@ async function handleSetupButton(interaction, ctx){
   }
 
   if(customId === 'setup:verify:role'){
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_rolesel:verify', 0, null, 'Pick the ✅ Verified Wallet role');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_rolesel:verify', null, 'Pick the ✅ Verified Wallet role');
     return interaction.editReply({ content:'**Select the ✅ Verified Wallet role** (given to anyone who links a wallet):'+pageLabel, components: rows, embeds:[] });
   }
 
   if(customId === 'setup:verify:holderrole'){
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_rolesel:holder', 0, null, 'Pick the 🏆 Holder role');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_rolesel:holder', null, 'Pick the 🏆 Holder role');
     return interaction.editReply({ content:'**Select the 🏆 Holder role** (given to members who hold ≥1 token):'+pageLabel, components: rows, embeds:[] });
   }
 
@@ -513,7 +513,7 @@ async function handleSetupButton(interaction, ctx){
 
   // ── trait role: add ────────────────────────────────────────────────────────
   if(customId === 'setup:traitrole:add'){
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_traitrole:rolesel', 0, 'setup:step:5', 'Pick a role to assign...');
+    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_traitrole:rolesel', 'setup:step:5', 'Pick a role to assign...');
     return interaction.editReply({
       content: '**Step 1 of 2 — Pick the Discord role to assign:**'+pageLabel,
       embeds: [],
@@ -521,15 +521,8 @@ async function handleSetupButton(interaction, ctx){
     });
   }
 
-  // ── role picker: page navigation ─────────────────────────────────────────
-  if(customId.startsWith('rolepg:')){
-    const parsed = parseRolePagerCustomId(customId);
-    const { rows, pageLabel } = buildRolePickerRows(interaction.guild, parsed.targetCustomId, parsed.page, parsed.cancelId, 'Pick a role...');
-    return interaction.editReply({ content:'**Select a role:**'+pageLabel, embeds:[], components: rows });
-  }
-
   // ── trait role: role selected → open trait fields modal ─────────────────
-  if(customId === 'setup_traitrole:rolesel'){
+  if(customId.startsWith('setup_traitrole:rolesel')){
     const roleId = interaction.values[0];
     const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     const modal  = new ModalBuilder()

@@ -110,34 +110,34 @@ async function handlePresetSelect(interaction, ctx){
 
 // ── Custom window modal — free-text window + timezone, same as the old commands ─
 async function showCustomWindowModal(interaction, type){
-  const modal = new ModalBuilder().setCustomId(`gva_modal:customwindow:${type}`).setTitle('Custom Duration');
+  const modal = new ModalBuilder().setCustomId(`gva_modal:customwindow:${type}`).setTitle('Set the Duration');
   modal.addComponents(
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('window')
-        .setLabel('Shorthand (use this OR start/end below)')
+        .setLabel('Quick duration (blank = use dates below)')
         .setStyle(TextInputStyle.Short)
-        .setPlaceholder('now 24hrs, today-10am 7days, 06-07-2026-3pm')
+        .setPlaceholder('e.g. 24 hours, or 7 days')
         .setRequired(false)
     ),
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('start')
-        .setLabel('OR: start date (leave blank for "now")')
+        .setLabel('Start date (blank = starts now)')
         .setStyle(TextInputStyle.Short)
-        .setPlaceholder('June 16 2026, or 2026-06-16')
+        .setPlaceholder('e.g. June 16 2026')
         .setRequired(false)
     ),
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('end')
-        .setLabel('OR: end date (leave blank for "now")')
+        .setLabel('End date (blank = 24h after start)')
         .setStyle(TextInputStyle.Short)
-        .setPlaceholder('now, or June 20 2026')
+        .setPlaceholder('e.g. June 20 2026')
         .setRequired(false)
     ),
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('timezone')
-        .setLabel('Timezone override (date-only inputs)')
+        .setLabel('Timezone (blank = server default)')
         .setStyle(TextInputStyle.Short)
-        .setPlaceholder('Leave blank to use the server default set in /config')
+        .setPlaceholder('e.g. America/New_York — set default in /config')
         .setRequired(false)
     ),
   );
@@ -166,7 +166,9 @@ async function handleCustomWindowModal(interaction, ctx){
 
   const summary = windowText
     ? `\`${windowText}\``
-    : `**${startText || 'now'}** → **${endText || 'now'}**`;
+    : startText && !endText
+      ? `**${startText}** → 24 hours later`
+      : `**${startText || 'now'}** → **${endText || 'now'}**`;
 
   // Modals can't chain directly into another modal from a modal submit —
   // Discord requires a button/select click in between. Show a confirm button.
