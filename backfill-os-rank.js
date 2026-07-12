@@ -42,7 +42,8 @@ if(envName){
 
 const CONTRACT      = '0x078be86f3104a32313a47815792230a3808642cc';
 const TOTAL_TOKENS  = 10000;
-const DELAY_MS      = 500;   // ms between normal requests
+const delayArgIdx   = process.argv.indexOf('--delay');
+const DELAY_MS      = delayArgIdx !== -1 ? parseInt(process.argv[delayArgIdx + 1]) : 200;   // ms between normal requests (429 handling below backs off automatically if this is too aggressive)
 const CHECKPOINT_FILE = path.join(__dirname, 'backfill-progress.json');
 
 const OPENSEA_KEY   = process.env.OPENSEA_KEY || process.env.OPENSEA_API_KEY;
