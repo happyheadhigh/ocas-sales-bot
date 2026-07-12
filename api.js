@@ -1204,6 +1204,33 @@ async function fetchInputSnapshots(tokenIds) {
     return {};
   }
 }
+
+// Bulk map of survivor_token_id -> its CURRENT (latest) image, straight from
+// burn_state_snapshots. This is the one ground-truth source that's actually
+// kept correct as of the most recent burn a token won -- confirmed directly
+// via /db/token/:id/burn-history working correctly for tokens where other
+// image paths were wrong. tokens.image_url (used previously by /db/all-traits)
+// is written live by lib/burn-poller.js at burn-finalization time, but has
+// confirmed historical gaps (see check-live-metadata-gaps.js,
+// backfill-missing-survivor-images.js) -- so treat it as a secondary
+// fallback, not the primary source, wherever a token needs its current image.
+// tokenIds: optional array to scope the query (e.g. one wallet's holdings);
+// omit for the full collection-wide map.
+async function getSurvivorImageMap(tokenIds = null) {
+  const scoped = Array.isArray(tokenIds) && tokenIds.length > 0;
+  const sql = `
+    SELECT DISTINCT ON (be.survivor_token_id) be.survivor_token_id AS token_id, bss.image_data
+    FROM burn_events be
+    JOIN burn_state_snapshots bss ON bss.burn_event_id = be.id AND bss.token_id = be.survivor_token_id
+    WHERE bss.image_data IS NOT NULL
+      ${scoped ? 'AND be.survivor_token_id = ANY($1::int[])' : ''}
+    ORDER BY be.survivor_token_id, be.burned_at DESC, be.id DESC
+  `;
+  const result = await pool.query(sql, scoped ? [tokenIds.map(id => parseInt(id))] : []);
+  const map = {};
+  for (const r of result.rows) map[parseInt(r.token_id)] = r.image_data;
+  return map;
+}
 function burnEndpointError(res, route, e, fallback = {}) {
   console.error(`${route} error:`, e.message);
   if (isMissingBurnTable(e)) {
@@ -1338,6 +1365,36 @@ app.get('/db/survivor-counts', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/survivor-images ────────────────────────────────────────────────
+// Bulk map of token_id -> current (latest) image for every token that has
+// ever been a burn survivor, sourced from burn_state_snapshots -- the same
+// ground-truth data /db/token/:id/burn-history already uses. Exists because
+// the grid/wallet's default image source is a static, build-time manifest
+// of each token's ORIGINAL appearance, and the fallback for survivors was a
+// live OpenSea lookup that depends on OpenSea having already re-indexed the
+// updated tokenURI -- confirmed unreliable directly (token #4527 still
+// served pre-burn art from OpenSea after two burns). Same TTL-cache pattern
+// as /db/survivor-counts so the grid/wallet can load this once at init
+// instead of a per-token call.
+let _survivorImagesCache = null;
+let _survivorImagesCacheTs = 0;
+const SURVIVOR_IMAGES_TTL = 5 * 60 * 1000;
+app.get('/db/survivor-images', auth, async (req, res) => {
+  try {
+    const now = Date.now();
+    if (_survivorImagesCache && (now - _survivorImagesCacheTs) < SURVIVOR_IMAGES_TTL) {
+      return res.json(_survivorImagesCache);
+    }
+    const images = await getSurvivorImageMap();
+    _survivorImagesCache = { ok: true, images };
+    _survivorImagesCacheTs = now;
+    res.json(_survivorImagesCache);
+  } catch (e) {
+    console.error('/db/survivor-images error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 app.get('/db/wallet/:address/favorites', auth, async (req, res) => {
   const address = cleanAddress(req.params.address);
@@ -1434,6 +1491,27 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
     const totalCostBasis = owned.reduce((s, r) => s + (parseFloat(r.cost_eth) || 0), 0);
     const unrealizedPnl = (estimated != null && totalCostBasis > 0) ? (estimated - totalCostBasis) : null;
 
+    // Current image for any owned token that's a burn survivor. The
+    // frontend's default image source is a static, build-time-generated
+    // manifest of each token's ORIGINAL appearance -- it has no way to
+    // know a token evolved via a burn. It was falling back to a live
+    // OpenSea lookup to catch this, but that depends on OpenSea's indexer
+    // having already re-crawled the updated tokenURI, which lags or never
+    // happens for infrequently-viewed tokens -- confirmed directly (token
+    // #4527: OpenSea still served pre-burn art after two burns). This
+    // reads the same burn_state_snapshots data /db/token/:id/burn-history
+    // already uses (proven correct there), so top_tokens can carry the
+    // real current image with zero dependency on a third party.
+    const topSlice = owned.slice(0, 250);
+    let survivorImageMap = {};
+    if (topSlice.length) {
+      try {
+        survivorImageMap = await getSurvivorImageMap(topSlice.map(r => parseInt(r.token_id)));
+      } catch (e) {
+        console.warn('[/db/wallet/:address/summary] survivor image lookup failed (non-fatal):', e.message);
+      }
+    }
+
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
     res.json({
       ok: true,
@@ -1450,12 +1528,13 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
         sold_count: soldCount,
         unrealized_pnl: unrealizedPnl,
         total_cost_basis: totalCostBasis > 0 ? totalCostBasis : null,
-        top_tokens: owned.slice(0, 250).map(r => ({
+        top_tokens: topSlice.map(r => ({
           token_id: parseInt(r.token_id),
           os_rank: r.os_rank ? parseInt(r.os_rank) : null,
           obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null,
           price_eth: r.price_eth != null ? parseFloat(r.price_eth) : null,
           cost_eth: r.cost_eth != null ? parseFloat(r.cost_eth) : null,
+          image: survivorImageMap[parseInt(r.token_id)] || null,
         })),
       },
     });
@@ -2379,6 +2458,16 @@ app.get('/db/all-traits', auth, async (req, res) => {
 
     const survivorIds = new Set(survivorsRes.rows.map(r => parseInt(r.id)));
     const imageUrlById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), r.image_url || null]));
+    // tokens.image_url is written live by burn-poller.js at burn-finalization
+    // time but has confirmed historical gaps (NULL/stale for some survivors —
+    // see check-live-metadata-gaps.js). burn_state_snapshots is the same
+    // ground-truth source /db/token/:id/burn-history already uses
+    // successfully, so prefer it here and only fall back to image_url where
+    // a snapshot doesn't exist yet.
+    const survivorSnapshotImages = await getSurvivorImageMap([...survivorIds]).catch(e => {
+      console.warn('[/db/all-traits] survivor snapshot image lookup failed (non-fatal):', e.message);
+      return {};
+    });
 
     // Get all traits for surviving tokens in one query
     const traitsRes = await pool.query(`
@@ -2391,12 +2480,12 @@ app.get('/db/all-traits', auth, async (req, res) => {
     // Build tokens object: { "1": { traits: { "Type": "Human 6", ... }, image: "..." }, ... }
     const tokens = {};
 
-    // Initialize all survivors with empty traits + whatever image_url is on file
-    // (only populated for tokens that have gone through a burn finalization
-    // since the 2026-07-02 fix — most tokens will have image:null here, which
-    // is fine, TraitView already falls back to its own static image source)
+    // Initialize all survivors with empty traits + current image (snapshot
+    // preferred, tokens.image_url as fallback — most non-survivor tokens
+    // will have image:null here, which is fine, TraitView already falls
+    // back to its own static image source for those)
     for (const id of survivorIds) {
-      tokens[String(id)] = { traits: {}, image: imageUrlById.get(id) || null };
+      tokens[String(id)] = { traits: {}, image: survivorSnapshotImages[id] || imageUrlById.get(id) || null };
     }
 
     // Populate traits
