@@ -141,7 +141,7 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     // DB
     pgPool, dbLoad, dbSave, getConfig, setConfig,
     // Cache
-    getCachedImage, setCachedImage, clearCachedImage, getCachedTraits, setCachedTraits,
+    getCachedImage, setCachedImage, clearCachedImage, getCachedTraits, setCachedTraits, getCachedTraitIndex,
     sweepSessions, slideshowSessions, recentChannelPosts,
     // RPC
     burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock,
