@@ -222,7 +222,7 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
     .addOptions(options);
 
   const row2Btns = [
-    new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('cfg:collections:back').setLabel('← Collections').setStyle(ButtonStyle.Secondary),
   ];
   if(!isPrimary) row2Btns.push(
     new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)
@@ -731,6 +731,18 @@ async function handleConfigButton(interaction, ctx){
       const { col, isPrimary } = resolveColFromId(cfg, allCols[0]);
       if(col) return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(allCols[0], isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
     }
+    return interaction.editReply({ content:'', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
+  }
+
+  // ── Back button from inside a collection's edit screen — always shows the
+  // list, even with only one collection configured. Deliberately does NOT
+  // share cfg:cat:collection's "skip straight to editing it" shortcut above,
+  // since that shortcut only makes sense the first time someone opens
+  // Collections from the dashboard, not when they're explicitly asking to
+  // go back from an already-open collection. Sharing the same customId
+  // for both used to make the back button look like a no-op whenever only
+  // one collection existed, since it just re-rendered the identical screen.
+  if(customId === 'cfg:collections:back'){
     return interaction.editReply({ content:'', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
 
