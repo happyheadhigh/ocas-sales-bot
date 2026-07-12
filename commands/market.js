@@ -929,7 +929,7 @@ async function showTfTraitPicker(interaction, ctx, slug, page = 0){
   // slash-command response.
   const isComponent = typeof interaction.isMessageComponent === 'function' && interaction.isMessageComponent();
   let traitIndex = [];
-  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
+  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){ console.warn('[traitfind] getCachedTraitIndex failed:', e.message); }
   const allTraitNames = sortTraitNamesTypeFirst([...new Set(traitIndex.map(t => t.trait_name))]);
   const PAGE_SIZE = 24; // leave room for a "More categories" option as the 25th slot
   const totalPages = Math.max(1, Math.ceil(allTraitNames.length / PAGE_SIZE));
@@ -975,7 +975,7 @@ async function showTfValuePicker(interaction, ctx, slug, traitName){
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
-  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
+  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){ console.warn('[traitfind] getCachedTraitIndex failed:', e.message); }
   const matchingRows = traitIndex.filter(t => t.trait_name === traitName);
   if(!matchingRows.length){
     return interaction.update({ content: `No values found for **${traitName}**.`, components: [] });
@@ -1235,7 +1235,7 @@ async function showMaTraitPicker(interaction, ctx, slug, page = 0){
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
-  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
+  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){ console.warn('[traitfind] getCachedTraitIndex failed:', e.message); }
   const allTraitNames = sortTraitNamesTypeFirst([...new Set(traitIndex.map(t => t.trait_name))]);
   const PAGE_SIZE = 24;
   const totalPages = Math.max(1, Math.ceil(allTraitNames.length / PAGE_SIZE));
@@ -1279,7 +1279,7 @@ async function showMaValuePicker(interaction, ctx, slug, traitName){
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
-  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){}
+  try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){ console.warn('[traitfind] getCachedTraitIndex failed:', e.message); }
   const valueRows = traitIndex.filter(t => t.trait_name === traitName).slice(0, 25);
   if(!valueRows.length){
     return interaction.update({ content: `No values found for **${traitName}**.`, components: [] });
