@@ -500,13 +500,21 @@ const _roleConflictCache = new Map(); // 'guildId:roleId' -> {result, ts}
 const _traitIndexCache = new Map();
 async function getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug) {
   const cached = _traitIndexCache.get(slug);
-  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached.rows;
+  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) {
+    if (!cached.rows.length) console.warn(`[traitIndex] returning cached EMPTY result for "${slug}" (cached ${Math.round((Date.now()-cached.ts)/1000)}s ago)`);
+    return cached.rows;
+  }
   try {
     const rows = await getTraitIndex(RAILWAY_URL, API_SECRET, slug);
+    if (!rows.length) console.warn(`[traitIndex] API call for "${slug}" succeeded but returned 0 rows`);
     _traitIndexCache.set(slug, { rows, ts: Date.now() });
     return rows;
   } catch(e) {
-    if (cached) return cached.rows;
+    console.warn(`[traitIndex] API call for "${slug}" failed:`, e.message);
+    if (cached) {
+      console.warn(`[traitIndex] falling back to stale cache from ${Math.round((Date.now()-cached.ts)/1000)}s ago`);
+      return cached.rows;
+    }
     throw e;
   }
 }
