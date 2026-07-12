@@ -715,7 +715,7 @@ async function handleConfigButton(interaction, ctx){
   function resolveColFromId(cfg, colId){
     const isPrimary = colId === 'primary';
     const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
+      ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     return { col, isPrimary };
   }
@@ -786,7 +786,7 @@ async function handleConfigButton(interaction, ctx){
     const colId = parts[3];
     const isPrimary = colId === 'primary';
     const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName }
+      ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName }
       : (cfg.collections||[])[parseInt(colId)];
     const modal = new ModalBuilder().setCustomId(`cfg_modal:editcol:${field}:${colId}`).setTitle(`Edit ${field==='contract'?'Contract':'Slug'}`);
     modal.addComponents(new ActionRowBuilder().addComponents(
@@ -885,7 +885,7 @@ async function handleConfigButton(interaction, ctx){
     const colId = customId.split(':')[3];
     const isPrimary = colId === 'primary';
     const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
+      ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
@@ -956,7 +956,7 @@ async function handleConfigButton(interaction, ctx){
     const colId = customId.split(':')[4];
     const isPrimary = colId === 'primary';
     const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
+      ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
@@ -1317,7 +1317,7 @@ async function handleConfigButton(interaction, ctx){
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
+      ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     const status = col.paused ? '⏸️ Paused' : '▶️ Resumed';
@@ -1338,7 +1338,7 @@ async function handleConfigButton(interaction, ctx){
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug, name: cfg.contractName, animated: cfg.animated }
+      ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, animated: cfg.animated }
       : (cfg.collections||[])[parseInt(colId)];
     const isOcasCol = col?.contract?.toLowerCase() === OCAS_CONTRACT;
     return interaction.editReply({
@@ -1701,7 +1701,7 @@ async function handleConfigButton(interaction, ctx){
         .setLabel('OpenSea Collection Slug')
         .setStyle(TextInputStyle.Short)
         .setPlaceholder('on-chain-all-stars')
-        .setValue(cfg.collectionSlug || '')
+        .setValue(cfg.collectionSlug || cfg.slug || '')
         .setRequired(true)
     ));
     return interaction.showModal(modal);
@@ -2109,7 +2109,7 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
       }
       await setConfig(guildId, cfg);
       const col = isPrimary
-        ? { contract:cfg.contract, slug:cfg.collectionSlug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
+        ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
         : cfg.collections[parseInt(colId)];
       return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
     }
@@ -2478,7 +2478,7 @@ async function handleConfigModal(interaction, ctx){
         if(cfg.collectionSlug && cfg.contract){
           try{
             const { maybeStartBackfill } = require('../lib/auto-backfill');
-            const result = await maybeStartBackfill(pgPool, { contract: cfg.contract, slug: cfg.collectionSlug });
+            const result = await maybeStartBackfill(pgPool, { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug });
             if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
           }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
         }
@@ -2503,7 +2503,7 @@ async function handleConfigModal(interaction, ctx){
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
-      ? { contract:cfg.contract, slug:cfg.collectionSlug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
+      ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
       : cfg.collections[parseInt(colId)];
     return interaction.editReply({ content:`✅ Updated.${waitMsg}`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
   }
