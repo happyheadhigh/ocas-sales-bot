@@ -2384,7 +2384,14 @@ async function showMeWallet(interaction, ctx){
     lines.push('');
   }
 
-  lines.push(`[📊 Full analytics on TraitView](https://traitview.com/wallet/${wallet})`);
+  // TraitView is a single-page app with no dedicated /wallet/:address route --
+  // confirmed broken in production (linked straight to a bogus path that
+  // rendered a stray "Quick preview / Not in current filters" overlay, not
+  // an actual wallet page). Every other TraitView deep-link in this codebase
+  // uses a query param the SPA actually reads (?jump=, ?token=, ?verify=true);
+  // there's no equivalent ?wallet= handler client-side yet, so point at the
+  // homepage for now rather than a URL that 404s/misbehaves.
+  lines.push(`[📊 Full analytics on TraitView](https://traitview.com)`);
 
   const embed = new EmbedBuilder()
     .setTitle('💼 Portfolio')
