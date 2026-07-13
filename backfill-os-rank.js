@@ -1,8 +1,13 @@
 /**
  * backfill-os-rank.js
  * ─────────────────────────────────────────────────────────────────
- * One-time script to fetch OpenSea rarity rank for all 10,000 OCAS
- * tokens and store it in the tokens.os_rank column in Railway Postgres.
+ * One-time script to fetch OpenSea rarity rank for all "10,000" OCAS
+ * token IDs and store it in the tokens.os_rank column in Railway Postgres.
+ * Skips token IDs already known to be burned (via burn_event_inputs/
+ * burn_events, excluding survivor self-references -- same query pattern
+ * used everywhere else in this repo) instead of wasting an OpenSea call +
+ * delay on an ID that returns 404 anyway. Collection is currently down to
+ * ~8,600 alive tokens after burns, so this skips ~1,400 pointless requests.
  *
  * Usage:
  *   node backfill-os-rank.js
@@ -13,8 +18,8 @@
  * so you can safely stop and resume at any time.
  *
  * Rate limit strategy:
- *   - 200ms between requests (normal)
- *   - 429 → exponential backoff starting at 2s, doubling up to 60s
+ *   - 300ms between requests (normal)
+ *   - 429 → exponential backoff starting at 5s, doubling up to 120s
  *   - 3 consecutive failures → pause 60s then retry
  * ─────────────────────────────────────────────────────────────────
  */
@@ -118,6 +123,17 @@ async function fetchOsRank(tokenId, retries = 0) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ── Burned token IDs — skip these, OpenSea 404s them anyway ──────────────────
+async function loadBurnedIds() {
+  const res = await pool.query(`
+    SELECT DISTINCT bei.burned_token_id
+    FROM burn_event_inputs bei
+    JOIN burn_events be ON be.id = bei.burn_event_id
+    WHERE bei.burned_token_id != be.survivor_token_id
+  `);
+  return new Set(res.rows.map(r => parseInt(r.burned_token_id)));
+}
+
 // ── Ensure os_rank column exists ──────────────────────────────────────────────
 async function ensureColumns() {
   await pool.query(`
@@ -161,16 +177,32 @@ async function main() {
 
   if (!DRY_RUN) await ensureColumns();
 
+  const burnedIds = await loadBurnedIds().catch(e => {
+    console.warn('[BurnedIds] lookup failed (non-fatal, will hit OpenSea for burned IDs too):', e.message);
+    return new Set();
+  });
+  console.log(`   Burned:   ${burnedIds.size} token ID(s) will be skipped\n`);
+
   const progress = loadProgress();
   let startFrom = START_FROM ?? progress.lastCompleted + 1;
 
   if (startFrom > 1) console.log(`⏩ Resuming from token #${startFrom}`);
 
-  const stats = { success: 0, noRank: 0, failed: 0, skipped: startFrom - 1 };
+  const stats = { success: 0, noRank: 0, failed: 0, skipped: startFrom - 1, burnedSkipped: 0 };
   let batch = [];
   let consecutiveFails = 0;
 
   for (let id = startFrom; id <= TOTAL_TOKENS; id++) {
+    if (burnedIds.has(id)) {
+      stats.burnedSkipped++;
+      if (id % 100 === 0) {
+        progress.lastCompleted = id;
+        saveProgress(progress);
+        const pct = ((id / TOTAL_TOKENS) * 100).toFixed(1);
+        console.log(`  📍 Checkpoint: ${id}/${TOTAL_TOKENS} (${pct}%) — ✓${stats.success} 🔥${stats.burnedSkipped} ✗${stats.failed}`);
+      }
+      continue;
+    }
     const result = await fetchOsRank(id);
 
     if (result.error) {
@@ -242,10 +274,11 @@ async function main() {
   saveProgress(progress);
 
   console.log(`\n✅ Backfill complete!`);
-  console.log(`   ✓ Success:  ${stats.success}`);
-  console.log(`   — No rank: ${stats.noRank}`);
-  console.log(`   ✗ Failed:  ${stats.failed}`);
-  console.log(`   ⏩ Skipped: ${stats.skipped}`);
+  console.log(`   ✓ Success:      ${stats.success}`);
+  console.log(`   — No rank:     ${stats.noRank}`);
+  console.log(`   ✗ Failed:      ${stats.failed}`);
+  console.log(`   ⏩ Skipped (resume): ${stats.skipped}`);
+  console.log(`   🔥 Skipped (burned): ${stats.burnedSkipped}`);
   if (DRY_RUN) console.log(`\n   (DRY RUN — nothing was written to DB)`);
 
   await pool.end();
