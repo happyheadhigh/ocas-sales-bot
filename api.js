@@ -2330,52 +2330,73 @@ app.get('/tv/link-status-by-wallet', auth,
 });
 
 
+// ── GET /db/collections ───────────────────────────────────────────────────────
+// Lists the collections registry. Read-only for now — the onboarding
+// trigger that inserts new rows (search an unknown slug -> kick off backfill)
+// is a later phase; this just exposes what's already in the table.
+app.get('/db/collections', auth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT slug, contract, chain, name, status, token_standard, total_supply,
+             is_animated, has_svg_images, error_message,
+             traits_synced_at, market_synced_at, created_at, updated_at
+      FROM collections
+      ORDER BY (slug = $1) DESC, created_at ASC
+    `, [OCAS_SLUG]);
+    res.json({ ok: true, collections: result.rows });
+  } catch (e) {
+    console.error('[/db/collections]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 // ── GET /db/traits-fast ───────────────────────────────────────────────────────
 // Serves traits_fast.json structure computed live from DB, excluding burned tokens.
-// Cached in memory for 5 minutes.
+// Cached in memory for 5 minutes, per collection_slug.
 // Returns: { ok, rank: [[id, score], ...], domain: {trait: [values]},
 //            buckets: {count: [ids]}, freq: {trait: {value: count}}, survivorCount }
-let _traitsFastCache = null;
-let _traitsFastCacheTs = 0;
+const _traitsFastCache = new Map(); // slug -> { data, ts }
 const TRAITS_FAST_TTL = 5 * 60 * 1000;
 
 app.get('/db/traits-fast', auth, async (req, res) => {
   try {
+    const slug = (req.query.slug || OCAS_SLUG).toString().toLowerCase();
+    const isOcas = slug === OCAS_SLUG;
     const now = Date.now();
-    if (_traitsFastCache && (now - _traitsFastCacheTs) < TRAITS_FAST_TTL) {
-      return res.json(_traitsFastCache);
+    const cached = _traitsFastCache.get(slug);
+    if (cached && (now - cached.ts) < TRAITS_FAST_TTL) {
+      return res.json(cached.data);
     }
 
-    const BURNED_EXCL = `NOT EXISTS (
+    // Burn mechanic only exists for OCAS — burn_event_inputs/burn_events have
+    // no collection_slug column, so this must never run for other slugs, or a
+    // numerically-colliding token_id in another collection (e.g. Fluxeto #81)
+    // could get wrongly excluded as "burned". See the cross-collection image
+    // collision bug fixed 2026-06-28 for the same underlying class of issue.
+    const BURNED_EXCL = isOcas ? `NOT EXISTS (
       SELECT 1 FROM burn_event_inputs bei
       JOIN burn_events be ON be.id = bei.burn_event_id
       WHERE bei.burned_token_id = t.id
       AND bei.burned_token_id != be.survivor_token_id
-    )`;
+    )` : 'TRUE';
 
-    const BURNED_EXCL_TT = `NOT EXISTS (
+    const BURNED_EXCL_TT = isOcas ? `NOT EXISTS (
       SELECT 1 FROM burn_event_inputs bei
       JOIN burn_events be ON be.id = bei.burn_event_id
       WHERE bei.burned_token_id = tt.token_id
       AND bei.burned_token_id != be.survivor_token_id
-    )`;
+    )` : 'TRUE';
 
     // 1. Surviving tokens sorted by obs_rank ASC (pre-computed rank in DB)
     // Falls back to id order if obs_rank not available
-    // NOTE: hardcoded to OCAS_SLUG for now — TraitView itself isn't
-    // multi-collection aware yet (no slug param sent), so without this
-    // filter, other configured collections' tokens/traits merge in here
-    // too (confirmed: Fluxeto traits appearing in TraitView's OCAS filter
-    // panel, same root cause as the /traitfind cross-collection bug fixed
-    // 2026-07-01 — the JOIN below also previously matched on token_id
-    // alone with no collection_slug check on either side).
     const [rankRes, traitRes] = await Promise.all([
       pool.query(`
         SELECT t.id, t.obs_rank, t.trait_count
         FROM tokens t
         WHERE t.collection_slug = $1 AND ${BURNED_EXCL}
         ORDER BY t.obs_rank ASC NULLS LAST, t.id ASC
-      `, [OCAS_SLUG]),
+      `, [slug]),
       // 2. Trait frequencies for surviving tokens
       pool.query(`
         SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS freq
@@ -2384,7 +2405,7 @@ app.get('/db/traits-fast', auth, async (req, res) => {
         WHERE tt.collection_slug = $1 AND ${BURNED_EXCL_TT}
         GROUP BY tt.trait_name, tt.trait_value
         ORDER BY tt.trait_name, tt.trait_value
-      `, [OCAS_SLUG])
+      `, [slug])
     ]);
 
     // rank array: [[id, obsRank], ...] sorted by obs_rank ASC
@@ -2416,9 +2437,9 @@ app.get('/db/traits-fast', auth, async (req, res) => {
       buckets[key].push(parseInt(id));
     }
 
-    _traitsFastCache = { ok: true, rank, domain, freq, buckets, survivorCount: rankRes.rows.length };
-    _traitsFastCacheTs = now;
-    res.json(_traitsFastCache);
+    const data = { ok: true, rank, domain, freq, buckets, survivorCount: rankRes.rows.length };
+    _traitsFastCache.set(slug, { data, ts: now });
+    res.json(data);
   } catch (e) {
     console.error('[/db/traits-fast]', e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -2429,45 +2450,56 @@ app.get('/db/traits-fast', auth, async (req, res) => {
 // ── GET /db/all-traits ────────────────────────────────────────────────────────
 // Returns all surviving tokens' traits in chunk-compatible format.
 // Used by TraitView to replace static chunk files with live DB data.
-// Server-side cache: 5 minutes. One DB query per 5 min regardless of visitors.
+// Server-side cache: 5 minutes per collection_slug.
 // Returns: { ok, tokens: { "1": { traits: {...} }, ... }, survivorCount }
-let _allTraitsCache = null;
-let _allTraitsCacheTs = 0;
+const _allTraitsCache = new Map(); // slug -> { data, ts }
 const ALL_TRAITS_TTL = 5 * 60 * 1000;
 
 app.get('/db/all-traits', auth, async (req, res) => {
   try {
+    const slug = (req.query.slug || OCAS_SLUG).toString().toLowerCase();
+    const isOcas = slug === OCAS_SLUG;
     const now = Date.now();
-    if (_allTraitsCache && (now - _allTraitsCacheTs) < ALL_TRAITS_TTL) {
-      return res.json(_allTraitsCache);
+    const cached = _allTraitsCache.get(slug);
+    if (cached && (now - cached.ts) < ALL_TRAITS_TTL) {
+      return res.json(cached.data);
     }
 
-    // Get all surviving token IDs
-    // NOTE: hardcoded to OCAS_SLUG for now — same reasoning as /db/traits-fast above.
-    const survivorsRes = await pool.query(`
-      SELECT t.id, t.image_url
-      FROM tokens t
-      WHERE t.collection_slug = $1 AND NOT EXISTS (
-        SELECT 1 FROM burn_event_inputs bei
-        JOIN burn_events be ON be.id = bei.burn_event_id
-        WHERE bei.burned_token_id = t.id
-        AND bei.burned_token_id != be.survivor_token_id
-      )
-      ORDER BY t.id
-    `, [OCAS_SLUG]);
+    // Burn mechanic only exists for OCAS — see note in /db/traits-fast above.
+    // Gate explicitly on isOcas rather than relying on absence of burn rows,
+    // since a numerically colliding token_id in another collection must
+    // never be excluded.
+    const survivorsRes = isOcas
+      ? await pool.query(`
+          SELECT t.id, t.image_url
+          FROM tokens t
+          WHERE t.collection_slug = $1 AND NOT EXISTS (
+            SELECT 1 FROM burn_event_inputs bei
+            JOIN burn_events be ON be.id = bei.burn_event_id
+            WHERE bei.burned_token_id = t.id
+            AND bei.burned_token_id != be.survivor_token_id
+          )
+          ORDER BY t.id
+        `, [slug])
+      : await pool.query(`
+          SELECT t.id, t.image_url
+          FROM tokens t
+          WHERE t.collection_slug = $1
+          ORDER BY t.id
+        `, [slug]);
 
     const survivorIds = new Set(survivorsRes.rows.map(r => parseInt(r.id)));
     const imageUrlById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), r.image_url || null]));
-    // tokens.image_url is written live by burn-poller.js at burn-finalization
-    // time but has confirmed historical gaps (NULL/stale for some survivors —
-    // see check-live-metadata-gaps.js). burn_state_snapshots is the same
-    // ground-truth source /db/token/:id/burn-history already uses
-    // successfully, so prefer it here and only fall back to image_url where
-    // a snapshot doesn't exist yet.
-    const survivorSnapshotImages = await getSurvivorImageMap([...survivorIds]).catch(e => {
-      console.warn('[/db/all-traits] survivor snapshot image lookup failed (non-fatal):', e.message);
-      return {};
-    });
+
+    // burn_state_snapshots is OCAS-only ground truth for post-burn survivor
+    // images — skip entirely for other collections; tokens.image_url (or
+    // token_svg_cache, read separately by the frontend) is the only source.
+    const survivorSnapshotImages = isOcas
+      ? await getSurvivorImageMap([...survivorIds]).catch(e => {
+          console.warn('[/db/all-traits] survivor snapshot image lookup failed (non-fatal):', e.message);
+          return {};
+        })
+      : {};
 
     // Get all traits for surviving tokens in one query
     const traitsRes = await pool.query(`
@@ -2475,15 +2507,13 @@ app.get('/db/all-traits', auth, async (req, res) => {
       FROM token_traits tt
       WHERE tt.collection_slug = $2 AND tt.token_id = ANY($1::int[])
       ORDER BY tt.token_id, COALESCE(tt.trait_index, 0), tt.trait_name
-    `, [[...survivorIds], OCAS_SLUG]);
+    `, [[...survivorIds], slug]);
 
     // Build tokens object: { "1": { traits: { "Type": "Human 6", ... }, image: "..." }, ... }
     const tokens = {};
 
     // Initialize all survivors with empty traits + current image (snapshot
-    // preferred, tokens.image_url as fallback — most non-survivor tokens
-    // will have image:null here, which is fine, TraitView already falls
-    // back to its own static image source for those)
+    // preferred for OCAS, tokens.image_url as fallback/only-source otherwise)
     for (const id of survivorIds) {
       tokens[String(id)] = { traits: {}, image: survivorSnapshotImages[id] || imageUrlById.get(id) || null };
     }
@@ -2496,10 +2526,10 @@ app.get('/db/all-traits', auth, async (req, res) => {
       }
     }
 
-    _allTraitsCache = { ok: true, tokens, survivorCount: survivorIds.size };
-    _allTraitsCacheTs = now;
+    const data = { ok: true, tokens, survivorCount: survivorIds.size };
+    _allTraitsCache.set(slug, { data, ts: now });
 
-    res.json(_allTraitsCache);
+    res.json(data);
   } catch (e) {
     console.error('[/db/all-traits]', e.message);
     res.status(500).json({ ok: false, error: e.message });
