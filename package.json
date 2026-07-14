@@ -12,13 +12,16 @@
     "burn:repair": "node burn-backfill-repair.js"
   },
   "dependencies": {
+    "@opensea/stream-js": "^0.4.0",
     "@supabase/supabase-js": "^2.39.0",
     "discord.js": "^14.14.0",
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
     "node-fetch": "^2.7.0",
+    "node-localstorage": "^3.0.5",
     "pg": "^8.20.0",
-    "sharp": "^0.33.3"
+    "sharp": "^0.33.3",
+    "ws": "^8.21.0"
   },
   "engines": {
     "node": ">=18.0.0"

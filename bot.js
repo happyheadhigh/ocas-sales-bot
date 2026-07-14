@@ -82,6 +82,7 @@ const {
   traitGroupsLabel, buildTokenSearchEmbed,
   lastSaleIds, lastListingIds,
 } = require('./lib/poll');
+const { initOpenSeaStream } = require('./lib/opensea-stream');
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
 const {
@@ -2262,6 +2263,13 @@ client.once('clientReady', async ()=>{
   pollListings();
   setInterval(pollSales, POLL_MS);
   setInterval(pollListings, POLL_MS);
+  // OpenSea Stream connector — instant listing/sale posting via WebSocket
+  // push instead of waiting for the next poll cycle. Runs ALONGSIDE the
+  // REST polling above for now, not replacing it — see lib/opensea-stream.js
+  // for exactly what is/isn't covered yet and why. Do not remove the
+  // polling above until Stream has been validated running for a real
+  // stretch of time.
+  initOpenSeaStream(client);
   // Persist cursors every 60s so restarts lose at most 1 min of cursor progress
   setInterval(saveSaleCursors, 60_000);
   setInterval(saveListingCursors, 60_000);
