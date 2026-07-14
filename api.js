@@ -219,7 +219,7 @@ app.get('/db/tokens', auth, async (req, res) => {
 app.get('/db/token/:id', auth, async (req, res) => {
   try {
     const tokenId = parseInt(req.params.id);
-    if (!tokenId || tokenId < 1 || tokenId > 10000) {
+    if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) { // generous, collection-agnostic bound — was hardcoded to OCAS's ~10k supply and also rejected token id 0 (breaks 0-indexed collections like CryptoPunks)
       return res.status(400).json({ ok: false, error: 'invalid token id' });
     }
     // Defaults to OCAS when no slug is provided so any caller not yet updated
@@ -413,7 +413,7 @@ app.get('/db/floor-trend', auth, async (req, res) => {
 app.get('/db/token-sales', auth, async (req, res) => {
   try {
     const tokenId = parseInt(req.query.token_id);
-    if (!tokenId || tokenId < 1 || tokenId > 10000) {
+    if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) { // generous, collection-agnostic bound — was hardcoded to OCAS's ~10k supply and also rejected token id 0 (breaks 0-indexed collections like CryptoPunks)
       return res.status(400).json({ ok: false, error: 'invalid token_id' });
     }
     const limit = Math.min(parseInt(req.query.limit || '200'), 500);
@@ -1843,7 +1843,7 @@ app.get('/db/wallet/:address/traits', auth, async (req, res) => {
 // ── GET /db/token/:id/history ────────────────────────────────────────────────
 app.get('/db/token/:id/history', auth, async (req, res) => {
   const tokenId = parseInt(req.params.id, 10);
-  if (!tokenId || tokenId < 1 || tokenId > 10000) return res.status(400).json({ ok: false, error: 'invalid token id' });
+  if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) return res.status(400).json({ ok: false, error: 'invalid token id' }); // generous, collection-agnostic bound — see /db/token/:id above for why
   const limit = intParam(req.query.limit, 100, 200);
   try {
     const result = await pool.query(`
