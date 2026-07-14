@@ -406,6 +406,145 @@ async function syncAllSales() {
 syncAllSales();
 setInterval(syncAllSales, 15 * 60 * 1000);
 
+// ── One-time full sales history seed for a newly onboarded collection ───────
+// Distinct from syncSales above: that one is deliberately capped at ~1000
+// recent events for the ongoing rolling sync (every 15 min), which is the
+// right bound for "stay current" but wrong for "give a brand-new collection
+// its actual trading history" — a collection could easily have many
+// thousands of historical sales going back to mint. This walks the full
+// event history with a much higher safety cap (50,000 sales) rather than no
+// cap at all, so a pathological collection can't run forever unnoticed —
+// hitting the cap logs clearly rather than failing silently.
+async function seedFullSalesHistory(collection) {
+  const { slug } = collection;
+  console.log(`[seed] Starting FULL sales history pull for ${slug} at ${new Date().toISOString()}`);
+
+  const MAX_PLAUSIBLE_TOKEN_ID = 10_000_000;
+  const MAX_PLAUSIBLE_PRICE_ETH = 100_000;
+  const MAX_PAGES = 500; // 500 * 100 = 50,000 sales safety cap
+
+  let cursor = null;
+  let pages = 0;
+  let totalWritten = 0;
+
+  try {
+    do {
+      const qs = new URLSearchParams({ event_type: 'sale', limit: '100' });
+      if (cursor) qs.set('next', cursor);
+
+      const resp = await fetch(
+        `https://api.opensea.io/api/v2/events/collection/${slug}?${qs}`,
+        { headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' } }
+      );
+
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        throw new Error(`OpenSea HTTP ${resp.status} on page ${pages}: ${errText.slice(0, 200)}`);
+      }
+
+      const body = await resp.json();
+      const events = body.asset_events || [];
+      const pageSales = [];
+
+      for (const ev of events) {
+        const rawId = ev?.nft?.identifier || ev?.asset?.token_id;
+        if (!rawId) continue;
+        const token_id = parseInt(rawId, 10);
+        if (isNaN(token_id) || token_id < 0 || token_id > MAX_PLAUSIBLE_TOKEN_ID) continue;
+
+        const priceWei = ev?.payment?.quantity || ev?.total_price;
+        if (!priceWei) continue;
+        const price_eth = parseFloat(priceWei) / 1e18;
+        if (isNaN(price_eth) || price_eth <= 0 || price_eth > MAX_PLAUSIBLE_PRICE_ETH) continue;
+
+        const currency = ev?.payment?.symbol || 'ETH';
+        const buyer  = ev?.buyer  || ev?.winner_account?.address || null;
+        const seller = ev?.seller || ev?.from_account?.address   || null;
+        const sale_ts = ev?.closing_date
+          ? new Date(ev.closing_date * 1000).toISOString()
+          : ev?.event_timestamp || new Date().toISOString();
+        const tx_hash = ev?.transaction || null;
+
+        pageSales.push({ token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash });
+      }
+
+      if (pageSales.length) {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          for (let i = 0; i < pageSales.length; i += 100) {
+            const batch = pageSales.slice(i, i + 100);
+            const vals = batch.map((_, j) =>
+              `($${j*8+1},$${j*8+2},$${j*8+3},$${j*8+4},$${j*8+5},$${j*8+6},$${j*8+7},$${j*8+8})`
+            ).join(', ');
+            const params = batch.flatMap(s => [
+              s.token_id, s.price_eth, s.currency, s.buyer, s.seller, s.sale_ts, s.tx_hash, slug
+            ]);
+            await client.query(`
+              INSERT INTO sales (token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash, collection_slug)
+              VALUES ${vals}
+              ON CONFLICT (token_id, sale_ts, collection_slug) DO NOTHING
+            `, params);
+          }
+          await client.query('COMMIT');
+          totalWritten += pageSales.length;
+        } catch (e) {
+          await client.query('ROLLBACK');
+          throw e;
+        } finally {
+          client.release();
+        }
+      }
+
+      cursor = body.next || null;
+      pages++;
+      if (pages % 20 === 0) console.log(`[seed] [${slug}] ...${pages} pages, ${totalWritten} sales written so far`);
+      if (pages >= MAX_PAGES) {
+        console.warn(`[seed] [${slug}] Hit the ${MAX_PAGES}-page safety cap (${MAX_PAGES * 100} events) — history pull stopped early, not necessarily complete`);
+        break;
+      }
+      if (cursor) await new Promise(r => setTimeout(r, 80));
+    } while (cursor);
+
+    console.log(`[seed] [${slug}] ✓ Full sales history pull complete: ${totalWritten} sales across ${pages} pages`);
+    return { ok: true, salesWritten: totalWritten, pages };
+  } catch (e) {
+    console.error(`[seed] [${slug}] Sales history pull failed after ${pages} pages, ${totalWritten} sales written:`, e.message);
+    throw e;
+  }
+}
+
+// Orchestrates the full one-time onboarding seed for a newly added
+// collection: full sales history (above) + current listings snapshot
+// (syncListings, unchanged — its existing cap is already right for "current
+// active listings"), with the collections registry status updated
+// throughout so the frontend/onboarding trigger can poll progress.
+async function seedMarketHistory(collection) {
+  const { slug } = collection;
+  try {
+    await pool.query(
+      `UPDATE collections SET status = 'backfilling_market', updated_at = NOW() WHERE slug = $1`,
+      [slug]
+    );
+
+    await seedFullSalesHistory(collection);
+    await syncListings(collection);
+
+    await pool.query(
+      `UPDATE collections SET status = 'ready', market_synced_at = NOW(), updated_at = NOW() WHERE slug = $1`,
+      [slug]
+    );
+    console.log(`[seed] [${slug}] Market history seed complete — status set to ready`);
+  } catch (e) {
+    await pool.query(
+      `UPDATE collections SET status = 'failed', error_message = $2, updated_at = NOW() WHERE slug = $1`,
+      [slug, e.message]
+    ).catch(dbErr => console.error(`[seed] [${slug}] Also failed to record error status:`, dbErr.message));
+    console.error(`[seed] [${slug}] Market history seed failed:`, e.message);
+    throw e;
+  }
+}
+
 // Export for use in api.js trigger endpoint
-module.exports = { syncListings, syncSales, syncAllListings, syncAllSales, discoverCollections };
+module.exports = { syncListings, syncSales, syncAllListings, syncAllSales, discoverCollections, seedFullSalesHistory, seedMarketHistory };
 })(); // end guard IIFE

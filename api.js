@@ -350,6 +350,32 @@ app.get('/db/listings/sync', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/collections/:slug/seed-market — one-time full sales history +
+// current listings pull for a newly onboarded collection. Runs in the
+// background; poll /db/collections (added in phase 1) to watch status go
+// pending -> backfilling_market -> ready/failed. Expects the collection row
+// to already exist (created by the trait/image backfill step) — this only
+// covers the market side.
+app.get('/db/collections/:slug/seed-market', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    const existing = await pool.query(`SELECT slug, contract FROM collections WHERE slug = $1`, [slug]);
+    if (!existing.rows.length) {
+      return res.status(404).json({ ok: false, error: `No collections row for slug "${slug}" — run the trait/image backfill first` });
+    }
+
+    res.json({ ok: true, message: `Market history seed started for ${slug} — running in background, poll /db/collections to watch status` });
+    syncListingsModule.seedMarketHistory(existing.rows[0]).catch(e => {
+      console.error(`[/db/collections/${slug}/seed-market] background seed failed:`, e.message);
+    });
+  } catch(e) {
+    console.error('/db/collections/:slug/seed-market error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/listings — all current listings from DB ───────────────────────────
 app.get('/db/listings', auth, async (req, res) => {
   try {
