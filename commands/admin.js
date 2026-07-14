@@ -1,7 +1,7 @@
 'use strict';
 
 const { EmbedBuilder, MessageFlags } = require('discord.js');
-const { COLORS } = require('../lib/constants');
+const { COLORS, OWNER_DISCORD_IDS } = require('../lib/constants');
 
 /**
  * Handle admin configuration commands.
@@ -155,10 +155,47 @@ if(commandName === 'verifydashboard'){
   }
 }
 
+if(commandName === 'globalstats'){
+  // Hard owner gate — independent of Discord's default_member_permissions,
+  // which only hides the command from the picker and can still be granted
+  // to someone else by a server admin. This check is the real boundary.
+  const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+  if(!isOwner) return interaction.reply({ content:'Unknown command.', flags: MessageFlags.Ephemeral });
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const { pgPool } = ctx;
+  try{
+    const [verifiedRes, uniqueRes, serverRes] = await Promise.all([
+      pgPool.query(`SELECT COUNT(*) FROM user_registrations WHERE verified = true`),
+      pgPool.query(`SELECT COUNT(DISTINCT wallet) FROM user_registrations WHERE verified = true AND wallet IS NOT NULL`),
+      pgPool.query(`SELECT COUNT(*) FROM server_configs`),
+    ]);
+    const verifiedCount = parseInt(verifiedRes.rows[0].count);
+    const uniqueWallets = parseInt(uniqueRes.rows[0].count);
+    const serverCount   = parseInt(serverRes.rows[0].count);
+
+    const embed = new EmbedBuilder()
+      .setTitle('🌐 Global Bot Stats')
+      .setColor(0x7aa2ff)
+      .addFields(
+        { name:'👥 Verified (rows)', value:'**'+verifiedCount+'**', inline:true },
+        { name:'🔑 Unique Wallets',  value:'**'+uniqueWallets+'**', inline:true },
+        { name:'🏠 Servers',         value:'**'+serverCount+'**',   inline:true },
+      )
+      .setFooter({ text:'Owner-only • bot-wide across all servers' })
+      .setTimestamp();
+
+    return interaction.editReply({ embeds:[embed] });
+  }catch(e){
+    console.error('[GlobalStats]', e.message);
+    return interaction.editReply({ content:'❌ Failed to load stats: '+e.message });
+  }
+}
+
 }
 
 const ADMIN_COMMANDS = new Set([
-  'setuphere','setlistingshere','setlistings','verifydashboard','status',
+  'setuphere','setlistingshere','setlistings','verifydashboard','status','globalstats',
 ]);
 
 // ── /verifydashboard ──────────────────────────────────────────────────────────

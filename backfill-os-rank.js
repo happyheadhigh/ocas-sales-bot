@@ -1,20 +1,31 @@
 /**
  * backfill-os-rank.js
  * ─────────────────────────────────────────────────────────────────
- * One-time script to fetch OpenSea rarity rank for all 10,000 OCAS
- * tokens and store it in the tokens.os_rank column in Railway Postgres.
+ * One-time script to fetch OpenSea rarity rank for all "10,000" OCAS
+ * token IDs and store it in the tokens.os_rank column in Railway Postgres.
+ * Skips token IDs already known to be burned (via burn_event_inputs/
+ * burn_events, excluding survivor self-references -- same query pattern
+ * used everywhere else in this repo) instead of wasting an OpenSea call +
+ * delay on an ID that returns 404 anyway. Collection is currently down to
+ * ~8,600 alive tokens after burns, so this skips ~1,400 pointless requests.
  *
  * Usage:
  *   node backfill-os-rank.js
  *   node backfill-os-rank.js --start 1000   # resume from token 1000
  *   node backfill-os-rank.js --dry-run       # test without writing to DB
  *
- * Progress is checkpointed every 100 tokens to backfill-progress.json
- * so you can safely stop and resume at any time.
+ * Progress is checkpointed every 100 tokens to the backfill_checkpoints
+ * table in Postgres (NOT a local file) -- this runs via `railway run`/one-
+ * off shells that don't persist a local filesystem across invocations,
+ * confirmed directly: a checkpoint written to backfill-progress.json in
+ * one container silently vanished by the next `node backfill-os-rank.js`
+ * call, even though the os_rank/os_score writes from that same run (which
+ * go straight to Postgres) were all still there. Only Postgres survives
+ * across containers here, so that's where the resume position has to live.
  *
  * Rate limit strategy:
- *   - 200ms between requests (normal)
- *   - 429 → exponential backoff starting at 2s, doubling up to 60s
+ *   - 300ms between requests (normal)
+ *   - 429 → exponential backoff starting at 5s, doubling up to 120s
  *   - 3 consecutive failures → pause 60s then retry
  * ─────────────────────────────────────────────────────────────────
  */
@@ -22,7 +33,6 @@
 require('dotenv').config();
 const { Pool }  = require('pg');
 const fetch     = require('node-fetch');
-const fs        = require('fs');
 const path      = require('path');
 
 // ── Environment selection ────────────────────────────────────────────────────
@@ -42,8 +52,9 @@ if(envName){
 
 const CONTRACT      = '0x078be86f3104a32313a47815792230a3808642cc';
 const TOTAL_TOKENS  = 10000;
-const DELAY_MS      = 500;   // ms between normal requests
-const CHECKPOINT_FILE = path.join(__dirname, 'backfill-progress.json');
+const delayArgIdx   = process.argv.indexOf('--delay');
+const DELAY_MS      = delayArgIdx !== -1 ? parseInt(process.argv[delayArgIdx + 1]) : 300;   // ms between normal requests -- 200 empirically hit 429s during tonight's cost-basis restore against the same OpenSea key, so defaulting higher; 429 handling below still backs off automatically if this is still too aggressive
+const CHECKPOINT_SCRIPT_NAME = 'os-rank';
 
 const OPENSEA_KEY   = process.env.OPENSEA_KEY || process.env.OPENSEA_API_KEY;
 const dbUrlArgIdx   = process.argv.indexOf('--db-url');
@@ -61,17 +72,32 @@ const pool = new Pool({
   max: 2,
 });
 
-// ── Load/save checkpoint ──────────────────────────────────────────────────────
-function loadProgress() {
-  try {
-    if (fs.existsSync(CHECKPOINT_FILE))
-      return JSON.parse(fs.readFileSync(CHECKPOINT_FILE, 'utf8'));
-  } catch {}
-  return { lastCompleted: 0, failed: [] };
+// ── Load/save checkpoint (Postgres-backed -- see header note) ────────────────
+async function ensureCheckpointTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS backfill_checkpoints (
+      script_name    TEXT PRIMARY KEY,
+      last_completed INT NOT NULL DEFAULT 0,
+      updated_at     TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
 }
 
-function saveProgress(progress) {
-  try { fs.writeFileSync(CHECKPOINT_FILE, JSON.stringify(progress, null, 2)); } catch {}
+async function loadProgress() {
+  const res = await pool.query(
+    `SELECT last_completed FROM backfill_checkpoints WHERE script_name=$1`,
+    [CHECKPOINT_SCRIPT_NAME]
+  );
+  return { lastCompleted: res.rows[0]?.last_completed || 0, failed: [] };
+}
+
+async function saveProgress(progress) {
+  await pool.query(
+    `INSERT INTO backfill_checkpoints (script_name, last_completed, updated_at)
+     VALUES ($1,$2,NOW())
+     ON CONFLICT (script_name) DO UPDATE SET last_completed=$2, updated_at=NOW()`,
+    [CHECKPOINT_SCRIPT_NAME, progress.lastCompleted]
+  ).catch(e => console.warn('[Checkpoint] save failed (non-fatal):', e.message));
 }
 
 // ── Fetch OS rank for a single token ─────────────────────────────────────────
@@ -117,6 +143,17 @@ async function fetchOsRank(tokenId, retries = 0) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ── Burned token IDs — skip these, OpenSea 404s them anyway ──────────────────
+async function loadBurnedIds() {
+  const res = await pool.query(`
+    SELECT DISTINCT bei.burned_token_id
+    FROM burn_event_inputs bei
+    JOIN burn_events be ON be.id = bei.burn_event_id
+    WHERE bei.burned_token_id != be.survivor_token_id
+  `);
+  return new Set(res.rows.map(r => parseInt(r.burned_token_id)));
+}
+
 // ── Ensure os_rank column exists ──────────────────────────────────────────────
 async function ensureColumns() {
   await pool.query(`
@@ -159,17 +196,34 @@ async function main() {
   console.log(`   Delay:    ${DELAY_MS}ms between requests\n`);
 
   if (!DRY_RUN) await ensureColumns();
+  await ensureCheckpointTable();
 
-  const progress = loadProgress();
+  const burnedIds = await loadBurnedIds().catch(e => {
+    console.warn('[BurnedIds] lookup failed (non-fatal, will hit OpenSea for burned IDs too):', e.message);
+    return new Set();
+  });
+  console.log(`   Burned:   ${burnedIds.size} token ID(s) will be skipped\n`);
+
+  const progress = await loadProgress();
   let startFrom = START_FROM ?? progress.lastCompleted + 1;
 
   if (startFrom > 1) console.log(`⏩ Resuming from token #${startFrom}`);
 
-  const stats = { success: 0, noRank: 0, failed: 0, skipped: startFrom - 1 };
+  const stats = { success: 0, noRank: 0, failed: 0, skipped: startFrom - 1, burnedSkipped: 0 };
   let batch = [];
   let consecutiveFails = 0;
 
   for (let id = startFrom; id <= TOTAL_TOKENS; id++) {
+    if (burnedIds.has(id)) {
+      stats.burnedSkipped++;
+      if (id % 100 === 0) {
+        progress.lastCompleted = id;
+        await saveProgress(progress);
+        const pct = ((id / TOTAL_TOKENS) * 100).toFixed(1);
+        console.log(`  📍 Checkpoint: ${id}/${TOTAL_TOKENS} (${pct}%) — ✓${stats.success} 🔥${stats.burnedSkipped} ✗${stats.failed}`);
+      }
+      continue;
+    }
     const result = await fetchOsRank(id);
 
     if (result.error) {
@@ -208,7 +262,7 @@ async function main() {
     // Checkpoint every 100 tokens
     if (id % 100 === 0) {
       progress.lastCompleted = id;
-      saveProgress(progress);
+      await saveProgress(progress);
       const pct = ((id / TOTAL_TOKENS) * 100).toFixed(1);
       const eta = Math.round(((TOTAL_TOKENS - id) * DELAY_MS) / 60000);
       console.log(`  📍 Checkpoint: ${id}/${TOTAL_TOKENS} (${pct}%) — ~${eta}min remaining | ✓${stats.success} ✗${stats.failed}`);
@@ -238,13 +292,14 @@ async function main() {
 
   progress.lastCompleted = TOTAL_TOKENS;
   progress.completedAt = new Date().toISOString();
-  saveProgress(progress);
+  await saveProgress(progress);
 
   console.log(`\n✅ Backfill complete!`);
-  console.log(`   ✓ Success:  ${stats.success}`);
-  console.log(`   — No rank: ${stats.noRank}`);
-  console.log(`   ✗ Failed:  ${stats.failed}`);
-  console.log(`   ⏩ Skipped: ${stats.skipped}`);
+  console.log(`   ✓ Success:      ${stats.success}`);
+  console.log(`   — No rank:     ${stats.noRank}`);
+  console.log(`   ✗ Failed:      ${stats.failed}`);
+  console.log(`   ⏩ Skipped (resume): ${stats.skipped}`);
+  console.log(`   🔥 Skipped (burned): ${stats.burnedSkipped}`);
   if (DRY_RUN) console.log(`\n   (DRY RUN — nothing was written to DB)`);
 
   await pool.end();

@@ -2384,7 +2384,13 @@ async function showMeWallet(interaction, ctx){
     lines.push('');
   }
 
-  lines.push(`[📊 Full analytics on TraitView](https://traitview.com/wallet/${wallet})`);
+  // TraitView now handles ?wallet= (traitview c46a4dd's follow-up) --
+  // deep-links straight into the read-only Wallet analytics tab for this
+  // address, no wallet connection required. Previously pointed at
+  // /wallet/${wallet}, a path that doesn't exist on this single-page app and
+  // rendered a stray "Quick preview / Not in current filters" overlay instead
+  // of an actual wallet page.
+  lines.push(`[📊 Full analytics on TraitView](https://traitview.com/?wallet=${wallet})`);
 
   const embed = new EmbedBuilder()
     .setTitle('💼 Portfolio')

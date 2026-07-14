@@ -73,6 +73,8 @@ const commands = [
   new SlashCommandBuilder().setName('config').setDescription('Configure your bot — collections, channels, roles (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('lotteries').setDescription('View live and completed lotteries and giveaways'),
   new SlashCommandBuilder().setName('giveaway').setDescription('Start a burn lottery, giveaway, guess game, or instant draw (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName('globalstats').setDescription('Owner only').setDefaultMemberPermissions('0'),
+
   new SlashCommandBuilder().setName('resetverify')
     .setDescription('Clear a member\'s verification so they can verify again (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
