@@ -23,6 +23,7 @@ const { runMigrations } = require('./lib/db');
 // [sync] log lines were ever appearing, on this version or the version
 // before today's rewrite.
 const syncListingsModule = require('./sync-listings');
+const { onboardCollection } = require('./lib/collection-onboard');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -346,6 +347,38 @@ app.get('/db/listings/sync', auth, async (req, res) => {
     res.json({ ok: true, message: 'Sync triggered for all configured collections — running in background' });
     syncListingsModule.syncAllListings();
   } catch(e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/onboard — full onboarding for a brand-new collection ──
+// Resolves the slug via OpenSea, validates it (rejects disabled/NSFW/non-
+// Ethereum/non-erc721 collections), creates the registry row, then runs
+// trait/image backfill followed by the market history seed in sequence.
+// Runs in background; poll /db/collections to watch status move through
+// pending -> backfilling_traits -> backfilling_market -> ready/failed.
+//
+// Admin-only, gated by a SEPARATE secret from the regular API key — that
+// key is already embedded in TraitView's public frontend JS (visible via
+// devtools), so it can't provide real gating for something that kicks off
+// OpenSea/Alchemy-heavy work. ADMIN_ONBOARD_SECRET must be set on Railway
+// and never given to the frontend; trigger manually (browser URL bar or
+// curl) until there's a considered decision to open this up more broadly.
+const ADMIN_ONBOARD_SECRET = process.env.ADMIN_ONBOARD_SECRET;
+app.get('/db/collections/onboard', async (req, res) => {
+  try {
+    if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+      return res.status(403).json({ ok: false, error: 'forbidden' });
+    }
+    const slug = String(req.query.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    res.json({ ok: true, message: `Onboarding started for "${slug}" — running in background, poll /db/collections to watch status` });
+    onboardCollection(pool, slug).catch(e => {
+      console.error(`[/db/collections/onboard] ${slug} failed:`, e.message);
+    });
+  } catch(e) {
+    console.error('/db/collections/onboard error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
