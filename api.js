@@ -12,7 +12,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const { OCAS_SLUG, BURN_CONTRACT } = require('./lib/constants');
-const { runMigrations } = require('./lib/db');
+const { runMigrations, fetchAndStoreCollectionTraits } = require('./lib/db');
 
 // Loaded at module level (not lazily inside a route handler) specifically
 // so its setInterval-driven sync loops actually start the moment this
@@ -380,6 +380,24 @@ app.get('/db/collections/onboard', async (req, res) => {
     });
   } catch(e) {
     console.error('/db/collections/onboard error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/:slug/sync-trait-index — populate collection_traits only ──
+// For collections onboarded before onboardCollection started calling this
+// automatically. Pulls trait-frequency stats directly from OpenSea's own
+// /v2/traits/{slug} endpoint (a separate data source from token_traits/
+// Alchemy) — this is specifically what /traitfind's dropdown depends on for
+// non-OCAS collections. Cheap and fast compared to a full re-backfill.
+app.get('/db/collections/:slug/sync-trait-index', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+    await fetchAndStoreCollectionTraits(slug, pool);
+    res.json({ ok: true, message: `Trait index sync attempted for "${slug}" — check /db/trait-index?slug=${slug} to confirm` });
+  } catch(e) {
+    console.error(`/db/collections/${req.params.slug}/sync-trait-index error:`, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
