@@ -5,6 +5,7 @@ const sharp = require('sharp');
 const { AttachmentBuilder, MessageFlags } = require('discord.js');
 const { extractPngFromSvg } = require('../lib/images');
 const { pgPool, dbLoad, dbSave } = require('../lib/db');
+const { SUPPORTED_CHAINS } = require('../lib/collection-backfill');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
 const DOWNLOAD_GUILD_WINDOW_MS = Math.max(10000, parseInt(process.env.DOWNLOAD_GUILD_WINDOW_MS || '60000', 10));
@@ -155,13 +156,20 @@ async function rpcCall(rpcUrl, method, params){
 
 
 async function fetchTokenUri(contract, tokenId, chain=DEFAULT_CHAIN){
-  const wsOrHttpRpc = process.env.ALCHEMY_WEBSOCKET_URL || process.env.ETH_RPC_URL || process.env.ALCHEMY_RPC_URL || '';
-  const rpc = wsOrHttpRpc
-    ? wsOrHttpRpc.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
-    : (process.env.ALCHEMY_API_KEY ? `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : '');
+  const alchemySubdomain = SUPPORTED_CHAINS[chain];
+  const envOverride = process.env.ALCHEMY_WEBSOCKET_URL || process.env.ETH_RPC_URL || process.env.ALCHEMY_RPC_URL || '';
+  // Env-var overrides are Ethereum-specific by their own naming (ETH_RPC_URL
+  // etc.) — only use them when we're actually on Ethereum, otherwise they'd
+  // silently point a non-Ethereum-chain call at an Ethereum RPC, the same
+  // class of bug this fix addresses.
+  const rpc = (chain === 'ethereum' || chain === DEFAULT_CHAIN) && envOverride
+    ? envOverride.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+    : (process.env.ALCHEMY_API_KEY && alchemySubdomain ? `https://${alchemySubdomain}.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : '');
 
   if(!rpc){
-    throw new Error('No Ethereum RPC configured. Set ALCHEMY_WEBSOCKET_URL, ETH_RPC_URL, ALCHEMY_RPC_URL, or ALCHEMY_API_KEY.');
+    throw new Error(alchemySubdomain
+      ? 'No Ethereum RPC configured. Set ALCHEMY_WEBSOCKET_URL, ETH_RPC_URL, ALCHEMY_RPC_URL, or ALCHEMY_API_KEY.'
+      : `Unsupported chain "${chain}" — no Alchemy subdomain known for it.`);
   }
 
   const result = await rpcCall(rpc, 'eth_call', [{ to:contract, data:encodeTokenUriCall(tokenId) }, 'latest']);
