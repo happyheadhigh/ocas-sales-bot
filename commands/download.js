@@ -402,6 +402,19 @@ async function runDownload(interaction, ctx, { tokenId, size, transparent, colle
         if(resolved){ contract = resolved.cfg.contract || contract; slug = resolved.cfg.slug || slug; chain = resolved.cfg.chain || chain; alias = resolved.alias; }
       }
     }
+    // Authoritative chain lookup — server_configs' own collection entries
+    // (primary + extras) never carry a chain field at all, so the branches
+    // above leave `chain` at its default regardless of which collection was
+    // actually resolved. The collections registry (populated during
+    // onboarding via real OpenSea resolution) is the actual source of
+    // truth; only fall back to whatever chain was already set if this
+    // collection predates the registry (e.g. OCAS).
+    try{
+      const chainRow = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]);
+      if(chainRow.rows[0]?.chain) chain = chainRow.rows[0].chain;
+    }catch(e){
+      console.warn('[download] collections chain lookup failed:', e.message);
+    }
     const finalTransparent = transparent;
     const rendered = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent, osHeaders: ctx.osHeaders });
     const { buffer } = rendered;
