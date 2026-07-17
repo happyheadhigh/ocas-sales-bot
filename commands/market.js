@@ -1108,7 +1108,12 @@ async function handleTraitBrowseInteraction(interaction, ctx){
 
   if(customId === 'tf_browse:col'){
     const slug = interaction.values[0];
-    return showTfTraitPicker(interaction, ctx, slug);
+    try{
+      return await showTfTraitPicker(interaction, ctx, slug);
+    }catch(e){
+      console.error('[tf_browse:col]', e.message);
+      return interaction.update({ content: `❌ Could not load traits for **${slug}**: ${e.message}`, components:[] }).catch(()=>{});
+    }
   }
 
   if(customId.startsWith('tf_browse:trait:')){

@@ -232,7 +232,7 @@ app.get('/db/token/:id', auth, async (req, res) => {
     const slug = (req.query.slug || OCAS_SLUG).toString();
 
     const [tokenRes, traitsRes] = await Promise.all([
-      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count FROM tokens WHERE id = $1 AND collection_slug = $2`, [tokenId, slug]),
+      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count, image_url FROM tokens WHERE id = $1 AND collection_slug = $2`, [tokenId, slug]),
       pool.query(`SELECT trait_name, trait_value, COALESCE(trait_index,0) AS trait_index FROM token_traits WHERE token_id = $1 AND collection_slug = $2 ORDER BY COALESCE(trait_index,0), trait_name`, [tokenId, slug])
     ]);
 
@@ -252,6 +252,7 @@ app.get('/db/token/:id', auth, async (req, res) => {
         os_score: t.os_score ? parseFloat(t.os_score) : null,
         rarity_score: t.rarity_score != null ? parseFloat(t.rarity_score) : null,
         trait_count: actualTraitCount,
+        image_url: t.image_url || null,
         traits
       }
     });
