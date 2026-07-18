@@ -1158,6 +1158,15 @@ async function handleTraitBrowseInteraction(interaction, ctx){
     // One OR-group: matches ANY of the selected values for this trait
     const groups = [traitValuesArr.map(v => ({ trait_name: traitName, trait_value: v }))];
 
+    // chain is a per-collection property, not per-token — one lookup covers
+    // this whole batch. Needed so the synthetic _dbToken below (an existing
+    // optimization to skip a redundant per-token DB call) doesn't silently
+    // bypass the on-chain image fallback the way it did before this fix —
+    // buildListingEmbed uses listing._dbToken directly when present, so
+    // without chain here it never even attempts the on-chain read.
+    const collChainInfo = await pgPool.query(`SELECT chain, contract FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const chainInfo = collChainInfo.rows[0] || null;
+
     try {
       if(mode === 'sales'){
         const qs = new URLSearchParams({ trait: traitName, value: traitValue, limit: '20', sort: 'desc' });
@@ -1196,7 +1205,7 @@ async function handleTraitBrowseInteraction(interaction, ctx){
             asset: { token_id: String(tokenId), identifier: String(tokenId), name:'#'+tokenId, traits: t.traits?.__attributes||[] },
             payment: { quantity: priceWei, decimals:18, symbol:'ETH', token_address:'' },
             maker: t.seller||'', url: t.url||null, os_rank: t.os_rank||null,
-            _dbToken: { traits: t.traits||{}, obs_rank: t.obs_rank||null, os_rank: t.os_rank||null },
+            _dbToken: { traits: t.traits||{}, obs_rank: t.obs_rank||null, os_rank: t.os_rank||null, chain: chainInfo?.chain||null, contract: chainInfo?.contract||null },
           };
           return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
         }
