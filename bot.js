@@ -69,7 +69,7 @@ const {
 
 const { fetchTokenMetaFromDb, upsertTokenTraitRows, buildSaleEmbed, buildListingEmbed,
   traitObjectToArray, burnTypeBreakdown, fetchBurnDisplayTraits, fetchSnapshotImageForToken,
-  osRankBadge, titleTokenId, tokenMetaCache: embedsTokenMetaCache,
+  osRankBadge, titleTokenId, tokenMetaCache: embedsTokenMetaCache, resolveOnChainImage,
 } = require('./lib/embeds');
 const { resolveImage, sendEmbed, extractPngFromSvg, buildEmbedPayload, tokenMetaCache: imagesTokenMetaCache } = require('./lib/images');
 
@@ -147,7 +147,7 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock,
     // Embeds
     buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
-    resolveImage, extractPngFromSvg, fetchTokenMetaFromDb,
+    resolveImage, extractPngFromSvg, fetchTokenMetaFromDb, resolveOnChainImage,
     buildBurnEmbed, buildBurnLotteryEmbed,
     buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
     buildGenericLotteryStartEmbed, buildGenericLotteryResultEmbed,

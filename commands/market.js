@@ -522,7 +522,7 @@ async function handleMarketCommand(commandName, ctx){
     const _rfResolved  = resolveCollectionFromServerCfg(config, _rfColInput);
     const rfSlug       = _rfResolved?.slug || config.collectionSlug || config.slug;
 
-    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. min_rank must be ≤ max_rank and within 1–10000.', flags: MessageFlags.Ephemeral });
+    if(rankMin < 1 || rankMax > 1_000_000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. min_rank must be ≤ max_rank and within 1–1,000,000.', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
     return runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, modeRf, sortBy, rfSlug, _rfResolved });
@@ -811,8 +811,8 @@ async function handleRankFindModalSubmit(interaction, ctx){
   const collectionInput = parts.slice(2).join(':') || null;
   const rankMin = parseInt(interaction.fields.getTextInputValue('min_rank').trim(), 10);
   const rankMax = parseInt(interaction.fields.getTextInputValue('max_rank').trim(), 10);
-  if(isNaN(rankMin) || isNaN(rankMax) || rankMin < 1 || rankMax > 10000 || rankMin > rankMax){
-    return interaction.reply({ content: '❌ Invalid rank range. Minimum and maximum must be numbers between 1–10000, with minimum ≤ maximum.', flags: MessageFlags.Ephemeral });
+  if(isNaN(rankMin) || isNaN(rankMax) || rankMin < 1 || rankMax > 1_000_000 || rankMin > rankMax){
+    return interaction.reply({ content: '❌ Invalid rank range. Minimum and maximum must be numbers between 1–1,000,000, with minimum ≤ maximum.', flags: MessageFlags.Ephemeral });
   }
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`rf_browse:mode:${collectionInput || ''}:${rankMin}:${rankMax}`)
@@ -848,7 +848,7 @@ async function handleRankFindBrowseInteraction(interaction, ctx){
 
 async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, modeRf, sortBy, rfSlug, _rfResolved }){
   const { getRailwayApiUrl, fetchBotApiJson, buildSaleEmbed, postEmbeds, traitObjectToArray,
-          fetchTokenMetaFromDb, getRankTierColor, COLORS, resolveImage, traitDisplayLines } = ctx;
+          fetchTokenMetaFromDb, getRankTierColor, COLORS, resolveImage, traitDisplayLines, resolveOnChainImage } = ctx;
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET  = process.env.API_SECRET;
   const wantSales = modeRf === 'sales';
@@ -891,20 +891,25 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
         : (l.traits && typeof l.traits==='object' ? traitObjectToArray(l.traits) : []);
       const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
       const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
-      const listingUrl = l.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+      const tokenChain = dbMeta?.chain || 'ethereum';
+      const tokenContract = dbMeta?.contract || contract;
+      const listingUrl = l.url || `https://opensea.io/assets/${tokenChain}/${tokenContract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?jump=${tokenId}`;
       const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
       const embed = new EmbedBuilder()
         .setColor(rankColor)
         .setTitle(`${priceStr} ETH • #${tokenId}${rankBadge} • Listed`)
         .setURL(listingUrl)
-        .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
+        .setFooter({ text: `${rfSlug} · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
         .setTimestamp();
       const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
       if(tokenTraits.length){
         embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
       } else { embed.setDescription('**Links**\n' + tvLink); }
-      try{ embed._imageResult = await resolveImage({ identifier: String(tokenId) }, contract, 'ethereum'); }catch(e){}
+      try{
+        const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
+        embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+      }catch(e){}
       return embed;
     }));
     const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
