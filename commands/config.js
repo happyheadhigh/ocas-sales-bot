@@ -847,6 +847,7 @@ async function handleConfigButton(interaction, ctx){
     const field = parts[2]; // 'saleschan' or 'listchan'
     const colId = parts[3];
     const label = field==='saleschan' ? '🟢 Sales' : '📋 Listings';
+    const clearField = field==='saleschan' ? 'sales' : 'listings'; // clearchan handler expects 'sales'/'listings', not 'saleschan'/'listchan'
     const menu = new ChannelSelectMenuBuilder()
       .setCustomId(`cfg_chsel:col:${field}:${colId}`)
       .setPlaceholder(`Pick the ${label} channel`)
@@ -854,6 +855,7 @@ async function handleConfigButton(interaction, ctx){
     return interaction.editReply({ content:`**Select the ${label} channel:**`, embeds:[], components:[
       new ActionRowBuilder().addComponents(menu),
       new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`cfg:col:clearchan:${clearField}:${colId}`).setLabel(`🚫 Disable ${label.replace(/^\S+\s/, '')} Alerts`).setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(`cfg:col:view:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
       ),
     ]});
@@ -868,6 +870,7 @@ async function handleConfigButton(interaction, ctx){
     return interaction.editReply({ content:'**Select the 🔥 Burn Alerts channel:**', embeds:[], components:[
       new ActionRowBuilder().addComponents(menu),
       new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`cfg:col:clearchan:burn:${colId}`).setLabel('🚫 Disable Burn Alerts').setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(`cfg:col:view:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
       ),
     ]});
