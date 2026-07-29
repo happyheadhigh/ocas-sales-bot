@@ -282,6 +282,7 @@ function traitRolesRow(state){
 
 function summaryRow(){
   return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('setup:nickname:set').setLabel('🏷️ Set Nickname').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('setup:close').setLabel('Done ✅').setStyle(ButtonStyle.Success),
   );
 }
@@ -332,7 +333,7 @@ async function handleSetupButton(interaction, ctx){
 
   // Defer immediately — must happen within 3s or Discord kills the interaction
   // Modals are exempt (showModal is its own response), handle those below
-  const isModal = customId === 'setup:contract' || customId.startsWith('setup_traitrole:rolesel');
+  const isModal = customId === 'setup:contract' || customId === 'setup:nickname:set' || customId.startsWith('setup_traitrole:rolesel');
   if(!isModal) await interaction.deferUpdate();
 
   const state = await loadState(guildId, pgPool);
@@ -562,6 +563,21 @@ async function handleSetupButton(interaction, ctx){
     state.config.traitRoles = roles;
     await saveState(guildId, state, pgPool);
     return interaction.editReply({ content:'', embeds:[buildTraitRolesEmbed(state)], components:traitRolesRow(state) });
+  }
+
+  // ── optional: set nickname from the finish screen ───────────────────────────
+  if(customId === 'setup:nickname:set'){
+    const currentNickname = interaction.guild.members.me?.nickname || '';
+    const modal = new ModalBuilder().setCustomId('cfg_modal:nickname').setTitle('Set Bot Nickname');
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('nickname_input')
+        .setLabel('Nickname (max 32 characters)')
+        .setStyle(TextInputStyle.Short)
+        .setValue(currentNickname)
+        .setMaxLength(32)
+        .setRequired(true)
+    ));
+    return interaction.showModal(modal);
   }
 
   // ── close / skip ───────────────────────────────────────────────────────────
