@@ -79,6 +79,7 @@ function dashboardRow(){
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('🛡️ Access').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('🎰 Lotteries').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:nickname').setLabel('🏷️ Bot Nickname').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -103,6 +104,31 @@ function accessRow(cfg){
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('cfg:access:set').setLabel(hasRole ? '✏️ Change Role' : '➕ Set Bot Manager Role').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('cfg:access:clear').setLabel('🗑️ Clear').setStyle(ButtonStyle.Danger).setDisabled(!hasRole),
+      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+// ── Bot Nickname screen ────────────────────────────────────────────────────────
+// Nickname state lives entirely in Discord itself (the guild member object),
+// not in the bot's own config DB — read live each time rather than trying to
+// keep a separate copy in sync.
+function buildNicknameEmbed(currentNickname){
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('🏷️ Bot Nickname')
+    .setDescription(
+      SEP + '\n\n' +
+      `**Current Nickname:** ${currentNickname ? currentNickname : '*Default (bot\'s regular name)*'}\n\n` +
+      '*Give the bot a different display name just in this server — this only changes how it looks here. Its actual account name and every other server are unaffected.*'
+    );
+}
+
+function nicknameRow(hasNickname){
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:nickname:set').setLabel(hasNickname ? '✏️ Change Nickname' : '➕ Set Nickname').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('cfg:nickname:remove').setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger).setDisabled(!hasNickname),
       new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     ),
   ];
@@ -668,6 +694,7 @@ async function handleConfigButton(interaction, ctx){
   const tzCustomPicked = customId === 'cfg_tzsel:lotteries' && interaction.values?.[0] === 'custom';
   const isModal = customId === 'cfg:col:contract' || customId === 'cfg:col:slug' ||
                   customId === 'cfg:col:add' ||
+                  customId === 'cfg:nickname:set' ||
                   customId === 'cfg:filter:add' ||
                   tzCustomPicked ||
                   customId.startsWith('cfg:rank:set:') ||
@@ -1467,6 +1494,35 @@ async function handleConfigButton(interaction, ctx){
     return interaction.editReply({ content:'', embeds:[buildAccessEmbed(cfg)], components:accessRow(cfg) });
   }
 
+  // ── Bot Nickname ──────────────────────────────────────────────────────────
+  if(customId === 'cfg:cat:nickname'){
+    const currentNickname = interaction.guild.members.me?.nickname || null;
+    return interaction.editReply({ content:'', embeds:[buildNicknameEmbed(currentNickname)], components:nicknameRow(!!currentNickname) });
+  }
+
+  if(customId === 'cfg:nickname:set'){
+    const currentNickname = interaction.guild.members.me?.nickname || '';
+    const modal = new ModalBuilder().setCustomId('cfg_modal:nickname').setTitle('Set Bot Nickname');
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('nickname_input')
+        .setLabel('Nickname (max 32 characters)')
+        .setStyle(TextInputStyle.Short)
+        .setValue(currentNickname)
+        .setMaxLength(32)
+        .setRequired(true)
+    ));
+    return interaction.showModal(modal);
+  }
+
+  if(customId === 'cfg:nickname:remove'){
+    try{
+      await interaction.guild.members.me.setNickname(null);
+    }catch(e){
+      return interaction.editReply({ content:`❌ Couldn't remove the nickname: ${e.message}. Make sure the bot has the "Change Nickname" permission in this server.`, embeds:[], components:[] });
+    }
+    return interaction.editReply({ content:'', embeds:[buildNicknameEmbed(null)], components:nicknameRow(false) });
+  }
+
   // ── Lotteries (admin view, reuses the same session/dashboard as /lotteries) ──
   if(customId === 'cfg:cat:lotteries'){
     const { fetchAll: fetchAllLotteries, buildDashboardEmbed: buildLotteriesEmbed, dashboardButtons: lotteriesDashboardButtons, sessions: lotterySessions } = require('./lotteries');
@@ -2223,6 +2279,21 @@ async function handleConfigModal(interaction, ctx){
 
   await interaction.deferUpdate();
   const cfg = getConfig(guildId) || {};
+
+  // ── Set/change bot nickname ─────────────────────────────────────────────────
+  if(customId === 'cfg_modal:nickname'){
+    const newNickname = interaction.fields.getTextInputValue('nickname_input').trim();
+    if(!newNickname) return interaction.editReply({ content:'❌ Nickname cannot be empty.' });
+    try{
+      await interaction.guild.members.me.setNickname(newNickname);
+    }catch(e){
+      return interaction.editReply({
+        content: `❌ Couldn't set that nickname: ${e.message}. Make sure the bot has the "Change Nickname" permission in this server, and that its role is high enough (Discord won't let a bot change its own nickname if something else is blocking it).`,
+        embeds: [], components: [],
+      });
+    }
+    return interaction.editReply({ content:'', embeds:[buildNicknameEmbed(newNickname)], components:nicknameRow(true) });
+  }
 
   // ── Set giveaway timezone ─────────────────────────────────────────────────
   if(customId === 'cfg_modal:lotteries:settz'){
