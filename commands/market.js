@@ -1506,6 +1506,8 @@ async function showMaClearWizard(interaction, ctx){
     }
   }
   rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('mac_browse:toggle:sales').setLabel(alert.alertSales ? '🔕 Sales Off' : '🔔 Sales On').setStyle(alert.alertSales ? ButtonStyle.Secondary : ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('mac_browse:toggle:listings').setLabel(alert.alertListings ? '🔕 Listings Off' : '🔔 Listings On').setStyle(alert.alertListings ? ButtonStyle.Secondary : ButtonStyle.Success),
     new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
   ));
@@ -1530,6 +1532,51 @@ async function handleMaClearInteraction(interaction, ctx){
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
     );
     return interaction.update({ content: 'No changes made.', embeds: [], components: [backRow] });
+  }
+  if(customId.startsWith('mac_browse:toggle:')){
+    const field = customId.slice('mac_browse:toggle:'.length); // 'sales' or 'listings'
+    const alert = getAlert(interaction.user.id);
+    if(!alert) return interaction.update({ content: 'No alert found.', embeds: [], components: [] });
+    const updated = field === 'sales'
+      ? { ...alert, alertSales: !alert.alertSales }
+      : { ...alert, alertListings: !alert.alertListings };
+    setAlert(interaction.user.id, updated);
+    const filters = updated.traitFilters || {};
+    const fmtF = f => Object.keys(f).length===0 ? 'none (all tokens)' :
+      Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+    const embed = new EmbedBuilder()
+      .setTitle('🔔 My Alert')
+      .setColor(0x5865F2)
+      .setDescription([
+        `**Collection:** ${updated.slug||'any'}`,
+        `**Sales DMs:** ${updated.alertSales ? '✅ on' : '❌ off'}`,
+        `**Listing DMs:** ${updated.alertListings ? '✅ on' : '❌ off'}`,
+        `**Filters:**`,
+        fmtF(filters),
+      ].join('\n'));
+    const rows = [];
+    const valueBtns3 = [];
+    for(const [trait, val] of Object.entries(filters)){
+      const vals = Array.isArray(val) ? val : [val];
+      for(const v of vals){
+        valueBtns3.push(
+          new ButtonBuilder()
+            .setCustomId(`mac_browse:val:${trait}:${v}`)
+            .setLabel(`✕ ${trait}: ${v}`.slice(0, 80))
+            .setStyle(ButtonStyle.Danger)
+        );
+      }
+    }
+    for(let i = 0; i < Math.min(valueBtns3.length, 16); i += 4){
+      rows.push(new ActionRowBuilder().addComponents(valueBtns3.slice(i, i+4)));
+    }
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mac_browse:toggle:sales').setLabel(updated.alertSales ? '🔕 Sales Off' : '🔔 Sales On').setStyle(updated.alertSales ? ButtonStyle.Secondary : ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('mac_browse:toggle:listings').setLabel(updated.alertListings ? '🔕 Listings Off' : '🔔 Listings On').setStyle(updated.alertListings ? ButtonStyle.Secondary : ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Done').setStyle(ButtonStyle.Secondary),
+    ));
+    return interaction.update({ embeds: [embed], components: rows });
   }
   if(customId.startsWith('mac_browse:val:')){
     // Format: mac_browse:val:traitName:traitValue
@@ -1579,6 +1626,8 @@ async function handleMaClearInteraction(interaction, ctx){
       rows.push(new ActionRowBuilder().addComponents(valueBtns2.slice(i, i+4)));
     }
     rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mac_browse:toggle:sales').setLabel(alert.alertSales ? '🔕 Sales Off' : '🔔 Sales On').setStyle(alert.alertSales ? ButtonStyle.Secondary : ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('mac_browse:toggle:listings').setLabel(alert.alertListings ? '🔕 Listings Off' : '🔔 Listings On').setStyle(alert.alertListings ? ButtonStyle.Secondary : ButtonStyle.Success),
       new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Done').setStyle(ButtonStyle.Secondary),
     ));
