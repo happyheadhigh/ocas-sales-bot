@@ -522,7 +522,7 @@ async function handleMarketCommand(commandName, ctx){
     const _rfResolved  = resolveCollectionFromServerCfg(config, _rfColInput);
     const rfSlug       = _rfResolved?.slug || config.collectionSlug || config.slug;
 
-    if(rankMin < 1 || rankMax > 10000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. min_rank must be ≤ max_rank and within 1–10000.', flags: MessageFlags.Ephemeral });
+    if(rankMin < 1 || rankMax > 1_000_000 || rankMin > rankMax) return interaction.reply({ content: 'Invalid rank range. min_rank must be ≤ max_rank and within 1–1,000,000.', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
     return runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, modeRf, sortBy, rfSlug, _rfResolved });
@@ -811,8 +811,8 @@ async function handleRankFindModalSubmit(interaction, ctx){
   const collectionInput = parts.slice(2).join(':') || null;
   const rankMin = parseInt(interaction.fields.getTextInputValue('min_rank').trim(), 10);
   const rankMax = parseInt(interaction.fields.getTextInputValue('max_rank').trim(), 10);
-  if(isNaN(rankMin) || isNaN(rankMax) || rankMin < 1 || rankMax > 10000 || rankMin > rankMax){
-    return interaction.reply({ content: '❌ Invalid rank range. Minimum and maximum must be numbers between 1–10000, with minimum ≤ maximum.', flags: MessageFlags.Ephemeral });
+  if(isNaN(rankMin) || isNaN(rankMax) || rankMin < 1 || rankMax > 1_000_000 || rankMin > rankMax){
+    return interaction.reply({ content: '❌ Invalid rank range. Minimum and maximum must be numbers between 1–1,000,000, with minimum ≤ maximum.', flags: MessageFlags.Ephemeral });
   }
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`rf_browse:mode:${collectionInput || ''}:${rankMin}:${rankMax}`)
@@ -848,7 +848,7 @@ async function handleRankFindBrowseInteraction(interaction, ctx){
 
 async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, modeRf, sortBy, rfSlug, _rfResolved }){
   const { getRailwayApiUrl, fetchBotApiJson, buildSaleEmbed, postEmbeds, traitObjectToArray,
-          fetchTokenMetaFromDb, getRankTierColor, COLORS, resolveImage, traitDisplayLines } = ctx;
+          fetchTokenMetaFromDb, getRankTierColor, COLORS, resolveImage, traitDisplayLines, resolveOnChainImage } = ctx;
   const RAILWAY_URL = getRailwayApiUrl();
   const API_SECRET  = process.env.API_SECRET;
   const wantSales = modeRf === 'sales';
@@ -891,20 +891,25 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
         : (l.traits && typeof l.traits==='object' ? traitObjectToArray(l.traits) : []);
       const priceStr = l.price_eth >= 1 ? l.price_eth.toFixed(3) : l.price_eth.toFixed(4);
       const rankBadge = l.os_rank ? ` ⬥${Number(l.os_rank).toLocaleString()}` : '';
-      const listingUrl = l.url || `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+      const tokenChain = dbMeta?.chain || 'ethereum';
+      const tokenContract = dbMeta?.contract || contract;
+      const listingUrl = l.url || `https://opensea.io/assets/${tokenChain}/${tokenContract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?jump=${tokenId}`;
       const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
       const embed = new EmbedBuilder()
         .setColor(rankColor)
         .setTitle(`${priceStr} ETH • #${tokenId}${rankBadge} • Listed`)
         .setURL(listingUrl)
-        .setFooter({ text: `on-chain-all-stars · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
+        .setFooter({ text: `${rfSlug} · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
         .setTimestamp();
       const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
       if(tokenTraits.length){
         embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
       } else { embed.setDescription('**Links**\n' + tvLink); }
-      try{ embed._imageResult = await resolveImage({ identifier: String(tokenId) }, contract, 'ethereum'); }catch(e){}
+      try{
+        const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
+        embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+      }catch(e){}
       return embed;
     }));
     const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
@@ -1108,7 +1113,12 @@ async function handleTraitBrowseInteraction(interaction, ctx){
 
   if(customId === 'tf_browse:col'){
     const slug = interaction.values[0];
-    return showTfTraitPicker(interaction, ctx, slug);
+    try{
+      return await showTfTraitPicker(interaction, ctx, slug);
+    }catch(e){
+      console.error('[tf_browse:col]', e.message);
+      return interaction.update({ content: `❌ Could not load traits for **${slug}**: ${e.message}`, components:[] }).catch(()=>{});
+    }
   }
 
   if(customId.startsWith('tf_browse:trait:')){
@@ -1153,6 +1163,15 @@ async function handleTraitBrowseInteraction(interaction, ctx){
     // One OR-group: matches ANY of the selected values for this trait
     const groups = [traitValuesArr.map(v => ({ trait_name: traitName, trait_value: v }))];
 
+    // chain is a per-collection property, not per-token — one lookup covers
+    // this whole batch. Needed so the synthetic _dbToken below (an existing
+    // optimization to skip a redundant per-token DB call) doesn't silently
+    // bypass the on-chain image fallback the way it did before this fix —
+    // buildListingEmbed uses listing._dbToken directly when present, so
+    // without chain here it never even attempts the on-chain read.
+    const collChainInfo = await pgPool.query(`SELECT chain, contract FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const chainInfo = collChainInfo.rows[0] || null;
+
     try {
       if(mode === 'sales'){
         const qs = new URLSearchParams({ trait: traitName, value: traitValue, limit: '20', sort: 'desc' });
@@ -1191,7 +1210,7 @@ async function handleTraitBrowseInteraction(interaction, ctx){
             asset: { token_id: String(tokenId), identifier: String(tokenId), name:'#'+tokenId, traits: t.traits?.__attributes||[] },
             payment: { quantity: priceWei, decimals:18, symbol:'ETH', token_address:'' },
             maker: t.seller||'', url: t.url||null, os_rank: t.os_rank||null,
-            _dbToken: { traits: t.traits||{}, obs_rank: t.obs_rank||null, os_rank: t.os_rank||null },
+            _dbToken: { traits: t.traits||{}, obs_rank: t.obs_rank||null, os_rank: t.os_rank||null, chain: chainInfo?.chain||null, contract: chainInfo?.contract||null },
           };
           return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
         }
@@ -1487,6 +1506,8 @@ async function showMaClearWizard(interaction, ctx){
     }
   }
   rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('mac_browse:toggle:sales').setLabel(alert.alertSales ? '🔕 Sales Off' : '🔔 Sales On').setStyle(alert.alertSales ? ButtonStyle.Secondary : ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('mac_browse:toggle:listings').setLabel(alert.alertListings ? '🔕 Listings Off' : '🔔 Listings On').setStyle(alert.alertListings ? ButtonStyle.Secondary : ButtonStyle.Success),
     new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
   ));
@@ -1511,6 +1532,51 @@ async function handleMaClearInteraction(interaction, ctx){
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
     );
     return interaction.update({ content: 'No changes made.', embeds: [], components: [backRow] });
+  }
+  if(customId.startsWith('mac_browse:toggle:')){
+    const field = customId.slice('mac_browse:toggle:'.length); // 'sales' or 'listings'
+    const alert = getAlert(interaction.user.id);
+    if(!alert) return interaction.update({ content: 'No alert found.', embeds: [], components: [] });
+    const updated = field === 'sales'
+      ? { ...alert, alertSales: !alert.alertSales }
+      : { ...alert, alertListings: !alert.alertListings };
+    setAlert(interaction.user.id, updated);
+    const filters = updated.traitFilters || {};
+    const fmtF = f => Object.keys(f).length===0 ? 'none (all tokens)' :
+      Object.entries(f).map(([k,v]) => `**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n');
+    const embed = new EmbedBuilder()
+      .setTitle('🔔 My Alert')
+      .setColor(0x5865F2)
+      .setDescription([
+        `**Collection:** ${updated.slug||'any'}`,
+        `**Sales DMs:** ${updated.alertSales ? '✅ on' : '❌ off'}`,
+        `**Listing DMs:** ${updated.alertListings ? '✅ on' : '❌ off'}`,
+        `**Filters:**`,
+        fmtF(filters),
+      ].join('\n'));
+    const rows = [];
+    const valueBtns3 = [];
+    for(const [trait, val] of Object.entries(filters)){
+      const vals = Array.isArray(val) ? val : [val];
+      for(const v of vals){
+        valueBtns3.push(
+          new ButtonBuilder()
+            .setCustomId(`mac_browse:val:${trait}:${v}`)
+            .setLabel(`✕ ${trait}: ${v}`.slice(0, 80))
+            .setStyle(ButtonStyle.Danger)
+        );
+      }
+    }
+    for(let i = 0; i < Math.min(valueBtns3.length, 16); i += 4){
+      rows.push(new ActionRowBuilder().addComponents(valueBtns3.slice(i, i+4)));
+    }
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mac_browse:toggle:sales').setLabel(updated.alertSales ? '🔕 Sales Off' : '🔔 Sales On').setStyle(updated.alertSales ? ButtonStyle.Secondary : ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('mac_browse:toggle:listings').setLabel(updated.alertListings ? '🔕 Listings Off' : '🔔 Listings On').setStyle(updated.alertListings ? ButtonStyle.Secondary : ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Done').setStyle(ButtonStyle.Secondary),
+    ));
+    return interaction.update({ embeds: [embed], components: rows });
   }
   if(customId.startsWith('mac_browse:val:')){
     // Format: mac_browse:val:traitName:traitValue
@@ -1560,6 +1626,8 @@ async function handleMaClearInteraction(interaction, ctx){
       rows.push(new ActionRowBuilder().addComponents(valueBtns2.slice(i, i+4)));
     }
     rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mac_browse:toggle:sales').setLabel(alert.alertSales ? '🔕 Sales Off' : '🔔 Sales On').setStyle(alert.alertSales ? ButtonStyle.Secondary : ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('mac_browse:toggle:listings').setLabel(alert.alertListings ? '🔕 Listings Off' : '🔔 Listings On').setStyle(alert.alertListings ? ButtonStyle.Secondary : ButtonStyle.Success),
       new ButtonBuilder().setCustomId('mac_browse:all').setLabel('Remove Everything').setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId('mac_browse:cancel').setLabel('Done').setStyle(ButtonStyle.Secondary),
     ));
