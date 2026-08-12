@@ -278,9 +278,18 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
 
   if(typeof src === 'string' && transparent){
   src = makeSvgTransparent(src);
-  src = src.replace(/<rect\b[^>]*>/gi, '');
-  src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*>\s*<\/path>/gi, '');
-  src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*\/?>/gi, '');
+  // The broader rect/filled-path stripping below removes EVERY matching
+  // element in the whole SVG, not just a background — fine for OCAS
+  // specifically (its character art apparently isn't built from these),
+  // but destructive for a collection whose actual artwork IS made of rects
+  // (confirmed happening for onchainhoodies: pixel art is visibly built
+  // from rects, so this was stripping the character itself, not just the
+  // background, leaving nothing to render — hence the blank image).
+  if(contract?.toLowerCase() === OCAS_CONTRACT){
+    src = src.replace(/<rect\b[^>]*>/gi, '');
+    src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*>\s*<\/path>/gi, '');
+    src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*\/?>/gi, '');
+  }
 }
 
   if(typeof src === 'string' && isSvgSource(src)){
