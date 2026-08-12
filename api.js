@@ -24,6 +24,7 @@ const { runMigrations, fetchAndStoreCollectionTraits } = require('./lib/db');
 // before today's rewrite.
 const syncListingsModule = require('./sync-listings');
 const { onboardCollection } = require('./lib/collection-onboard');
+const { fixCollectionImages } = require('./lib/collection-backfill');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -402,6 +403,32 @@ app.get('/db/collections/:slug/sync-trait-index', auth, async (req, res) => {
     res.json({ ok: true, message: `Trait index sync attempted for "${slug}" — check /db/trait-index?slug=${slug} to confirm` });
   } catch(e) {
     console.error(`/db/collections/${req.params.slug}/sync-trait-index error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/:slug/fix-images — re-verify images for a non-Ethereum
+// collection backfilled before writePage started always checking non-Ethereum
+// images against the real on-chain source. One-time correction pass; skips
+// traits entirely (those are already correct). Runs in the background —
+// iterates every token individually, so this takes a while for a large
+// collection. Check server logs for progress.
+app.get('/db/collections/:slug/fix-images', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    const collRes = await pool.query(`SELECT slug, contract, chain FROM collections WHERE slug = $1`, [slug]);
+    if (!collRes.rows.length) {
+      return res.status(404).json({ ok: false, error: `No collections row for slug "${slug}"` });
+    }
+
+    res.json({ ok: true, message: `Image fix started for "${slug}" — running in background, check server logs for progress` });
+    fixCollectionImages(pool, collRes.rows[0]).catch(e => {
+      console.error(`[/db/collections/${slug}/fix-images] background fix failed:`, e.message);
+    });
+  } catch(e) {
+    console.error(`/db/collections/${req.params.slug}/fix-images error:`, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
