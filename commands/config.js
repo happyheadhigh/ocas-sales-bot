@@ -2508,7 +2508,9 @@ async function handleConfigModal(interaction, ctx){
     // Backfill all verified wallets in this server for the new collection
     if(slug && contract){
       const { backfillServerWallets } = require('../lib/wallet-backfill');
-      backfillServerWallets(guildId, contract, slug, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+      pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug])
+        .then(r => backfillServerWallets(guildId, contract, slug, pgPool, process.env.ALCHEMY_API_KEY, r.rows[0]?.chain || 'ethereum'))
+        .catch(()=>{});
     }
 
     // Every server gets an automatic trait backfill for any new non-OCAS
@@ -2583,7 +2585,10 @@ async function handleConfigModal(interaction, ctx){
         // Trigger wallet backfill if both contract and slug are now set
         if(cfg.collections[idx].contract && cfg.collections[idx].slug){
           const { backfillServerWallets } = require('../lib/wallet-backfill');
-          backfillServerWallets(guildId, cfg.collections[idx].contract, cfg.collections[idx].slug, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+          const colContract = cfg.collections[idx].contract, colSlug = cfg.collections[idx].slug;
+          pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [colSlug])
+            .then(r => backfillServerWallets(guildId, colContract, colSlug, pgPool, process.env.ALCHEMY_API_KEY, r.rows[0]?.chain || 'ethereum'))
+            .catch(()=>{});
         }
       }
     }
