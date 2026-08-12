@@ -421,7 +421,7 @@ async function seedFullSalesHistory(collection) {
 
   const MAX_PLAUSIBLE_TOKEN_ID = 10_000_000;
   const MAX_PLAUSIBLE_PRICE_ETH = 100_000;
-  const MAX_PAGES = 500; // 500 * 100 = 50,000 sales safety cap
+  const MAX_PAGES = 2000; // 2000 * 100 = 200,000 sales safety cap — raised from 50,000, which would have quietly truncated a ~44k-token collection trading at anywhere near OnChainHoodies' ~1.2 sales/token ratio
 
   let cursor = null;
   let pages = 0;
