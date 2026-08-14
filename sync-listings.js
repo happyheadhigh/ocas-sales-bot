@@ -78,7 +78,26 @@ async function discoverCollections() {
     console.error('[sync] discoverCollections query failed, falling back to OCAS only:', e.message);
   }
 
-  return Array.from(map.values());
+  const collections = Array.from(map.values());
+
+  // Chain isn't in server_configs at all — same gap already fixed in
+  // /download, wallet-backfill, and elsewhere tonight. One batch query
+  // against the collections registry (the actual source of truth) rather
+  // than a lookup per collection.
+  try {
+    const chainRes = await pool.query(
+      `SELECT slug, chain FROM collections WHERE slug = ANY($1)`,
+      [collections.map(c => c.slug)]
+    );
+    const chainMap = {};
+    for (const row of chainRes.rows) chainMap[row.slug] = row.chain;
+    for (const c of collections) c.chain = chainMap[c.slug] || 'ethereum';
+  } catch (e) {
+    console.warn('[sync] discoverCollections chain lookup failed (defaulting to ethereum):', e.message);
+    for (const c of collections) c.chain = c.chain || 'ethereum';
+  }
+
+  return collections;
 }
 
 // ── Ensure floor_history table exists ─────────────────────────────────────────
@@ -109,7 +128,7 @@ async function ensureFloorHistoryTable() {
 ensureFloorHistoryTable();
 
 async function syncListings(collection) {
-  const { slug, contract } = collection;
+  const { slug, contract, chain = 'ethereum' } = collection;
   const startTime = Date.now();
   console.log(`[sync] Starting listings sync for ${slug} at ${new Date().toISOString()}`);
 
@@ -182,7 +201,7 @@ async function syncListings(collection) {
         if (!id || isNaN(id) || id < 0 || id > MAX_PLAUSIBLE_TOKEN_ID) continue;
         if (priceEth == null || isNaN(priceEth) || priceEth <= 0) continue;
 
-        const url = `https://opensea.io/assets/ethereum/${contract}/${id}`;
+        const url = `https://opensea.io/assets/${chain}/${contract}/${id}`;
         if (!listingsMap[id] || priceEth < listingsMap[id].price_eth) {
           listingsMap[id] = { price_eth: priceEth, url };
         }

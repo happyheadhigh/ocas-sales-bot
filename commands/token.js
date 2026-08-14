@@ -136,13 +136,18 @@ async function handleTokenCommand(commandName, ctx){
       // ── Random fallback ───────────────────────────────────────────────────
       if(!tokenId) tokenId = Math.floor(Math.random()*10000)+1;
 
+      // Fetch OS rank + chain for title badge, rank-tier sidebar color, and
+      // correct-chain image/URL below — one fetch, used for both.
+      const dbMeta  = await fetchTokenMetaFromDb(tokenId, activeCol.slug).catch(()=>null);
+      const tokenChain = dbMeta?.chain || 'ethereum';
+
       // ── Fetch + post image ────────────────────────────────────────────────
       let imgResult = getCachedImage(`${contract}:${tokenId}`);
       if(!imgResult){
-        imgResult = await resolveImage({identifier:String(tokenId)}, contract, 'ethereum');
+        imgResult = await resolveImage({identifier:String(tokenId)}, contract, tokenChain);
         if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
       }
-      const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+      const osUrl = `https://opensea.io/assets/${tokenChain}/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
 
       // Description: trait values + count + rank only, no category labels
@@ -157,8 +162,6 @@ async function handleTokenCommand(commandName, ctx){
       const priceLine   = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${floorPrice >= 1 ? floorPrice.toFixed(3) : floorPrice.toFixed(4)}\n` : '';
       const contextLine = descParts.length ? `${descParts.join(' · ')}\n` : '';
 
-      // Fetch OS rank for title badge + rank-tier sidebar color
-      const dbMeta  = await fetchTokenMetaFromDb(tokenId, activeCol.slug).catch(()=>null);
       const osRank  = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
       const rankBadge = osRank ? ` ⬥${osRank.toLocaleString()}` : '';
       const ocasColor = getRankTierColor(osRank) ?? COLORS.OCAS_BG;

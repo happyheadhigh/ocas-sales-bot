@@ -2648,6 +2648,8 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const colCfg = allCols.find(c => c.slug === slug);
   const colContract = colCfg?.contract || null;
   const isAnimated = colCfg?.animated === true;
+  const colChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+  const colChain = colChainRes.rows[0]?.chain || 'ethereum';
 
   let imageResult = null;
 
@@ -2825,7 +2827,7 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
 
   // Token image
   const tvUrl = `https://traitview.com/token/${slug}/${tokenId}`;
-  const osUrl = `https://opensea.io/assets/ethereum/${slug}/${tokenId}`;
+  const osUrl = `https://opensea.io/assets/${colChain}/${colContract || slug}/${tokenId}`;
   const embed = new EmbedBuilder()
     .setTitle(`🔍 Token #${tokenId}`)
     .setColor(unrealizedDisplay !== null && unrealizedDisplay >= 0 ? 0x57F287 : 0xED4245)

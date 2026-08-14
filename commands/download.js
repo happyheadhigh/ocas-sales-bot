@@ -236,7 +236,7 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
   // If no animation_url in on-chain metadata, try OpenSea API (gets CDN GIF)
   if(!animUrl && osHeaders && contract && tokenId){
     try{
-      const osNftUrl = `https://api.opensea.io/api/v2/chain/ethereum/contract/${contract}/nfts/${tokenId}`;
+      const osNftUrl = `https://api.opensea.io/api/v2/chain/${chain || 'ethereum'}/contract/${contract}/nfts/${tokenId}`;
       console.log('[Download] Fetching OS metadata for animation_url:', osNftUrl);
       const osRes = await fetch(osNftUrl, { headers: osHeaders() });
       if(osRes.ok){
