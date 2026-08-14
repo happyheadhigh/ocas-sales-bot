@@ -339,12 +339,27 @@ async function syncTraitRoles(guild, discordId, wallet){
     const rolesSummary = { assigned: [], skipped: [], alreadyHad: [] };
     let totalOwnedAcrossCollections = 0;
 
+    // Chain isn't in server config at all — resolve every collection in this
+    // loop from the collections registry in one batch query, same pattern
+    // used elsewhere tonight, rather than a lookup per collection.
+    const traitSyncChainMap = {};
+    try{
+      const chainRes = await pgPool.query(
+        `SELECT slug, chain FROM collections WHERE slug = ANY($1)`,
+        [Object.keys(rulesBySlug)]
+      );
+      for(const row of chainRes.rows) traitSyncChainMap[row.slug] = row.chain;
+    }catch(e){
+      console.warn('[TraitSync] chain lookup failed (defaulting to ethereum):', e.message);
+    }
+
     // Process each collection separately — fetch ownership + traits scoped to that slug
     for(const slug of Object.keys(rulesBySlug)){
       const rules = rulesBySlug[slug];
+      const slugChain = traitSyncChainMap[slug] || 'ethereum';
 
       const osRes = await fetch(
-        `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?collection=${slug}&limit=200`,
+        `https://api.opensea.io/api/v2/chain/${slugChain}/account/${wallet}/nfts?collection=${slug}&limit=200`,
         { headers: osHeaders() }
       );
       if(!osRes.ok){
@@ -670,13 +685,15 @@ client.on('interactionCreate', async (interaction)=>{
     const primaryWallet = wallets[0];
     const cfg = getConfig(guildId) || {};
     const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+    const slugChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const slugChain = slugChainRes.rows[0]?.chain || 'ethereum';
 
     // Fetch NFTs across all wallets combined
     let totalTokens = [];
     for(const w of wallets){
       try{
         const nftRes = await fetch(
-          `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+          `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
           { headers:osHeaders(), agent:osAgent }
         );
         if(nftRes.ok){
@@ -1021,6 +1038,8 @@ client.on('interactionCreate', async (interaction)=>{
         const knownWallet = globalEx.rows[0].wallet;
         const gCfg = getConfig(svGuild) || {};
         const slug = gCfg.collectionSlug || gCfg.slug || 'on-chain-all-stars';
+        const slugChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+        const slugChain = slugChainRes.rows[0]?.chain || 'ethereum';
 
         // Full OS profile fetch — get ALL linked wallets
         let allWallets = [knownWallet];
@@ -1043,7 +1062,7 @@ client.on('interactionCreate', async (interaction)=>{
         for(const w of allWallets){
           try{
             const nftRes = await fetch(
-              `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+              `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
               { headers:osHeaders() }
             );
             if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
@@ -1277,13 +1296,15 @@ client.on('interactionCreate', async (interaction)=>{
 
     const cfg  = getConfig(svGuild) || {};
     const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+    const slugChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const slugChain = slugChainRes.rows[0]?.chain || 'ethereum';
 
     // Fetch token holdings across all wallets
     let totalTokens = [];
     for(const w of wallets){
       try{
         const nftRes = await fetch(
-          `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+          `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
           { headers:osHeaders() }
         );
         if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
