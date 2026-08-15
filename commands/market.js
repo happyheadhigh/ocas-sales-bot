@@ -1,6 +1,7 @@
 'use strict';
 
 const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
+const { STACKERS_SLUG, formatStackersFields } = require('../lib/stackers');
 const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS, OCAS_SLUG } = require('../lib/constants');
 const { extractPngFromSvg, resolveImage } = require('../lib/images');
@@ -906,6 +907,10 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
       if(tokenTraits.length){
         embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
       } else { embed.setDescription('**Links**\n' + tvLink); }
+      if(rfSlug === STACKERS_SLUG){
+        const stackersFields = await formatStackersFields(tokenId);
+        if(stackersFields.length) embed.addFields(...stackersFields);
+      }
       try{
         const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
         embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
@@ -2834,6 +2839,11 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     .setDescription(descLines)
     .setURL(tvUrl)
     .setFooter({ text: `${currentIdx + 1} of ${sortedTokens.length} held tokens` });
+
+  if(slug === STACKERS_SLUG){
+    const stackersFields = await formatStackersFields(tokenId);
+    if(stackersFields.length) embed.addFields(...stackersFields);
+  }
 
   const components = [
     new ActionRowBuilder().addComponents(select),
