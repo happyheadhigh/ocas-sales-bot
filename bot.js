@@ -57,6 +57,7 @@ const {
   setClient, traitDisplayLines, fetchTokenUriFromContract,
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
+const { setClient: setStackersFusionClient, pollFusionEvents } = require('./lib/stackers-fusion-poller');
 
 const {
   buildBurnLotteryEmbed, buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
@@ -118,6 +119,7 @@ const client = new Client({ intents: [
 ] });
 setClient(client); // inject into burn-poller
 setPollClient(client); // inject into poll
+setStackersFusionClient(client); // inject into stackers fusion poller
 
 // ── resolveDiscordChannel — needs client, defined here ───────────────────────
 // Inject client into burn-poller so it can resolve channels
@@ -2293,6 +2295,15 @@ client.once('clientReady', async ()=>{
     setInterval(pollBurnEvents, 30_000);
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
+  }
+  // Poll Stackers fusion events every 60s — fusion is a deliberate user
+  // action, not automatic, so no need to poll as tight as sales/listings.
+  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
+    console.log('[StackersFusion] Starting fusion poller');
+    pollFusionEvents();
+    setInterval(pollFusionEvents, 60_000);
+  } else {
+    console.log('[StackersFusion] No ALCHEMY_API_KEY set — fusion poller disabled');
   }
   // Process pending burn alerts every 30s — waits for metadata to refresh before posting
   setInterval(processPendingBurnAlerts, 30_000);
