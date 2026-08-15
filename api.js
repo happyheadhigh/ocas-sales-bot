@@ -25,6 +25,7 @@ const { runMigrations, fetchAndStoreCollectionTraits } = require('./lib/db');
 const syncListingsModule = require('./sync-listings');
 const { onboardCollection } = require('./lib/collection-onboard');
 const { fixCollectionImages } = require('./lib/collection-backfill');
+const { takeStackersSnapshot } = require('./lib/stackers-analytics');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -429,6 +430,24 @@ app.get('/db/collections/:slug/fix-images', auth, async (req, res) => {
     });
   } catch(e) {
     console.error(`/db/collections/${req.params.slug}/fix-images error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/snapshot — manually trigger a Stackers analytics
+// snapshot. The scheduled job (bot.js) only runs once every 24h on purpose
+// — it iterates every token and takes real minutes, so it deliberately
+// doesn't run on every bot restart. Without a manual trigger there'd be no
+// way to actually test /stackerstats until a full day had passed. Runs in
+// the background — check server logs for progress ([StackersAnalytics] lines).
+app.get('/db/stackers/snapshot', auth, async (req, res) => {
+  try {
+    res.json({ ok: true, message: 'Stackers snapshot started — running in background, check server logs ([StackersAnalytics] lines) for progress' });
+    takeStackersSnapshot(pool).catch(e => {
+      console.error('[/db/stackers/snapshot] background snapshot failed:', e.message);
+    });
+  } catch(e) {
+    console.error('/db/stackers/snapshot error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });

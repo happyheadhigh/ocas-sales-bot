@@ -58,6 +58,8 @@ const {
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
 const { setClient: setStackersFusionClient, pollFusionEvents } = require('./lib/stackers-fusion-poller');
+const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
+const { takeStackersSnapshot } = require('./lib/stackers-analytics');
 
 const {
   buildBurnLotteryEmbed, buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
@@ -2070,6 +2072,7 @@ client.on('interactionCreate', async (interaction)=>{
   const ctx = buildCtx(interaction, guildId, config, isAdmin);
 
   if(ADMIN_COMMANDS.has(commandName))   return handleAdminCommand(commandName, ctx);
+  if(STACKERSTATS_COMMANDS.has(commandName)) return handleStackerStatsCommand(commandName, ctx);
   if(MARKET_COMMANDS.has(commandName))  return handleMarketCommand(commandName, ctx);
   if(OCAS_COMMANDS.has(commandName))    return handleOcasCommand(commandName, ctx);
   if(TOKEN_COMMANDS.has(commandName))   return handleTokenCommand(commandName, ctx);
@@ -2304,6 +2307,21 @@ client.once('clientReady', async ()=>{
     setInterval(pollFusionEvents, 60_000);
   } else {
     console.log('[StackersFusion] No ALCHEMY_API_KEY set — fusion poller disabled');
+  }
+  // Stackers analytics snapshot — iterates every token, takes real minutes
+  // for a collection this size, so this deliberately does NOT run
+  // immediately on startup (unlike the pollers above) — running it on every
+  // bot restart during a deploy/debug session would be wasteful. Interval
+  // only; the first snapshot happens once the first 24h period elapses.
+  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
+    console.log('[StackersAnalytics] Snapshot job scheduled (every 24h)');
+    setInterval(() => {
+      takeStackersSnapshot(pgPool).catch(e =>
+        console.error('[StackersAnalytics] Snapshot failed:', e.message)
+      );
+    }, 24 * 60 * 60 * 1000);
+  } else {
+    console.log('[StackersAnalytics] No ALCHEMY_API_KEY set — snapshot job disabled');
   }
   // Process pending burn alerts every 30s — waits for metadata to refresh before posting
   setInterval(processPendingBurnAlerts, 30_000);

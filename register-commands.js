@@ -26,6 +26,8 @@ const commands = [
 
   new SlashCommandBuilder().setName('status').setDescription('Show current bot configuration'),
 
+  new SlashCommandBuilder().setName('stackerstats').setDescription('Stackers collection-wide stats — tier distribution, asset popularity, vault totals'),
+
 
   new SlashCommandBuilder().setName('download')
   .setDescription('Download a high-res PNG for OCAS or another configured collection — leave blank for a guided menu')
