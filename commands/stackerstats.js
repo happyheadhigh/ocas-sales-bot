@@ -50,6 +50,16 @@ async function handleStackerStatsCommand(commandName, ctx){
     .setColor(0xF97316)
     .setFooter({ text: `Snapshot from ${new Date(latest.snapshot_at).toLocaleString()}` });
 
+  // A snapshot now checkpoints its progress periodically rather than only
+  // writing once at the end (a bot restart mid-run used to mean losing
+  // everything). tokens_processed < total_tokens means this row is a
+  // checkpoint from a run that got interrupted, not a complete picture —
+  // shown clearly rather than silently presented as final.
+  if(latest.tokens_processed < latest.total_tokens){
+    const pct = ((latest.tokens_processed / latest.total_tokens) * 100).toFixed(0);
+    embed.setDescription(`⚠️ **Partial snapshot** — only ${latest.tokens_processed}/${latest.total_tokens} tokens (${pct}%) were processed before this run was interrupted. Numbers below reflect just that subset, not the full collection. A complete run will replace this automatically.`);
+  }
+
   embed.addFields(
     { name: 'Tokens', value: `${latest.total_tokens} total · ${latest.active_tokens} active`, inline: false },
     { name: '🎚️ Tier Distribution', value: tierLines.join('\n') || 'No data', inline: true },
@@ -64,7 +74,7 @@ async function handleStackerStatsCommand(commandName, ctx){
   // would be exactly the kind of confident-sounding guess this feature was
   // built to avoid. If there's no comparison snapshot yet (not enough
   // history), this section is skipped entirely rather than shown empty.
-  if(comparison){
+  if(comparison && latest.tokens_processed === latest.total_tokens){
     const compTotals = comparison.vault_totals || {};
     const deltaLines = [];
     for(const [symbol, latestAmount] of Object.entries(vaultTotals)){
