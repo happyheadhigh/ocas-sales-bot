@@ -6,6 +6,7 @@ const { AttachmentBuilder, MessageFlags } = require('discord.js');
 const { extractPngFromSvg } = require('../lib/images');
 const { pgPool, dbLoad, dbSave } = require('../lib/db');
 const { SUPPORTED_CHAINS } = require('../lib/collection-backfill');
+const { STACKERS_SLUG, formatStackersText } = require('../lib/stackers');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
 const DOWNLOAD_GUILD_WINDOW_MS = Math.max(10000, parseInt(process.env.DOWNLOAD_GUILD_WINDOW_MS || '60000', 10));
@@ -441,6 +442,10 @@ async function runDownload(interaction, ctx, { tokenId, size, transparent, colle
       if(rawUrl) content += `\n📥 *To save the full quality GIF: [tap here](${rawUrl})*`;
     } else {
       content = `PNG download for **${alias.toUpperCase()} #${tokenId}** · ${size}px${finalTransparent?' · transparent':''}`;
+    }
+    if(slug === STACKERS_SLUG){
+      const stackersText = await formatStackersText(tokenId);
+      if(stackersText) content += `\n\n${stackersText}`;
     }
     return interaction.editReply({ content, files:[att] });
   }catch(e){
