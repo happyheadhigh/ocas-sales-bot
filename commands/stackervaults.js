@@ -28,7 +28,7 @@ async function handleStackerVaultsCommand(commandName, ctx){
   const embed = new EmbedBuilder()
     .setTitle('🏦 Listed Stackers with Unclaimed Vault Value')
     .setColor(0xF97316)
-    .setDescription('Real, unclaimed value sitting in each token\'s vault — a buyer gets this on top of the token itself, since vault balance travels with the NFT on sale. Sorted cheapest listing first.')
+    .setDescription('Sorted cheapest listing first.')
     .setFooter({ text: `Vault data checked periodically, not live — listing prices are current` });
 
   for(const row of rows.slice(0, 10)){
