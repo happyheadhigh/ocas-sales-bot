@@ -638,6 +638,59 @@ app.get('/db/stackers/token-debug/:tokenId', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/deployment-block-debug — finds the vault contract's
+// real deployment block via binary search on eth_getCode (empty before
+// deployment, real bytecode after) rather than guessing. Deliberately
+// avoids eth_getLogs entirely for this -- getCode queries a single block
+// at a time, so it isn't subject to this account's confirmed 10-block
+// range cap on eth_getLogs specifically. O(log n) calls regardless of how
+// many total blocks exist, so this is cheap and fast either way. Exists to
+// answer a concrete question before deciding whether a full historical
+// Claimed-event backfill is actually practical: how many blocks would it
+// need to cover, and how many 10-block eth_getLogs calls would that mean.
+app.get('/db/stackers/deployment-block-debug', auth, async (req, res) => {
+  try {
+    const { getProvider, VAULT_ADDRESS } = require('./lib/stackers');
+    const provider = getProvider();
+
+    const latest = await provider.getBlockNumber();
+    const latestCode = await provider.getCode(VAULT_ADDRESS, latest);
+    if(latestCode === '0x'){
+      return res.status(500).json({ ok: false, error: 'Contract has no code at the latest block — wrong address, or something is off' });
+    }
+
+    let low = 0;
+    let high = latest;
+    let calls = 0;
+    while(low < high){
+      const mid = Math.floor((low + high) / 2);
+      const code = await provider.getCode(VAULT_ADDRESS, mid);
+      calls++;
+      if(code === '0x'){
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+
+    const deploymentBlock = low;
+    const totalBlocks = latest - deploymentBlock;
+    const chunksAt10PerCall = Math.ceil(totalBlocks / 10);
+
+    res.json({
+      ok: true,
+      deploymentBlock,
+      latestBlock: latest,
+      totalBlocksSinceDeployment: totalBlocks,
+      eth_getLogs_calls_needed_at_10_per_call: chunksAt10PerCall,
+      binarySearchCallsUsed: calls,
+    });
+  } catch(e) {
+    console.error('/db/stackers/deployment-block-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/collections/:slug/seed-market — one-time full sales history +
 // current listings pull for a newly onboarded collection. Runs in the
 // background; poll /db/collections (added in phase 1) to watch status go
