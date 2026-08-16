@@ -490,6 +490,62 @@ app.get('/db/schema-debug/:table', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/cost-basis-debug/:wallet — diagnoses a real cost-basis
+// gap (confirmed real secondary purchases showing Spent: Ξ0.0000). Checks
+// wallet_token_intervals (what we think this wallet holds and its current
+// cost_eth), our own sales table (does our cache have a matching row for
+// this wallet as buyer — using price_eth/currency, confirmed via
+// /db/schema-debug/sales to be the real live columns), and a live OpenSea
+// sale-events lookup for the first held token (does OpenSea itself have
+// the record, independent of whether it made it into our own cache) — to
+// see which specific layer is actually failing rather than guessing.
+app.get('/db/stackers/cost-basis-debug/:wallet', auth, async (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').toLowerCase();
+    if(!/^0x[0-9a-f]{40}$/.test(wallet)) return res.status(400).json({ ok: false, error: 'valid wallet address required' });
+
+    const intervalsRes = await pool.query(
+      `SELECT token_id, cost_eth, acquired_at FROM wallet_token_intervals
+       WHERE wallet_address = $1 AND collection_slug = 'stackersxyz' AND disposed_at IS NULL
+       ORDER BY token_id`,
+      [wallet]
+    );
+
+    const tokenIds = intervalsRes.rows.map(r => r.token_id);
+    const salesRes = tokenIds.length ? await pool.query(
+      `SELECT token_id, price_eth, currency, buyer, seller, sale_ts FROM sales
+       WHERE collection_slug = 'stackersxyz' AND token_id = ANY($1)`,
+      [tokenIds]
+    ) : { rows: [] };
+
+    let liveOpenSeaCheck = null;
+    if(tokenIds.length){
+      const testToken = tokenIds[0];
+      try{
+        const qs = new URLSearchParams({ event_type: 'sale', token_ids: testToken.toString() }).toString();
+        const osRes = await fetch(`https://api.opensea.io/api/v2/events/collection/stackersxyz?${qs}`, {
+          headers: { 'X-API-KEY': process.env.OPENSEA_KEY || '', 'Accept': 'application/json' }
+        });
+        const osData = osRes.ok ? await osRes.json() : { error: `HTTP ${osRes.status}` };
+        liveOpenSeaCheck = { testedTokenId: testToken, status: osRes.status, eventCount: osData?.asset_events?.length ?? null, raw: osData };
+      }catch(e){
+        liveOpenSeaCheck = { testedTokenId: testToken, error: e.message };
+      }
+    }
+
+    res.json({
+      ok: true,
+      wallet,
+      heldTokens: intervalsRes.rows,
+      matchingSalesInOurDb: salesRes.rows,
+      liveOpenSeaCheck,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/cost-basis-debug/${req.params.wallet} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/snapshots-debug — direct view of stackers_snapshots rows.
 // Diagnostic only, not used by any command. Exists specifically to resolve
 // a real discrepancy: server logs showed a snapshot completing successfully,
