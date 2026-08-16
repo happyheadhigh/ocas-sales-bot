@@ -469,6 +469,31 @@ app.get('/db/stackers/snapshots-debug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/tier-weights-debug — raw TIER_BURN/TIER_WEIGHT values
+// straight from the contract. Diagnostic only. Real live data just showed
+// Tier 1 displaying as (0.0x) instead of the expected 1.0x for the base
+// tier — meaning the guessed basis-points conversion in formatTierWeight()
+// is wrong. This exists to see the actual raw numbers rather than guess at
+// a second conversion factor with no evidence.
+app.get('/db/stackers/tier-weights-debug', auth, async (req, res) => {
+  try {
+    const { getContracts, getTierThresholds } = require('./lib/stackers');
+    const { nft } = getContracts();
+    const thresholds = await getTierThresholds(nft);
+    res.json({
+      ok: true,
+      thresholds: thresholds.map(t => ({
+        index: t.index,
+        burnThreshold: t.burn.toString(),
+        weightRaw: t.weightRaw.toString(),
+      })),
+    });
+  } catch(e) {
+    console.error('/db/stackers/tier-weights-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/collections/:slug/seed-market — one-time full sales history +
 // current listings pull for a newly onboarded collection. Runs in the
 // background; poll /db/collections (added in phase 1) to watch status go
