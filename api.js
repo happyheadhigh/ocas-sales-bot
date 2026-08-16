@@ -494,6 +494,38 @@ app.get('/db/stackers/tier-weights-debug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/token-debug/:tokenId — checks whether a token's image
+// mismatch is actually a bug or expected behavior. Stackers' NFT contract
+// has an artworkOf(tokenId) function and an ArtworkAssigned event, separate
+// from the token ID itself -- a common reveal-shuffle pattern where the art
+// shown is deliberately decoupled from the token number. Testing directly
+// whether a reported tokenId's assigned artwork differs from the tokenId,
+// which would explain a served image that looks "wrong" at a glance but is
+// actually correct.
+app.get('/db/stackers/token-debug/:tokenId', auth, async (req, res) => {
+  try {
+    const tokenId = parseInt(req.params.tokenId, 10);
+    if(!tokenId) return res.status(400).json({ ok: false, error: 'valid tokenId required' });
+    const { getContracts } = require('./lib/stackers');
+    const { nft } = getContracts();
+    const [artworkId, fusedArtId, tokenUri] = await Promise.all([
+      nft.artworkOf(tokenId).catch(e => `ERROR: ${e.message}`),
+      nft.fusedArt(tokenId).catch(e => `ERROR: ${e.message}`),
+      nft.tokenURI(tokenId).catch(e => `ERROR: ${e.message}`),
+    ]);
+    res.json({
+      ok: true,
+      tokenId,
+      artworkOf: artworkId?.toString?.() ?? artworkId,
+      fusedArt: fusedArtId?.toString?.() ?? fusedArtId,
+      tokenURI: tokenUri,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/token-debug/${req.params.tokenId} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/collections/:slug/seed-market — one-time full sales history +
 // current listings pull for a newly onboarded collection. Runs in the
 // background; poll /db/collections (added in phase 1) to watch status go
