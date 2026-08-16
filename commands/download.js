@@ -6,6 +6,9 @@ const { AttachmentBuilder, MessageFlags } = require('discord.js');
 const { extractPngFromSvg } = require('../lib/images');
 const { pgPool, dbLoad, dbSave } = require('../lib/db');
 const { SUPPORTED_CHAINS } = require('../lib/collection-backfill');
+const { ipfsToHttp, fetchWithGatewayFallback } = require('../lib/ipfs-gateway');
+const { STACKERS_SLUG } = require('../lib/stackers');
+const { getOrCacheStackerImage } = require('../lib/stackers-image-cache');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
 const DOWNLOAD_GUILD_WINDOW_MS = Math.max(10000, parseInt(process.env.DOWNLOAD_GUILD_WINDOW_MS || '60000', 10));
@@ -176,65 +179,6 @@ async function fetchTokenUri(contract, tokenId, chain=DEFAULT_CHAIN){
   return decodeAbiString(result);
 }
 
-// Returns an array of candidate HTTP URLs to try, in priority order. For
-// ipfs:// URIs specifically, tries several gateways rather than a single
-// hardcoded one — ipfs.io (what this used to point to exclusively) is a
-// free, shared public gateway used across the entire web3 ecosystem, and
-// is known to be one of the more congested ones. Cloudflare and dweb.link
-// tend to be meaningfully faster in practice; ipfs.io kept as a last
-// fallback rather than removed, since it's still a legitimate gateway,
-// just not the best first choice. Non-IPFS URLs pass through unaffected,
-// as a single-item array.
-function ipfsToHttpCandidates(url){
-  const s = String(url || '');
-  if(s.startsWith('ipfs://')){
-    const path = s.replace('ipfs://','').replace(/^ipfs\//,'');
-    return [
-      `https://cloudflare-ipfs.com/ipfs/${path}`,
-      `https://dweb.link/ipfs/${path}`,
-      `https://ipfs.io/ipfs/${path}`,
-    ];
-  }
-  return [s];
-}
-
-// Backward-compatible single-URL helper, for callers that just need a
-// display/link URL rather than an actual fetch (e.g. showing a raw link
-// to the user) — returns the first, fastest candidate.
-function ipfsToHttp(url){
-  return ipfsToHttpCandidates(url)[0];
-}
-
-// Tries each gateway candidate in sequence with a real timeout (node-fetch
-// v2 has none by default). Moves to the next candidate on a transient 5xx
-// specifically (a genuine gateway-side problem, worth trying elsewhere for)
-// or on a hard failure like a timeout — but not on a 404 or other non-5xx
-// error, where a different gateway serving the exact same content wouldn't
-// help.
-async function fetchWithGatewayFallback(url, fetchOptions = {}){
-  const candidates = ipfsToHttpCandidates(url);
-  let lastErr = null;
-  for(let i = 0; i < candidates.length; i++){
-    const candidateUrl = candidates[i];
-    try{
-      console.log(`[Download] Fetching (gateway ${i+1}/${candidates.length}):`, candidateUrl);
-      const r = await fetch(candidateUrl, { timeout: 15000, ...fetchOptions });
-      console.log('[Download] Fetch status:', r.status);
-      if(r.ok) return r;
-      if([502,503,504].includes(r.status) && i < candidates.length - 1){
-        lastErr = new Error(`HTTP ${r.status}`);
-        continue;
-      }
-      throw new Error(`HTTP ${r.status}`);
-    }catch(e){
-      lastErr = e;
-      if(i === candidates.length - 1) throw lastErr;
-      console.log(`[Download] Gateway ${i+1} failed (${e.message}), trying next`);
-    }
-  }
-  throw lastErr;
-}
-
 async function loadJsonFromUri(uri){
   const u = String(uri || '');
   if(u.startsWith('data:application/json;base64,')) return JSON.parse(Buffer.from(u.split(',')[1], 'base64').toString('utf8'));
@@ -277,7 +221,7 @@ function isSvgSource(src){
 }
 
 
-async function renderTokenPng({ contract, tokenId, chain, size, transparent, osHeaders }){
+async function renderTokenPng({ contract, tokenId, chain, size, transparent, osHeaders, slug }){
   const uri = await fetchTokenUri(contract, tokenId, chain);
   const meta = await loadJsonFromUri(uri);
 
@@ -325,7 +269,18 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
     }
   }
 
-  let src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
+  let src;
+  if(slug === STACKERS_SLUG){
+    try{
+      const cached = await getOrCacheStackerImage(pgPool, tokenId);
+      src = cached.data;
+    }catch(e){
+      console.warn(`[Download] Stacker image cache path failed for token ${tokenId}, falling back to generic resolution:`, e.message);
+    }
+  }
+  if(src === undefined){
+    src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
+  }
 
   if(typeof src === 'string' && transparent){
   src = makeSvgTransparent(src);
@@ -476,7 +431,7 @@ async function runDownload(interaction, ctx, { tokenId, size, transparent, colle
       console.warn('[download] collections chain lookup failed:', e.message);
     }
     const finalTransparent = transparent;
-    const rendered = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent, osHeaders: ctx.osHeaders });
+    const rendered = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent, osHeaders: ctx.osHeaders, slug });
     const { buffer } = rendered;
     const ext = rendered.ext || 'png';
     const sizeStr = ext === 'png' ? `-${size}` : '';

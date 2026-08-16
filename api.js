@@ -452,6 +452,24 @@ app.get('/db/stackers/snapshot', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/backfill-image-cache — proactively caches every
+// Stacker token's image, so /download can serve from Postgres instead of
+// a live IPFS fetch on every request. Safe to re-run — skips tokens
+// already cached. Runs in the background, same pattern as the snapshot
+// trigger; check server logs ([StackersImageCache] lines) for progress.
+app.get('/db/stackers/backfill-image-cache', auth, async (req, res) => {
+  try {
+    const { backfillStackerImageCache } = require('./lib/stackers-image-cache');
+    res.json({ ok: true, message: 'Stackers image cache backfill started — running in background, check server logs ([StackersImageCache] lines) for progress' });
+    backfillStackerImageCache(pool).catch(e => {
+      console.error('[/db/stackers/backfill-image-cache] background backfill failed:', e.message);
+    });
+  } catch(e) {
+    console.error('/db/stackers/backfill-image-cache error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/snapshots-debug — direct view of stackers_snapshots rows.
 // Diagnostic only, not used by any command. Exists specifically to resolve
 // a real discrepancy: server logs showed a snapshot completing successfully,
