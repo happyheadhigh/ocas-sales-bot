@@ -6,7 +6,6 @@ const { AttachmentBuilder, MessageFlags } = require('discord.js');
 const { extractPngFromSvg } = require('../lib/images');
 const { pgPool, dbLoad, dbSave } = require('../lib/db');
 const { SUPPORTED_CHAINS } = require('../lib/collection-backfill');
-const { STACKERS_SLUG, formatStackersText } = require('../lib/stackers');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
 const DOWNLOAD_GUILD_WINDOW_MS = Math.max(10000, parseInt(process.env.DOWNLOAD_GUILD_WINDOW_MS || '60000', 10));
@@ -198,12 +197,39 @@ async function imageSourceToSvgOrBuffer(image){
   if(img.startsWith('data:image/svg+xml;utf8,')) return decodeURIComponent(img.split(',').slice(1).join(','));
   if(img.trim().startsWith('<svg')) return img;
   if(img.startsWith('http') || img.startsWith('ipfs://')){
-    const r = await fetch(ipfsToHttp(img));
-    if(!r.ok) throw new Error(`image HTTP ${r.status}`);
-    const buf = await r.buffer();
-    const ct = r.headers.get('content-type') || '';
-    if(ct.includes('svg') || buf.toString('utf8',0,20).includes('<svg')) return buf.toString('utf8');
-    return buf;
+    const url = ipfsToHttp(img);
+    // Single retry for the transient-5xx family specifically (502/503/504 —
+    // "server was temporarily overloaded," the standard signal for exactly
+    // that) — not for 404s or other errors, where retrying wouldn't help.
+    // Explicit timeout since node-fetch v2 has none by default, same
+    // missing-timeout gap already fixed elsewhere tonight for a different
+    // library — a 504 specifically means a response did come back, but a
+    // genuine hang (not just a slow-but-real 504) was still possible here
+    // without this.
+    let lastErr = null;
+    for(let attempt = 1; attempt <= 2; attempt++){
+      try{
+        console.log(`[Download] Fetching image (attempt ${attempt}/2):`, url);
+        const r = await fetch(url, { timeout: 15000 });
+        console.log('[Download] Image fetch status:', r.status);
+        if(r.ok){
+          const buf = await r.buffer();
+          const ct = r.headers.get('content-type') || '';
+          if(ct.includes('svg') || buf.toString('utf8',0,20).includes('<svg')) return buf.toString('utf8');
+          return buf;
+        }
+        if([502,503,504].includes(r.status) && attempt === 1){
+          console.log(`[Download] Transient ${r.status}, retrying once after 1s`);
+          await new Promise(res => setTimeout(res, 1000));
+          continue;
+        }
+        throw new Error(`image HTTP ${r.status}`);
+      }catch(e){
+        lastErr = e;
+        if(attempt === 2) throw e;
+      }
+    }
+    throw lastErr;
   }
   throw new Error('Unsupported image format.');
 }
@@ -442,10 +468,6 @@ async function runDownload(interaction, ctx, { tokenId, size, transparent, colle
       if(rawUrl) content += `\n📥 *To save the full quality GIF: [tap here](${rawUrl})*`;
     } else {
       content = `PNG download for **${alias.toUpperCase()} #${tokenId}** · ${size}px${finalTransparent?' · transparent':''}`;
-    }
-    if(slug === STACKERS_SLUG){
-      const stackersText = await formatStackersText(tokenId);
-      if(stackersText) content += `\n\n${stackersText}`;
     }
     return interaction.editReply({ content, files:[att] });
   }catch(e){
