@@ -176,18 +176,70 @@ async function fetchTokenUri(contract, tokenId, chain=DEFAULT_CHAIN){
   return decodeAbiString(result);
 }
 
-function ipfsToHttp(url){
+// Returns an array of candidate HTTP URLs to try, in priority order. For
+// ipfs:// URIs specifically, tries several gateways rather than a single
+// hardcoded one — ipfs.io (what this used to point to exclusively) is a
+// free, shared public gateway used across the entire web3 ecosystem, and
+// is known to be one of the more congested ones. Cloudflare and dweb.link
+// tend to be meaningfully faster in practice; ipfs.io kept as a last
+// fallback rather than removed, since it's still a legitimate gateway,
+// just not the best first choice. Non-IPFS URLs pass through unaffected,
+// as a single-item array.
+function ipfsToHttpCandidates(url){
   const s = String(url || '');
-  if(s.startsWith('ipfs://')) return 'https://ipfs.io/ipfs/' + s.replace('ipfs://','').replace(/^ipfs\//,'');
-  return s;
+  if(s.startsWith('ipfs://')){
+    const path = s.replace('ipfs://','').replace(/^ipfs\//,'');
+    return [
+      `https://cloudflare-ipfs.com/ipfs/${path}`,
+      `https://dweb.link/ipfs/${path}`,
+      `https://ipfs.io/ipfs/${path}`,
+    ];
+  }
+  return [s];
+}
+
+// Backward-compatible single-URL helper, for callers that just need a
+// display/link URL rather than an actual fetch (e.g. showing a raw link
+// to the user) — returns the first, fastest candidate.
+function ipfsToHttp(url){
+  return ipfsToHttpCandidates(url)[0];
+}
+
+// Tries each gateway candidate in sequence with a real timeout (node-fetch
+// v2 has none by default). Moves to the next candidate on a transient 5xx
+// specifically (a genuine gateway-side problem, worth trying elsewhere for)
+// or on a hard failure like a timeout — but not on a 404 or other non-5xx
+// error, where a different gateway serving the exact same content wouldn't
+// help.
+async function fetchWithGatewayFallback(url, fetchOptions = {}){
+  const candidates = ipfsToHttpCandidates(url);
+  let lastErr = null;
+  for(let i = 0; i < candidates.length; i++){
+    const candidateUrl = candidates[i];
+    try{
+      console.log(`[Download] Fetching (gateway ${i+1}/${candidates.length}):`, candidateUrl);
+      const r = await fetch(candidateUrl, { timeout: 15000, ...fetchOptions });
+      console.log('[Download] Fetch status:', r.status);
+      if(r.ok) return r;
+      if([502,503,504].includes(r.status) && i < candidates.length - 1){
+        lastErr = new Error(`HTTP ${r.status}`);
+        continue;
+      }
+      throw new Error(`HTTP ${r.status}`);
+    }catch(e){
+      lastErr = e;
+      if(i === candidates.length - 1) throw lastErr;
+      console.log(`[Download] Gateway ${i+1} failed (${e.message}), trying next`);
+    }
+  }
+  throw lastErr;
 }
 
 async function loadJsonFromUri(uri){
   const u = String(uri || '');
   if(u.startsWith('data:application/json;base64,')) return JSON.parse(Buffer.from(u.split(',')[1], 'base64').toString('utf8'));
   if(u.startsWith('data:application/json;utf8,')) return JSON.parse(decodeURIComponent(u.split(',').slice(1).join(',')));
-  const r = await fetch(ipfsToHttp(u));
-  if(!r.ok) throw new Error(`metadata HTTP ${r.status}`);
+  const r = await fetchWithGatewayFallback(u);
   return await r.json();
 }
 
@@ -197,39 +249,11 @@ async function imageSourceToSvgOrBuffer(image){
   if(img.startsWith('data:image/svg+xml;utf8,')) return decodeURIComponent(img.split(',').slice(1).join(','));
   if(img.trim().startsWith('<svg')) return img;
   if(img.startsWith('http') || img.startsWith('ipfs://')){
-    const url = ipfsToHttp(img);
-    // Single retry for the transient-5xx family specifically (502/503/504 —
-    // "server was temporarily overloaded," the standard signal for exactly
-    // that) — not for 404s or other errors, where retrying wouldn't help.
-    // Explicit timeout since node-fetch v2 has none by default, same
-    // missing-timeout gap already fixed elsewhere tonight for a different
-    // library — a 504 specifically means a response did come back, but a
-    // genuine hang (not just a slow-but-real 504) was still possible here
-    // without this.
-    let lastErr = null;
-    for(let attempt = 1; attempt <= 2; attempt++){
-      try{
-        console.log(`[Download] Fetching image (attempt ${attempt}/2):`, url);
-        const r = await fetch(url, { timeout: 15000 });
-        console.log('[Download] Image fetch status:', r.status);
-        if(r.ok){
-          const buf = await r.buffer();
-          const ct = r.headers.get('content-type') || '';
-          if(ct.includes('svg') || buf.toString('utf8',0,20).includes('<svg')) return buf.toString('utf8');
-          return buf;
-        }
-        if([502,503,504].includes(r.status) && attempt === 1){
-          console.log(`[Download] Transient ${r.status}, retrying once after 1s`);
-          await new Promise(res => setTimeout(res, 1000));
-          continue;
-        }
-        throw new Error(`image HTTP ${r.status}`);
-      }catch(e){
-        lastErr = e;
-        if(attempt === 2) throw e;
-      }
-    }
-    throw lastErr;
+    const r = await fetchWithGatewayFallback(img);
+    const buf = await r.buffer();
+    const ct = r.headers.get('content-type') || '';
+    if(ct.includes('svg') || buf.toString('utf8',0,20).includes('<svg')) return buf.toString('utf8');
+    return buf;
   }
   throw new Error('Unsupported image format.');
 }
@@ -285,7 +309,7 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
     if(isGif || isMp4){
       console.log('[Download] Fetching animated file:', ipfsToHttp(animUrl));
       // Request GIF explicitly — CDNs like seadn.io may serve WebP otherwise
-      const r = await fetch(ipfsToHttp(animUrl), { headers: { 'Accept': 'image/gif,image/*;q=0.9' } });
+      const r = await fetchWithGatewayFallback(animUrl, { headers: { 'Accept': 'image/gif,image/*;q=0.9' } });
       console.log('[Download] Fetch status:', r.status, 'content-type:', r.headers.get('content-type'));
       if(!r.ok) throw new Error('animation fetch HTTP ' + r.status);
       const buffer = await r.buffer();
