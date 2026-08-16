@@ -470,6 +470,26 @@ app.get('/db/stackers/backfill-image-cache', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/schema-debug/:table — direct ground-truth check of a table's
+// real, live columns. Exists specifically because code across this
+// codebase disagrees about the sales table's actual price column name
+// (price_eth vs sale_price) -- rather than guess which is real, checking
+// the live database directly.
+app.get('/db/schema-debug/:table', auth, async (req, res) => {
+  try {
+    const table = String(req.params.table || '').toLowerCase();
+    if(!/^[a-z_]+$/.test(table)) return res.status(400).json({ ok: false, error: 'invalid table name' });
+    const result = await pool.query(
+      `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
+      [table]
+    );
+    res.json({ ok: true, table, columns: result.rows });
+  } catch(e) {
+    console.error(`/db/schema-debug/${req.params.table} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/snapshots-debug — direct view of stackers_snapshots rows.
 // Diagnostic only, not used by any command. Exists specifically to resolve
 // a real discrepancy: server logs showed a snapshot completing successfully,
