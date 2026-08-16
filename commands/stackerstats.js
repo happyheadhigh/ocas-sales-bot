@@ -9,7 +9,17 @@ async function handleStackerStatsCommand(commandName, ctx){
 
   await interaction.deferReply();
 
-  const { latest, comparison } = await getLatestSnapshotWithComparison(pgPool).catch(() => ({ latest: null, comparison: null }));
+  try{
+    const debugCount = await pgPool.query(`SELECT COUNT(*) AS n FROM stackers_snapshots`);
+    console.log(`[stackerstats] This connection sees ${debugCount.rows[0].n} row(s) in stackers_snapshots`);
+  }catch(e){
+    console.error('[stackerstats] Even the debug COUNT query failed:', e.message);
+  }
+
+  const { latest, comparison } = await getLatestSnapshotWithComparison(pgPool).catch(e => {
+    console.error('[stackerstats] getLatestSnapshotWithComparison failed:', e.message, e.stack);
+    return { latest: null, comparison: null };
+  });
   if(!latest){
     return interaction.editReply({
       content: 'No Stackers snapshot exists yet — the analytics job runs periodically and needs at least one full pass to have data. Check back after the next scheduled run.',
