@@ -452,6 +452,23 @@ app.get('/db/stackers/snapshot', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/snapshots-debug — direct view of stackers_snapshots rows.
+// Diagnostic only, not used by any command. Exists specifically to resolve
+// a real discrepancy: server logs showed a snapshot completing successfully,
+// but /stackerstats (running in the bot service) reported no snapshot exists
+// at all — this checks the table directly rather than guessing why.
+app.get('/db/stackers/snapshots-debug', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, snapshot_at, total_tokens, tokens_processed, active_tokens FROM stackers_snapshots ORDER BY snapshot_at DESC LIMIT 10`
+    );
+    res.json({ ok: true, count: result.rows.length, rows: result.rows });
+  } catch(e) {
+    console.error('/db/stackers/snapshots-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/collections/:slug/seed-market — one-time full sales history +
 // current listings pull for a newly onboarded collection. Runs in the
 // background; poll /db/collections (added in phase 1) to watch status go
