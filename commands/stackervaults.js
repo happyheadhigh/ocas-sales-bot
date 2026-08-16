@@ -74,7 +74,7 @@ async function handleWalletSubcommand(interaction, pgPool){
     address = verifiedRes.rows[0].wallet.toLowerCase();
   }
 
-  const summary = await getWalletVaultSummary(address, pgPool).catch(e => {
+  const summary = await getWalletVaultSummary(address).catch(e => {
     console.error('[stackervaults wallet] getWalletVaultSummary failed:', e.message, e.stack);
     return null;
   });
