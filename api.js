@@ -514,8 +514,8 @@ app.get('/db/stackers/cost-basis-debug/:wallet', auth, async (req, res) => {
     const tokenIds = intervalsRes.rows.map(r => r.token_id);
     const salesRes = tokenIds.length ? await pool.query(
       `SELECT token_id, price_eth, currency, buyer, seller, sale_ts FROM sales
-       WHERE collection_slug = 'stackersxyz' AND token_id = ANY($1)`,
-      [tokenIds]
+       WHERE collection_slug = 'stackersxyz' AND token_id = ANY($1) AND LOWER(buyer) = $2`,
+      [tokenIds, wallet]
     ) : { rows: [] };
 
     let liveOpenSeaCheck = null;
