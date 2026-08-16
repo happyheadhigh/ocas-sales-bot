@@ -28,7 +28,22 @@ const commands = [
 
   new SlashCommandBuilder().setName('stackerstats').setDescription('Stackers collection-wide stats — tier distribution, asset popularity, vault totals'),
 
-  new SlashCommandBuilder().setName('stackervaults').setDescription('Currently listed Stackers with unclaimed value sitting in their vault'),
+  new SlashCommandBuilder()
+    .setName('stackervaults')
+    .setDescription('Stackers vault value — listings or a specific wallet')
+    .addSubcommand(sub =>
+      sub.setName('listings')
+        .setDescription('Currently listed Stackers with unclaimed value sitting in their vault')
+    )
+    .addSubcommand(sub =>
+      sub.setName('wallet')
+        .setDescription('Total unclaimed vault value across a wallet\'s held Stackers')
+        .addStringOption(opt =>
+          opt.setName('address')
+            .setDescription('Wallet address to check — leave blank to use your own verified wallet')
+            .setRequired(false)
+        )
+    ),
 
 
   new SlashCommandBuilder().setName('download')
