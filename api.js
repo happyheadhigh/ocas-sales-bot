@@ -470,6 +470,24 @@ app.get('/db/stackers/backfill-image-cache', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/refresh-vault-listings — manually trigger the
+// listed-with-unclaimed-vault-value refresh. The scheduled job only runs
+// every 6h; without a manual trigger there'd be no way to test /stackervaults
+// until then. Runs in the background, check server logs
+// ([StackersVaultListings] lines) for progress.
+app.get('/db/stackers/refresh-vault-listings', auth, async (req, res) => {
+  try {
+    const { refreshVaultListingsCache } = require('./lib/stackers-vault-listings');
+    res.json({ ok: true, message: 'Stackers vault-listings refresh started — running in background, check server logs ([StackersVaultListings] lines) for progress' });
+    refreshVaultListingsCache(pool).catch(e => {
+      console.error('[/db/stackers/refresh-vault-listings] background refresh failed:', e.message);
+    });
+  } catch(e) {
+    console.error('/db/stackers/refresh-vault-listings error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/schema-debug/:table — direct ground-truth check of a table's
 // real, live columns. Exists specifically because code across this
 // codebase disagrees about the sales table's actual price column name
