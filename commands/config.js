@@ -216,6 +216,7 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
       `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\n` +
       (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\n` : '') +
       (isStackers ? `**Vault Listing Alerts:** ${col.vaultListingAlert ? '🏦 ON' : '🔕 OFF'}\n` : '') +
+      (isStackers ? `**Fusion Alerts Channel:** ${cfg.fusionChannel ? `<#${cfg.fusionChannel}>` : '`Not set (uses Sales Channel)`'}\n` : '') +
       `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\n` +
       `**Sales Filters:** ${Object.keys(col.salesFilters||{}).length} active\n` +
       `**Rank Alert:** ${raLabel}${!isOcas ? ' 🔒' : ''}\n` +
@@ -246,6 +247,7 @@ function collectionEditRow(colId, isPrimary, isOcas=false, isStackers=false){
   }
   if(isStackers){
     options.push(new StringSelectMenuOptionBuilder().setLabel('Vault Listing Alerts').setEmoji('🏦').setValue('vaultalert').setDescription('Alert on new listings with unclaimed vault value'));
+    options.push(new StringSelectMenuOptionBuilder().setLabel('Fusion Alerts Channel').setEmoji('🔥').setValue('fusionchan').setDescription('Where fusion alerts post — defaults to Sales Channel if not set'));
   }
 
   const menu = new StringSelectMenuBuilder()
@@ -683,6 +685,7 @@ async function handleConfigButton(interaction, ctx){
       salesfilters:  `cfg:col:salesfilters:${colId}`,
       rankalert:     `cfg:col:rankalert:${colId}`,
       vaultalert:    `cfg:col:vaultalert:${colId}`,
+      fusionchan:    `cfg:col:fusionchan:${colId}`,
       traitroles:    `cfg:col:traitroles:${colId}`,
       pause:         `cfg:col:pause:${colId}`,
       rebackfill:    `cfg:col:rebackfill:${colId}`,
@@ -859,14 +862,16 @@ async function handleConfigButton(interaction, ctx){
       if(field === 'sales')    { delete cfg.channelId; delete cfg.salesChannel; }
       if(field === 'listings') { delete cfg.listingsChannelId; delete cfg.listingsChannel; }
       if(field === 'burn')     { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      if(field === 'fusion')   { delete cfg.fusionChannel; }
     } else {
       const idx = parseInt(colId);
       if(cfg.collections?.[idx]){
         if(field === 'sales')    cfg.collections[idx].salesChannel    = null;
         if(field === 'listings') cfg.collections[idx].listingsChannel = null;
       }
-      // burn channel is always top-level in cfg
+      // burn and fusion channels are always top-level in cfg
       if(field === 'burn') { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      if(field === 'fusion') { delete cfg.fusionChannel; }
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
@@ -905,6 +910,21 @@ async function handleConfigButton(interaction, ctx){
       new ActionRowBuilder().addComponents(menu),
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`cfg:col:clearchan:burn:${colId}`).setLabel('🚫 Disable Burn Alerts').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`cfg:col:view:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
+  }
+
+  if(customId.startsWith('cfg:col:fusionchan:')){
+    const colId = customId.split(':')[3];
+    const menu = new ChannelSelectMenuBuilder()
+      .setCustomId(`cfg_chsel:col:fusionchan:${colId}`)
+      .setPlaceholder('Pick the Fusion Alerts channel')
+      .addChannelTypes(ChannelType.GuildText);
+    return interaction.editReply({ content:'**Select the 🔥 Fusion Alerts channel:**\n_Leave unset and fusion alerts post to the Sales Channel instead._', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`cfg:col:clearchan:fusion:${colId}`).setLabel('↩️ Reset to Sales Channel').setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(`cfg:col:view:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
       ),
     ]});
@@ -2198,6 +2218,7 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
         if(field==='saleschan')  cfg.channelId         = chId;
         if(field==='listchan')   cfg.listingsChannelId = chId;
         if(field==='burnchan')   { cfg.burnChannel = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+        if(field==='fusionchan') cfg.fusionChannel = chId;
       } else {
         const idx = parseInt(colId);
         if(!cfg.collections) cfg.collections = [];
@@ -2205,8 +2226,9 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
           if(field==='saleschan')  cfg.collections[idx].salesChannel    = chId;
           if(field==='listchan')   cfg.collections[idx].listingsChannel = chId;
         }
-        // burn channel is always top-level in cfg
+        // burn and fusion channels are always top-level in cfg
         if(field==='burnchan') { cfg.burnChannel = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+        if(field==='fusionchan') cfg.fusionChannel = chId;
       }
       await setConfig(guildId, cfg);
       const col = isPrimary
