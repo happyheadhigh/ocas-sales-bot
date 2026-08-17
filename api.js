@@ -850,6 +850,26 @@ app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/asset-count-only-debug — just assetCount(), nothing
+// else. Exists because assets(idx) on the new engine returned real data
+// our old ABI's 8-field struct couldn't decode, and the new contract isn't
+// verified yet (confirmed directly: Blockscout returns "Contract source
+// code not verified"), so the real struct layout can't be pulled
+// authoritatively right now. assetCount() itself is a simple uint8 with no
+// struct to get wrong — far lower risk of a bad guess than reverse-
+// engineering assets()'s full layout from raw bytes would be.
+app.get('/db/stackers/asset-count-only-debug', auth, async (req, res) => {
+  try {
+    const { getContracts } = require('./lib/stackers');
+    const { engine } = getContracts();
+    const count = await engine.assetCount();
+    res.json({ ok: true, assetCount: Number(count) });
+  } catch(e) {
+    console.error('/db/stackers/asset-count-only-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
 // every 6h; without a manual trigger there'd be no way to test /stackervaults
