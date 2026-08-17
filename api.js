@@ -480,8 +480,9 @@ app.get('/db/stackers/backfill-image-cache', auth, async (req, res) => {
 app.get('/db/stackers/backfill-token-status', auth, async (req, res) => {
   try {
     const { backfillTokenStatus } = require('./lib/stackers-status-poller');
-    res.json({ ok: true, message: 'Stackers token-status backfill started — running in background, check server logs ([StackersStatus] lines) for progress' });
-    backfillTokenStatus(pool).catch(e => {
+    const force = req.query.force === 'true';
+    res.json({ ok: true, message: `Stackers token-status backfill started${force ? ' (force mode)' : ''} — running in background, check server logs ([StackersStatus] lines) for progress` });
+    backfillTokenStatus(pool, force).catch(e => {
       console.error('[/db/stackers/backfill-token-status] background backfill failed:', e.message);
     });
   } catch(e) {
