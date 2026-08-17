@@ -490,6 +490,55 @@ app.get('/db/stackers/backfill-token-status', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/engine-assets-debug — lists every asset the engine
+// currently knows about (assetCount + assets(idx) for each index), and
+// separately what's actually showing up in the live tier/asset cache's
+// split data. Distinguishes "a real asset exists that isn't showing" from
+// "an asset was added to the engine but no token has chosen it in their
+// split yet" — asset popularity counts chosen splits, not the engine's
+// available list, so those are two genuinely different things.
+app.get('/db/stackers/engine-assets-debug', auth, async (req, res) => {
+  try {
+    const { getContracts, resolveAsset, getProvider } = require('./lib/stackers');
+    const { engine } = getContracts();
+    const provider = getProvider();
+
+    const count = Number(await engine.assetCount());
+    const engineAssets = [];
+    for(let i = 0; i < count; i++){
+      const raw = await engine.assets(i);
+      const token1 = raw[0];
+      const isStock = raw[raw.length - 1];
+      const { symbol } = await resolveAsset(token1, provider).catch(() => ({ symbol: `unknown(${token1})` }));
+      engineAssets.push({
+        idx: i,
+        symbol,
+        isStock,
+        raw: raw.map(v => v?.toString?.() ?? v), // full raw tuple, for verifying field order if the interpreted symbol/isStock look wrong
+      });
+    }
+
+    const cachedRes = await pool.query(`SELECT split FROM stackers_token_status WHERE split IS NOT NULL`);
+    const chosenSymbols = new Set();
+    for(const row of cachedRes.rows){
+      for(const s of (row.split || [])){
+        if(s?.symbol) chosenSymbols.add(s.symbol);
+      }
+    }
+
+    res.json({
+      ok: true,
+      engineAssetCount: count,
+      engineAssets,
+      symbolsChosenByAnyToken: Array.from(chosenSymbols).sort(),
+      registeredButNeverChosen: engineAssets.map(a => a.symbol).filter(s => !chosenSymbols.has(s)),
+    });
+  } catch(e) {
+    console.error('/db/stackers/engine-assets-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
 // every 6h; without a manual trigger there'd be no way to test /stackervaults
