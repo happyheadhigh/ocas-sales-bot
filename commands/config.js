@@ -10,6 +10,7 @@ const {
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
+const { STACKERS_SLUG } = require('../lib/stackers');
 const { isPaidFeature } = require('./market');
 const { buildRolePickerRows } = require('../lib/role-picker');
 const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
@@ -201,6 +202,7 @@ function collectionsRow(cfg){
 // Single collection edit embed
 function buildCollectionEditEmbed(col, isPrimary, cfg={}){
   const isOcas = col.contract?.toLowerCase() === OCAS_CONTRACT;
+  const isStackers = col.slug === STACKERS_SLUG;
   const ra = col.rankAlert;
   const raLabel = ra ? `#${ra.min}–#${ra.max} (${ra.rankType==='obs'?'TraitView':'OpenSea'})` : 'Not set';
   return new EmbedBuilder()
@@ -213,6 +215,7 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
       `**Sales Channel:** ${col.salesChannel ? `<#${col.salesChannel}>` : '`Not set`'} ${ok(col.salesChannel)}\n` +
       `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\n` +
       (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\n` : '') +
+      (isStackers ? `**Vault Listing Alerts:** ${col.vaultListingAlert ? '🏦 ON' : '🔕 OFF'}\n` : '') +
       `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\n` +
       `**Sales Filters:** ${Object.keys(col.salesFilters||{}).length} active\n` +
       `**Rank Alert:** ${raLabel}${!isOcas ? ' 🔒' : ''}\n` +
@@ -224,7 +227,7 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
     .setFooter({ text: 'Only visible to you' });
 }
 
-function collectionEditRow(colId, isPrimary, isOcas=false){
+function collectionEditRow(colId, isPrimary, isOcas=false, isStackers=false){
   const options = [
     new StringSelectMenuOptionBuilder().setLabel('Name').setEmoji('✏️').setValue('name').setDescription('Edit the display name'),
     new StringSelectMenuOptionBuilder().setLabel('Slug').setEmoji('🔗').setValue('slug').setDescription('Edit the OpenSea collection slug'),
@@ -240,6 +243,9 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
   ];
   if(isOcas){
     options.push(new StringSelectMenuOptionBuilder().setLabel('Burn Alerts Channel').setEmoji('🔥').setValue('burnchan').setDescription('Where burn alerts post'));
+  }
+  if(isStackers){
+    options.push(new StringSelectMenuOptionBuilder().setLabel('Vault Listing Alerts').setEmoji('🏦').setValue('vaultalert').setDescription('Alert on new listings with unclaimed vault value'));
   }
 
   const menu = new StringSelectMenuBuilder()
@@ -676,6 +682,7 @@ async function handleConfigButton(interaction, ctx){
       filters:       `cfg:col:filters:${colId}`,
       salesfilters:  `cfg:col:salesfilters:${colId}`,
       rankalert:     `cfg:col:rankalert:${colId}`,
+      vaultalert:    `cfg:col:vaultalert:${colId}`,
       traitroles:    `cfg:col:traitroles:${colId}`,
       pause:         `cfg:col:pause:${colId}`,
       rebackfill:    `cfg:col:rebackfill:${colId}`,
@@ -756,7 +763,7 @@ async function handleConfigButton(interaction, ctx){
     if(allCols.length === 1){
       // Only one collection configured — skip the picker, go straight to editing it.
       const { col, isPrimary } = resolveColFromId(cfg, allCols[0]);
-      if(col) return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(allCols[0], isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+      if(col) return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(allCols[0], isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
     }
     return interaction.editReply({ content:'', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
@@ -778,7 +785,7 @@ async function handleConfigButton(interaction, ctx){
     const colId = interaction.values[0];
     const { col, isPrimary } = resolveColFromId(cfg, colId);
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // Add collection button
@@ -866,7 +873,7 @@ async function handleConfigButton(interaction, ctx){
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : cfg.collections?.[parseInt(colId)] || {};
     return interaction.editReply({ content:'✅ Channel cleared.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)
-], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   if(customId.startsWith('cfg:col:saleschan:') || customId.startsWith('cfg:col:listchan:')){
@@ -930,7 +937,7 @@ async function handleConfigButton(interaction, ctx){
       ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // Remove extra collection
@@ -940,7 +947,7 @@ async function handleConfigButton(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   if(customId.startsWith('cfg:col:filters:')){
@@ -1001,7 +1008,7 @@ async function handleConfigButton(interaction, ctx){
       ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   if(customId.startsWith('cfg:col:salesfilters:')){
@@ -1346,6 +1353,28 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // ── Pause/Resume toggle (per collection) ─────────────────────────────────
+  // ── Vault Listing Alerts toggle (Stackers only) ───────────────────────────────
+  if(customId.startsWith('cfg:col:vaultalert:')){
+    const colId = customId.split(':')[3];
+    const isPrimary = colId === 'primary';
+    if(isPrimary){
+      cfg.vaultListingAlert = !cfg.vaultListingAlert;
+    } else {
+      const cols = cfg.collections || [];
+      const idx = parseInt(colId);
+      if(cols[idx]) cols[idx].vaultListingAlert = !cols[idx].vaultListingAlert;
+      cfg.collections = cols;
+    }
+    await setConfig(guildId, cfg);
+    const col = isPrimary
+      ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused, vaultListingAlert: cfg.vaultListingAlert }
+      : (cfg.collections||[])[parseInt(colId)];
+    if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
+    const status = col.vaultListingAlert ? '🏦 Vault Listing Alerts ON' : '🔕 Vault Listing Alerts OFF';
+    const channelNote = col.vaultListingAlert ? ` — posts to your existing sales channel, no separate setup needed.` : '';
+    return interaction.editReply({ content:`${status} for ${col.name||col.slug}.${channelNote}`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
+  }
+
   if(customId.startsWith('cfg:col:pause:')){
     const colId = customId.split(':')[3];
     const isPrimary = colId === 'primary';
@@ -1363,7 +1392,7 @@ async function handleConfigButton(interaction, ctx){
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     const status = col.paused ? '⏸️ Paused' : '▶️ Resumed';
-    return interaction.editReply({ content:`${status} for ${col.name||col.slug}.`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:`${status} for ${col.name||col.slug}.`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // ── Animated toggle ──────────────────────────────────────────────────────────
@@ -1383,10 +1412,11 @@ async function handleConfigButton(interaction, ctx){
       ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, animated: cfg.animated }
       : (cfg.collections||[])[parseInt(colId)];
     const isOcasCol = col?.contract?.toLowerCase() === OCAS_CONTRACT;
+    const isStackersCol = col?.slug === STACKERS_SLUG;
     return interaction.editReply({
       content: `${col?.animated ? '🎞️ Animated ON' : '🖼️ Static'} for **${col?.name||col?.slug}**.`,
       embeds: [buildCollectionEditEmbed(col, isPrimary, isOcasCol)],
-      components: collectionEditRow(colId, isPrimary, isOcasCol)
+      components: collectionEditRow(colId, isPrimary, isOcasCol, isStackersCol)
     });
   }
 
@@ -2182,7 +2212,7 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
       const col = isPrimary
         ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
         : cfg.collections[parseInt(colId)];
-      return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+      return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
     }
 
     // Standard channel edit
@@ -2351,7 +2381,7 @@ async function handleConfigModal(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
-    return interaction.editReply({ content:'✅ Name updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'✅ Name updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // ── Per-collection listing filter modal ────────────────────────────────────
@@ -2596,7 +2626,7 @@ async function handleConfigModal(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
       : cfg.collections[parseInt(colId)];
-    return interaction.editReply({ content:`✅ Updated.${waitMsg}`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:`✅ Updated.${waitMsg}`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // ── Add trait role ─────────────────────────────────────────────────────────

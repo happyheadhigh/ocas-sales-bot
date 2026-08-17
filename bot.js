@@ -58,6 +58,7 @@ const {
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
 const { setClient: setStackersFusionClient, pollFusionEvents } = require('./lib/stackers-fusion-poller');
+const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vault-listing-alerts');
 const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
 const { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS } = require('./commands/stackervaults');
 const { takeStackersSnapshot } = require('./lib/stackers-analytics');
@@ -124,6 +125,7 @@ const client = new Client({ intents: [
 setClient(client); // inject into burn-poller
 setPollClient(client); // inject into poll
 setStackersFusionClient(client); // inject into stackers fusion poller
+setStackersVaultAlertsClient(client); // inject into stackers vault-listing alerts
 
 // ── resolveDiscordChannel — needs client, defined here ───────────────────────
 // Inject client into burn-poller so it can resolve channels

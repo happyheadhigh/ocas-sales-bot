@@ -1730,6 +1730,7 @@ async function showMeHub(interaction, ctx){
       new StringSelectMenuOptionBuilder().setLabel('📣 Trait Alert').setDescription('Sales & listing DMs by trait').setValue('trait_alert'),
       new StringSelectMenuOptionBuilder().setLabel('🏷️ Price Alerts').setDescription('DM when a token drops below a price').setValue('price_alerts'),
       new StringSelectMenuOptionBuilder().setLabel('📉 Floor Alerts').setDescription('DM when a collection floor drops').setValue('floor_alerts'),
+      new StringSelectMenuOptionBuilder().setLabel('🏦 Stackers Vault Alerts').setDescription('DM when a new listing has unclaimed vault value').setValue('stackers_vault'),
       new StringSelectMenuOptionBuilder().setLabel('💼 Wallet').setDescription('Verification & wallet analytics').setValue('wallet'),
       new StringSelectMenuOptionBuilder().setLabel('📊 TraitView').setDescription('Link your TraitView account').setValue('traitview'),
     ]);
@@ -1949,6 +1950,35 @@ function generateTVCode() {
   let code = '';
   for(let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
   return code;
+}
+
+async function showMeStackersVaultAlert(interaction, ctx) {
+  const { getVaultDmOptIns } = require('../lib/stackers-vault-listing-alerts');
+  const userId = interaction.user.id;
+
+  const updateFn = interaction.deferred || interaction.replied ? 'editReply'
+    : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
+
+  const optIns = await getVaultDmOptIns();
+  const isOn = !!optIns[userId];
+
+  const embed = new EmbedBuilder()
+    .setTitle('🏦 Stackers Vault Alerts')
+    .setColor(isOn ? 0x57F287 : 0x5865F2)
+    .setDescription([
+      `**DMs:** ${isOn ? '✅ on' : '❌ off'}`,
+      '',
+      'Get a DM the moment a new Stacker listing appears with real, unclaimed value sitting in its vault — value that comes with the token on purchase.',
+      '',
+      'Works independent of any server — this is a personal setting, not tied to a specific guild.',
+    ].join('\n'));
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:stackersvault:toggle').setLabel(isOn ? '🔕 Turn Off' : '🔔 Turn On').setStyle(isOn ? ButtonStyle.Secondary : ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
 }
 
 async function showMeTraitView(interaction, ctx) {
@@ -2871,8 +2901,17 @@ async function handleMeInteraction(interaction, ctx){
     if(section === 'trait_alert') return showMeTraitAlert(interaction, ctx);
     if(section === 'price_alerts') return showMePriceAlerts(interaction, ctx);
     if(section === 'floor_alerts') return showMeFloorAlerts(interaction, ctx);
+    if(section === 'stackers_vault') return showMeStackersVaultAlert(interaction, ctx);
     if(section === 'wallet') return showMeWallet(interaction, ctx);
     if(section === 'traitview') return showMeTraitView(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:stackersvault:toggle'){
+    const { setVaultDmOptIn, getVaultDmOptIns } = require('../lib/stackers-vault-listing-alerts');
+    const current = await getVaultDmOptIns();
+    const isOn = !!current[interaction.user.id];
+    await setVaultDmOptIn(interaction.user.id, !isOn);
+    return showMeStackersVaultAlert(interaction, ctx);
   }
 
   // Back to hub
