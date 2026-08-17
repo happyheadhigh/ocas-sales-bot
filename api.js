@@ -931,6 +931,61 @@ app.get('/db/stackers/poller-status-debug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/catchup-fusion, /db/stackers/catchup-status —
+// manually-triggered catch-up bursts, separate from the automatic
+// background polling rate. Confirmed live the automatic rate alone cannot
+// realistically clear the actual backlog (fusion: ~46.7h behind at only
+// +2 blocks/min net; status: ~10h behind and actively getting WORSE at
+// -298 blocks/min net) -- a permanently higher automatic rate was
+// considered but rejected given the confirmed rate-limit sensitivity on
+// this account; a bounded, one-time burst is a safer way to actually
+// clear the backlog without raising the permanent baseline risk.
+// Loops repeatedly (no delay between iterations, unlike the 60s automatic
+// cadence) until caught up or a time budget is hit, logging progress
+// periodically. Runs in the background; check server logs for progress.
+const CATCHUP_TIME_BUDGET_MS = 60 * 60 * 1000; // 1 hour ceiling per trigger
+const CATCHUP_CHUNK_CAP = 500; // 5000 blocks per poll-function call during the burst
+
+app.get('/db/stackers/catchup-fusion', auth, async (req, res) => {
+  try {
+    const { pollFusionEvents } = require('./lib/stackers-fusion-poller');
+    res.json({ ok: true, message: 'Fusion catch-up burst started — running in background for up to 1 hour, check server logs ([StackersFusion] lines) for progress' });
+    (async () => {
+      const startedAt = Date.now();
+      let iterations = 0;
+      while(Date.now() - startedAt < CATCHUP_TIME_BUDGET_MS){
+        await pollFusionEvents(CATCHUP_CHUNK_CAP).catch(e => console.error('[FusionCatchup] iteration failed:', e.message));
+        iterations++;
+        if(iterations % 5 === 0) console.log(`[FusionCatchup] ${iterations} iterations completed so far`);
+      }
+      console.log(`[FusionCatchup] Time budget reached after ${iterations} iterations`);
+    })();
+  } catch(e) {
+    console.error('/db/stackers/catchup-fusion error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/db/stackers/catchup-status', auth, async (req, res) => {
+  try {
+    const { pollTokenStatusEvents } = require('./lib/stackers-status-poller');
+    res.json({ ok: true, message: 'Status catch-up burst started — running in background for up to 1 hour, check server logs ([StackersStatus] lines) for progress' });
+    (async () => {
+      const startedAt = Date.now();
+      let iterations = 0;
+      while(Date.now() - startedAt < CATCHUP_TIME_BUDGET_MS){
+        await pollTokenStatusEvents(pool, CATCHUP_CHUNK_CAP).catch(e => console.error('[StatusCatchup] iteration failed:', e.message));
+        iterations++;
+        if(iterations % 5 === 0) console.log(`[StatusCatchup] ${iterations} iterations completed so far`);
+      }
+      console.log(`[StatusCatchup] Time budget reached after ${iterations} iterations`);
+    })();
+  } catch(e) {
+    console.error('/db/stackers/catchup-status error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
