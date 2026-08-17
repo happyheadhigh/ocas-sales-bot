@@ -596,6 +596,69 @@ app.get('/db/stackers/token-split-debug/:tokenId', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/token-history-debug/:tokenId — a mobile-friendly
+// alternative to reading a block explorer directly. Searches recent
+// SplitSet events for one specific token, returning clean JSON: what was
+// actually set, when, and the transaction hash for independent
+// verification. Confirmed 10-block eth_getLogs cap on this account means a
+// deep lookback needs many sequential calls -- defaults to a bounded
+// window that should complete within a normal request rather than timing
+// out, and reports the actual block/time range covered so a "nothing
+// found" result is interpretable (genuinely never happened vs. simply
+// outside the window searched), not just a blind yes/no. ?blocks= can
+// widen the window if the default isn't deep enough.
+app.get('/db/stackers/token-history-debug/:tokenId', auth, async (req, res) => {
+  try {
+    const tokenId = parseInt(req.params.tokenId, 10);
+    if(!tokenId) return res.status(400).json({ ok: false, error: 'valid tokenId required' });
+    const lookback = Math.min(parseInt(req.query.blocks, 10) || 1500, 5000);
+
+    const { getContracts, getProvider } = require('./lib/stackers');
+    const { engine } = getContracts();
+    const provider = getProvider();
+
+    const latest = await provider.getBlockNumber();
+    const fromBlock = Math.max(0, latest - lookback);
+
+    const [latestBlockInfo, fromBlockInfo] = await Promise.all([
+      provider.getBlock(latest),
+      provider.getBlock(fromBlock),
+    ]);
+    const hoursSpanned = ((latestBlockInfo.timestamp - fromBlockInfo.timestamp) / 3600).toFixed(1);
+
+    const CHUNK = 10; // confirmed cap on this account
+    const events = [];
+    for(let start = fromBlock; start <= latest; start += CHUNK){
+      const end = Math.min(start + CHUNK - 1, latest);
+      const chunkEvents = await engine.queryFilter(engine.filters.SplitSet(tokenId), start, end);
+      events.push(...chunkEvents);
+    }
+
+    const eventDetail = await Promise.all(events.map(async e => {
+      const block = await provider.getBlock(e.blockNumber);
+      return {
+        blockNumber: e.blockNumber,
+        timestamp: new Date(block.timestamp * 1000).toISOString(),
+        count: Number(e.args.count),
+        txHash: e.transactionHash,
+        explorerUrl: `https://robinhoodchain.blockscout.com/tx/${e.transactionHash}`,
+      };
+    }));
+
+    res.json({
+      ok: true,
+      tokenId,
+      searchedBlocks: `${fromBlock}-${latest}`,
+      approxHoursSpanned: hoursSpanned,
+      splitSetEventsFound: eventDetail.length,
+      events: eventDetail,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/token-history-debug/${req.params.tokenId} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
 // every 6h; without a manual trigger there'd be no way to test /stackervaults
