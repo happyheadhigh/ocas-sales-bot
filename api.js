@@ -539,6 +539,63 @@ app.get('/db/stackers/engine-assets-debug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/token-split-debug/:tokenId — raw splitOf() and
+// vault balance for one specific token, unresolved where symbol lookup
+// might fail silently. Exists because a real, personally-confirmed case
+// (actively earning STACK) contradicted the engine-assets-debug picture
+// (STACK not registered as asset idx 0-12) even on a fresh recheck --
+// rather than guess further, this looks at the actual raw data for a
+// specific token directly.
+app.get('/db/stackers/token-split-debug/:tokenId', auth, async (req, res) => {
+  try {
+    const tokenId = parseInt(req.params.tokenId, 10);
+    if(!tokenId) return res.status(400).json({ ok: false, error: 'valid tokenId required' });
+    const { getContracts, resolveAsset, getProvider } = require('./lib/stackers');
+    const { engine, vault } = getContracts();
+    const provider = getProvider();
+
+    const splitRaw = await engine.splitOf(tokenId);
+    const [assetIdxs, weightsBps, count] = splitRaw;
+    const splitDetail = [];
+    for(let i = 0; i < Number(count); i++){
+      const idx = Number(assetIdxs[i]);
+      let symbol = null, tokenAddress = null, resolveError = null;
+      try{
+        tokenAddress = await vault.assetToken(idx);
+        const resolved = await resolveAsset(tokenAddress, provider);
+        symbol = resolved.symbol;
+      }catch(e){
+        resolveError = e.message;
+      }
+      splitDetail.push({ assetIdx: idx, weightBps: Number(weightsBps[i]), symbol, tokenAddress, resolveError });
+    }
+
+    const balancesRaw = await vault.balancesOf(tokenId);
+    const [balanceTokens, balanceAmounts] = balancesRaw;
+    const balanceDetail = [];
+    for(let i = 0; i < balanceTokens.length; i++){
+      if(balanceAmounts[i] === 0n) continue;
+      let symbol = null;
+      try{
+        const resolved = await resolveAsset(balanceTokens[i], provider);
+        symbol = resolved.symbol;
+      }catch{}
+      balanceDetail.push({ tokenAddress: balanceTokens[i], symbol, amountRaw: balanceAmounts[i].toString() });
+    }
+
+    res.json({
+      ok: true,
+      tokenId,
+      rawSplitCount: Number(count),
+      splitDetail,
+      nonZeroVaultBalances: balanceDetail,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/token-split-debug/${req.params.tokenId} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
 // every 6h; without a manual trigger there'd be no way to test /stackervaults
