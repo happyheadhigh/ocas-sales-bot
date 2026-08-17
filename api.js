@@ -889,6 +889,48 @@ app.get('/db/version-debug', auth, async (req, res) => {
   });
 });
 
+// ── GET /db/stackers/poller-status-debug — real cursor position for both
+// Stackers pollers vs. the current chain head. Exists to answer a
+// concrete question directly: is a poller still working through a real
+// backlog (expected, temporary, will resolve on its own) or has it
+// genuinely stopped advancing (a real problem worth digging into), rather
+// than guessing from a missing alert alone.
+app.get('/db/stackers/poller-status-debug', auth, async (req, res) => {
+  try {
+    const { dbLoad } = require('./lib/db');
+    const { getProvider } = require('./lib/stackers');
+    const provider = getProvider();
+
+    const [fusionCursorRaw, statusCursorRaw, latest] = await Promise.all([
+      dbLoad('stackers_fusion_last_block').catch(() => null),
+      dbLoad('stackers_status_last_block').catch(() => null),
+      provider.getBlockNumber(),
+    ]);
+
+    const fusionCursor = fusionCursorRaw ? parseInt(fusionCursorRaw, 10) : null;
+    const statusCursor = statusCursorRaw ? parseInt(statusCursorRaw, 10) : null;
+    const secondsPerBlock = 0.1; // confirmed live earlier tonight
+
+    res.json({
+      ok: true,
+      latestBlock: latest,
+      fusionPoller: fusionCursor === null ? null : {
+        cursor: fusionCursor,
+        blocksBehind: latest - fusionCursor,
+        approxMinutesBehind: ((latest - fusionCursor) * secondsPerBlock / 60).toFixed(1),
+      },
+      statusPoller: statusCursor === null ? null : {
+        cursor: statusCursor,
+        blocksBehind: latest - statusCursor,
+        approxMinutesBehind: ((latest - statusCursor) * secondsPerBlock / 60).toFixed(1),
+      },
+    });
+  } catch(e) {
+    console.error('/db/stackers/poller-status-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
