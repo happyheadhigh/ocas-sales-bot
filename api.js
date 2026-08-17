@@ -608,6 +608,8 @@ app.get('/db/stackers/token-split-debug/:tokenId', auth, async (req, res) => {
 // found" result is interpretable (genuinely never happened vs. simply
 // outside the window searched), not just a blind yes/no. ?blocks= can
 // widen the window if the default isn't deep enough.
+// (redeploy-trigger marker: forcing a fresh commit after two prior pushes
+// apparently didn't trigger Railway's auto-deploy webhook)
 app.get('/db/stackers/token-history-debug/:tokenId', auth, async (req, res) => {
   try {
     const tokenId = parseInt(req.params.tokenId, 10);
