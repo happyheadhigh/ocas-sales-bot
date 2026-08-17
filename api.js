@@ -470,6 +470,26 @@ app.get('/db/stackers/backfill-image-cache', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/backfill-token-status — one-time seed for the
+// event-driven tier/active/split cache. The status poller only tracks
+// changes going forward from whenever it first starts; tokens already
+// activated/tiered/split before that need this initial full read once.
+// Deliberately skips vault balance entirely (getStackerStatusOnly, not
+// getStackerInfo), so this is meaningfully faster than the full analytics
+// snapshot. Safe to re-run — only touches tokens not already in the cache.
+app.get('/db/stackers/backfill-token-status', auth, async (req, res) => {
+  try {
+    const { backfillTokenStatus } = require('./lib/stackers-status-poller');
+    res.json({ ok: true, message: 'Stackers token-status backfill started — running in background, check server logs ([StackersStatus] lines) for progress' });
+    backfillTokenStatus(pool).catch(e => {
+      console.error('[/db/stackers/backfill-token-status] background backfill failed:', e.message);
+    });
+  } catch(e) {
+    console.error('/db/stackers/backfill-token-status error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
 // every 6h; without a manual trigger there'd be no way to test /stackervaults
