@@ -871,6 +871,23 @@ app.get('/db/stackers/asset-count-only-debug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/version-debug — which commit is actually running right now.
+// Exists because "just wait for deployment" was already guessed once and
+// turned out wrong -- a live check reported the old Vault Listing Alerts
+// wording even after the fix was confirmed pushed to GitHub. Railway
+// injects git commit info as environment variables automatically, so this
+// reports that directly rather than guessing about deployment timing again.
+app.get('/db/version-debug', auth, async (req, res) => {
+  res.json({
+    ok: true,
+    railwayGitCommitSha: process.env.RAILWAY_GIT_COMMIT_SHA || null,
+    railwayGitCommitMessage: process.env.RAILWAY_GIT_COMMIT_MESSAGE || null,
+    railwayDeploymentId: process.env.RAILWAY_DEPLOYMENT_ID || null,
+    serverTimeNow: new Date().toISOString(),
+  });
+});
+
+
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
 // every 6h; without a manual trigger there'd be no way to test /stackervaults
