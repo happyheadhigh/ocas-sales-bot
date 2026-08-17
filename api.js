@@ -659,6 +659,47 @@ app.get('/db/stackers/token-history-debug/:tokenId', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/block-time-debug — precise seconds-per-block for
+// Robinhood Chain. Exists because token-history-debug's default 1500-block
+// lookback came back approxHoursSpanned: 0.0 live -- meaning this chain
+// produces blocks much faster than assumed when that default was picked,
+// and that search was nowhere near deep enough to be conclusive. Uses a
+// wide, well-separated sample (10,000 blocks apart) for an accurate
+// average rather than local variance from just two adjacent blocks.
+app.get('/db/stackers/block-time-debug', auth, async (req, res) => {
+  try {
+    const { getProvider } = require('./lib/stackers');
+    const provider = getProvider();
+
+    const latest = await provider.getBlockNumber();
+    const sampleBack = 10000;
+    const earlier = Math.max(0, latest - sampleBack);
+
+    const [latestBlock, earlierBlock] = await Promise.all([
+      provider.getBlock(latest),
+      provider.getBlock(earlier),
+    ]);
+
+    const blockSpan = latest - earlier;
+    const secondsSpan = latestBlock.timestamp - earlierBlock.timestamp;
+    const secondsPerBlock = secondsSpan / blockSpan;
+    const blocksPerHour = 3600 / secondsPerBlock;
+
+    res.json({
+      ok: true,
+      sampledBlocks: `${earlier}-${latest}`,
+      secondsSpan,
+      secondsPerBlock: secondsPerBlock.toFixed(3),
+      blocksPerHour: Math.round(blocksPerHour),
+      blocksNeededFor12Hours: Math.round(blocksPerHour * 12),
+      blocksNeededFor24Hours: Math.round(blocksPerHour * 24),
+    });
+  } catch(e) {
+    console.error('/db/stackers/block-time-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
 // every 6h; without a manual trigger there'd be no way to test /stackervaults
