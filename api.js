@@ -700,6 +700,87 @@ app.get('/db/stackers/block-time-debug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/wallet-tx-debug/:wallet — a wallet's recent
+// transactions to the Stackers engine contract, via Blockscout's own
+// indexed API rather than scanning raw blocks via RPC. Exists because
+// token-history-debug's RPC approach turned out completely impractical on
+// this chain (block-time-debug confirmed ~0.1s/block, meaning a real
+// 12-hour search would need 40,000+ sequential eth_getLogs calls at the
+// confirmed 10-block cap) -- Blockscout's API is a pre-built, indexed
+// database, a genuinely different mechanism that doesn't have this
+// problem at all. Tries the modern v2 API first, falls back to the
+// legacy etherscan-compatible format if that fails, since it's genuinely
+// unconfirmed which this specific instance supports.
+app.get('/db/stackers/wallet-tx-debug/:wallet', auth, async (req, res) => {
+  try {
+    const wallet = req.params.wallet;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(wallet)) return res.status(400).json({ ok: false, error: 'valid wallet address required' });
+    const { ENGINE_ADDRESS } = require('./lib/stackers');
+    const engineAddr = ENGINE_ADDRESS.toLowerCase();
+
+    let source = null;
+    let allTxs = [];
+
+    // Try the modern v2 API first
+    try{
+      const v2Url = `https://robinhoodchain.blockscout.com/api/v2/addresses/${wallet}/transactions`;
+      const r = await fetch(v2Url, { headers: { 'Accept': 'application/json' } });
+      if(r.ok){
+        const data = await r.json();
+        if(Array.isArray(data.items)){
+          source = 'v2';
+          allTxs = data.items.map(tx => ({
+            hash: tx.hash,
+            to: (tx.to?.hash || '').toLowerCase(),
+            timestamp: tx.timestamp,
+            status: tx.status,
+            methodCalled: tx.method || null,
+          }));
+        }
+      }
+    }catch{}
+
+    // Fall back to the legacy etherscan-compatible format
+    if(!source){
+      const legacyUrl = `https://robinhoodchain.blockscout.com/api?module=account&action=txlist&address=${wallet}&sort=desc`;
+      const r = await fetch(legacyUrl, { headers: { 'Accept': 'application/json' } });
+      if(r.ok){
+        const data = await r.json();
+        if(Array.isArray(data.result)){
+          source = 'legacy';
+          allTxs = data.result.map(tx => ({
+            hash: tx.hash,
+            to: (tx.to || '').toLowerCase(),
+            timestamp: new Date(Number(tx.timeStamp) * 1000).toISOString(),
+            status: tx.isError === '1' ? 'error' : 'ok',
+            methodCalled: tx.methodId || null,
+          }));
+        }
+      }
+    }
+
+    if(!source){
+      return res.status(502).json({ ok: false, error: 'Neither Blockscout API format returned usable data — may need to check the site directly' });
+    }
+
+    const txsToEngine = allTxs
+      .filter(tx => tx.to === engineAddr)
+      .slice(0, 20)
+      .map(tx => ({ ...tx, explorerUrl: `https://robinhoodchain.blockscout.com/tx/${tx.hash}` }));
+
+    res.json({
+      ok: true,
+      wallet,
+      apiSource: source,
+      totalTxsReturned: allTxs.length,
+      txsToEngineContract: txsToEngine,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/wallet-tx-debug/${req.params.wallet} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
 // every 6h; without a manual trigger there'd be no way to test /stackervaults
