@@ -795,35 +795,46 @@ app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
 
     let source = null;
     let abi = null;
+    const attempts = [];
 
     // Try the modern v2 API first
     try{
       const v2Url = `https://robinhoodchain.blockscout.com/api/v2/smart-contracts/${address}`;
       const r = await fetch(v2Url, { headers: { 'Accept': 'application/json' } });
+      const bodyText = await r.text();
+      attempts.push({ format: 'v2', url: v2Url, status: r.status, bodyPreview: bodyText.slice(0, 500) });
       if(r.ok){
-        const data = await r.json();
+        const data = JSON.parse(bodyText);
         if(data.abi){
           source = 'v2';
           abi = data.abi;
         }
       }
-    }catch{}
+    }catch(e){
+      attempts.push({ format: 'v2', error: e.message });
+    }
 
     // Fall back to the legacy etherscan-compatible format
     if(!source){
-      const legacyUrl = `https://robinhoodchain.blockscout.com/api?module=contract&action=getabi&address=${address}`;
-      const r = await fetch(legacyUrl, { headers: { 'Accept': 'application/json' } });
-      if(r.ok){
-        const data = await r.json();
-        if(data.status === '1' && data.result){
-          source = 'legacy';
-          abi = JSON.parse(data.result);
+      try{
+        const legacyUrl = `https://robinhoodchain.blockscout.com/api?module=contract&action=getabi&address=${address}`;
+        const r = await fetch(legacyUrl, { headers: { 'Accept': 'application/json' } });
+        const bodyText = await r.text();
+        attempts.push({ format: 'legacy', url: legacyUrl, status: r.status, bodyPreview: bodyText.slice(0, 500) });
+        if(r.ok){
+          const data = JSON.parse(bodyText);
+          if(data.status === '1' && data.result){
+            source = 'legacy';
+            abi = JSON.parse(data.result);
+          }
         }
+      }catch(e){
+        attempts.push({ format: 'legacy', error: e.message });
       }
     }
 
     if(!source){
-      return res.status(502).json({ ok: false, error: 'Could not fetch a verified ABI from either Blockscout API format — contract may not be verified, or this instance uses a different API shape' });
+      return res.status(502).json({ ok: false, error: 'Could not fetch a verified ABI from either Blockscout API format', attempts });
     }
 
     // Just the assets-related functions/events, to keep this readable —
