@@ -215,7 +215,7 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
       `**Sales Channel:** ${col.salesChannel ? `<#${col.salesChannel}>` : '`Not set`'} ${ok(col.salesChannel)}\n` +
       `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\n` +
       (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\n` : '') +
-      (isStackers ? `**Vault Listing Alerts:** ${col.vaultListingAlert ? '🏦 ON' : '🔕 OFF'}\n` : '') +
+      (isStackers ? `**Vault Alerts Channel:** ${cfg.vaultAlertChannel ? `<#${cfg.vaultAlertChannel}>` : '`Not set (uses Sales Channel)`'}\n` : '') +
       (isStackers ? `**Fusion Alerts Channel:** ${cfg.fusionChannel ? `<#${cfg.fusionChannel}>` : '`Not set (uses Sales Channel)`'}\n` : '') +
       `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\n` +
       `**Sales Filters:** ${Object.keys(col.salesFilters||{}).length} active\n` +
@@ -246,7 +246,7 @@ function collectionEditRow(colId, isPrimary, isOcas=false, isStackers=false){
     options.push(new StringSelectMenuOptionBuilder().setLabel('Burn Alerts Channel').setEmoji('🔥').setValue('burnchan').setDescription('Where burn alerts post'));
   }
   if(isStackers){
-    options.push(new StringSelectMenuOptionBuilder().setLabel('Vault Listing Alerts').setEmoji('🏦').setValue('vaultalert').setDescription('Alert on new listings with unclaimed vault value'));
+    options.push(new StringSelectMenuOptionBuilder().setLabel('Vault Alerts Channel').setEmoji('🏦').setValue('vaultalert').setDescription('Where new listings with unclaimed vault value post — defaults to Sales Channel'));
     options.push(new StringSelectMenuOptionBuilder().setLabel('Fusion Alerts Channel').setEmoji('🔥').setValue('fusionchan').setDescription('Where fusion alerts post — defaults to Sales Channel if not set'));
   }
 
@@ -684,7 +684,7 @@ async function handleConfigButton(interaction, ctx){
       filters:       `cfg:col:filters:${colId}`,
       salesfilters:  `cfg:col:salesfilters:${colId}`,
       rankalert:     `cfg:col:rankalert:${colId}`,
-      vaultalert:    `cfg:col:vaultalert:${colId}`,
+      vaultalert:    `cfg:col:vaultalertchan:${colId}`,
       fusionchan:    `cfg:col:fusionchan:${colId}`,
       traitroles:    `cfg:col:traitroles:${colId}`,
       pause:         `cfg:col:pause:${colId}`,
@@ -863,15 +863,17 @@ async function handleConfigButton(interaction, ctx){
       if(field === 'listings') { delete cfg.listingsChannelId; delete cfg.listingsChannel; }
       if(field === 'burn')     { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
       if(field === 'fusion')   { delete cfg.fusionChannel; }
+      if(field === 'vaultalert') { delete cfg.vaultAlertChannel; }
     } else {
       const idx = parseInt(colId);
       if(cfg.collections?.[idx]){
         if(field === 'sales')    cfg.collections[idx].salesChannel    = null;
         if(field === 'listings') cfg.collections[idx].listingsChannel = null;
       }
-      // burn and fusion channels are always top-level in cfg
+      // burn, fusion, and vault-alert channels are always top-level in cfg
       if(field === 'burn') { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
       if(field === 'fusion') { delete cfg.fusionChannel; }
+      if(field === 'vaultalert') { delete cfg.vaultAlertChannel; }
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
@@ -1373,26 +1375,20 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // ── Pause/Resume toggle (per collection) ─────────────────────────────────
-  // ── Vault Listing Alerts toggle (Stackers only) ───────────────────────────────
-  if(customId.startsWith('cfg:col:vaultalert:')){
+  // ── Vault Listing Alerts channel (Stackers only) ──────────────────────────────
+  if(customId.startsWith('cfg:col:vaultalertchan:')){
     const colId = customId.split(':')[3];
-    const isPrimary = colId === 'primary';
-    if(isPrimary){
-      cfg.vaultListingAlert = !cfg.vaultListingAlert;
-    } else {
-      const cols = cfg.collections || [];
-      const idx = parseInt(colId);
-      if(cols[idx]) cols[idx].vaultListingAlert = !cols[idx].vaultListingAlert;
-      cfg.collections = cols;
-    }
-    await setConfig(guildId, cfg);
-    const col = isPrimary
-      ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused, vaultListingAlert: cfg.vaultListingAlert }
-      : (cfg.collections||[])[parseInt(colId)];
-    if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
-    const status = col.vaultListingAlert ? '🏦 Vault Listing Alerts ON' : '🔕 Vault Listing Alerts OFF';
-    const channelNote = col.vaultListingAlert ? ` — posts to your existing sales channel, no separate setup needed.` : '';
-    return interaction.editReply({ content:`${status} for ${col.name||col.slug}.${channelNote}`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
+    const menu = new ChannelSelectMenuBuilder()
+      .setCustomId(`cfg_chsel:col:vaultalertchan:${colId}`)
+      .setPlaceholder('Pick the Vault Listing Alerts channel')
+      .addChannelTypes(ChannelType.GuildText);
+    return interaction.editReply({ content:'**Select the 🏦 Vault Listing Alerts channel:**\n_Leave unset and vault listing alerts post to the Sales Channel instead._', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`cfg:col:clearchan:vaultalert:${colId}`).setLabel('↩️ Reset to Sales Channel').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`cfg:col:view:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
   }
 
   if(customId.startsWith('cfg:col:pause:')){
@@ -2219,6 +2215,7 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
         if(field==='listchan')   cfg.listingsChannelId = chId;
         if(field==='burnchan')   { cfg.burnChannel = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
         if(field==='fusionchan') cfg.fusionChannel = chId;
+        if(field==='vaultalertchan') cfg.vaultAlertChannel = chId;
       } else {
         const idx = parseInt(colId);
         if(!cfg.collections) cfg.collections = [];
@@ -2226,9 +2223,10 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
           if(field==='saleschan')  cfg.collections[idx].salesChannel    = chId;
           if(field==='listchan')   cfg.collections[idx].listingsChannel = chId;
         }
-        // burn and fusion channels are always top-level in cfg
+        // burn, fusion, and vault-alert channels are always top-level in cfg
         if(field==='burnchan') { cfg.burnChannel = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
         if(field==='fusionchan') cfg.fusionChannel = chId;
+        if(field==='vaultalertchan') cfg.vaultAlertChannel = chId;
       }
       await setConfig(guildId, cfg);
       const col = isPrimary
