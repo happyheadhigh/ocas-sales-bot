@@ -781,6 +781,64 @@ app.get('/db/stackers/wallet-tx-debug/:wallet', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/contract-abi-debug/:address — fetches the actual
+// verified ABI from Blockscout for a given contract, rather than guessing
+// a struct's field layout from raw undecoded bytes. Exists specifically
+// because the new engine's assets() call returned real data that our old
+// ABI's expected 8-field struct couldn't decode -- Stackers' docs mark
+// this contract as "(live, verified)," so the real, authoritative
+// structure should be fetchable directly instead of reverse-engineered.
+app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
+  try {
+    const address = req.params.address;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(address)) return res.status(400).json({ ok: false, error: 'valid contract address required' });
+
+    let source = null;
+    let abi = null;
+
+    // Try the modern v2 API first
+    try{
+      const v2Url = `https://robinhoodchain.blockscout.com/api/v2/smart-contracts/${address}`;
+      const r = await fetch(v2Url, { headers: { 'Accept': 'application/json' } });
+      if(r.ok){
+        const data = await r.json();
+        if(data.abi){
+          source = 'v2';
+          abi = data.abi;
+        }
+      }
+    }catch{}
+
+    // Fall back to the legacy etherscan-compatible format
+    if(!source){
+      const legacyUrl = `https://robinhoodchain.blockscout.com/api?module=contract&action=getabi&address=${address}`;
+      const r = await fetch(legacyUrl, { headers: { 'Accept': 'application/json' } });
+      if(r.ok){
+        const data = await r.json();
+        if(data.status === '1' && data.result){
+          source = 'legacy';
+          abi = JSON.parse(data.result);
+        }
+      }
+    }
+
+    if(!source){
+      return res.status(502).json({ ok: false, error: 'Could not fetch a verified ABI from either Blockscout API format — contract may not be verified, or this instance uses a different API shape' });
+    }
+
+    // Just the assets-related functions/events, to keep this readable —
+    // the full ABI can be large and most of it isn't relevant here.
+    const relevant = abi.filter(item =>
+      (item.name || '').toLowerCase().includes('asset') || (item.name || '').toLowerCase().includes('split')
+    );
+
+    res.json({ ok: true, address, apiSource: source, fullAbiLength: abi.length, relevantEntries: relevant });
+  } catch(e) {
+    console.error(`/db/stackers/contract-abi-debug/${req.params.address} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
 // every 6h; without a manual trigger there'd be no way to test /stackervaults
