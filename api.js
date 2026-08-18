@@ -491,6 +491,26 @@ app.get('/db/stackers/backfill-token-status', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/backfill-vault-balances — one-time seed for vault
+// balance specifically, kept separate from the tier/status backfill above.
+// The live listener (Credited/Claimed events) only tracks changes going
+// forward; tokens with existing balance before it first started need this
+// initial read once. Safe to re-run — skips tokens that already have
+// vault_balances populated unless ?force=true.
+app.get('/db/stackers/backfill-vault-balances', auth, async (req, res) => {
+  try {
+    const { backfillVaultBalances } = require('./lib/stackers-status-poller');
+    const force = req.query.force === 'true';
+    res.json({ ok: true, message: `Stackers vault-balance backfill started${force ? ' (force mode)' : ''} — running in background, check server logs ([StackersStatus] lines) for progress` });
+    backfillVaultBalances(pool, force).catch(e => {
+      console.error('[/db/stackers/backfill-vault-balances] background backfill failed:', e.message);
+    });
+  } catch(e) {
+    console.error('/db/stackers/backfill-vault-balances error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/engine-assets-debug — lists every asset the engine
 // currently knows about (assetCount + assets(idx) for each index), and
 // separately what's actually showing up in the live tier/asset cache's

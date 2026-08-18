@@ -32,6 +32,25 @@ async function getInstantTierAndAssetStats(pgPool){
   return { totalTracked, tierDist, assetPop, activeCount };
 }
 
+// Vault totals computed live from the event-driven cache (Credited/Claimed
+// events, lib/stackers-live-events.js) rather than the periodic snapshot —
+// now that both events are confirmed real on the verified vault contract,
+// this data can be genuinely current too, not up-to-24h stale like before.
+async function getInstantVaultTotals(pgPool){
+  const res = await pgPool.query(`SELECT vault_balances FROM stackers_token_status WHERE vault_balances IS NOT NULL`);
+  if(!res.rows.length) return null;
+
+  const totals = {};
+  for(const row of res.rows){
+    for(const b of (row.vault_balances || [])){
+      if(!b?.symbol) continue;
+      const amount = parseFloat(b.amountFormatted) || 0;
+      totals[b.symbol] = (totals[b.symbol] || 0) + amount;
+    }
+  }
+  return { tokensCovered: res.rows.length, totals };
+}
+
 async function handleStackerStatsCommand(commandName, ctx){
   const { interaction, pgPool } = ctx;
   if(commandName !== 'stackerstats') return;
@@ -45,6 +64,11 @@ async function handleStackerStatsCommand(commandName, ctx){
 
   const instant = await getInstantTierAndAssetStats(pgPool).catch(e => {
     console.error('[stackerstats] getInstantTierAndAssetStats failed:', e.message, e.stack);
+    return null;
+  });
+
+  const instantVault = await getInstantVaultTotals(pgPool).catch(e => {
+    console.error('[stackerstats] getInstantVaultTotals failed:', e.message, e.stack);
     return null;
   });
 
@@ -81,7 +105,8 @@ async function handleStackerStatsCommand(commandName, ctx){
     return `${symbol}: **${count}** (${pct}%)`;
   });
 
-  const vaultTotals = latest?.vault_totals || {};
+  const usingInstantVault = !!instantVault;
+  const vaultTotals = usingInstantVault ? instantVault.totals : (latest?.vault_totals || {});
   const vaultEntries = Object.entries(vaultTotals).sort(([a], [b]) => a.localeCompare(b));
   const vaultLines = vaultEntries.map(([symbol, amount]) =>
     `${symbol}: **${parseFloat(amount).toLocaleString(undefined, { maximumFractionDigits: 4 })}**`
@@ -94,14 +119,19 @@ async function handleStackerStatsCommand(commandName, ctx){
   const footerParts = [];
   if(usingInstant) footerParts.push('Tier/Asset: live');
   else footerParts.push('Tier/Asset: last snapshot');
-  if(latest) footerParts.push(`Vault: snapshot from ${new Date(latest.snapshot_at).toLocaleString()}`);
+  if(usingInstantVault) footerParts.push('Vault: live');
+  else if(latest) footerParts.push(`Vault: snapshot from ${new Date(latest.snapshot_at).toLocaleString()}`);
   embed.setFooter({ text: footerParts.join(' · ') });
 
-  if(!usingInstant){
-    embed.setDescription('_Live tier/asset cache hasn\'t been seeded yet — showing the last full snapshot instead. This will switch to live automatically once the one-time backfill runs._');
-  } else if(latest && latest.tokens_processed < latest.total_tokens){
+  if(!usingInstant && !usingInstantVault){
+    embed.setDescription('_Live caches haven\'t been seeded yet — showing the last full snapshot instead. This will switch to live automatically once the one-time backfills run._');
+  } else if(!usingInstant){
+    embed.setDescription('_Live tier/asset cache hasn\'t been seeded yet — showing the last full snapshot for that section instead. Vault holdings below are already live._');
+  } else if(!usingInstantVault && latest && latest.tokens_processed < latest.total_tokens){
     const pct = ((latest.tokens_processed / latest.total_tokens) * 100).toFixed(0);
     embed.setDescription(`⚠️ Vault holdings below are from a **partial snapshot** — only ${latest.tokens_processed}/${latest.total_tokens} tokens (${pct}%) were processed before that run was interrupted. Tier/Asset data above is live and unaffected.`);
+  } else if(!usingInstantVault){
+    embed.setDescription('_Live vault-balance cache hasn\'t been seeded yet — showing the last full snapshot for that section instead. Tier/Asset data above is already live._');
   }
 
   embed.addFields(
@@ -124,9 +154,10 @@ async function handleStackerStatsCommand(commandName, ctx){
     }
     if(deltaLines.length){
       const hoursElapsed = (new Date(latest.snapshot_at) - new Date(comparison.snapshot_at)) / 3_600_000;
+      const currentLabel = usingInstantVault ? 'live now' : `last snapshot, ${new Date(latest.snapshot_at).toLocaleString()}`;
       embed.addFields({
-        name: `📈 Collection-Wide Accrual (last ~${hoursElapsed.toFixed(0)}h, observed)`,
-        value: deltaLines.join('\n') + '\n\n_Real change since the last snapshot — not a projection or promise, just what actually happened. Per-token/per-tier rates aren\'t shown here since actual earnings depend on live weight distribution, which shifts as Stackers activate, fuse, and re-tier._',
+        name: `📈 Collection-Wide Accrual (${currentLabel} vs ~${hoursElapsed.toFixed(0)}h earlier)`,
+        value: deltaLines.join('\n') + '\n\n_Real change since the comparison point — not a projection or promise, just what actually happened. Per-token/per-tier rates aren\'t shown here since actual earnings depend on live weight distribution, which shifts as Stackers activate, fuse, and re-tier._',
         inline: false,
       });
     }
