@@ -139,7 +139,7 @@ async function syncListings(collection) {
     let pages = 0;
 
     do {
-      const qs = new URLSearchParams({ chain: 'ethereum', limit: '100' });
+      const qs = new URLSearchParams({ chain, limit: '100' });
       if (next) qs.set('next', next);
 
       const resp = await fetch(
