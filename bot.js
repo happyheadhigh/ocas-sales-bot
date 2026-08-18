@@ -2366,7 +2366,7 @@ client.once('clientReady', async ()=>{
       console.error('[StackersAnalytics] Live vault snapshot failed:', e.message)
     );
   }, 15 * 60 * 1000);
-  // Stackers vault-listings refresh — removed. /stackervaults listings now
+  // Stackers vault-listings refresh — removed. /stackers listings now
   // reads live: stackers_token_status.vault_balances (kept current via the
   // Credited/Claimed live event listeners) joined directly against the
   // listings table (already fresh via the existing sync pipeline). The
