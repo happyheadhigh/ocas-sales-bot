@@ -511,6 +511,22 @@ app.get('/db/stackers/backfill-vault-balances', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/take-vault-snapshot — manually trigger a live vault
+// snapshot. Unlike the other backfill triggers, this is a pure aggregation
+// of already-live data (no on-chain reads at all), so it's essentially
+// instant -- returns the actual snapshot result directly rather than
+// running in the background, since there's no meaningful wait involved.
+app.get('/db/stackers/take-vault-snapshot', auth, async (req, res) => {
+  try {
+    const { takeLiveVaultSnapshot } = require('./lib/stackers-analytics');
+    const totals = await takeLiveVaultSnapshot(pool);
+    res.json({ ok: true, vaultTotals: totals });
+  } catch(e) {
+    console.error('/db/stackers/take-vault-snapshot error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/engine-assets-debug — lists every asset the engine
 // currently knows about (assetCount + assets(idx) for each index), and
 // separately what's actually showing up in the live tier/asset cache's

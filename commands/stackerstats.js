@@ -1,7 +1,7 @@
 'use strict';
 
 const { EmbedBuilder, MessageFlags } = require('discord.js');
-const { getLatestSnapshotWithComparison } = require('../lib/stackers-analytics');
+const { getLatestSnapshotWithComparison, getVaultAccrualComparison } = require('../lib/stackers-analytics');
 
 // Tier/asset stats computed live from the event-driven status cache
 // (lib/stackers-status-poller.js) rather than the periodic snapshot —
@@ -70,6 +70,11 @@ async function handleStackerStatsCommand(commandName, ctx){
   const instantVault = await getInstantVaultTotals(pgPool).catch(e => {
     console.error('[stackerstats] getInstantVaultTotals failed:', e.message, e.stack);
     return null;
+  });
+
+  const { latest: vaultSnapLatest, comparison: vaultSnapComparison } = await getVaultAccrualComparison(pgPool).catch(e => {
+    console.error('[stackerstats] getVaultAccrualComparison failed:', e.message, e.stack);
+    return { latest: null, comparison: null };
   });
 
   if(!latest && !instant){
@@ -141,8 +146,8 @@ async function handleStackerStatsCommand(commandName, ctx){
     { name: '🏦 Total Vault Holdings', value: vaultLines.join('\n') || 'No snapshot data yet', inline: false },
   );
 
-  if(comparison && latest && latest.tokens_processed === latest.total_tokens){
-    const compTotals = comparison.vault_totals || {};
+  if(vaultSnapComparison && usingInstantVault){
+    const compTotals = vaultSnapComparison.vault_totals || {};
     const deltaLines = [];
     for(const [symbol, latestAmount] of Object.entries(vaultTotals)){
       const before = parseFloat(compTotals[symbol] || '0');
@@ -153,18 +158,23 @@ async function handleStackerStatsCommand(commandName, ctx){
       deltaLines.push(`${symbol}: ${sign}${delta.toLocaleString(undefined, { maximumFractionDigits: 4 })}`);
     }
     if(deltaLines.length){
-      const hoursElapsed = (new Date(latest.snapshot_at) - new Date(comparison.snapshot_at)) / 3_600_000;
-      const currentLabel = usingInstantVault ? 'live now' : `last snapshot, ${new Date(latest.snapshot_at).toLocaleString()}`;
+      const hoursElapsed = (new Date() - new Date(vaultSnapComparison.snapshot_at)) / 3_600_000;
       embed.addFields({
-        name: `📈 Collection-Wide Accrual (${currentLabel} vs ~${hoursElapsed.toFixed(0)}h earlier)`,
+        name: `📈 Collection-Wide Accrual (live now vs ~${hoursElapsed.toFixed(1)}h earlier)`,
         value: deltaLines.join('\n') + '\n\n_Real change since the comparison point — not a projection or promise, just what actually happened. Per-token/per-tier rates aren\'t shown here since actual earnings depend on live weight distribution, which shifts as Stackers activate, fuse, and re-tier._',
         inline: false,
       });
     }
-  } else if(latest){
+  } else if(vaultSnapLatest){
     embed.addFields({
       name: '📈 Collection-Wide Accrual',
-      value: '_Not enough snapshot history yet to show a real accrual rate — check back once the analytics job has run for about a day._',
+      value: '_Only one live snapshot so far — check back in about an hour for the first real comparison._',
+      inline: false,
+    });
+  } else {
+    embed.addFields({
+      name: '📈 Collection-Wide Accrual',
+      value: '_No snapshot history yet — the first one is taken on startup, check back shortly._',
       inline: false,
     });
   }

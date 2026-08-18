@@ -62,7 +62,7 @@ const { startLiveListeners: startStackersLiveListeners } = require('./lib/stacke
 const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vault-listing-alerts');
 const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
 const { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS, handleListingsPageButton, handleFusedPageButton } = require('./commands/stackervaults');
-const { takeStackersSnapshot } = require('./lib/stackers-analytics');
+const { takeStackersSnapshot, takeLiveVaultSnapshot } = require('./lib/stackers-analytics');
 
 const {
   buildBurnLotteryEmbed, buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
@@ -2328,21 +2328,28 @@ client.once('clientReady', async ()=>{
   } else {
     console.log('[StackersLive] No ALCHEMY_API_KEY set — live listener disabled');
   }
-  // Stackers analytics snapshot — iterates every token, takes real minutes
-  // for a collection this size, so this deliberately does NOT run
-  // immediately on startup (unlike the pollers above) — running it on every
-  // bot restart during a deploy/debug session would be wasteful. Interval
-  // only; the first snapshot happens once the first 24h period elapses.
-  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
-    console.log('[StackersAnalytics] Snapshot job scheduled (every 24h)');
-    setInterval(() => {
-      takeStackersSnapshot(pgPool).catch(e =>
-        console.error('[StackersAnalytics] Snapshot failed:', e.message)
-      );
-    }, 24 * 60 * 60 * 1000);
-  } else {
-    console.log('[StackersAnalytics] No ALCHEMY_API_KEY set — snapshot job disabled');
-  }
+  // Stackers live vault-totals snapshot — replaces the old 24h full
+  // on-chain sweep. This is a pure aggregation of the already-live
+  // stackers_token_status.vault_balances data (kept current via the
+  // Credited/Claimed live event listeners), not a fresh on-chain read at
+  // all -- no RPC cost, so unlike the old sweep this safely runs
+  // immediately on startup too, not just on the interval. Hourly gives the
+  // accrual comparison meaningful data within about an hour instead of
+  // needing up to 48h for two full sweeps to complete under the old design.
+  // The old full-sweep function (lib/stackers-analytics.js,
+  // takeStackersSnapshot) remains available but is no longer auto-
+  // scheduled -- it's now redundant given live tracking covers the same
+  // ground, and its real RPC cost isn't worth paying automatically anymore
+  // given tonight's confirmed account strain.
+  console.log('[StackersAnalytics] Live vault snapshot job scheduled (every 1h, runs immediately too)');
+  takeLiveVaultSnapshot(pgPool).catch(e =>
+    console.error('[StackersAnalytics] Initial live vault snapshot failed:', e.message)
+  );
+  setInterval(() => {
+    takeLiveVaultSnapshot(pgPool).catch(e =>
+      console.error('[StackersAnalytics] Live vault snapshot failed:', e.message)
+    );
+  }, 60 * 60 * 1000);
   // Stackers vault-listings refresh — removed. /stackervaults listings now
   // reads live: stackers_token_status.vault_balances (kept current via the
   // Credited/Claimed live event listeners) joined directly against the
