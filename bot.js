@@ -63,7 +63,6 @@ const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vaul
 const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
 const { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS } = require('./commands/stackervaults');
 const { takeStackersSnapshot } = require('./lib/stackers-analytics');
-const { refreshVaultListingsCache } = require('./lib/stackers-vault-listings');
 
 const {
   buildBurnLotteryEmbed, buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
@@ -2338,20 +2337,12 @@ client.once('clientReady', async ()=>{
   } else {
     console.log('[StackersAnalytics] No ALCHEMY_API_KEY set — snapshot job disabled');
   }
-  // Stackers vault-listings refresh — only walks the currently listed
-  // subset (much smaller than the full collection), so a shorter interval
-  // than the full snapshot makes sense here. Same "interval only, no
-  // immediate run on startup" reasoning as the snapshot job above.
-  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
-    console.log('[StackersVaultListings] Refresh job scheduled (every 6h)');
-    setInterval(() => {
-      refreshVaultListingsCache(pgPool).catch(e =>
-        console.error('[StackersVaultListings] Refresh failed:', e.message)
-      );
-    }, 6 * 60 * 60 * 1000);
-  } else {
-    console.log('[StackersVaultListings] No ALCHEMY_API_KEY set — refresh job disabled');
-  }
+  // Stackers vault-listings refresh — removed. /stackervaults listings now
+  // reads live: stackers_token_status.vault_balances (kept current via the
+  // Credited/Claimed live event listeners) joined directly against the
+  // listings table (already fresh via the existing sync pipeline). The
+  // periodic full sweep this used to run is no longer needed for this
+  // purpose and was just spending RPC calls on data nothing reads anymore.
   // Process pending burn alerts every 30s — waits for metadata to refresh before posting
   setInterval(processPendingBurnAlerts, 30_000);
   // Only run rank sync on production — staging shares the same codebase but shouldn't consume OS API quota
