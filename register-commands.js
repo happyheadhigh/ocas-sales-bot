@@ -57,6 +57,21 @@ const commands = [
     .addSubcommand(sub =>
       sub.setName('fused')
         .setDescription('Browse currently listed fused Stackers — tier, vault balance, image, one at a time')
+    )
+    .addSubcommand(sub =>
+      sub.setName('optimize')
+        .setDescription('Best way to spend $STACK across your Stackers — activate, upgrade, and fuse')
+        .addIntegerOption(opt =>
+          opt.setName('budget')
+            .setDescription('How much $STACK you have to spend')
+            .setRequired(true)
+            .setMinValue(1)
+        )
+        .addStringOption(opt =>
+          opt.setName('address')
+            .setDescription('Wallet to plan for — leave blank to use your own verified wallet')
+            .setRequired(false)
+        )
     ),
 
 
