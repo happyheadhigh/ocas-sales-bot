@@ -1142,6 +1142,39 @@ app.get('/db/stackers/trait-check-debug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/fusion-trait-debug — checks the real shape of
+// Burned, $STACK Burned, and Rarity traits before building anything on
+// them. Includes the specific tokens from a real reference screenshot
+// (#511 absorbed into #107) so actual values can be cross-checked
+// against what Stackers' own official bot displayed for that exact fusion.
+app.get('/db/stackers/fusion-trait-debug', auth, async (req, res) => {
+  try {
+    const burnedValues = await pool.query(
+      `SELECT trait_value, COUNT(*) FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name = 'Burned' GROUP BY trait_value ORDER BY COUNT(*) DESC LIMIT 10`
+    );
+    const stackBurnedSample = await pool.query(
+      `SELECT token_id, trait_value FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name = '$STACK Burned' LIMIT 5`
+    );
+    const rarityValues = await pool.query(
+      `SELECT trait_value, COUNT(*) FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name = 'Rarity' GROUP BY trait_value ORDER BY COUNT(*) DESC LIMIT 10`
+    );
+    const referenceTokens = await pool.query(
+      `SELECT token_id, trait_name, trait_value FROM token_traits WHERE collection_slug = 'stackersxyz' AND token_id IN (511, 107) AND trait_name IN ('Burned', '$STACK Burned', 'Rarity', 'Fused', 'Multiplier', 'Tier') ORDER BY token_id, trait_name`
+    );
+
+    res.json({
+      ok: true,
+      burnedTraitValueCounts: burnedValues.rows,
+      stackBurnedSample: stackBurnedSample.rows,
+      rarityValueCounts: rarityValues.rows,
+      referenceTokens: referenceTokens.rows,
+    });
+  } catch(e) {
+    console.error('/db/stackers/fusion-trait-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/catchup-fusion, /db/stackers/catchup-status —
 // manually-triggered catch-up bursts, separate from the automatic
 // background polling rate. Confirmed live the automatic rate alone cannot
