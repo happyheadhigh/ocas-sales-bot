@@ -61,7 +61,7 @@ const { setClient: setStackersFusionClient } = require('./lib/stackers-fusion-po
 const { startLiveListeners: startStackersLiveListeners } = require('./lib/stackers-live-events');
 const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vault-listing-alerts');
 const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
-const { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS } = require('./commands/stackervaults');
+const { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS, handleListingsPageButton } = require('./commands/stackervaults');
 const { takeStackersSnapshot } = require('./lib/stackers-analytics');
 
 const {
@@ -847,6 +847,9 @@ client.on('interactionCreate', async (interaction)=>{
   if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
     const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser };
     return handleMeInteraction(interaction, meCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('stackervaults:listings:page:')){
+    return handleListingsPageButton(interaction, pgPool);
   }
 
   // Modal submissions for price/floor alerts

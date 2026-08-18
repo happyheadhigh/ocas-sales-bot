@@ -1,36 +1,28 @@
 'use strict';
 
-const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
+const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { getVaultListings } = require('../lib/stackers-vault-listings');
 const { getWalletVaultSummary } = require('../lib/stackers-wallet-vault');
 const { STACKERS_SLUG, NFT_ADDRESS, formatStackersFields } = require('../lib/stackers');
 const { getOrCacheStackerImage } = require('../lib/stackers-image-cache');
 
-async function handleListingsSubcommand(interaction, pgPool){
-  await interaction.deferReply();
+const LISTINGS_PAGE_SIZE = 10;
+const LISTINGS_QUERY_LIMIT = 50; // raised from 15 -- the chain-mismatch fix (querying 'ethereum' instead of the real chain) means significantly more real listings should surface now than before
 
-  const rows = await getVaultListings(pgPool, 15).catch(e => {
-    console.error('[stackervaults listings] getVaultListings failed:', e.message, e.stack);
-    return null;
-  });
-
-  if(rows === null){
-    return interaction.editReply({ content: 'Something went wrong looking this up — try again in a moment.' });
-  }
-
-  if(!rows.length){
-    return interaction.editReply({
-      content: 'No currently listed Stackers with unclaimed vault value found right now — either nothing qualifies, or the background check hasn\'t run yet. Check back after the next scheduled refresh.',
-    });
-  }
+// Shared render logic — used by both the initial slash command and every
+// button-click page change, so they can never drift out of sync with
+// each other the way two separate copies of this logic eventually would.
+function buildListingsPage(rows, page){
+  const totalPages = Math.ceil(rows.length / LISTINGS_PAGE_SIZE);
+  const pageRows = rows.slice(page * LISTINGS_PAGE_SIZE, (page + 1) * LISTINGS_PAGE_SIZE);
 
   const embed = new EmbedBuilder()
     .setTitle('🏦 Listed Stackers with Unclaimed Vault Value')
     .setColor(0xF97316)
-    .setDescription('Sorted cheapest listing first.')
-    .setFooter({ text: `Vault data checked periodically, not live — listing prices are current` });
+    .setDescription(`Sorted cheapest listing first.${totalPages > 1 ? ` Page ${page + 1} of ${totalPages}.` : ''}`)
+    .setFooter({ text: 'Vault balances and listing prices are both live' });
 
-  for(const row of rows.slice(0, 10)){
+  for(const row of pageRows){
     const balances = row.vault_balances || [];
     const vaultText = balances.map(b => `${parseFloat(b.amountFormatted).toFixed(4)} ${b.symbol}`).join(', ');
     const priceStr = row.price_eth >= 1 ? Number(row.price_eth).toFixed(3) : Number(row.price_eth).toFixed(4);
@@ -41,11 +33,66 @@ async function handleListingsSubcommand(interaction, pgPool){
     });
   }
 
-  if(rows.length > 10){
-    embed.addFields({ name: '\u200b', value: `+ ${rows.length - 10} more not shown here`, inline: false });
+  const components = [];
+  if(totalPages > 1){
+    const navRow = new ActionRowBuilder();
+    if(page > 0){
+      navRow.addComponents(
+        new ButtonBuilder().setCustomId(`stackervaults:listings:page:${page - 1}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary)
+      );
+    }
+    if(page < totalPages - 1){
+      navRow.addComponents(
+        new ButtonBuilder().setCustomId(`stackervaults:listings:page:${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary)
+      );
+    }
+    components.push(navRow);
   }
 
-  return interaction.editReply({ embeds: [embed] });
+  return { embed, components };
+}
+
+async function handleListingsSubcommand(interaction, pgPool){
+  await interaction.deferReply();
+
+  const rows = await getVaultListings(pgPool, LISTINGS_QUERY_LIMIT).catch(e => {
+    console.error('[stackervaults listings] getVaultListings failed:', e.message, e.stack);
+    return null;
+  });
+
+  if(rows === null){
+    return interaction.editReply({ content: 'Something went wrong looking this up — try again in a moment.' });
+  }
+
+  if(!rows.length){
+    return interaction.editReply({
+      content: 'No currently listed Stackers with unclaimed vault value found right now — either nothing genuinely qualifies at the moment, or the one-time vault-balance seed hasn\'t finished yet for these tokens.',
+    });
+  }
+
+  const { embed, components } = buildListingsPage(rows, 0);
+  return interaction.editReply({ embeds: [embed], components });
+}
+
+// Button-click page changes — re-queries fresh each time rather than
+// trying to carry the full result set through the customId itself
+// (Discord caps custom IDs at 100 characters, nowhere near enough room
+// for 50 rows of data). The query itself is a cheap Postgres join, not
+// an RPC call, so re-running it per click is inexpensive.
+async function handleListingsPageButton(interaction, pgPool){
+  const page = parseInt(interaction.customId.split(':')[3], 10) || 0;
+
+  const rows = await getVaultListings(pgPool, LISTINGS_QUERY_LIMIT).catch(e => {
+    console.error('[stackervaults listings page] getVaultListings failed:', e.message, e.stack);
+    return null;
+  });
+
+  if(rows === null || !rows.length){
+    return interaction.update({ content: 'Something went wrong looking this up — try again in a moment.', embeds: [], components: [] });
+  }
+
+  const { embed, components } = buildListingsPage(rows, page);
+  return interaction.update({ embeds: [embed], components });
 }
 
 async function handleWalletSubcommand(interaction, pgPool){
@@ -172,4 +219,4 @@ async function handleStackerVaultsCommand(commandName, ctx){
 
 const STACKERVAULTS_COMMANDS = new Set(['stackervaults']);
 
-module.exports = { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS };
+module.exports = { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS, handleListingsPageButton };
