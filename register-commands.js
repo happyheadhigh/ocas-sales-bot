@@ -29,20 +29,11 @@ const commands = [
   new SlashCommandBuilder().setName('stackerstats').setDescription('Stackers collection-wide stats — tier distribution, asset popularity, vault totals'),
 
   new SlashCommandBuilder()
-    .setName('stackervaults')
-    .setDescription('Stackers vault value — listings, a specific wallet, or a specific token')
+    .setName('stackers')
+    .setDescription('Browse Stackers — listings with unclaimed vault value, fused Stackers, or a specific token')
     .addSubcommand(sub =>
       sub.setName('listings')
         .setDescription('Currently listed Stackers with unclaimed value sitting in their vault')
-    )
-    .addSubcommand(sub =>
-      sub.setName('wallet')
-        .setDescription('Total unclaimed vault value across a wallet\'s held Stackers')
-        .addStringOption(opt =>
-          opt.setName('address')
-            .setDescription('Wallet address to check — leave blank to use your own verified wallet')
-            .setRequired(false)
-        )
     )
     .addSubcommand(sub =>
       sub.setName('token')
@@ -57,21 +48,6 @@ const commands = [
     .addSubcommand(sub =>
       sub.setName('fused')
         .setDescription('Browse currently listed fused Stackers — tier, vault balance, image, one at a time')
-    )
-    .addSubcommand(sub =>
-      sub.setName('optimize')
-        .setDescription('Best way to spend $STACK across your Stackers — activate, upgrade, and fuse')
-        .addIntegerOption(opt =>
-          opt.setName('budget')
-            .setDescription('How much $STACK you have to spend')
-            .setRequired(true)
-            .setMinValue(1)
-        )
-        .addStringOption(opt =>
-          opt.setName('address')
-            .setDescription('Wallet to plan for — leave blank to use your own verified wallet')
-            .setRequired(false)
-        )
     ),
 
 

@@ -1061,7 +1061,7 @@ app.get('/db/stackers/poller-status-debug', auth, async (req, res) => {
 });
 
 // ── GET /db/stackers/vault-listings-funnel-debug — breaks down exactly
-// where the /stackervaults listings count narrows, step by step. Exists
+// where the /stackers listings count narrows, step by step. Exists
 // because a small result count (6 tokens) raised a real question of
 // whether that's genuinely correct or a bug somewhere in the join/filter
 // -- rather than guess either way, this shows the real number at each

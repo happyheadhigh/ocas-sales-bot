@@ -2,6 +2,9 @@
 
 const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
 const { STACKERS_SLUG, formatStackersFields } = require('../lib/stackers');
+const { getWalletVaultSummary, getHeldTokenIds } = require('../lib/stackers-wallet-vault');
+const { optimize } = require('../lib/stackers-optimizer');
+const { getRecentRoundHistory } = require('../lib/stackers-analytics');
 const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS, OCAS_SLUG } = require('../lib/constants');
 const { extractPngFromSvg, resolveImage } = require('../lib/images');
@@ -1730,7 +1733,7 @@ async function showMeHub(interaction, ctx){
       new StringSelectMenuOptionBuilder().setLabel('📣 Trait Alert').setDescription('Sales & listing DMs by trait').setValue('trait_alert'),
       new StringSelectMenuOptionBuilder().setLabel('🏷️ Price Alerts').setDescription('DM when a token drops below a price').setValue('price_alerts'),
       new StringSelectMenuOptionBuilder().setLabel('📉 Floor Alerts').setDescription('DM when a collection floor drops').setValue('floor_alerts'),
-      new StringSelectMenuOptionBuilder().setLabel('🏦 Stackers Vault Alerts').setDescription('DM when a new listing has unclaimed vault value').setValue('stackers_vault'),
+      new StringSelectMenuOptionBuilder().setLabel('🥞 My Stackers').setDescription('Wallet summary, strategy optimizer, vault listing DMs').setValue('my_stackers'),
       new StringSelectMenuOptionBuilder().setLabel('💼 Wallet').setDescription('Verification & wallet analytics').setValue('wallet'),
       new StringSelectMenuOptionBuilder().setLabel('📊 TraitView').setDescription('Link your TraitView account').setValue('traitview'),
     ]);
@@ -1952,8 +1955,9 @@ function generateTVCode() {
   return code;
 }
 
-async function showMeStackersVaultAlert(interaction, ctx) {
+async function showMeStackersHub(interaction, ctx) {
   const { getVaultDmOptIns } = require('../lib/stackers-vault-listing-alerts');
+  const { pgPool } = ctx;
   const userId = interaction.user.id;
 
   const updateFn = interaction.deferred || interaction.replied ? 'editReply'
@@ -1962,23 +1966,176 @@ async function showMeStackersVaultAlert(interaction, ctx) {
   const optIns = await getVaultDmOptIns();
   const isOn = !!optIns[userId];
 
+  const verifiedRes = pgPool ? await pgPool.query(
+    `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+    [userId]
+  ).catch(() => ({ rows: [] })) : { rows: [] };
+  const wallet = verifiedRes.rows[0]?.wallet || null;
+
+  const lines = [];
+
+  if(wallet){
+    const shortAddr = `${wallet.slice(0,6)}...${wallet.slice(-4)}`;
+    lines.push(`💼 **Wallet:** \`${shortAddr}\``);
+
+    const summary = await getWalletVaultSummary(wallet).catch(() => null);
+    if(summary && summary.tokenCount){
+      lines.push('');
+      lines.push(`🏦 **Unclaimed Vault** — across ${summary.tokenCount} held Stacker${summary.tokenCount === 1 ? '' : 's'}:`);
+      lines.push(summary.totals.length
+        ? summary.totals.map(t => `  ${t.amount.toFixed(4)} ${t.symbol}`).join('\n')
+        : '  Empty across all held tokens');
+      if(summary.failed) lines.push(`  _${summary.failed} token(s) couldn't be checked_`);
+    } else {
+      lines.push('');
+      lines.push('🏦 **Unclaimed Vault** — you don\'t currently hold any Stackers.');
+    }
+  } else {
+    lines.push('💼 **Wallet** — not verified. Verify a wallet to see your vault summary and use the strategy optimizer.');
+  }
+
+  lines.push('');
+  lines.push(`📬 **New-Listing Vault DMs:** ${isOn ? '✅ on' : '❌ off'} — a DM the moment a new listing appears with real, unclaimed value in its vault. Works independent of any server.`);
+
   const embed = new EmbedBuilder()
-    .setTitle('🏦 Stackers Vault Alerts')
-    .setColor(isOn ? 0x57F287 : 0x5865F2)
-    .setDescription([
-      `**DMs:** ${isOn ? '✅ on' : '❌ off'}`,
-      '',
-      'Get a DM the moment a new Stacker listing appears with real, unclaimed value sitting in its vault — value that comes with the token on purchase.',
-      '',
-      'Works independent of any server — this is a personal setting, not tied to a specific guild.',
-    ].join('\n'));
+    .setTitle('🥞 My Stackers')
+    .setColor(isOn ? 0x57F287 : 0xF97316)
+    .setDescription(lines.join('\n'));
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('me_browse:stackersvault:toggle').setLabel(isOn ? '🔕 Turn Off' : '🔔 Turn On').setStyle(isOn ? ButtonStyle.Secondary : ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('me_browse:stackersvault:toggle').setLabel(isOn ? '🔕 Turn Off DMs' : '🔔 Turn On DMs').setStyle(isOn ? ButtonStyle.Secondary : ButtonStyle.Success),
   );
+  if(wallet){
+    row.addComponents(new ButtonBuilder().setCustomId('me_browse:stackers:optimize').setLabel('🧮 Run Optimizer').setStyle(ButtonStyle.Primary));
+  }
+  row.addComponents(new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary));
 
   return interaction[updateFn]({ embeds: [embed], components: [row] });
+}
+
+async function showStackerOptimizeModal(interaction) {
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const modal = new ModalBuilder()
+    .setCustomId('me_modal:stackeroptimize')
+    .setTitle('Stacker Strategy Optimizer');
+
+  const budgetInput = new TextInputBuilder()
+    .setCustomId('budget')
+    .setLabel('How much $STACK do you have to spend?')
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder('e.g. 350000')
+    .setRequired(true);
+
+  modal.addComponents(new AR().addComponents(budgetInput));
+  return interaction.showModal(modal);
+}
+
+// Tier index -> display multiplier, matching Stackers' own docs table exactly
+const STACKER_TIER_MULTIPLIERS = [null, 1.0, 1.4, 1.9, 2.5, 3.5];
+
+// Ported from the old standalone /stackervaults optimize subcommand --
+// same logic, but always plans for the caller's own verified wallet
+// rather than an optional address override, since /me is inherently
+// personal.
+async function showStackerOptimizeResult(interaction, ctx, budget) {
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+
+  const verifiedRes = await pgPool.query(
+    `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+    [userId]
+  ).catch(() => ({ rows: [] }));
+  if(!verifiedRes.rows.length){
+    return interaction.reply({ content: 'You haven\'t verified a wallet yet — verify one first from the Wallet section.', flags: MessageFlags.Ephemeral });
+  }
+  const address = verifiedRes.rows[0].wallet.toLowerCase();
+
+  const tokenIds = await getHeldTokenIds(address).catch(e => {
+    console.error('[me stackers optimize] getHeldTokenIds failed:', e.message, e.stack);
+    return null;
+  });
+
+  if(tokenIds === null){
+    return interaction.reply({ content: 'Something went wrong looking up your wallet — try again in a moment.', flags: MessageFlags.Ephemeral });
+  }
+  if(!tokenIds.length){
+    return interaction.reply({ content: 'Your verified wallet doesn\'t hold any Stackers right now.', flags: MessageFlags.Ephemeral });
+  }
+
+  const statusRes = await pgPool.query(
+    `SELECT token_id, tier_index FROM stackers_token_status WHERE token_id = ANY($1)`,
+    [tokenIds]
+  ).catch(() => ({ rows: [] }));
+  const tierByToken = new Map(statusRes.rows.map(r => [r.token_id, r.tier_index]));
+
+  const tokens = tokenIds.map(id => {
+    const tierIndex = tierByToken.get(id);
+    return { id, tier: tierIndex !== undefined && tierIndex !== null ? tierIndex + 1 : 0 };
+  });
+
+  const result = optimize(tokens, budget);
+
+  const actionLines = result.actionsTaken.map((a, idx) => {
+    const step = idx + 1;
+    if(a.type === 'upgrade'){
+      const mult = STACKER_TIER_MULTIPLIERS[a.toTier];
+      const reforgeNote = a.componentId !== a.groupSurvivorId ? ` (Reforge, part of #${a.groupSurvivorId}'s fused group)` : '';
+      return `**${step}.** Upgrade #${a.componentId} to ${mult}×${reforgeNote} — **${a.cost.toLocaleString()}** $STACK`;
+    }
+    const verb = a.type === 'fusePair' ? 'Fuse' : 'Fuse (3-way)';
+    return `**${step}.** ${verb} #${a.survivorId} + #${a.absorbedIds.join(' + #')} → new weight **${a.resultingWeight}** — **${a.cost.toLocaleString()}** $STACK`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle('🧮 Stacker Strategy — Recommended Steps')
+    .setColor(0xF97316)
+    .setDescription(
+      actionLines.length
+        ? actionLines.join('\n') + '\n\n_A strong, reasoned allocation — not a mathematical guarantee of the single best possible one. Each step is a separate on-chain transaction, in the order shown._'
+        : '_No beneficial action found — either your budget is too small for anything meaningful, or everything you hold is already fully optimized._'
+    )
+    .addFields(
+      { name: 'Budget', value: `${budget.toLocaleString()} $STACK`, inline: true },
+      { name: 'Spent', value: `${result.totalSpent.toLocaleString()} $STACK`, inline: true },
+      { name: 'Unused', value: `${result.remainingBudget.toLocaleString()} $STACK`, inline: true },
+      { name: 'Resulting Total Weight', value: `${result.totalWeight}`, inline: false },
+    );
+
+  if(result.remainingBudget > 0 && actionLines.length){
+    embed.addFields({ name: 'Why budget is left over', value: 'Everything affordable with what remains is already at max tier or fully fused — more Stackers would be needed to usefully spend the rest.', inline: false });
+  }
+
+  const recentRounds = await getRecentRoundHistory(pgPool, 24).catch(() => []);
+  if(recentRounds.length >= 2){
+    const totalPotWei = recentRounds.reduce((sum, r) => sum + BigInt(r.pot_wei), 0n);
+    const totalWeightSum = recentRounds.reduce((sum, r) => sum + BigInt(r.total_weight), 0n);
+    const avgPotWei = totalPotWei / BigInt(recentRounds.length);
+    const avgTotalWeight = totalWeightSum / BigInt(recentRounds.length);
+
+    if(avgTotalWeight > 0n){
+      const myShareOfPotWei = (avgPotWei * BigInt(result.totalWeight)) / avgTotalWeight;
+      const estimatedEthPerHour = Number(myShareOfPotWei) / 1e18;
+      embed.addFields({
+        name: '📈 Estimated Earnings (based on real recent rounds)',
+        value: `~**${estimatedEthPerHour.toFixed(6)} ETH/hour** worth of assets, based on the last ${recentRounds.length} recorded round(s) — averaged to smooth out any single hour's volume being unusually high or low.\n\n_A real estimate, not a promise — trading volume drives the actual pot every hour and isn't guaranteed or predictable._`,
+        inline: false,
+      });
+    }
+  } else {
+    embed.addFields({
+      name: '📈 Estimated Earnings',
+      value: `_Not enough real round history yet to estimate — ${recentRounds.length} recorded so far, need at least 2. Check back in a couple hours._`,
+      inline: false,
+    });
+  }
+
+  embed.setFooter({ text: `Planning for ${address.slice(0,6)}...${address.slice(-4)} · ${tokens.length} Stacker(s) held` });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary)
+  );
+
+  return interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
 }
 
 async function showMeTraitView(interaction, ctx) {
@@ -2901,7 +3058,7 @@ async function handleMeInteraction(interaction, ctx){
     if(section === 'trait_alert') return showMeTraitAlert(interaction, ctx);
     if(section === 'price_alerts') return showMePriceAlerts(interaction, ctx);
     if(section === 'floor_alerts') return showMeFloorAlerts(interaction, ctx);
-    if(section === 'stackers_vault') return showMeStackersVaultAlert(interaction, ctx);
+    if(section === 'my_stackers') return showMeStackersHub(interaction, ctx);
     if(section === 'wallet') return showMeWallet(interaction, ctx);
     if(section === 'traitview') return showMeTraitView(interaction, ctx);
   }
@@ -2911,7 +3068,11 @@ async function handleMeInteraction(interaction, ctx){
     const current = await getVaultDmOptIns();
     const isOn = !!current[interaction.user.id];
     await setVaultDmOptIn(interaction.user.id, !isOn);
-    return showMeStackersVaultAlert(interaction, ctx);
+    return showMeStackersHub(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:stackers:optimize'){
+    return showStackerOptimizeModal(interaction);
   }
 
   // Back to hub
@@ -3275,4 +3436,4 @@ async function showFloorAlertModal(interaction, slug){
   return interaction.showModal(modal);
 }
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick };
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, showStackerOptimizeResult };

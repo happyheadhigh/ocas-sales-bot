@@ -61,7 +61,7 @@ const { setClient: setStackersFusionClient } = require('./lib/stackers-fusion-po
 const { startLiveListeners: startStackersLiveListeners } = require('./lib/stackers-live-events');
 const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vault-listing-alerts');
 const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
-const { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS, handleListingsPageButton, handleFusedPageButton } = require('./commands/stackervaults');
+const { handleStackersCommand, STACKERS_COMMANDS, handleListingsPageButton, handleFusedPageButton } = require('./commands/stackers');
 const { takeStackersSnapshot, takeLiveVaultSnapshot } = require('./lib/stackers-analytics');
 
 const {
@@ -105,7 +105,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, showStackerOptimizeResult }   = require('./commands/market');
 const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
@@ -848,10 +848,10 @@ client.on('interactionCreate', async (interaction)=>{
     const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser };
     return handleMeInteraction(interaction, meCtx);
   }
-  if(interaction.isButton() && interaction.customId.startsWith('stackervaults:listings:page:')){
+  if(interaction.isButton() && interaction.customId.startsWith('stackers:listings:page:')){
     return handleListingsPageButton(interaction, pgPool);
   }
-  if(interaction.isButton() && interaction.customId.startsWith('stackervaults:fused:page:')){
+  if(interaction.isButton() && interaction.customId.startsWith('stackers:fused:page:')){
     return handleFusedPageButton(interaction, pgPool);
   }
 
@@ -860,6 +860,16 @@ client.on('interactionCreate', async (interaction)=>{
     const parts = interaction.customId.split(':');
     const alertType = parts[1];
     const slug = parts.slice(2).join(':');
+
+    if(alertType === 'stackeroptimize'){
+      const raw = interaction.fields.getTextInputValue('budget').trim().replace(/[,\s]/g, '');
+      const budget = parseInt(raw, 10);
+      if(isNaN(budget) || budget <= 0){
+        return interaction.reply({ content: '❌ Invalid budget. Enter a positive number of $STACK, e.g. 350000.', flags: MessageFlags.Ephemeral });
+      }
+      const meCtx = { pgPool };
+      return showStackerOptimizeResult(interaction, meCtx, budget);
+    }
 
     if(alertType === 'pricealert'){
       const tokenId = parseInt(interaction.fields.getTextInputValue('token_id').trim());
@@ -2083,7 +2093,7 @@ client.on('interactionCreate', async (interaction)=>{
 
   if(ADMIN_COMMANDS.has(commandName))   return handleAdminCommand(commandName, ctx);
   if(STACKERSTATS_COMMANDS.has(commandName)) return handleStackerStatsCommand(commandName, ctx);
-  if(STACKERVAULTS_COMMANDS.has(commandName)) return handleStackerVaultsCommand(commandName, ctx);
+  if(STACKERS_COMMANDS.has(commandName)) return handleStackersCommand(commandName, ctx);
   if(MARKET_COMMANDS.has(commandName))  return handleMarketCommand(commandName, ctx);
   if(OCAS_COMMANDS.has(commandName))    return handleOcasCommand(commandName, ctx);
   if(TOKEN_COMMANDS.has(commandName))   return handleTokenCommand(commandName, ctx);
