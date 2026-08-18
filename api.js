@@ -960,6 +960,54 @@ app.get('/db/stackers/poller-status-debug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/vault-listings-funnel-debug — breaks down exactly
+// where the /stackervaults listings count narrows, step by step. Exists
+// because a small result count (6 tokens) raised a real question of
+// whether that's genuinely correct or a bug somewhere in the join/filter
+// -- rather than guess either way, this shows the real number at each
+// stage: total listed, of those how many have any status row at all, of
+// those how many have vault_balances populated, of those how many are
+// actually non-empty (the real filter used), and for context how many
+// listed tokens are marked active at all (since an inactive token has no
+// way to be earning anything in the first place).
+app.get('/db/stackers/vault-listings-funnel-debug', auth, async (req, res) => {
+  try {
+    const { STACKERS_SLUG } = require('./lib/stackers');
+
+    const totalListed = await pool.query(
+      `SELECT COUNT(*) FROM listings WHERE collection_slug = $1`, [STACKERS_SLUG]
+    );
+    const hasAnyStatusRow = await pool.query(
+      `SELECT COUNT(*) FROM listings l JOIN stackers_token_status s ON s.token_id = l.token_id WHERE l.collection_slug = $1`,
+      [STACKERS_SLUG]
+    );
+    const hasNonNullBalances = await pool.query(
+      `SELECT COUNT(*) FROM listings l JOIN stackers_token_status s ON s.token_id = l.token_id WHERE l.collection_slug = $1 AND s.vault_balances IS NOT NULL`,
+      [STACKERS_SLUG]
+    );
+    const hasNonEmptyBalances = await pool.query(
+      `SELECT COUNT(*) FROM listings l JOIN stackers_token_status s ON s.token_id = l.token_id WHERE l.collection_slug = $1 AND s.vault_balances IS NOT NULL AND jsonb_array_length(s.vault_balances) > 0`,
+      [STACKERS_SLUG]
+    );
+    const isActive = await pool.query(
+      `SELECT COUNT(*) FROM listings l JOIN stackers_token_status s ON s.token_id = l.token_id WHERE l.collection_slug = $1 AND s.is_active = true`,
+      [STACKERS_SLUG]
+    );
+
+    res.json({
+      ok: true,
+      totalCurrentlyListed: parseInt(totalListed.rows[0].count, 10),
+      listedWithAnyStatusRow: parseInt(hasAnyStatusRow.rows[0].count, 10),
+      listedWithNonNullVaultBalances: parseInt(hasNonNullBalances.rows[0].count, 10),
+      listedWithNonEmptyVaultBalances: parseInt(hasNonEmptyBalances.rows[0].count, 10),
+      listedAndActive: parseInt(isActive.rows[0].count, 10),
+    });
+  } catch(e) {
+    console.error('/db/stackers/vault-listings-funnel-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/catchup-fusion, /db/stackers/catchup-status —
 // manually-triggered catch-up bursts, separate from the automatic
 // background polling rate. Confirmed live the automatic rate alone cannot
