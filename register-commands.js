@@ -30,7 +30,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('stackervaults')
-    .setDescription('Stackers vault value — listings or a specific wallet')
+    .setDescription('Stackers vault value — listings, a specific wallet, or a specific token')
     .addSubcommand(sub =>
       sub.setName('listings')
         .setDescription('Currently listed Stackers with unclaimed value sitting in their vault')
@@ -42,6 +42,16 @@ const commands = [
           opt.setName('address')
             .setDescription('Wallet address to check — leave blank to use your own verified wallet')
             .setRequired(false)
+        )
+    )
+    .addSubcommand(sub =>
+      sub.setName('token')
+        .setDescription('Full status for one specific Stacker — tier, split, vault balance, listing status')
+        .addIntegerOption(opt =>
+          opt.setName('id')
+            .setDescription('Token ID')
+            .setRequired(true)
+            .setMinValue(1)
         )
     ),
 

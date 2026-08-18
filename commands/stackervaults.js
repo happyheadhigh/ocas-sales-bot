@@ -1,9 +1,10 @@
 'use strict';
 
-const { EmbedBuilder } = require('discord.js');
+const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const { getVaultListings } = require('../lib/stackers-vault-listings');
 const { getWalletVaultSummary } = require('../lib/stackers-wallet-vault');
-const { STACKERS_SLUG, NFT_ADDRESS } = require('../lib/stackers');
+const { STACKERS_SLUG, NFT_ADDRESS, formatStackersFields } = require('../lib/stackers');
+const { getOrCacheStackerImage } = require('../lib/stackers-image-cache');
 
 async function handleListingsSubcommand(interaction, pgPool){
   await interaction.deferReply();
@@ -19,7 +20,7 @@ async function handleListingsSubcommand(interaction, pgPool){
 
   if(!rows.length){
     return interaction.editReply({
-      content: 'No currently listed Stackers with unclaimed vault value found right now — either nothing genuinely qualifies at the moment, or the one-time vault-balance seed hasn\'t finished yet for these tokens.',
+      content: 'No currently listed Stackers with unclaimed vault value found right now — either nothing qualifies, or the background check hasn\'t run yet. Check back after the next scheduled refresh.',
     });
   }
 
@@ -27,7 +28,7 @@ async function handleListingsSubcommand(interaction, pgPool){
     .setTitle('🏦 Listed Stackers with Unclaimed Vault Value')
     .setColor(0xF97316)
     .setDescription('Sorted cheapest listing first.')
-    .setFooter({ text: `Vault balances and listing prices are both live` });
+    .setFooter({ text: `Vault data checked periodically, not live — listing prices are current` });
 
   for(const row of rows.slice(0, 10)){
     const balances = row.vault_balances || [];
@@ -107,12 +108,65 @@ async function handleWalletSubcommand(interaction, pgPool){
   return interaction.editReply({ embeds: [embed] });
 }
 
+async function handleTokenSubcommand(interaction, pgPool){
+  await interaction.deferReply();
+
+  const tokenId = interaction.options.getInteger('id');
+
+  // Same formatter already proven working in the fusion alert embeds —
+  // tier, split, and vault balance in one call, fails safe (returns an
+  // empty array, not a thrown error) if the token can't be read at all.
+  const fields = await formatStackersFields(String(tokenId)).catch(() => []);
+  if(!fields.length){
+    return interaction.editReply({
+      content: `Couldn't read data for Stacker #${tokenId} — either the token ID is wrong, or there was a temporary issue reading the chain. Try again in a moment.`,
+    });
+  }
+
+  const listingRes = await pgPool.query(
+    `SELECT price_eth FROM listings WHERE token_id = $1 AND collection_slug = $2`,
+    [tokenId, STACKERS_SLUG]
+  ).catch(() => ({ rows: [] }));
+  const listing = listingRes.rows[0];
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Stacker #${tokenId}`)
+    .setColor(0xF97316)
+    .setURL(`https://opensea.io/assets/robinhood/${NFT_ADDRESS}/${tokenId}`)
+    .addFields(...fields);
+
+  if(listing){
+    const priceStr = listing.price_eth >= 1 ? Number(listing.price_eth).toFixed(3) : Number(listing.price_eth).toFixed(4);
+    embed.addFields({ name: '🏷️ Listed', value: `Ξ${priceStr}`, inline: false });
+  } else {
+    embed.addFields({ name: '🏷️ Listed', value: 'Not currently listed', inline: false });
+  }
+
+  // Cache-first, not force-refresh — unlike the fusion handler, there's
+  // no specific reason to suspect the art just changed here, so the
+  // faster cached read is the right choice for an on-demand lookup.
+  const files = [];
+  try{
+    const cached = await getOrCacheStackerImage(pgPool, tokenId);
+    const ext = cached.isSvg ? 'svg' : 'png';
+    const filename = `stacker-${tokenId}.${ext}`;
+    const buffer = cached.isSvg ? Buffer.from(cached.data, 'utf8') : cached.data;
+    files.push(new AttachmentBuilder(buffer, { name: filename }));
+    embed.setImage(`attachment://${filename}`);
+  }catch(e){
+    console.warn(`[stackervaults token] Failed to attach image for #${tokenId}:`, e.message);
+  }
+
+  return interaction.editReply({ embeds: [embed], files });
+}
+
 async function handleStackerVaultsCommand(commandName, ctx){
   const { interaction, pgPool } = ctx;
   if(commandName !== 'stackervaults') return;
 
   const subcommand = interaction.options.getSubcommand();
   if(subcommand === 'wallet') return handleWalletSubcommand(interaction, pgPool);
+  if(subcommand === 'token') return handleTokenSubcommand(interaction, pgPool);
   return handleListingsSubcommand(interaction, pgPool);
 }
 
