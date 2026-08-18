@@ -840,11 +840,20 @@ app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
       return res.status(502).json({ ok: false, error: 'Could not fetch a verified ABI from either Blockscout API format', attempts });
     }
 
-    // Just the assets-related functions/events, to keep this readable —
-    // the full ABI can be large and most of it isn't relevant here.
-    const relevant = abi.filter(item =>
-      (item.name || '').toLowerCase().includes('asset') || (item.name || '').toLowerCase().includes('split')
-    );
+    // Default: just the assets-related functions/events, to keep this
+    // readable — the full ABI can be large and most of it isn't relevant
+    // for most checks. ?eventsOnly=true instead returns every event the
+    // contract emits, unfiltered by name — needed to see the real full
+    // picture (e.g. checking for vault-balance-related events) rather than
+    // guessing which name patterns might be relevant.
+    let relevant;
+    if(req.query.eventsOnly === 'true'){
+      relevant = abi.filter(item => item.type === 'event');
+    } else {
+      relevant = abi.filter(item =>
+        (item.name || '').toLowerCase().includes('asset') || (item.name || '').toLowerCase().includes('split')
+      );
+    }
 
     res.json({ ok: true, address, apiSource: source, fullAbiLength: abi.length, relevantEntries: relevant });
   } catch(e) {
