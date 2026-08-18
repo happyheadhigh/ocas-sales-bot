@@ -986,6 +986,42 @@ app.get('/db/stackers/catchup-status', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/websocket-debug — checks whether this Alchemy
+// account actually supports a live WebSocket connection to Robinhood
+// Chain, before committing to building anything on top of it (a live
+// eth_subscribe-based listener would sidestep the eth_getLogs block-range
+// limitation entirely, rather than continuing to work around it). Same
+// host as the existing HTTP RPC endpoint, wss:// instead of https:// --
+// Alchemy's standard convention. Times out after 10s rather than hanging
+// the request indefinitely, and always cleans up the connection via
+// provider.destroy() regardless of success or failure.
+app.get('/db/stackers/websocket-debug', auth, async (req, res) => {
+  const key = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+  if(!key) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY env var' });
+
+  const wssUrl = `wss://robinhood-mainnet.g.alchemy.com/v2/${key}`;
+  let provider = null;
+
+  try{
+    const { ethers } = require('ethers');
+    provider = new ethers.WebSocketProvider(wssUrl);
+
+    const blockNumber = await Promise.race([
+      provider.getBlockNumber(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out after 10s waiting for a response')), 10000)),
+    ]);
+
+    res.json({ ok: true, connected: true, blockNumber });
+  }catch(e){
+    console.error('/db/stackers/websocket-debug error:', e.message);
+    res.status(500).json({ ok: false, connected: false, error: e.message });
+  }finally{
+    if(provider){
+      provider.destroy().catch(()=>{});
+    }
+  }
+});
+
 
 // ── GET /db/stackers/refresh-vault-listings — manually trigger the
 // listed-with-unclaimed-vault-value refresh. The scheduled job only runs
