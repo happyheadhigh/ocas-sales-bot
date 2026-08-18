@@ -527,6 +527,57 @@ app.get('/db/stackers/take-vault-snapshot', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/wallet-full-status-debug/:wallet — full tier/active/
+// split/vault detail for every Stacker a wallet holds, not just vault
+// totals. Reuses getHeldTokenIds (a single OpenSea call, not Alchemy RPC)
+// for the real, current owner list, then pulls per-token detail from the
+// already-live stackers_token_status data -- no on-chain reads for that
+// part at all. Built for strategy planning, where knowing each token's
+// current tier/active state (not just its vault balance) is what actually
+// matters for deciding what to burn or stake next.
+app.get('/db/stackers/wallet-full-status-debug/:wallet', auth, async (req, res) => {
+  try {
+    const wallet = req.params.wallet;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(wallet)) return res.status(400).json({ ok: false, error: 'valid wallet address required' });
+
+    const { getHeldTokenIds } = require('./lib/stackers-wallet-vault');
+    const tokenIds = await getHeldTokenIds(wallet.toLowerCase());
+
+    if(!tokenIds.length){
+      return res.json({ ok: true, wallet, tokenCount: 0, tokens: [] });
+    }
+
+    const statusRes = await pool.query(
+      `SELECT token_id, tier_index, is_active, split, vault_balances FROM stackers_token_status WHERE token_id = ANY($1)`,
+      [tokenIds]
+    );
+    const statusByToken = new Map(statusRes.rows.map(r => [r.token_id, r]));
+
+    const TIER_MULTIPLIERS = [1.0, 1.4, 1.9, 2.5, 3.5]; // confirmed from Stackers' own docs table, indexed by tier_index
+
+    const tokens = tokenIds.map(tokenId => {
+      const status = statusByToken.get(tokenId);
+      if(!status){
+        return { tokenId, hasStatusData: false };
+      }
+      return {
+        tokenId,
+        hasStatusData: true,
+        isActive: status.is_active,
+        tierIndex: status.tier_index,
+        multiplier: status.tier_index !== null ? TIER_MULTIPLIERS[status.tier_index] : null,
+        split: status.split,
+        vaultBalances: status.vault_balances,
+      };
+    });
+
+    res.json({ ok: true, wallet, tokenCount: tokenIds.length, tokens });
+  } catch(e) {
+    console.error(`/db/stackers/wallet-full-status-debug/${req.params.wallet} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/engine-assets-debug — lists every asset the engine
 // currently knows about (assetCount + assets(idx) for each index), and
 // separately what's actually showing up in the live tier/asset cache's
