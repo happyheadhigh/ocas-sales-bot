@@ -578,6 +578,39 @@ app.get('/db/stackers/wallet-full-status-debug/:wallet', auth, async (req, res) 
   }
 });
 
+// ── GET /db/stackers/round-history-debug — real recorded RoundSettled
+// data, as it accumulates via the live listener. Exists to verify this is
+// actually working and building up real history, and to give a quick
+// sanity check on the numbers (average pot/weight) rather than needing to
+// query the table directly.
+app.get('/db/stackers/round-history-debug', auth, async (req, res) => {
+  try {
+    const { getRecentRoundHistory } = require('./lib/stackers-analytics');
+    const hours = parseInt(req.query.hours, 10) || 24;
+    const rows = await getRecentRoundHistory(pool, hours);
+
+    let avgPotWei = null, avgWeight = null;
+    if(rows.length){
+      const totalPot = rows.reduce((sum, r) => sum + BigInt(r.pot_wei), 0n);
+      const totalWeight = rows.reduce((sum, r) => sum + BigInt(r.total_weight), 0n);
+      avgPotWei = (totalPot / BigInt(rows.length)).toString();
+      avgWeight = (totalWeight / BigInt(rows.length)).toString();
+    }
+
+    res.json({
+      ok: true,
+      hoursRequested: hours,
+      roundsRecorded: rows.length,
+      averagePotWei: avgPotWei,
+      averageTotalWeight: avgWeight,
+      rounds: rows,
+    });
+  } catch(e) {
+    console.error('/db/stackers/round-history-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/engine-assets-debug — lists every asset the engine
 // currently knows about (assetCount + assets(idx) for each index), and
 // separately what's actually showing up in the live tier/asset cache's
