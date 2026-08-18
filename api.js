@@ -1008,6 +1008,40 @@ app.get('/db/stackers/vault-listings-funnel-debug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/trait-check-debug — checks whether Stackers trait
+// data exists in token_traits at all, and specifically whether a "Fused"
+// trait is present. Exists because a genuinely better data source might
+// already exist (Fused as a real OpenSea-filterable trait, confirmed via
+// screenshot) rather than needing forward-only event tracking from
+// scratch -- checking before building on an assumption either way.
+app.get('/db/stackers/trait-check-debug', auth, async (req, res) => {
+  try {
+    const totalRows = await pool.query(
+      `SELECT COUNT(*) FROM token_traits WHERE collection_slug = 'stackersxyz'`
+    );
+    const distinctTraitNames = await pool.query(
+      `SELECT DISTINCT trait_name FROM token_traits WHERE collection_slug = 'stackersxyz' ORDER BY trait_name`
+    );
+    const fusedValues = await pool.query(
+      `SELECT trait_value, COUNT(*) FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name ILIKE '%fused%' GROUP BY trait_value`
+    );
+    const fusedSample = await pool.query(
+      `SELECT token_id, trait_value FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name ILIKE '%fused%' AND trait_value != 'No' LIMIT 5`
+    );
+
+    res.json({
+      ok: true,
+      totalStackersTraitRows: parseInt(totalRows.rows[0].count, 10),
+      distinctTraitNames: distinctTraitNames.rows.map(r => r.trait_name),
+      fusedTraitValueCounts: fusedValues.rows,
+      fusedSample: fusedSample.rows,
+    });
+  } catch(e) {
+    console.error('/db/stackers/trait-check-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/catchup-fusion, /db/stackers/catchup-status —
 // manually-triggered catch-up bursts, separate from the automatic
 // background polling rate. Confirmed live the automatic rate alone cannot
