@@ -19,7 +19,7 @@ async function handleListingsSubcommand(interaction, pgPool){
 
   if(!rows.length){
     return interaction.editReply({
-      content: 'No currently listed Stackers with unclaimed vault value found right now — either nothing qualifies, or the background check hasn\'t run yet. Check back after the next scheduled refresh.',
+      content: 'No currently listed Stackers with unclaimed vault value found right now — either nothing genuinely qualifies at the moment, or the one-time vault-balance seed hasn\'t finished yet for these tokens.',
     });
   }
 
@@ -27,7 +27,7 @@ async function handleListingsSubcommand(interaction, pgPool){
     .setTitle('🏦 Listed Stackers with Unclaimed Vault Value')
     .setColor(0xF97316)
     .setDescription('Sorted cheapest listing first.')
-    .setFooter({ text: `Vault data checked periodically, not live — listing prices are current` });
+    .setFooter({ text: `Vault balances and listing prices are both live` });
 
   for(const row of rows.slice(0, 10)){
     const balances = row.vault_balances || [];
