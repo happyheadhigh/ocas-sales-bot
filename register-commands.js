@@ -53,6 +53,10 @@ const commands = [
             .setRequired(true)
             .setMinValue(1)
         )
+    )
+    .addSubcommand(sub =>
+      sub.setName('fused')
+        .setDescription('Browse currently listed fused Stackers — tier, vault balance, image, one at a time')
     ),
 
 

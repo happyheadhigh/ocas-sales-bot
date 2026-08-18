@@ -207,6 +207,117 @@ async function handleTokenSubcommand(interaction, pgPool){
   return interaction.editReply({ embeds: [embed], files });
 }
 
+// Fetches the list of currently listed, fused Stackers, cheapest first.
+// Uses the Fused trait directly (confirmed real, OpenSea-filterable data:
+// "2 parts"/"3 parts"/"No") rather than event-based tracking -- this
+// covers every fusion in the collection's full history, not just ones
+// that happen from here forward, since it reads from already-synced
+// metadata rather than something built from scratch tonight.
+async function getListedFusedTokens(pgPool){
+  const res = await pgPool.query(
+    `SELECT tt.token_id, tt.trait_value AS fused_parts, l.price_eth
+     FROM token_traits tt
+     JOIN listings l ON l.token_id = tt.token_id AND l.collection_slug = $1
+     WHERE tt.collection_slug = $1 AND tt.trait_name = 'Fused' AND tt.trait_value != 'No'
+     ORDER BY l.price_eth ASC`,
+    [STACKERS_SLUG]
+  );
+  return res.rows;
+}
+
+// Shared render logic for one token in the fused browser — used by both
+// the initial command and every Prev/Next click, same reasoning as
+// buildListingsPage: one copy of this logic instead of two that could
+// drift apart. Reuses formatStackersFields (tier/split/vault, same
+// formatter proven working in tonight's fusion alerts) and the same
+// image-attachment approach as handleTokenSubcommand.
+async function buildFusedTokenView(pgPool, fusedList, index){
+  const entry = fusedList[index];
+  const tokenId = entry.token_id;
+
+  const fields = await formatStackersFields(String(tokenId)).catch(() => []);
+
+  const priceStr = entry.price_eth >= 1 ? Number(entry.price_eth).toFixed(3) : Number(entry.price_eth).toFixed(4);
+  const embed = new EmbedBuilder()
+    .setTitle(`🔥 Stacker #${tokenId} — Fused (${entry.fused_parts})`)
+    .setColor(0xF97316)
+    .setURL(`https://opensea.io/assets/robinhood/${NFT_ADDRESS}/${tokenId}`)
+    .setDescription(`Listed for Ξ${priceStr} · ${index + 1} of ${fusedList.length}`);
+
+  if(fields.length) embed.addFields(...fields);
+
+  const files = [];
+  try{
+    const cached = await getOrCacheStackerImage(pgPool, tokenId);
+    const ext = cached.isSvg ? 'svg' : 'png';
+    const filename = `stacker-${tokenId}.${ext}`;
+    const buffer = cached.isSvg ? Buffer.from(cached.data, 'utf8') : cached.data;
+    files.push(new AttachmentBuilder(buffer, { name: filename }));
+    embed.setImage(`attachment://${filename}`);
+  }catch(e){
+    console.warn(`[stackervaults fused] Failed to attach image for #${tokenId}:`, e.message);
+  }
+
+  const components = [];
+  if(fusedList.length > 1){
+    const navRow = new ActionRowBuilder();
+    if(index > 0){
+      navRow.addComponents(
+        new ButtonBuilder().setCustomId(`stackervaults:fused:page:${index - 1}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary)
+      );
+    }
+    if(index < fusedList.length - 1){
+      navRow.addComponents(
+        new ButtonBuilder().setCustomId(`stackervaults:fused:page:${index + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary)
+      );
+    }
+    components.push(navRow);
+  }
+
+  return { embed, components, files };
+}
+
+async function handleFusedSubcommand(interaction, pgPool){
+  await interaction.deferReply();
+
+  const fusedList = await getListedFusedTokens(pgPool).catch(e => {
+    console.error('[stackervaults fused] getListedFusedTokens failed:', e.message, e.stack);
+    return null;
+  });
+
+  if(fusedList === null){
+    return interaction.editReply({ content: 'Something went wrong looking this up — try again in a moment.' });
+  }
+
+  if(!fusedList.length){
+    return interaction.editReply({ content: 'No currently listed fused Stackers found right now.' });
+  }
+
+  const { embed, components, files } = await buildFusedTokenView(pgPool, fusedList, 0);
+  return interaction.editReply({ embeds: [embed], components, files });
+}
+
+// Button-click navigation — re-queries the listed+fused set fresh each
+// time rather than carrying it through the customId (same reasoning as
+// the listings pagination: Discord's 100-char customId limit, and this
+// query is a cheap Postgres join, not an RPC call).
+async function handleFusedPageButton(interaction, pgPool){
+  const index = parseInt(interaction.customId.split(':')[3], 10) || 0;
+
+  const fusedList = await getListedFusedTokens(pgPool).catch(e => {
+    console.error('[stackervaults fused page] getListedFusedTokens failed:', e.message, e.stack);
+    return null;
+  });
+
+  if(fusedList === null || !fusedList.length){
+    return interaction.update({ content: 'Something went wrong looking this up — try again in a moment.', embeds: [], components: [], files: [] });
+  }
+
+  const safeIndex = Math.min(index, fusedList.length - 1);
+  const { embed, components, files } = await buildFusedTokenView(pgPool, fusedList, safeIndex);
+  return interaction.update({ embeds: [embed], components, files });
+}
+
 async function handleStackerVaultsCommand(commandName, ctx){
   const { interaction, pgPool } = ctx;
   if(commandName !== 'stackervaults') return;
@@ -214,9 +325,10 @@ async function handleStackerVaultsCommand(commandName, ctx){
   const subcommand = interaction.options.getSubcommand();
   if(subcommand === 'wallet') return handleWalletSubcommand(interaction, pgPool);
   if(subcommand === 'token') return handleTokenSubcommand(interaction, pgPool);
+  if(subcommand === 'fused') return handleFusedSubcommand(interaction, pgPool);
   return handleListingsSubcommand(interaction, pgPool);
 }
 
 const STACKERVAULTS_COMMANDS = new Set(['stackervaults']);
 
-module.exports = { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS, handleListingsPageButton };
+module.exports = { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS, handleListingsPageButton, handleFusedPageButton };
