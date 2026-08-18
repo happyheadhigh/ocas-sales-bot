@@ -57,8 +57,8 @@ const {
   setClient, traitDisplayLines, fetchTokenUriFromContract,
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
-const { setClient: setStackersFusionClient, pollFusionEvents } = require('./lib/stackers-fusion-poller');
-const { pollTokenStatusEvents } = require('./lib/stackers-status-poller');
+const { setClient: setStackersFusionClient } = require('./lib/stackers-fusion-poller');
+const { startLiveListeners: startStackersLiveListeners } = require('./lib/stackers-live-events');
 const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vault-listing-alerts');
 const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
 const { handleStackerVaultsCommand, STACKERVAULTS_COMMANDS } = require('./commands/stackervaults');
@@ -2305,25 +2305,23 @@ client.once('clientReady', async ()=>{
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
   }
-  // Poll Stackers fusion events every 60s — fusion is a deliberate user
-  // action, not automatic, so no need to poll as tight as sales/listings.
+  // Stackers live event listener — replaces the two separate 60s polling
+  // intervals that used to run here. Confirmed live tonight that repeated
+  // small-block-range polling genuinely cannot keep pace with this chain's
+  // block rate (~598 blocks/minute against a confirmed 10-block eth_getLogs
+  // cap on this account) without either falling permanently behind or
+  // taking on rate-limit risk uncomfortable for a permanent background
+  // rate. A live WebSocket subscription sidesteps the block-range
+  // limitation entirely rather than continuing to tune around it — the
+  // two pollers below remain in place internally as a much-lower-frequency
+  // safety net, not the primary mechanism anymore.
   if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
-    console.log('[StackersFusion] Starting fusion poller');
-    pollFusionEvents();
-    setInterval(pollFusionEvents, 60_000);
+    console.log('[StackersLive] Starting live event listener');
+    startStackersLiveListeners(pgPool).catch(e =>
+      console.error('[StackersLive] Failed to start:', e.message)
+    );
   } else {
-    console.log('[StackersFusion] No ALCHEMY_API_KEY set — fusion poller disabled');
-  }
-  // Poll Stackers tier/active/split status events every 60s — this is what
-  // keeps /stackerstats' tier distribution and asset popularity genuinely
-  // live rather than up-to-24h stale, unlike vault balance which still
-  // needs the slower periodic snapshot.
-  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
-    console.log('[StackersStatus] Starting status poller');
-    pollTokenStatusEvents(pgPool);
-    setInterval(() => pollTokenStatusEvents(pgPool), 60_000);
-  } else {
-    console.log('[StackersStatus] No ALCHEMY_API_KEY set — status poller disabled');
+    console.log('[StackersLive] No ALCHEMY_API_KEY set — live listener disabled');
   }
   // Stackers analytics snapshot — iterates every token, takes real minutes
   // for a collection this size, so this deliberately does NOT run
