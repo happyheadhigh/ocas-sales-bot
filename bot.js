@@ -2333,15 +2333,21 @@ client.once('clientReady', async ()=>{
   // stackers_token_status.vault_balances data (kept current via the
   // Credited/Claimed live event listeners), not a fresh on-chain read at
   // all -- no RPC cost, so unlike the old sweep this safely runs
-  // immediately on startup too, not just on the interval. Hourly gives the
-  // accrual comparison meaningful data within about an hour instead of
-  // needing up to 48h for two full sweeps to complete under the old design.
+  // immediately on startup too, not just on the interval. 15 minutes gets
+  // the first real accrual comparison available within about that long,
+  // rather than needing up to 48h for two full sweeps under the old
+  // design -- the comparison's actual window (24h lookback, in
+  // getVaultAccrualComparison) is what determines the steady-state
+  // comparison length, not this interval; going faster than this
+  // wouldn't meaningfully improve anything further, just accumulate more
+  // rows for no real benefit, which is why snapshots older than 48h get
+  // pruned automatically inside takeLiveVaultSnapshot itself.
   // The old full-sweep function (lib/stackers-analytics.js,
   // takeStackersSnapshot) remains available but is no longer auto-
   // scheduled -- it's now redundant given live tracking covers the same
   // ground, and its real RPC cost isn't worth paying automatically anymore
   // given tonight's confirmed account strain.
-  console.log('[StackersAnalytics] Live vault snapshot job scheduled (every 1h, runs immediately too)');
+  console.log('[StackersAnalytics] Live vault snapshot job scheduled (every 15min, runs immediately too)');
   takeLiveVaultSnapshot(pgPool).catch(e =>
     console.error('[StackersAnalytics] Initial live vault snapshot failed:', e.message)
   );
@@ -2349,7 +2355,7 @@ client.once('clientReady', async ()=>{
     takeLiveVaultSnapshot(pgPool).catch(e =>
       console.error('[StackersAnalytics] Live vault snapshot failed:', e.message)
     );
-  }, 60 * 60 * 1000);
+  }, 15 * 60 * 1000);
   // Stackers vault-listings refresh — removed. /stackervaults listings now
   // reads live: stackers_token_status.vault_balances (kept current via the
   // Credited/Claimed live event listeners) joined directly against the
