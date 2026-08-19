@@ -2313,10 +2313,21 @@ client.once('clientReady', async ()=>{
   setInterval(saveSaleCursors, 60_000);
   setInterval(saveListingCursors, 60_000);
   // Poll burn events every 2 minutes (blocks ~12s apart, no need to rush)
-  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL){
+  // Gated on OCAS_BURN_POLLER_ENABLED, a genuine, deployment-controlled
+  // flag -- OCAS_CONTRACT itself is hardcoded in lib/constants.js, not
+  // read from an env var at all, so checking it directly would always be
+  // true regardless of which deployment is running. Defaults to enabled
+  // (only disabled by explicitly setting the env var to 'false'), so the
+  // existing OCAS deployment needs zero changes to keep working exactly
+  // as before -- only a new deployment not meant to track OCAS needs to
+  // explicitly opt out.
+  const ocasBurnPollerEnabled = process.env.OCAS_BURN_POLLER_ENABLED !== 'false';
+  if(ocasBurnPollerEnabled && (process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL)){
     console.log('[Burn] Starting burn poller');
     pollBurnEvents();
     setInterval(pollBurnEvents, 30_000);
+  } else if(!ocasBurnPollerEnabled){
+    console.log('[Burn] OCAS_BURN_POLLER_ENABLED=false — burn poller disabled (this deployment isn\'t tracking OCAS)');
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
   }
