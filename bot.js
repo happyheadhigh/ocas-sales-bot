@@ -2458,12 +2458,6 @@ async function migrateMarketCollectionsToServerConfigs(){
   }
 }
 
-// TEMPORARY diagnostic — confirms whether DISCORD_TOKEN is actually
-// present at process start, without ever logging the real value. Safe:
-// only reports presence/type/length. Remove once the TokenInvalid issue
-// is resolved.
-console.log('[Startup Debug] DISCORD_TOKEN present:', !!DISCORD_TOKEN, '| type:', typeof DISCORD_TOKEN, '| length:', (DISCORD_TOKEN || '').length);
-
 client.login(DISCORD_TOKEN);
 
 
