@@ -25,7 +25,7 @@ const {
 
 const {
   pgPool, runMigrations, dbLoad, dbSave,
-  loadAllConfigs, getConfig, setConfig, getAllConfigs, getUserAlerts,
+  loadAllConfigs, getConfig, setConfig, deleteConfig, getAllConfigs, getUserAlerts,
 } = require('./lib/db');
 
 const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
@@ -2252,6 +2252,38 @@ client.on('guildCreate', async (guild)=>{
       }
     }
   }catch(e){ console.warn('[Welcome]',guild.name,e.message); }
+});
+
+// ── Wipe server-scoped data on kick ───────────────────────────────────────────
+// Confirmed real gap: nothing cleaned up when the bot was removed from a
+// server, so re-inviting it left the entire prior setup (config, roles,
+// trait rules, verification panel) still fully intact -- a re-invited bot
+// looked "already configured" even though the person expected a clean slate.
+// Every table below was confirmed via lib/db.js to actually have a guild_id
+// column, rather than guessed. user_registrations/verification_codes also
+// have 'global' (cross-server, intentionally not guild-scoped) rows mixed
+// in with per-guild ones -- filtering by the real, specific guild.id here
+// naturally never touches those, since they only ever match the literal
+// string 'global', never an actual snowflake ID.
+client.on('guildDelete', async (guild)=>{
+  const gid = guild.id;
+  await deleteConfig(gid);
+  const tables = [
+    'user_alert_configs', 'verification_panels',
+    'trait_roles', 'traitview_links', 'tv_verify_codes',
+    'burn_lotteries', 'generic_lotteries', 'skipped_listing_batches',
+    'user_registrations', 'verification_codes',
+  ];
+  let cleaned = 0;
+  for(const table of tables){
+    try{
+      const res = await pgPool.query(`DELETE FROM ${table} WHERE guild_id=$1`, [gid]);
+      cleaned += res.rowCount || 0;
+    }catch(e){
+      console.warn(`[GuildDelete] Failed to clean ${table} for ${guild.name} (${gid}):`, e.message);
+    }
+  }
+  console.log(`[GuildDelete] Wiped config + ${cleaned} row(s) across ${tables.length + 1} tables for ${guild.name} (${gid})`);
 });
 
 
