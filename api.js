@@ -1159,6 +1159,38 @@ app.get('/db/stackers/trait-check-debug', auth, async (req, res) => {
 // ── GET /db/stackers/fusion-trait-debug — checks the real shape of
 // Burned, $STACK Burned, and Rarity traits before building anything on
 // them. Includes the specific tokens from a real reference screenshot
+// ── GET /db/collection-registry-debug/:slug — checks whether a collection's
+// onboarding actually completed and what chain got stored for it. Built to
+// answer a real, live question: is a wrong-chain link caused by the chain
+// lookup logic itself, or by the collections row simply not existing yet
+// because onboarding never fully completed for this slug.
+app.get('/db/collection-registry-debug/:slug', auth, async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    const collRow = await pool.query(
+      `SELECT slug, contract, chain, name, total_supply, token_standard, updated_at FROM collections WHERE slug=$1`,
+      [slug]
+    );
+    const backfillRow = await pool.query(
+      `SELECT slug, status, started_at, finished_at, tokens_written, error FROM collection_backfill_status WHERE slug=$1`,
+      [slug]
+    );
+    const traitCount = await pool.query(
+      `SELECT COUNT(*) FROM token_traits WHERE collection_slug=$1`,
+      [slug]
+    );
+    res.json({
+      ok: true,
+      collectionsRow: collRow.rows[0] || null,
+      backfillStatus: backfillRow.rows[0] || null,
+      tokenTraitsRowCount: parseInt(traitCount.rows[0].count, 10),
+    });
+  } catch(e) {
+    console.error('/db/collection-registry-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // (#511 absorbed into #107) so actual values can be cross-checked
 // against what Stackers' own official bot displayed for that exact fusion.
 app.get('/db/stackers/fusion-trait-debug', auth, async (req, res) => {
