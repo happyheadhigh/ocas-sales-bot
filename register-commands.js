@@ -71,17 +71,8 @@ const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 
   new SlashCommandBuilder().setName('rankfind').setDescription('Find listings or sales by OS rank range — leave blank for a guided menu').addIntegerOption(o=>o.setName('min_rank').setDescription('Minimum OS rank (default 1)').setRequired(false).setMinValue(1).setMaxValue(10000)).addIntegerOption(o=>o.setName('max_rank').setDescription('Maximum OS rank (default 100)').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('mode').setDescription('What to search (default: listings)').setRequired(false).addChoices({name:'Listings',value:'listings'},{name:'Sales',value:'sales'})).addStringOption(o=>o.setName('sort').setDescription('Sort order for listings (default: cheapest first)').setRequired(false).addChoices({name:'Cheapest first',value:'price'},{name:'Best rank first',value:'rank'})).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false).setAutocomplete(true)),
-  new SlashCommandBuilder().setName('ocas').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false)),
   new SlashCommandBuilder().setName('token').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection to search (defaults to primary)').setRequired(false).setAutocomplete(true)),
-  new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep cheapest listed OCAS').addStringOption(o=>o.setName('search').setDescription('e.g. 10, 2eth, 0.05 floor, 10 zombie').setRequired(false)),
-
-  new SlashCommandBuilder().setName('burnstats').setDescription('Show OCAS Burn Machine stats — total burned, created, estimated supply'),
-  new SlashCommandBuilder().setName('burnlatest').setDescription('Show recent finalized OCAS burn events').addIntegerOption(o=>o.setName('count').setDescription('Number of burns to show (max 10, default 1)').setRequired(false).setMinValue(1).setMaxValue(10)),
-  new SlashCommandBuilder().setName('burn').setDescription('Show burn status and lineage for a token').addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(true).setMinValue(1).setMaxValue(10000)),
-  new SlashCommandBuilder().setName('burnwallet').setDescription('Show burn history for a wallet address').addStringOption(o=>o.setName('wallet').setDescription('Wallet address (0x...)').setRequired(true)),
-  new SlashCommandBuilder().setName('burnleaderboard').setDescription('Top OCAS burners ranked by tokens burned'),
-  new SlashCommandBuilder().setName('burnrefresh').setDescription('Refresh metadata and re-post burn alert for a created token (5 min cooldown)').addIntegerOption(o=>o.setName('token').setDescription('Survivor/created token ID').setRequired(true).setMinValue(1).setMaxValue(10000)),
 
   new SlashCommandBuilder().setName('synctraits').setDescription('Refresh token traits from contract — fixes missing/stale traits in DB (admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('mode').setDescription('survivors = refresh all burn survivors; token = single token (default)').setRequired(false).addChoices({name:'Single token',value:'token'},{name:'All burn survivors',value:'survivors'}))
@@ -95,8 +86,6 @@ const commands = [
 
   new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('config').setDescription('Configure your bot — collections, channels, roles (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-  new SlashCommandBuilder().setName('lotteries').setDescription('View live and completed lotteries and giveaways'),
-  new SlashCommandBuilder().setName('giveaway').setDescription('Start a burn lottery, giveaway, guess game, or instant draw (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('globalstats').setDescription('Owner only').setDefaultMemberPermissions('0'),
 
   new SlashCommandBuilder().setName('resetverify')
