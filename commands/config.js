@@ -1536,23 +1536,27 @@ async function handleConfigButton(interaction, ctx){
     return interaction.editReply({ content:'✅ Collection removed.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
   if(customId === 'cfg:col:removeprimary'){
-    delete cfg.contract;
-    delete cfg.contractName;
-    delete cfg.collectionSlug;
-    delete cfg.slug;
-    delete cfg.salesChannel;
-    delete cfg.channelId;
-    delete cfg.listingsChannel;
-    delete cfg.listingsChannelId;
-    delete cfg.burnChannel;
-    delete cfg.vaultAlertChannel;
-    delete cfg.fusionChannel;
-    delete cfg.isPaidTier;
-    delete cfg.animated;
-    delete cfg.listingFilters;
-    delete cfg.salesFilters;
-    delete cfg.rankAlert;
-    delete cfg.paused;
+    // setConfig merges {...dbCfg, ...cfg} -- a JS delete removes the key
+    // entirely, which the merge then reads as "not in cfg" and silently
+    // restores from the database. Explicit null keeps the key present so
+    // the merge actually overwrites it.
+    cfg.contract = null;
+    cfg.contractName = null;
+    cfg.collectionSlug = null;
+    cfg.slug = null;
+    cfg.salesChannel = null;
+    cfg.channelId = null;
+    cfg.listingsChannel = null;
+    cfg.listingsChannelId = null;
+    cfg.burnChannel = null;
+    cfg.vaultAlertChannel = null;
+    cfg.fusionChannel = null;
+    cfg.isPaidTier = null;
+    cfg.animated = null;
+    cfg.listingFilters = null;
+    cfg.salesFilters = null;
+    cfg.rankAlert = null;
+    cfg.paused = null;
     await setConfig(guildId, cfg);
     return interaction.editReply({ content:'✅ Primary collection removed. Click **➕ Add Collection** to set up a new one.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
