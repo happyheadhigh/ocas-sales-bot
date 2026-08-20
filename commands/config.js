@@ -1497,7 +1497,22 @@ async function handleConfigButton(interaction, ctx){
 
     // Run backfill directly — bypasses the "already backfilled" guard in maybeStartBackfill
     const { backfillCollectionTraits } = require('../lib/collection-backfill');
-    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug })
+    // chain/totalSupply were never passed here, so backfillCollectionTraits()
+    // silently fell back to its own default of chain='ethereum' every time —
+    // for a non-Ethereum collection (e.g. Robinhood Chain), that means Alchemy
+    // gets asked about the contract on the WRONG chain, finds nothing, and the
+    // whole run finishes instantly with 0 tokens written and no error at all.
+    // The other two call sites (auto-backfill.js, collection-onboard.js)
+    // already resolve chain correctly — this one just never did. Reading it
+    // straight from the collections table (already confirmed correct) avoids
+    // re-hitting OpenSea's API a second time, which is also where the
+    // total_supply mismatch came from in the first place.
+    const collRow = await pgPool.query(
+      `SELECT chain, total_supply FROM collections WHERE slug=$1`, [col.slug]
+    ).catch(()=>({ rows:[] }));
+    const chain       = collRow.rows[0]?.chain || 'ethereum';
+    const totalSupply = collRow.rows[0]?.total_supply || null;
+    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug, chain, totalSupply })
       .then(async stats => {
         // Store animated detection result in collection config
         if(typeof stats?.animated === 'boolean'){
