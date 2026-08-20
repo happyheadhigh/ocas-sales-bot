@@ -1191,6 +1191,49 @@ app.get('/db/collection-registry-debug/:slug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/alchemy-nft-test/:chain/:contract — calls Alchemy's
+// getNFTsForContract directly for a given chain/contract and shows the raw
+// result. Built to answer a real, live question: is the backfill writing
+// zero tokens because Alchemy's NFT API genuinely returns nothing for this
+// specific, recently-migrated contract (its indexer hasn't caught up yet),
+// or because something in our own backfill code is the actual problem.
+app.get('/db/alchemy-nft-test/:chain/:contract', auth, async (req, res) => {
+  try {
+    const { chain, contract } = req.params;
+    const SUPPORTED = { ethereum: 'eth-mainnet', base: 'base-mainnet', polygon: 'polygon-mainnet', robinhood: 'robinhood-mainnet' };
+    const subdomain = SUPPORTED[chain];
+    if(!subdomain) return res.status(400).json({ ok: false, error: `Unsupported chain "${chain}"` });
+
+    const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    if(!ALCHEMY_KEY) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY' });
+
+    const url = new URL(`https://${subdomain}.g.alchemy.com/nft/v3/${ALCHEMY_KEY}/getNFTsForContract`);
+    url.searchParams.set('contractAddress', contract);
+    url.searchParams.set('withMetadata', 'true');
+    url.searchParams.set('limit', '5');
+
+    const r = await fetch(url.toString());
+    const bodyText = await r.text();
+    let body;
+    try { body = JSON.parse(bodyText); } catch(_) { body = { rawText: bodyText.slice(0, 500) }; }
+
+    res.json({
+      ok: true,
+      httpStatus: r.status,
+      subdomain,
+      contract,
+      nftsReturned: Array.isArray(body?.nfts) ? body.nfts.length : null,
+      totalCount: body?.totalCount ?? null,
+      pageKey: body?.pageKey ?? null,
+      firstNftSample: body?.nfts?.[0] || null,
+      rawBodyIfNoNftsField: body?.nfts ? undefined : body,
+    });
+  } catch(e) {
+    console.error('/db/alchemy-nft-test error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // (#511 absorbed into #107) so actual values can be cross-checked
 // against what Stackers' own official bot displayed for that exact fusion.
 app.get('/db/stackers/fusion-trait-debug', auth, async (req, res) => {
