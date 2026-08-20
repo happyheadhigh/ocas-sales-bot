@@ -620,7 +620,7 @@ async function handleMarketCommand(commandName, ctx){
 
       const labelParts = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
       if(traitCount !== null) labelParts.push(traitCount + ' traits');
-      const traitLabel = labelParts.length ? labelParts.join(' · ') : 'OCAS';
+      const traitLabel = labelParts.length ? labelParts.join(' · ') : (sweepConfig.name || sweepConfig.contractName || sweepSlug);
 
       let modeTitle;
       if(sweepMode === 'budget') modeTitle = `Budget Sweep Ξ${budget} · ${traitLabel}`;
