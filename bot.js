@@ -756,7 +756,7 @@ client.on('interactionCreate', async (interaction)=>{
   }
   // ── Setup wizard modal + button handlers ───────────────────────────────────
   if(interaction.isModalSubmit() && interaction.customId.startsWith('setup_modal:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupModal(interaction, setupCtx);
   }
   if(interaction.isModalSubmit() && (interaction.customId.startsWith('cfg_modal:') || interaction.customId.startsWith('cfg_modal:col_filter:'))){
@@ -771,7 +771,7 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   if(interaction.isButton() && interaction.customId.startsWith('setup:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isButton() && (interaction.customId.startsWith('cfg:') || interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col_filter:'))){
@@ -789,17 +789,17 @@ client.on('interactionCreate', async (interaction)=>{
   }
   // Channel select menus from setup wizard (still native Discord component)
   if(interaction.isChannelSelectMenu() && interaction.customId.startsWith('setup_chsel:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   // Role select menus from setup wizard — now a manually-paginated StringSelectMenu
   // (see lib/role-picker.js); isRoleSelectMenu() kept as a harmless fallback.
   if((interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) && interaction.customId.startsWith('setup_rolesel:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_traitrole:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isStringSelectMenu() && (interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col:') || interaction.customId.startsWith('cfg_filter:') || interaction.customId.startsWith('cfg_col_filter:') || interaction.customId.startsWith('cfg_col_salesfilter:') || interaction.customId.startsWith('cfg_tzsel:'))){

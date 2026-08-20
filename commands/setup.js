@@ -287,8 +287,53 @@ function summaryRow(){
   );
 }
 
+// ── Error recovery ────────────────────────────────────────────────────────────
+// Any unhandled throw inside a wizard step used to leave the interaction
+// unacknowledged — Discord shows "This interaction failed" and the ephemeral
+// message goes dead, forcing the user back to /setup. Progress is always saved
+// to server_configs before a step can throw (saveState is called after each
+// mutation), so on error we surface a recovery screen instead of going silent.
+function buildErrorEmbed(err){
+  const msg = (err && err.message) ? err.message : 'Unknown error';
+  return new EmbedBuilder()
+    .setColor(0xED4245)
+    .setTitle('⚠️ Something went wrong')
+    .setDescription(
+      SEP + '\n\n' +
+      'That step hit an unexpected error, but your progress up to this point is saved.\n\n' +
+      `\`${msg.slice(0, 300)}\`\n\n` +
+      'Click below to pick up right where you left off, or dismiss and run `/setup` again later.'
+    )
+    .setFooter({ text: 'Only visible to you' });
+}
+function errorRow(){
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('setup:retry').setLabel('🔄 Continue Setup').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('setup:close').setLabel('✖️ Dismiss').setStyle(ButtonStyle.Secondary),
+  );
+}
+async function recoverFromWizardError(interaction, ctx, err){
+  console.error('[Setup] Wizard error:', err && err.message, err && err.stack);
+  try{
+    const payload = { content:'', embeds:[buildErrorEmbed(err)], components:[errorRow()] };
+    if(interaction.deferred || interaction.replied){
+      return await interaction.editReply(payload).catch(()=>{});
+    }
+    return await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral }).catch(()=>{});
+  }catch(_){
+    // Nothing further we can safely do — original error is already logged above.
+  }
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 async function handleSetupCommand(interaction, ctx){
+  try{
+    return await handleSetupCommandInner(interaction, ctx);
+  }catch(err){
+    return recoverFromWizardError(interaction, ctx, err);
+  }
+}
+async function handleSetupCommandInner(interaction, ctx){
   await interaction.deferReply({ flags: 64 }); // ephemeral
   const { pgPool, getConfig } = ctx;
   const guildId = interaction.guildId;
@@ -321,6 +366,13 @@ async function resumeStep(interaction, state, ctx){
 }
 
 async function handleSetupButton(interaction, ctx){
+  try{
+    return await handleSetupButtonInner(interaction, ctx);
+  }catch(err){
+    return recoverFromWizardError(interaction, ctx, err);
+  }
+}
+async function handleSetupButtonInner(interaction, ctx){
   const { pgPool, setConfig, getConfig } = ctx;
   const guildId  = interaction.guildId;
   const customId = interaction.customId;
@@ -337,6 +389,11 @@ async function handleSetupButton(interaction, ctx){
   if(!isModal) await interaction.deferUpdate();
 
   const state = await loadState(guildId, pgPool);
+
+  // ── retry after an error screen — just re-render the current step ─────────
+  if(customId === 'setup:retry'){
+    return resumeStep(interaction, state, ctx);
+  }
 
   // ── back navigation ────────────────────────────────────────────────────────
   if(customId.startsWith('setup:back:')){
@@ -619,6 +676,13 @@ async function handleSetupButton(interaction, ctx){
 }
 
 async function handleSetupModal(interaction, ctx){
+  try{
+    return await handleSetupModalInner(interaction, ctx);
+  }catch(err){
+    return recoverFromWizardError(interaction, ctx, err);
+  }
+}
+async function handleSetupModalInner(interaction, ctx){
   const { pgPool, setConfig, getConfig } = ctx;
   const guildId  = interaction.guildId;
   const customId = interaction.customId;
