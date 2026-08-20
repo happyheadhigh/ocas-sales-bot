@@ -152,10 +152,16 @@ async function handleTokenCommand(commandName, ctx){
 
       // ── Fetch + post image ────────────────────────────────────────────────
       let imgResult = getCachedImage(`${contract}:${tokenId}`);
+      if(!imgResult && dbMeta?.image_url && isDiscordOk(dbMeta.image_url)){
+        // Prefer whatever the backfill already fetched and stored in
+        // tokens.image_url over a live OpenSea call — see the comment in
+        // fetchTokenMetaFromDb for why this matters for non-Ethereum chains.
+        imgResult = { type:'url', url: dbMeta.image_url };
+      }
       if(!imgResult){
         imgResult = await resolveImage({identifier:String(tokenId)}, contract, tokenChain);
-        if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
       }
+      if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
       const osUrl = `https://opensea.io/assets/${tokenChain}/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
 
