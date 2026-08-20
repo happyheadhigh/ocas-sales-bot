@@ -2217,12 +2217,11 @@ client.on('guildCreate', async (guild)=>{
         '`/setup` — initial configuration wizard\n' +
         '`/config` — manage channels, roles & listing filters\n' +
         '`/synctraits` — manually sync holder trait roles\n' +
-        '`/lotteries` — manage burn lotteries & giveaways\n' +
+        '`/traitfind` — search tokens, listings, or sales by trait\n' +
         '`/help` — full command list\n\n' +
         '**Recommended channel setup:**\n' +
         '`#sales` — auto-posts every sale\n' +
         '`#listings` — auto-posts new listings\n' +
-        '`#burns` — burn machine alerts\n' +
         '`#owner-verification` — wallet verification panel\n\n' +
         '*This bot will never DM members or ask for seed phrases.*'
       )
