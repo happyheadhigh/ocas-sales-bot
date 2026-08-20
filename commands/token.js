@@ -24,6 +24,14 @@ async function handleTokenCommand(commandName, ctx){
     const colInput = interaction.options.getString('collection') || null;
     const resolved = resolveCollectionFromServerCfg(config, colInput);
     const activeCol = resolved ? {...config, ...resolved} : config;
+    // Generic label for the actually-resolved collection — this used to be a
+    // hardcoded "OCAS" throughout this command's user-facing text (title,
+    // error messages), so explicitly selecting a different collection (e.g.
+    // robinhood-chimps) still showed "OCAS #5000" in the embed even when the
+    // underlying data (image, traits, contract) was already correctly
+    // resolved to the right collection the whole time — the label was just
+    // lying about it.
+    const colLabel = activeCol.name || activeCol.contractName || activeCol.slug || activeCol.collectionSlug || 'Token';
     const tokenInput = interaction.options.getInteger('token');
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const contract   = activeCol.contract || config.contract || '';
@@ -89,7 +97,7 @@ async function handleTokenCommand(commandName, ctx){
         matchedGroups = resolved.groups;
 
         if(!matchedGroups.length){
-          await interaction.editReply(`I couldn't match **"${searchForTraits}"** to any known OCAS trait value. Try a more exact trait value like **Zombie**, **Gold Chain**, or **Diamond Choker**.`);
+          await interaction.editReply(`I couldn't match **"${searchForTraits}"** to any known ${colLabel} trait value. Try a more exact trait value like **Zombie**, **Gold Chain**, or **Diamond Choker**.`);
           return;
         }
         if(resolved.unmatched.length){
@@ -112,7 +120,7 @@ async function handleTokenCommand(commandName, ctx){
           if(!j.ok) throw new Error(j.error || 'multi-trait-floor API error');
           if(!j.floor){
             const label = matchedGroups.length ? traitGroupsLabel(matchedGroups) : `${traitCount} traits`;
-            await interaction.editReply(`No listed OCAS found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
+            await interaction.editReply(`No listed ${colLabel} found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
             return;
           }
           tokenId = j.floor.token_id;
@@ -126,7 +134,7 @@ async function handleTokenCommand(commandName, ctx){
           const tokens = j.tokens || [];
           if(!tokens.length){
             const label = matchedGroups.length ? traitGroupsLabel(matchedGroups) : `${traitCount} traits`;
-            await interaction.editReply(`No OCAS tokens found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
+            await interaction.editReply(`No ${colLabel} tokens found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
             return;
           }
           const picked = tokens[Math.floor(Math.random() * tokens.length)];
@@ -174,8 +182,10 @@ async function handleTokenCommand(commandName, ctx){
           .setStyle(ButtonStyle.Secondary)
       );
 
+      // Generic label for the actually-resolved collection — computed near
+      // the top of this function, see there for why.
       const embed = new EmbedBuilder()
-        .setTitle(`OCAS #${tokenId}${rankBadge}`)
+        .setTitle(`${colLabel} #${tokenId}${rankBadge}`)
         .setColor(ocasColor)
         .setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
 
