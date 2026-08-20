@@ -9,6 +9,10 @@ const {
 
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
 const { buildRolePickerRows } = require('../lib/role-picker');
+const {
+  initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker,
+  buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId,
+} = require('../lib/value-picker');
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 
@@ -148,16 +152,36 @@ function buildVerificationEmbed(state){
     .setFooter({ text: 'Only visible to you' });
 }
 
-function buildTraitRolesEmbed(state){
+// Trait roles saved from the wizard always use collection_slug IS NULL (the
+// "primary" collection slot — same as /config's default view), so a role
+// added here or later via /config shows up together, not in two separate lists.
+async function fetchWizardTraitRoles(guildId, pgPool){
+  try{
+    const r = await pgPool.query(
+      `SELECT id, trait_type, trait_value, role_id, minimum_count FROM trait_roles
+       WHERE guild_id=$1 AND collection_slug IS NULL ORDER BY trait_type, trait_value`,
+      [guildId]
+    );
+    return r.rows;
+  }catch(e){ console.warn('[Setup] fetchWizardTraitRoles:', e.message); return []; }
+}
+function traitRuleLabel(r){
+  if(r.trait_type === '_count') return `Own ${r.minimum_count}+ tokens`;
+  if(r.trait_type === '_totalburns') return `${r.minimum_count}+ burn transactions, ever`;
+  if(r.trait_type === '_maxburn') return `${r.minimum_count}+ tokens in a single burn`;
+  return `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`;
+}
+
+function buildTraitRolesEmbed(state, roles){
   const cfg = state.config;
-  const roles = cfg.traitRoles || [];
+  roles = roles || [];
 
   let roleList = '';
   if(roles.length === 0){
     roleList = '*No trait roles configured yet.*\n';
   } else {
     roleList = roles.map((r, i) =>
-      `**${i+1}.** <@&${r.roleId}> — ${r.traitType === '_count' ? `Own ${r.minCount}+ tokens` : `${r.traitType}: ${r.traitValue}${r.minCount > 1 ? ` (×${r.minCount})` : ''}`}`
+      `**${i+1}.** <@&${r.role_id}> — ${traitRuleLabel(r)}`
     ).join('\n') + '\n';
   }
 
@@ -176,13 +200,13 @@ function buildTraitRolesEmbed(state){
     .setFooter({ text: 'Only visible to you — manage trait roles anytime with /config' });
 }
 
-function buildSummaryEmbed(state, guild){
+function buildSummaryEmbed(state, guild, roles){
   const cfg = state.config;
   const isOcas = cfg.contract?.toLowerCase() === OCAS_CONTRACT;
   const ch  = id => id ? `<#${id}>` : 'Not set';
   const rol = id => id ? `<@&${id}>` : 'Not set';
   const tick = v => v ? '✅' : '❌';
-  const roles = cfg.traitRoles || [];
+  roles = roles || [];
 
   return new EmbedBuilder()
     .setColor(0x57F287)
@@ -249,8 +273,8 @@ function verificationRow(configured){
   return [row1, row2];
 }
 
-function traitRolesRow(state){
-  const roles = state.config.traitRoles || [];
+function traitRolesRow(state, roles, guild){
+  roles = roles || [];
   const rows = [];
 
   // Add / Next row
@@ -261,14 +285,17 @@ function traitRolesRow(state){
     new ButtonBuilder().setCustomId('setup:skip').setLabel('Skip').setStyle(ButtonStyle.Secondary),
   ));
 
-  // Delete select if roles exist
+  // Delete select if roles exist — keyed by the trait_roles row id, so
+  // deleting here actually removes the DB row (previously this only spliced
+  // an in-memory wizard array, so a "deleted" role kept auto-assigning).
   if(roles.length > 0){
-    const options = roles.map((r, i) =>
-      new StringSelectMenuOptionBuilder()
-        .setLabel(`${i+1}. ${r.traitType === '_count' ? `Own ${r.minCount}+ tokens` : `${r.traitType}: ${r.traitValue}`}`)
-        .setDescription(`Role: ${r.roleId ? `<@&${r.roleId}>` : (r.roleName||'Unknown')}`)
-        .setValue(String(i))
-    );
+    const options = roles.slice(0, 25).map((r, i) => {
+      const roleName = guild?.roles?.cache?.get(r.role_id)?.name || 'Unknown role';
+      return new StringSelectMenuOptionBuilder()
+        .setLabel(`${i+1}. ${traitRuleLabel(r)}`.slice(0, 100))
+        .setDescription(`Role: ${roleName}`.slice(0, 100))
+        .setValue(String(r.id));
+    });
     rows.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
         .setCustomId('setup_traitrole:delete')
@@ -361,8 +388,12 @@ async function resumeStep(interaction, state, ctx){
   if(step === 2) return interaction.editReply({ embeds:[buildCollectionEmbed(state)], components:[collectionRow(!!state.config.contract)] });
   if(step === 3) return interaction.editReply({ embeds:[buildChannelsEmbed(state)], components:[channelsRow(isOcas)] });
   if(step === 4){ const v = !!(state.config.verifyChannel && state.config.verifyRole); return interaction.editReply({ embeds:[buildVerificationEmbed(state)], components:verificationRow(v) }); }
-  if(step === 5) return interaction.editReply({ embeds:[buildTraitRolesEmbed(state)], components:traitRolesRow(state) });
-  return interaction.editReply({ embeds:[buildSummaryEmbed(state, interaction.guild)], components:[summaryRow()] });
+  if(step === 5){
+    const roles = await fetchWizardTraitRoles(interaction.guildId, pgPool);
+    return interaction.editReply({ embeds:[buildTraitRolesEmbed(state, roles)], components:traitRolesRow(state, roles, interaction.guild) });
+  }
+  const summaryRoles = await fetchWizardTraitRoles(interaction.guildId, pgPool);
+  return interaction.editReply({ embeds:[buildSummaryEmbed(state, interaction.guild, summaryRoles)], components:[summaryRow()] });
 }
 
 async function handleSetupButton(interaction, ctx){
@@ -385,7 +416,14 @@ async function handleSetupButtonInner(interaction, ctx){
 
   // Defer immediately — must happen within 3s or Discord kills the interaction
   // Modals are exempt (showModal is its own response), handle those below
-  const isModal = customId === 'setup:contract' || customId === 'setup:nickname:set' || customId.startsWith('setup_traitrole:rolesel');
+  // 'setup_traitrole:rolesel' used to open a modal directly and needed to skip
+  // the defer — it no longer does (it now renders the category picker), so
+  // it's been removed from this list. The value-picker's "Set Count" button
+  // (customId ends in ':setcount') opens a modal too, so it's added here.
+  const isModal = customId === 'setup:contract' || customId === 'setup:nickname:set'
+    || customId.startsWith('setup:traitrole:manual:')
+    || customId.startsWith('setup:traitrole:quickmodal:')
+    || (customId.startsWith('vpick:wtraitrole:') && customId.endsWith(':setcount'));
   if(!isModal) await interaction.deferUpdate();
 
   const state = await loadState(guildId, pgPool);
@@ -417,7 +455,10 @@ async function handleSetupButtonInner(interaction, ctx){
     if(step === 2) return interaction.editReply({ embeds:[buildCollectionEmbed(state)], components:[collectionRow(!!state.config.contract)] });
     if(step === 3) return interaction.editReply({ embeds:[buildChannelsEmbed(state)], components:[channelsRow(isOcas)] });
     if(step === 4){ const v = !!(state.config.verifyChannel && state.config.verifyRole); return interaction.editReply({ embeds:[buildVerificationEmbed(state)], components:verificationRow(v) }); }
-    if(step === 5) return interaction.editReply({ embeds:[buildTraitRolesEmbed(state)], components:traitRolesRow(state) });
+    if(step === 5){
+      const roles = await fetchWizardTraitRoles(guildId, pgPool);
+      return interaction.editReply({ embeds:[buildTraitRolesEmbed(state, roles)], components:traitRolesRow(state, roles, interaction.guild) });
+    }
     if(step === 6){
       try{
         const sc = state.config;
@@ -446,7 +487,8 @@ async function handleSetupButtonInner(interaction, ctx){
         }catch(e){ console.warn('[Setup] panel sync:', e.message); }
       }catch(e){ console.error('[Setup] Save error:', e.message); }
       await clearWizardState(guildId, pgPool);
-      return interaction.editReply({ embeds:[buildSummaryEmbed(state, interaction.guild)], components:[summaryRow()] });
+      const finishRoles = await fetchWizardTraitRoles(guildId, pgPool);
+      return interaction.editReply({ embeds:[buildSummaryEmbed(state, interaction.guild, finishRoles)], components:[summaryRow()] });
     }
   }
 
@@ -463,7 +505,7 @@ async function handleSetupButtonInner(interaction, ctx){
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('slug_input').setLabel('OpenSea Collection Slug')
-          .setStyle(TextInputStyle.Short).setPlaceholder('fluxeto')
+          .setStyle(TextInputStyle.Short).setPlaceholder('your-collection-slug')
           .setRequired(false).setMaxLength(100)
       ),
     );
@@ -573,17 +615,205 @@ async function handleSetupButtonInner(interaction, ctx){
   if(customId === 'setup:traitrole:add'){
     const { rows, pageLabel } = buildRolePickerRows(interaction.guild, 'setup_traitrole:rolesel', 'setup:step:5', 'Pick a role to assign...');
     return interaction.editReply({
-      content: '**Step 1 of 2 — Pick the Discord role to assign:**'+pageLabel,
+      content: '**Step 1 of 3 — Pick the Discord role to assign:**'+pageLabel,
       embeds: [],
       components: rows,
     });
   }
 
-  // ── trait role: role selected → open trait fields modal ─────────────────
+  // ── trait role: role selected → guided category picker (dropdowns) ────────
+  // Previously this opened a free-text modal (type/value/count typed by hand).
+  // Now it mirrors /config's guided flow: category dropdown → value dropdown
+  // (paginated "menu X of Y" past 25 options) → optional count, all sourced
+  // from the collection's own cached traits so nothing has to be typed.
   if(customId.startsWith('setup_traitrole:rolesel')){
     const roleId = interaction.values[0];
     const role   = await interaction.guild.roles.fetch(roleId).catch(()=>null);
-    const modal  = new ModalBuilder()
+    const slug   = state.config.collectionSlug || state.config.slug || '';
+    const isOcas = state.config.contract?.toLowerCase() === OCAS_CONTRACT;
+
+    const catRes = await pgPool.query(
+      `SELECT DISTINCT trait_name FROM collection_traits WHERE slug=$1 ORDER BY trait_name`,
+      [slug]
+    ).catch(()=>({ rows:[] }));
+    const categories = catRes.rows.map(r => r.trait_name).filter(Boolean);
+
+    if(!categories.length){
+      return interaction.editReply({
+        content: `**Adding trait role for ${role?.name || 'role'}**\n\nNo cached trait data found for this collection yet. Click below to enter the trait manually.`,
+        embeds: [],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`setup:traitrole:manual:${roleId}`).setLabel('✏️ Enter Manually').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('setup:step:5').setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+          ),
+        ],
+      });
+    }
+
+    // Special options (Token Count + burn-based, when OCAS) go first, menu 0 only.
+    const specialCount = isOcas ? 3 : 1;
+    const CAT_CHUNK = 25;
+    const catMenuCount = Math.min(4, Math.ceil((categories.length + specialCount) / CAT_CHUNK));
+    const catRows = [];
+    for(let i = 0; i < catMenuCount; i++){
+      const startIdx = i === 0 ? 0 : i * CAT_CHUNK - specialCount;
+      const roomLeft = i === 0 ? CAT_CHUNK - specialCount : CAT_CHUNK;
+      const slice = categories.slice(startIdx, startIdx + roomLeft);
+      if(!slice.length && i > 0) break;
+      const opts = slice.map(c => new StringSelectMenuOptionBuilder().setLabel(c.slice(0,100)).setValue(c));
+      if(i === 0){
+        opts.unshift(new StringSelectMenuOptionBuilder()
+          .setLabel('🪙 Token Count').setValue('_count')
+          .setDescription('Assign role based on how many tokens the user holds'));
+        if(isOcas){
+          opts.unshift(new StringSelectMenuOptionBuilder()
+            .setLabel('🔥 Total Burns').setValue('_totalburns')
+            .setDescription('Number of separate burn transactions this wallet has ever done'));
+          opts.unshift(new StringSelectMenuOptionBuilder()
+            .setLabel('💥 Biggest Single Burn').setValue('_maxburn')
+            .setDescription('Largest number of tokens fed into any ONE burn transaction'));
+        }
+      }
+      const m = new StringSelectMenuBuilder()
+        .setCustomId(`setup_traitrole:catsel:${roleId}:${i}`)
+        .setPlaceholder(catMenuCount > 1 ? `Categories (menu ${i+1} of ${catMenuCount})` : 'Step 2 of 3 — Pick a trait category...')
+        .addOptions(opts.slice(0, 25));
+      catRows.push(new ActionRowBuilder().addComponents(m));
+    }
+    catRows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('setup:step:5').setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+    ));
+    return interaction.editReply({
+      content: `**Adding trait role for ${role?.name || 'role'}**\n\nStep 2 of 3 — Pick the trait category:`,
+      embeds: [],
+      components: catRows,
+    });
+  }
+
+  // ── trait role: category selected → value picker (or count shortcut) ──────
+  if(customId.startsWith('setup_traitrole:catsel:')){
+    const parts    = customId.split(':');
+    const roleId   = parts[2];
+    const category = interaction.values[0];
+
+    if(category === '_count' || category === '_totalburns' || category === '_maxburn'){
+      const labels = {
+        _count:      ['Token Count Rule', 'Set Token Count', 'the minimum token count'],
+        _totalburns: ['Total Burns Rule', 'Set Total Burns', 'the minimum number of burn transactions this wallet has ever done'],
+        _maxburn:    ['Biggest Single Burn Rule', 'Set Burn Size', 'the minimum tokens in any ONE burn transaction'],
+      }[category];
+      return interaction.editReply({
+        content: `**${labels[0]}**\n\nClick below to set ${labels[2]} for this role.`,
+        embeds: [],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`setup:traitrole:quickmodal:${roleId}:${category}`).setLabel(`✏️ ${labels[1]}`).setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('setup:step:5').setLabel('← Cancel').setStyle(ButtonStyle.Secondary),
+          ),
+        ],
+      });
+    }
+
+    const slug = state.config.collectionSlug || state.config.slug || '';
+    const valRes = await pgPool.query(
+      `SELECT DISTINCT trait_value FROM collection_traits WHERE slug=$1 AND trait_name=$2 ORDER BY trait_value`,
+      [slug, category]
+    ).catch(()=>({ rows:[] }));
+    const values = valRes.rows.map(r => r.trait_value).filter(Boolean);
+    if(!values.length){
+      return interaction.editReply({ content: `❌ No trait values found for category **${category}**. Try again.`, embeds:[], components:[] });
+    }
+
+    const sessionKey = `${interaction.user.id}:wtraitrole:${roleId}:${category}`;
+    initValuePicker(sessionKey, values);
+    const customIdPrefix = `wtraitrole:${roleId}:${encodeURIComponent(category)}`;
+    const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
+      placeholder: 'Pick one or more values...',
+      cancelId: 'setup:step:5',
+      countButton: true,
+    });
+    return interaction.editReply({
+      content: `**Adding trait role**\n\nCategory: **${category}**\nStep 3 of 3 — Pick the trait value(s) that qualify${truncatedNote}\n\nPick from as many of the menus below as you want, then Done to finish (defaults to needing 1), or Set Count first for a different minimum.`,
+      embeds: [],
+      components: rows,
+    });
+  }
+
+  // ── trait role: paginated value picker dispatch (sel / setcount / done) ───
+  if(customId.startsWith('vpick:wtraitrole:')){
+    try{
+      const parsed = parseValuePickerCustomId(customId);
+      if(!parsed){
+        return interaction.editReply({ content: '❌ Something went wrong with this picker. Please start over.', embeds:[], components:[] });
+      }
+      const { action, customIdPrefix } = parsed;
+      const [, roleId, catEnc] = customIdPrefix.split(':');
+      const category = decodeURIComponent(catEnc);
+      const sessionKey = `${interaction.user.id}:wtraitrole:${roleId}:${category}`;
+      const session = getValuePickerSession(sessionKey);
+      if(!session){
+        return interaction.editReply({ content: '❌ This picker session expired (likely a bot restart mid-flow). Please start over.', embeds:[], components:[] });
+      }
+
+      if(action === 'sel'){
+        recordMenuSelection(sessionKey, parsed.menuIndex, interaction.values || []);
+        const { rows, truncatedNote } = buildStackedValuePickerRows(sessionKey, customIdPrefix, {
+          placeholder: 'Pick one or more values...', cancelId: 'setup:step:5', countButton: true,
+        });
+        return interaction.editReply({
+          content: `**${category}**${truncatedNote}\n\npick from as many of the menus below as you want, then Done to finish (defaults to needing 1), or Set Count first for a different minimum.`,
+          embeds: [], components: rows,
+        });
+      }
+
+      if(action === 'setcount'){
+        if(!session.selected.size){
+          return interaction.editReply({ content: 'No values were selected. Please pick at least one value first.', embeds:[], components:[] });
+        }
+        const modal = new ModalBuilder()
+          .setCustomId(`setup_modal:trcount:${roleId}:${encodeURIComponent(category)}`)
+          .setTitle(`${category}`.slice(0, 45));
+        modal.addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tr_count_min')
+            .setLabel('How many needed? (default: 1)')
+            .setStyle(TextInputStyle.Short).setPlaceholder('e.g. 1, 3, 5').setRequired(false)
+        ));
+        return interaction.showModal(modal);
+      }
+
+      if(action === 'done'){
+        const selectedValues = [...session.selected];
+        clearValuePicker(sessionKey);
+        if(!selectedValues.length){
+          return interaction.editReply({ content: 'No values were selected — nothing added.', embeds:[], components:[] });
+        }
+        for(const val of selectedValues){
+          await pgPool.query(
+            `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+             VALUES ($1,$2,$3,$4,1,NULL)
+             ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=NULL`,
+            [guildId, roleId, category, val]
+          ).catch(e => console.warn('[Setup] trait_roles insert:', e.message));
+        }
+        const roles = await fetchWizardTraitRoles(guildId, pgPool);
+        return interaction.editReply({
+          content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}>:\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
+          embeds: [buildTraitRolesEmbed(state, roles)],
+          components: traitRolesRow(state, roles, interaction.guild),
+        });
+      }
+    }catch(e){
+      console.error('[Setup] vpick dispatcher error:', e);
+      return interaction.editReply({ content: `❌ Something went wrong saving your picks: ${e.message || 'unknown error'}. Please try again or start over.`, embeds:[], components:[] }).catch(()=>{});
+    }
+  }
+
+  // ── trait role: manual fallback entry (no cached trait data) ──────────────
+  if(customId.startsWith('setup:traitrole:manual:')){
+    const roleId = customId.split(':')[3];
+    const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    const modal = new ModalBuilder()
       .setCustomId('setup_modal:traitrole:'+roleId)
       .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
     modal.addComponents(
@@ -612,14 +842,38 @@ async function handleSetupButtonInner(interaction, ctx){
     return interaction.showModal(modal);
   }
 
-  // ── trait role: delete select ─────────────────────────────────────────────
+  // ── trait role: quick-modal for _count/_totalburns/_maxburn (number only) ─
+  if(customId.startsWith('setup:traitrole:quickmodal:')){
+    const parts    = customId.split(':');
+    const roleId   = parts[3];
+    const category = parts[4];
+    const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    const fieldLabels = {
+      _count:      'Minimum tokens owned (default: 1)',
+      _totalburns: 'Minimum burn transactions (default: 1)',
+      _maxburn:    'Minimum tokens in one burn (default: 1)',
+    };
+    const modal = new ModalBuilder()
+      .setCustomId(`setup_modal:trquick:${roleId}:${category}`)
+      .setTitle(`Role: ${(role?.name || 'Selected').slice(0, 40)}`);
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('tr_quick_count')
+        .setLabel((fieldLabels[category] || 'Minimum count').slice(0, 45))
+        .setStyle(TextInputStyle.Short).setPlaceholder('e.g. 1, 5, 10').setRequired(false)
+    ));
+    return interaction.showModal(modal);
+  }
+
+  // ── trait role: delete select — removes the actual trait_roles DB row ─────
+  // (previously this only spliced an in-memory wizard array; the DB row
+  // stayed active and kept auto-assigning even after "deleting" it here)
   if(customId === 'setup_traitrole:delete'){
-    const idx = parseInt(interaction.values[0]);
-    const roles = state.config.traitRoles || [];
-    if(!isNaN(idx) && roles[idx]) roles.splice(idx, 1);
-    state.config.traitRoles = roles;
-    await saveState(guildId, state, pgPool);
-    return interaction.editReply({ content:'', embeds:[buildTraitRolesEmbed(state)], components:traitRolesRow(state) });
+    const rowId = parseInt(interaction.values[0]);
+    if(!isNaN(rowId)){
+      await pgPool.query('DELETE FROM trait_roles WHERE id=$1 AND guild_id=$2', [rowId, guildId]).catch(e=>console.warn('[Setup] trait_roles delete:', e.message));
+    }
+    const roles = await fetchWizardTraitRoles(guildId, pgPool);
+    return interaction.editReply({ content:'', embeds:[buildTraitRolesEmbed(state, roles)], components:traitRolesRow(state, roles, interaction.guild) });
   }
 
   // ── optional: set nickname from the finish screen ───────────────────────────
@@ -722,7 +976,8 @@ async function handleSetupModalInner(interaction, ctx){
     return interaction.editReply({ content:'', embeds:[buildCollectionEmbed(state)], components:[collectionRow(true)] });
   }
 
-  // ── add trait role ─────────────────────────────────────────────────────────
+  // ── add trait role (manual fallback — only reached when no cached trait
+  //    data exists for the collection yet, see setup_traitrole:rolesel) ──────
   if(customId.startsWith('setup_modal:traitrole:')){
     const roleId      = customId.split(':')[2];
     const traitTypeRaw = interaction.fields.getTextInputValue('tr_trait_type').trim();
@@ -735,27 +990,70 @@ async function handleSetupModalInner(interaction, ctx){
     if(!role)
       return interaction.editReply({ content:'❌ Role not found. Please try again.' });
 
-    if(!state.config.traitRoles) state.config.traitRoles = [];
-    state.config.traitRoles.push({
-      roleId,
-      roleName: role.name,
-      traitType,
-      traitValue: traitVal || null,
-      minCount,
-    });
-    await saveState(guildId, state, pgPool);
-
-    // Also persist to trait_roles table
     try{
       await pgPool.query(
-        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count)
-         VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO NOTHING`,
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,$3,$4,$5,NULL)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=NULL`,
         [guildId, roleId, traitType, traitVal||'', minCount]
       );
     }catch(e){ console.warn('[Setup] trait_roles insert:', e.message); }
 
-    return interaction.editReply({ content:'', embeds:[buildTraitRolesEmbed(state)], components:traitRolesRow(state) });
+    const roles = await fetchWizardTraitRoles(guildId, pgPool);
+    return interaction.editReply({ content:'', embeds:[buildTraitRolesEmbed(state, roles)], components:traitRolesRow(state, roles, interaction.guild) });
+  }
+
+  // ── trait role: quick-modal submit (numeric-only categories) ──────────────
+  if(customId.startsWith('setup_modal:trquick:')){
+    const parts    = customId.split(':');
+    const roleId   = parts[2];
+    const category = parts[3];
+    const minCount = parseInt(interaction.fields.getTextInputValue('tr_quick_count').trim()) || 1;
+
+    const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
+    if(!role) return interaction.editReply({ content:'❌ Role not found. Please try again.' });
+
+    await pgPool.query(
+      `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+       VALUES ($1,$2,$3,'',$4,NULL)
+       ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=NULL`,
+      [guildId, roleId, category, minCount]
+    ).catch(e => console.warn('[Setup] trait_roles insert:', e.message));
+
+    const roles = await fetchWizardTraitRoles(guildId, pgPool);
+    return interaction.editReply({ content:'✅ Trait role added.', embeds:[buildTraitRolesEmbed(state, roles)], components:traitRolesRow(state, roles, interaction.guild) });
+  }
+
+  // ── trait role: custom-count modal submit — finalizes a value-picker session ──
+  if(customId.startsWith('setup_modal:trcount:')){
+    const parts    = customId.split(':');
+    const roleId   = parts[2];
+    const category = decodeURIComponent(parts[3]);
+    const minCount = parseInt(interaction.fields.getTextInputValue('tr_count_min').trim()) || 1;
+
+    const sessionKey = `${interaction.user.id}:wtraitrole:${roleId}:${category}`;
+    const session = getValuePickerSession(sessionKey);
+    if(!session || !session.selected.size){
+      return interaction.editReply({ content: '❌ This session expired before you set a count. Please pick the value(s) again.', embeds:[], components:[] });
+    }
+    const selectedValues = [...session.selected];
+    clearValuePicker(sessionKey);
+
+    for(const val of selectedValues){
+      await pgPool.query(
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,$3,$4,$5,NULL)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=NULL`,
+        [guildId, roleId, category, val, minCount]
+      ).catch(e => console.warn('[Setup] trait_roles insert:', e.message));
+    }
+
+    const roles = await fetchWizardTraitRoles(guildId, pgPool);
+    return interaction.editReply({
+      content: `✅ Added **${selectedValues.length}** trait role rule${selectedValues.length > 1 ? 's' : ''} for <@&${roleId}> (need ${minCount}+):\n${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
+      embeds: [buildTraitRolesEmbed(state, roles)],
+      components: traitRolesRow(state, roles, interaction.guild),
+    });
   }
 
   // channel/role selects handled in handleSetupButton

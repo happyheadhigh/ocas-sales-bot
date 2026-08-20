@@ -400,8 +400,22 @@ app.get('/db/collections/:slug/sync-trait-index', auth, async (req, res) => {
   try {
     const slug = String(req.params.slug || '').toLowerCase().trim();
     if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
-    await fetchAndStoreCollectionTraits(slug, pool);
-    res.json({ ok: true, message: `Trait index sync attempted for "${slug}" — check /db/trait-index?slug=${slug} to confirm` });
+    // This used to always report ok:true regardless of whether the OpenSea
+    // fetch actually succeeded, since fetchAndStoreCollectionTraits swallowed
+    // every error internally and returned nothing — making this endpoint
+    // useless as an actual diagnostic. It now returns what really happened.
+    const result = await fetchAndStoreCollectionTraits(slug, pool);
+    const countRes = await pool.query(`SELECT COUNT(*)::int AS n FROM collection_traits WHERE slug=$1`, [slug]).catch(()=>({rows:[{n:0}]}));
+    res.json({
+      ok: !!result.ok,
+      slug,
+      reason: result.reason || null,
+      opensea_status: result.status || null,
+      rows_in_collection_traits: countRes.rows[0]?.n || 0,
+      message: result.ok
+        ? `Trait index sync succeeded for "${slug}" — check /db/trait-index?slug=${slug} to confirm`
+        : `Trait index sync did NOT populate data for "${slug}": ${result.reason || 'unknown reason'}`,
+    });
   } catch(e) {
     console.error(`/db/collections/${req.params.slug}/sync-trait-index error:`, e.message);
     res.status(500).json({ ok: false, error: e.message });

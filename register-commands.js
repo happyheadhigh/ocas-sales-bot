@@ -73,6 +73,14 @@ const commands = [
   new SlashCommandBuilder().setName('rankfind').setDescription('Find listings or sales by OS rank range — leave blank for a guided menu').addIntegerOption(o=>o.setName('min_rank').setDescription('Minimum OS rank (default 1)').setRequired(false).setMinValue(1).setMaxValue(10000)).addIntegerOption(o=>o.setName('max_rank').setDescription('Maximum OS rank (default 100)').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('mode').setDescription('What to search (default: listings)').setRequired(false).addChoices({name:'Listings',value:'listings'},{name:'Sales',value:'sales'})).addStringOption(o=>o.setName('sort').setDescription('Sort order for listings (default: cheapest first)').setRequired(false).addChoices({name:'Cheapest first',value:'price'},{name:'Best rank first',value:'rank'})).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false).setAutocomplete(true)),
   new SlashCommandBuilder().setName('token').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection to search (defaults to primary)').setRequired(false).setAutocomplete(true)),
+  // /sweep re-added: its handler is fully generic/multi-collection-aware
+  // (resolveCollectionFromServerCfg + per-guild paid-tier gate) — it only
+  // got caught in the original OCAS-specific command removal because its
+  // description said "OCAS." burnstats/burnlatest/burn/burnwallet/
+  // burnleaderboard/burnrefresh stay removed — those genuinely only work
+  // with OCAS's burn-tracking data, which this deployment doesn't have.
+  new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep the cheapest listed tokens in your collection').addStringOption(o=>o.setName('search').setDescription('e.g. 10, 2eth, 0.05 floor, 10 zombie').setRequired(false)).addStringOption(o=>o.setName('collection').setDescription('Collection to sweep (defaults to primary)').setRequired(false).setAutocomplete(true)),
+
 
   new SlashCommandBuilder().setName('synctraits').setDescription('Refresh token traits from contract — fixes missing/stale traits in DB (admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('mode').setDescription('survivors = refresh all burn survivors; token = single token (default)').setRequired(false).addChoices({name:'Single token',value:'token'},{name:'All burn survivors',value:'survivors'}))

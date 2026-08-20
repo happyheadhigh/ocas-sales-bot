@@ -774,6 +774,13 @@ client.on('interactionCreate', async (interaction)=>{
     const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
+  // Setup wizard's own paginated trait-value picker (distinct from /config's
+  // vpick:traitrole: / vpick:filtertrait: above — this one stays inside the
+  // wizard's embeds instead of exiting to /config's UI).
+  if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('vpick:wtraitrole:')){
+    const setupCtx = { pgPool, setConfig, getConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
   if(interaction.isButton() && (interaction.customId.startsWith('cfg:') || interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col_filter:'))){
     const cfgCtx = { pgPool, getConfig, setConfig, syncBurnConfig: syncBurnConfigFromServerConfigs };
     return handleConfigButton(interaction, cfgCtx);
