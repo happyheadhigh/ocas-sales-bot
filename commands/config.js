@@ -858,12 +858,21 @@ async function handleConfigButton(interaction, ctx){
     const field  = parts[3]; // 'sales' or 'listings'
     const colId  = parts[4];
     const isPrimary = colId === 'primary';
+    // Using `= null` here, not `delete` — setConfig() re-fetches the DB row
+    // and merges it under the incoming cfg (`{...dbCfg, ...cfg}`) to avoid
+    // clobbering fields the caller doesn't know about. That merge can only
+    // override a key that's actually PRESENT on the incoming object; a
+    // `delete`d key is simply absent, so the merge let the old DB value flow
+    // straight back through and the "disabled" channel came right back the
+    // next time any /config action re-saved the config. Every downstream
+    // reader already treats null exactly like unset (e.g. lib/poll.js's
+    // `if(!ctx.listingsChannelId) continue`), so this is a safe, real fix.
     if(isPrimary){
-      if(field === 'sales')    { delete cfg.channelId; delete cfg.salesChannel; }
-      if(field === 'listings') { delete cfg.listingsChannelId; delete cfg.listingsChannel; }
-      if(field === 'burn')     { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
-      if(field === 'fusion')   { delete cfg.fusionChannel; }
-      if(field === 'vaultalert') { delete cfg.vaultAlertChannel; }
+      if(field === 'sales')    { cfg.channelId = null; cfg.salesChannel = null; }
+      if(field === 'listings') { cfg.listingsChannelId = null; cfg.listingsChannel = null; }
+      if(field === 'burn')     { cfg.burnChannel = null; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      if(field === 'fusion')   { cfg.fusionChannel = null; }
+      if(field === 'vaultalert') { cfg.vaultAlertChannel = null; }
     } else {
       const idx = parseInt(colId);
       if(cfg.collections?.[idx]){
@@ -871,9 +880,9 @@ async function handleConfigButton(interaction, ctx){
         if(field === 'listings') cfg.collections[idx].listingsChannel = null;
       }
       // burn, fusion, and vault-alert channels are always top-level in cfg
-      if(field === 'burn') { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
-      if(field === 'fusion') { delete cfg.fusionChannel; }
-      if(field === 'vaultalert') { delete cfg.vaultAlertChannel; }
+      if(field === 'burn') { cfg.burnChannel = null; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      if(field === 'fusion') { cfg.fusionChannel = null; }
+      if(field === 'vaultalert') { cfg.vaultAlertChannel = null; }
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
