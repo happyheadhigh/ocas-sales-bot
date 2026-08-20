@@ -261,6 +261,9 @@ function collectionEditRow(colId, isPrimary, isOcas=false, isStackers=false){
   if(!isPrimary) row2Btns.push(
     new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)
   );
+  if(isPrimary) row2Btns.push(
+    new ButtonBuilder().setCustomId('cfg:col:removeprimary').setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)
+  );
 
   return [
     new ActionRowBuilder().addComponents(menu),
@@ -1531,6 +1534,27 @@ async function handleConfigButton(interaction, ctx){
       await setConfig(guildId, cfg);
     }
     return interaction.editReply({ content:'✅ Collection removed.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
+  }
+  if(customId === 'cfg:col:removeprimary'){
+    delete cfg.contract;
+    delete cfg.contractName;
+    delete cfg.collectionSlug;
+    delete cfg.slug;
+    delete cfg.salesChannel;
+    delete cfg.channelId;
+    delete cfg.listingsChannel;
+    delete cfg.listingsChannelId;
+    delete cfg.burnChannel;
+    delete cfg.vaultAlertChannel;
+    delete cfg.fusionChannel;
+    delete cfg.isPaidTier;
+    delete cfg.animated;
+    delete cfg.listingFilters;
+    delete cfg.salesFilters;
+    delete cfg.rankAlert;
+    delete cfg.paused;
+    await setConfig(guildId, cfg);
+    return interaction.editReply({ content:'✅ Primary collection removed. Click **➕ Add Collection** to set up a new one.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
   if(customId === 'cfg:cat:channels'){
     const isOcas = cfg.contract?.toLowerCase() === OCAS_CONTRACT;
