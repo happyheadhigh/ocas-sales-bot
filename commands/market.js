@@ -79,20 +79,17 @@ function resolveCollectionFromServerCfg(serverCfg, collectionInput){
   const all = [primary, ...extras].filter(c => c.slug);
 
   if(!collectionInput) {
-    // No explicit collection was given -- and there's currently no slash
-    // command option to provide one anyway. Previously this just returned
-    // whatever "primary" happened to be configured as, with no regard for
-    // whether OCAS was even the primary slot. That's exactly how a server
-    // with OCAS registered as a secondary/"extra" collection (and
-    // something else as primary) silently swept the wrong collection with
-    // no way to override it. Prefer OCAS specifically wherever it's
-    // configured for this server; only fall back to "primary" as a last
-    // resort when OCAS genuinely isn't configured here and there's more
-    // than one other collection to choose between (fully ambiguous case).
-    const ocasMatch = all.find(c => (c.slug||'').toLowerCase() === OCAS_SLUG);
-    if(ocasMatch) return ocasMatch;
-    if(all.length === 1) return all[0];
-    return primary.slug ? primary : null;
+    // Blank /token (and other collection-aware commands) should show the
+    // guild's actual PRIMARY collection — whatever that's configured as —
+    // not a hardcoded preference for one specific collection. This used to
+    // explicitly search for and prefer OCAS wherever it was configured for
+    // a server (even as a secondary/"extra" collection), from back when
+    // /sweep and friends had no collection option at all and this was the
+    // only way to avoid silently sweeping the wrong collection. Every
+    // collection-aware command now has a real `collection` option with
+    // autocomplete, so that workaround is no longer needed and was actively
+    // wrong for any server where OCAS isn't the intended primary.
+    return primary.slug ? primary : (all[0] || null);
   }
 
   const input = collectionInput.toLowerCase();
