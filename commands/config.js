@@ -1531,7 +1531,10 @@ async function handleConfigButton(interaction, ctx){
           await setConfig(guildId, freshCfg).catch(()=>{});
         }
         const animatedNote = stats?.animated ? ' · 🎞️ Animated detected' : '';
-        interaction.followUp({ content:`✅ Re-backfill complete for **${col.name||col.slug}** — ${stats?.written||0} tokens updated${animatedNote}.`, ephemeral: true }).catch(()=>{});
+        const repairNote = stats?.queuedForRepair
+          ? ` (${stats.queuedForRepair} more resolving in the background — check back shortly)`
+          : '';
+        interaction.followUp({ content:`✅ Re-backfill complete for **${col.name||col.slug}** — ${stats?.written||0} tokens updated${repairNote}${animatedNote}.`, ephemeral: true }).catch(()=>{});
       })
       .catch(e => {
         console.error('[Config rebackfill]', e.message);

@@ -448,6 +448,47 @@ app.get('/db/collections/:slug/fix-images', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/collections/:slug/repair-status — check progress of the
+// background metadata repair queue (Tier 4 of the tiered backfill) without
+// needing to tail server logs. Reports pending/done/permanently_failed
+// counts, plus a small sample of currently-pending token IDs so it's
+// obvious at a glance whether the drain is actually making progress.
+app.get('/db/collections/:slug/repair-status', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    const countsRes = await pool.query(
+      `SELECT status, COUNT(*)::int AS n FROM metadata_repair_jobs WHERE collection_slug=$1 GROUP BY status`,
+      [slug]
+    );
+    const counts = { pending: 0, done: 0, permanently_failed: 0 };
+    for (const row of countsRes.rows) counts[row.status] = row.n;
+
+    const sampleRes = await pool.query(
+      `SELECT token_id, attempts, last_error, last_attempt_at FROM metadata_repair_jobs
+       WHERE collection_slug=$1 AND status='pending' ORDER BY token_id ASC LIMIT 10`,
+      [slug]
+    );
+
+    const total = counts.pending + counts.done + counts.permanently_failed;
+    res.json({
+      ok: true,
+      slug,
+      total,
+      pending: counts.pending,
+      done: counts.done,
+      permanently_failed: counts.permanently_failed,
+      percentComplete: total ? Math.round(((counts.done + counts.permanently_failed) / total) * 100) : 100,
+      stillDraining: counts.pending > 0,
+      samplePendingTokens: sampleRes.rows,
+    });
+  } catch(e) {
+    console.error(`/db/collections/${req.params.slug}/repair-status error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/snapshot — manually trigger a Stackers analytics
 // snapshot. The scheduled job (bot.js) only runs once every 24h on purpose
 // — it iterates every token and takes real minutes, so it deliberately
