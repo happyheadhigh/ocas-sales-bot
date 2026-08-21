@@ -295,7 +295,7 @@ async function syncTraitRoles(guild, discordId, wallet){
       [guild.id]
     );
 
-    if(!traitRolesRes.rows.length) return { assigned: [], skipped: [], alreadyHad: [] }; // No trait roles configured
+    if(!traitRolesRes.rows.length) return { assigned: [], skipped: [], alreadyHad: [], failed: [] }; // No trait roles configured
 
     const cfg = getConfig(guild.id) || {};
     const primarySlug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
@@ -310,7 +310,7 @@ async function syncTraitRoles(guild, discordId, wallet){
     }
 
     const member = await guild.members.fetch(discordId).catch(()=>null);
-    if(!member) return { assigned: [], skipped: [], alreadyHad: [] };
+    if(!member) return { assigned: [], skipped: [], alreadyHad: [], failed: [] };
 
     // Burn-based rules (_totalburns/_maxburn) aren't tied to any one
     // collection's ownership data the way trait/count rules are -- compute
@@ -344,7 +344,7 @@ async function syncTraitRoles(guild, discordId, wallet){
       }
     }
 
-    const rolesSummary = { assigned: [], skipped: [], alreadyHad: [] };
+    const rolesSummary = { assigned: [], skipped: [], alreadyHad: [], failed: [] };
     let totalOwnedAcrossCollections = 0;
 
     // Chain isn't in server config at all — resolve every collection in this
@@ -419,8 +419,23 @@ async function syncTraitRoles(guild, discordId, wallet){
         if(meetsMin && !hasRole){
           const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
           if(!conflict){
-            await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
-            rolesSummary.assigned.push(tr.role_id);
+            // Confirmed real bug: rolesSummary.assigned.push() used to happen
+            // unconditionally right after this call, regardless of whether
+            // roles.add() actually succeeded — .catch() only logged the
+            // error, it never stopped the push. A failed assignment (e.g.
+            // "Missing Permissions" from the bot's role sitting below the
+            // target role in the server's hierarchy) was silently counted
+            // as a success, so /synctraits's own "✅ synced" reply gave zero
+            // indication that anything had actually failed — confirmed live,
+            // the only way to discover this was checking Railway's own
+            // server logs directly, which no other server's admin can do.
+            try{
+              await member.roles.add(tr.role_id);
+              rolesSummary.assigned.push(tr.role_id);
+            }catch(e){
+              console.error('[TraitSync] add role failed:', e.message);
+              rolesSummary.failed.push({ roleId: tr.role_id, reason: e.message });
+            }
           } else {
             console.log('[TraitSync] SKIP add — role managed by other bot:', tr.role_id);
             rolesSummary.skipped.push(tr.role_id);
@@ -458,7 +473,7 @@ async function syncTraitRoles(guild, discordId, wallet){
     return rolesSummary;
   }catch(e){
     console.error('[TraitSync] Error:', e.message);
-    return { assigned: [], skipped: [], alreadyHad: [] };
+    return { assigned: [], skipped: [], alreadyHad: [], failed: [] };
   }
 }
 
@@ -2244,11 +2259,28 @@ client.on('interactionCreate', async (interaction)=>{
         'SELECT discord_id, wallet FROM user_registrations WHERE guild_id=$1 AND verified=true',
         [guildId]
       );
+      // Failures used to be completely invisible here — syncTraitRoles's
+      // return value was discarded entirely, and the reply always said
+      // "✅ synced" even when individual role assignments failed (e.g.
+      // Discord's "Missing Permissions" when the bot's own role sits below
+      // the trait role in the server's hierarchy). Confirmed live: the only
+      // way to discover this was checking Railway's own server logs
+      // directly, which no other server's admin can do. Now aggregated and
+      // surfaced directly in the reply.
+      let totalFailed = 0;
+      const failureReasons = new Set();
       for(const reg of regs.rows){
-        await syncTraitRoles(interaction.guild, reg.discord_id, reg.wallet);
+        const result = await syncTraitRoles(interaction.guild, reg.discord_id, reg.wallet);
+        if(result?.failed?.length){
+          totalFailed += result.failed.length;
+          for(const f of result.failed) failureReasons.add(f.reason);
+        }
         await new Promise(r=>setTimeout(r,500));
       }
-      return interaction.editReply({content:'✅ Trait roles synced for '+regs.rows.length+' verified member'+(regs.rows.length!==1?'s':'')+'.'});
+      const failureNote = totalFailed
+        ? `\n\n⚠️ **${totalFailed} role assignment${totalFailed===1?'':'s'} failed:** ${[...failureReasons].slice(0,3).join('; ')}\nThis usually means the bot's own role needs to be moved **above** the trait role in Server Settings → Roles.`
+        : '';
+      return interaction.editReply({content:'✅ Trait roles synced for '+regs.rows.length+' verified member'+(regs.rows.length!==1?'s':'')+'.'+failureNote});
     }catch(e){
       console.error('[SyncTraits]', e.message);
       return interaction.editReply({content:'❌ Sync failed: '+e.message});
