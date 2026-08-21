@@ -969,7 +969,7 @@ async function handleSetupModalInner(interaction, ctx){
       fetchAndStoreCollectionTraits(slugRaw, pgPool).catch(()=>{});
       try{
         const { maybeStartBackfill } = require('../lib/auto-backfill');
-        maybeStartBackfill(pgPool, { contract, slug: slugRaw }).catch(()=>{});
+        maybeStartBackfill(pgPool, { contract, slug: slugRaw, guildId, guildName: interaction.guild?.name }).catch(()=>{});
       }catch(_){}
     }
     await saveState(guildId, state, pgPool);

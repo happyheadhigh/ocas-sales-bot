@@ -1534,7 +1534,7 @@ async function handleConfigButton(interaction, ctx){
 
     await interaction.editReply({ content:`🔄 Re-backfilling **${col.name||col.slug}**... This may take a minute.`, embeds:[], components:[] });
 
-    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug, chain, totalSupply })
+    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug, chain, totalSupply, guildId, guildName: interaction.guild?.name })
       .then(async stats => {
         await releaseBackfillLock(pgPool, col.slug, { success: true, tokensWritten: stats?.written || 0 });
         // Store animated detection result in collection config
@@ -2656,7 +2656,7 @@ async function handleConfigModal(interaction, ctx){
     if(slug && contract){
       try{
         const { maybeStartBackfill } = require('../lib/auto-backfill');
-        const result = await maybeStartBackfill(pgPool, { contract, slug });
+        const result = await maybeStartBackfill(pgPool, { contract, slug, guildId, guildName: interaction.guild?.name });
         if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
       }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
     }
@@ -2692,7 +2692,7 @@ async function handleConfigModal(interaction, ctx){
         if(cfg.collectionSlug && cfg.contract){
           try{
             const { maybeStartBackfill } = require('../lib/auto-backfill');
-            const result = await maybeStartBackfill(pgPool, { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug });
+            const result = await maybeStartBackfill(pgPool, { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, guildId, guildName: interaction.guild?.name });
             if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
           }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
         }
