@@ -1496,10 +1496,17 @@ async function handleConfigButton(interaction, ctx){
     }
     await setConfig(guildId, cfg);
 
-    await interaction.editReply({ content:`🔄 Re-backfilling **${col.name||col.slug}**... This may take a minute.`, embeds:[], components:[] });
-
-    // Run backfill directly — bypasses the "already backfilled" guard in maybeStartBackfill
+    // Run backfill directly — bypasses the "already backfilled" guard in
+    // maybeStartBackfill (intentional: this button should be able to force
+    // a re-run even after a prior completion), but now goes through the
+    // SAME lock (tryClaimBackfillLock) that the auto-trigger path checks —
+    // confirmed live that skipping this entirely let a manual re-backfill
+    // click collide with an auto-triggered run already in progress for the
+    // same slug, running two full concurrent backfills that each burned
+    // real Alchemy/OpenSea request volume for no benefit (ON CONFLICT
+    // protections meant no data got corrupted, just wasted duplicate work).
     const { backfillCollectionTraits } = require('../lib/collection-backfill');
+    const { tryClaimBackfillLock, releaseBackfillLock } = require('../lib/auto-backfill');
     // chain/totalSupply were never passed here, so backfillCollectionTraits()
     // silently fell back to its own default of chain='ethereum' every time —
     // for a non-Ethereum collection (e.g. Robinhood Chain), that means Alchemy
@@ -1515,8 +1522,21 @@ async function handleConfigButton(interaction, ctx){
     ).catch(()=>({ rows:[] }));
     const chain       = collRow.rows[0]?.chain || 'ethereum';
     const totalSupply = collRow.rows[0]?.total_supply || null;
+
+    const claim = await tryClaimBackfillLock(pgPool, col.slug, col.contract).catch(() => ({ claimed: true })); // fail open — a lock-check error shouldn't block a manual retry
+    if(!claim.claimed){
+      const secondsAgo = Math.round((claim.startedMsAgo || 0) / 1000);
+      return interaction.editReply({
+        content: `⏳ A backfill is already running for **${col.name||col.slug}** (started ~${secondsAgo}s ago). Please wait for it to finish before starting another — running two at once just wastes API calls without going any faster.`,
+        embeds: [], components: [],
+      });
+    }
+
+    await interaction.editReply({ content:`🔄 Re-backfilling **${col.name||col.slug}**... This may take a minute.`, embeds:[], components:[] });
+
     backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug, chain, totalSupply })
       .then(async stats => {
+        await releaseBackfillLock(pgPool, col.slug, { success: true, tokensWritten: stats?.written || 0 });
         // Store animated detection result in collection config
         if(typeof stats?.animated === 'boolean'){
           const freshCfg = getConfig(guildId) || {};
@@ -1537,6 +1557,7 @@ async function handleConfigButton(interaction, ctx){
         interaction.followUp({ content:`✅ Re-backfill complete for **${col.name||col.slug}** — ${stats?.written||0} tokens updated${repairNote}${animatedNote}.`, ephemeral: true }).catch(()=>{});
       })
       .catch(e => {
+        releaseBackfillLock(pgPool, col.slug, { success: false, error: e.message }).catch(()=>{});
         console.error('[Config rebackfill]', e.message);
         interaction.followUp({ content:`❌ Re-backfill failed: ${e.message}`, ephemeral: true }).catch(()=>{});
       });
