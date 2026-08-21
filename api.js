@@ -24,7 +24,7 @@ const { runMigrations, fetchAndStoreCollectionTraits } = require('./lib/db');
 // before today's rewrite.
 const syncListingsModule = require('./sync-listings');
 const { onboardCollection } = require('./lib/collection-onboard');
-const { fixCollectionImages } = require('./lib/collection-backfill');
+const { fixCollectionImages, fetchRawTokenUri, diagnoseIpfsGateways } = require('./lib/collection-backfill');
 const { takeStackersSnapshot } = require('./lib/stackers-analytics');
 
 const app = express();
@@ -1230,6 +1230,52 @@ app.get('/db/alchemy-nft-test/:chain/:contract', auth, async (req, res) => {
     });
   } catch(e) {
     console.error('/db/alchemy-nft-test error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/ipfs-resolve-test — check where a single token's image/metadata
+// actually lives, WITHOUT running any part of a real backfill ─────────────
+// Two ways to call it:
+//   ?uri=ipfs://<cid>/<path>              — test gateways directly against a
+//                                            known URI (e.g. copied from a
+//                                            backfill's own log output)
+//   ?chain=robinhood&contract=0x..&tokenId=5 — resolves the real on-chain
+//                                              tokenURI first via eth_call,
+//                                              then tests gateways against it
+// Tests every gateway INDIVIDUALLY (not racing to first success like the
+// real backfill does) so it reports each one's own outcome + response time —
+// this answers "which gateway(s) actually work for this content" directly,
+// in one request, instead of inferring it from a multi-minute page-by-page
+// backfill run.
+app.get('/db/ipfs-resolve-test', auth, async (req, res) => {
+  try {
+    const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    const SUPPORTED = { ethereum: 'eth-mainnet', base: 'base-mainnet', polygon: 'polygon-mainnet', robinhood: 'robinhood-mainnet' };
+
+    let uri = req.query.uri ? String(req.query.uri) : null;
+    let tokenUriSource = uri ? 'provided directly' : null;
+
+    if(!uri){
+      const { chain, contract, tokenId } = req.query;
+      if(!chain || !contract || !tokenId){
+        return res.status(400).json({ ok: false, error: 'Provide either ?uri=ipfs://... OR ?chain=&contract=&tokenId=' });
+      }
+      const subdomain = SUPPORTED[String(chain)];
+      if(!subdomain) return res.status(400).json({ ok: false, error: `Unsupported chain "${chain}"` });
+      if(!ALCHEMY_KEY) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY' });
+      try{
+        uri = await fetchRawTokenUri(String(contract), parseInt(tokenId), ALCHEMY_KEY, subdomain);
+        tokenUriSource = `resolved on-chain via eth_call on ${subdomain}`;
+      }catch(e){
+        return res.status(502).json({ ok: false, error: `Failed to resolve on-chain tokenURI: ${e.message}` });
+      }
+    }
+
+    const diagnosis = await diagnoseIpfsGateways(uri, ALCHEMY_KEY, req.query.chain ? SUPPORTED[String(req.query.chain)] : 'eth-mainnet');
+    res.json({ ok: true, tokenUri: uri, tokenUriSource, ...diagnosis });
+  } catch(e) {
+    console.error('/db/ipfs-resolve-test error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
