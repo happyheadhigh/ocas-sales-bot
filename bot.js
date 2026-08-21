@@ -1667,9 +1667,11 @@ client.on('interactionCreate', async (interaction)=>{
     // stale message from before this fix) still means OCAS, unchanged.
     const slugFromButton = parts[2] ? decodeURIComponent(parts[2]) : '';
     const isOcasToken = !slugFromButton || slugFromButton === OCAS_SLUG;
+    console.log(`[ShowTraits] customId="${interaction.customId}" tokenId=${tokenId} slugFromButton="${slugFromButton}" isOcasToken=${isOcasToken}`);
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const RAILWAY_URL = getRailwayApiUrl();
+      console.log(`[ShowTraits] RAILWAY_URL="${RAILWAY_URL}" (empty means this whole API path is skipped)`);
       const API_SECRET  = process.env.API_SECRET;
       let traits = null;
 
@@ -1721,11 +1723,15 @@ client.on('interactionCreate', async (interaction)=>{
         // lookup to the real collection instead of silently defaulting to
         // OCAS.
         if(RAILWAY_URL){
+          const fetchUrl = `${RAILWAY_URL}/db/token/${tokenId}?${new URLSearchParams({ key: API_SECRET||'', slug: slugFromButton })}`;
+          console.log(`[ShowTraits] fetching non-OCAS traits: ${fetchUrl.replace(API_SECRET || '__none__', '***')}`);
           try{
             const tqs = new URLSearchParams({ key: API_SECRET||'', slug: slugFromButton });
             const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
+            console.log(`[ShowTraits] response status=${tr.status} ok=${tr.ok}`);
             if(tr.ok){
               const tj = await tr.json();
+              console.log(`[ShowTraits] response body: ok=${tj.ok} hasTraits=${!!tj.token?.traits} traitKeys=${tj.token?.traits ? Object.keys(tj.token.traits).join(',') : 'none'}`);
               if(tj.ok && tj.token?.traits) traits = tj.token.traits;
             }
           }catch(apiErr){

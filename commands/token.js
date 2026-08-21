@@ -146,8 +146,16 @@ async function handleTokenCommand(commandName, ctx){
       if(!tokenId) tokenId = Math.floor(Math.random()*10000)+1;
 
       // Fetch OS rank + chain for title badge, rank-tier sidebar color, and
-      // correct-chain image/URL below — one fetch, used for both.
-      const dbMeta  = await fetchTokenMetaFromDb(tokenId, activeCol.slug).catch(()=>null);
+      // correct-chain image/URL below — one fetch, used for both. Falls
+      // back to activeCol.collectionSlug too, matching the same pattern
+      // used for the Show Traits button's customId — activeCol.slug alone
+      // was inconsistent with how other parts of this same command resolve
+      // the collection, and fetchTokenMetaFromDb's own default param
+      // (OCAS_SLUG) means an undefined slug here silently fetches OCAS's
+      // data instead of failing loudly.
+      const resolvedSlugForMeta = activeCol.slug || activeCol.collectionSlug;
+      const dbMeta  = await fetchTokenMetaFromDb(tokenId, resolvedSlugForMeta).catch(()=>null);
+      console.log(`[token] dbMeta fetch: slug="${resolvedSlugForMeta}" (activeCol.slug="${activeCol.slug}" activeCol.collectionSlug="${activeCol.collectionSlug}") -> image_url=${dbMeta?.image_url ? 'present' : 'null'} chain=${dbMeta?.chain}`);
       const tokenChain = dbMeta?.chain || 'ethereum';
 
       // ── Fetch + post image ────────────────────────────────────────────────
@@ -190,10 +198,11 @@ async function handleTokenCommand(commandName, ctx){
           // every time. Confirmed live: /token showing "Chimps #5000" with
           // the correct title still showed genuine OCAS traits (Type,
           // Clothes, Hat Hair...) when Show Traits was clicked.
-          .setCustomId(`ocas_traits:${tokenId}:${encodeURIComponent(activeCol.slug || activeCol.collectionSlug || '')}`)
+          .setCustomId(`ocas_traits:${tokenId}:${encodeURIComponent(resolvedSlugForMeta || '')}`)
           .setLabel('Show Traits')
           .setStyle(ButtonStyle.Secondary)
       );
+      console.log(`[token] Show Traits button built with slug="${resolvedSlugForMeta || ''}" -> customId="ocas_traits:${tokenId}:${encodeURIComponent(resolvedSlugForMeta || '')}"`);
 
       // Generic label for the actually-resolved collection — computed near
       // the top of this function, see there for why.
