@@ -62,7 +62,6 @@ function buildDashboardEmbed(cfg, traitRoles){
       `✅ **Verified Role:** ${rol(cfg.verifyRole)} ${ok(cfg.verifyRole)}\n` +
       `🏆 **Holder Role:** ${cfg.holderRole ? rol(cfg.holderRole) + ' ✅' : '`Not set` ⚪'}\n` +
       `🎭 **Trait Roles:** ${tCount} configured\n` +
-      `🖼️ **Embed Style:** ${cfg.embedShowTraits === false ? 'Large artwork (no traits shown)' : 'Traits + thumbnail (default)'}\n` +
       `\n\n` +
       SEP + '\n' +
       '*Select a category below to edit.*'
@@ -71,7 +70,6 @@ function buildDashboardEmbed(cfg, traitRoles){
 }
 
 function dashboardRow(cfg={}){
-  const artStyle = cfg.embedShowTraits === false;
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('📦 Collections').setStyle(ButtonStyle.Secondary),
@@ -83,12 +81,7 @@ function dashboardRow(cfg={}){
       new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('🛡️ Access').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('🎰 Lotteries').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:nickname').setLabel('🏷️ Bot Nickname').setStyle(ButtonStyle.Secondary),
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('cfg:toggle:embedstyle')
-        .setLabel(artStyle ? '📋 Switch to Traits + Thumbnail' : '🖼️ Switch to Large Artwork')
-        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:embedstyle').setLabel('🖼️ Embed Style').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -431,6 +424,42 @@ function rolesRow(traitRoles, colId){
   return rows;
 }
 
+// ── Embed Style screen — independent per-context toggles ──────────────────────
+// Sales/listings/commands can each independently show traits+thumbnail
+// (default) or large artwork with no traits — e.g. a server might want
+// artwork-focused sales/command results but keep the full trait list on
+// listings. All default to true (traits shown) so no server's display
+// changes without opting in.
+function buildEmbedStyleEmbed(cfg){
+  const modeLabel = (key) => (cfg.embedShowTraits?.[key] === false) ? '🖼️ Large artwork (no traits)' : '📋 Traits + thumbnail (default)';
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('🖼️ Embed Style')
+    .setDescription(
+      SEP + '\n\n' +
+      'Controls how sale alerts, listing alerts, and command results ' +
+      '(/traitfind, /rankfind) display each token — the full trait list ' +
+      'with a small thumbnail, or a large, artwork-focused image with no ' +
+      'trait list. Each can be set independently.\n\n' +
+      `🟢 **Sales Alerts:** ${modeLabel('sales')}\n` +
+      `📋 **Listing Alerts:** ${modeLabel('listings')}\n` +
+      `⌨️ **Commands** (/traitfind, /rankfind, etc.): ${modeLabel('commands')}\n`
+    )
+    .setFooter({ text: 'Only visible to you' });
+}
+function embedStyleRow(){
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:toggle:embedstyle:sales').setLabel('Toggle Sales').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:toggle:embedstyle:listings').setLabel('Toggle Listings').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:toggle:embedstyle:commands').setLabel('Toggle Commands').setStyle(ButtonStyle.Secondary),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 // ── Filters screen ────────────────────────────────────────────────────────────
@@ -757,15 +786,23 @@ async function handleConfigButton(interaction, ctx){
     colSlug ? [guildId, colSlug] : [guildId]
   ).catch(()=>({ rows:[] }));
 
-  // ── Embed style toggle (traits+thumbnail vs large artwork) ────────────────
-  if(customId === 'cfg:toggle:embedstyle'){
-    cfg.embedShowTraits = cfg.embedShowTraits === false ? true : false;
-    await setConfig(guildId, cfg);
-    const trRes = await traitRolesQ();
+  // ── Embed style category + toggles ─────────────────────────────────────────
+  if(customId === 'cfg:cat:embedstyle'){
     return interaction.editReply({
       content: '',
-      embeds: [buildDashboardEmbed(cfg, trRes.rows)],
-      components: dashboardRow(cfg),
+      embeds: [buildEmbedStyleEmbed(cfg)],
+      components: embedStyleRow(),
+    });
+  }
+  if(customId.startsWith('cfg:toggle:embedstyle:')){
+    const key = customId.split(':')[3]; // 'sales' | 'listings' | 'commands'
+    cfg.embedShowTraits = cfg.embedShowTraits || {};
+    cfg.embedShowTraits[key] = cfg.embedShowTraits[key] === false ? true : false;
+    await setConfig(guildId, cfg);
+    return interaction.editReply({
+      content: '',
+      embeds: [buildEmbedStyleEmbed(cfg)],
+      components: embedStyleRow(),
     });
   }
 

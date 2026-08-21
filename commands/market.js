@@ -149,7 +149,7 @@ async function handleMarketCommand(commandName, ctx){
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const sales=(await r.json()).asset_events||[];
       if(!sales.length){await interaction.editReply('No sales found.');return;}
-      const embed=await buildSaleEmbed(sales[0],activeConfig);
+      const embed=await buildSaleEmbed(sales[0],activeConfig, 'commands');
       const ir=embed._imageResult;delete embed._imageResult;
       if(ir?.type==='buffer'){const att=new AttachmentBuilder(ir.buffer,{name:ir.filename});embed.setThumbnail(`attachment://${ir.filename}`);await interaction.editReply({embeds:[embed],files:[att]});}
       else{if(ir?.type==='url')embed.setThumbnail(ir.url);await interaction.editReply({embeds:[embed]});}
@@ -172,7 +172,7 @@ async function handleMarketCommand(commandName, ctx){
       if(!sales.length){await interaction.editReply('No sales found.');return;}
       const cfg={...config,slug};
       const embeds=[];
-      for(const s of sales.reverse()){ const e=await buildSaleEmbed(s,cfg).catch(()=>null); if(e) embeds.push(e); }
+      for(const s of sales.reverse()){ const e=await buildSaleEmbed(s,cfg, 'commands').catch(()=>null); if(e) embeds.push(e); }
       await postEmbeds(interaction, embeds, `Last ${sales.length} sales for **${slug}**:`);
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
@@ -192,7 +192,7 @@ async function handleMarketCommand(commandName, ctx){
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const sales=(await r.json()).asset_events||[];
       if(!sales.length){await interaction.editReply(`No sales found for #${tokenId}.`);return;}
-      const embed=await buildSaleEmbed(sales[0],config);
+      const embed=await buildSaleEmbed(sales[0],config, 'commands');
       const ir=embed._imageResult;delete embed._imageResult;
       if(ir?.type==='buffer'){const att=new AttachmentBuilder(ir.buffer,{name:ir.filename});embed.setThumbnail(`attachment://${ir.filename}`);await interaction.editReply({embeds:[embed],files:[att]});}
       else{if(ir?.type==='url')embed.setThumbnail(ir.url);await interaction.editReply({embeds:[embed]});}
@@ -268,7 +268,7 @@ async function handleMarketCommand(commandName, ctx){
             payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH'?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
             event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
           };
-          return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+          return buildSaleEmbed(syntheticSale, cfg, 'commands').catch(()=>null);
         }));
         const totalNote = j.count > want ? ` (showing ${want} of ${j.count} total)` : '';
         await postEmbeds(interaction, saleEmbeds.filter(Boolean),
@@ -303,7 +303,7 @@ async function handleMarketCommand(commandName, ctx){
             os_rank: t.os_rank || null,
             _dbToken: scopedDbToken,
           };
-          return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
+          return buildListingEmbed(fakeListingObj, cfg, 'commands').catch(()=>null);
         }
         const dbMeta = await fetchTokenMetaFromDb(tokenId, slug).catch(()=>null);
         return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
@@ -338,7 +338,7 @@ async function handleMarketCommand(commandName, ctx){
       const listings=(await r.json()).asset_events||[];
       if(!listings.length){await interaction.editReply('No listings found.');return;}
       const cfg={...config,slug:colSlug};
-      const embeds=await Promise.all(listings.reverse().map(l=>buildListingEmbed(l,cfg).catch(()=>null)));
+      const embeds=await Promise.all(listings.reverse().map(l=>buildListingEmbed(l,cfg, 'commands').catch(()=>null)));
       await postEmbeds(interaction, embeds.filter(Boolean), `${listings.length} recent listings for **${colSlug}**:`);
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
@@ -871,7 +871,7 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
           payment: { symbol: (sale.currency||'ETH'), token_address: isWethSale?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
           event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
         };
-        return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+        return buildSaleEmbed(syntheticSale, cfg, 'commands').catch(()=>null);
       }));
       await postEmbeds(interaction, saleEmbeds.filter(Boolean),
         `📊 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${sales.length} recent sale${sales.length===1?'':'s'}:`);
@@ -904,7 +904,10 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
         .setFooter({ text: `${rfSlug} · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
         .setTimestamp();
       const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
-      if(tokenTraits.length){
+      // Same per-server toggle as everywhere else — /rankfind is a command
+      // result, so it always checks the "commands" context.
+      const showTraits = config.embedShowTraits?.commands !== false;
+      if(showTraits && tokenTraits.length){
         embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
       } else { embed.setDescription('**Links**\n' + tvLink); }
       if(rfSlug === STACKERS_SLUG){
@@ -912,9 +915,18 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
         if(stackersFields.length) embed.addFields(...stackersFields);
       }
       try{
-        const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
-        embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+        // Prefer the backfill's own cached image over a live gateway race —
+        // this branch is a separate, hand-rolled embed builder (doesn't
+        // reuse buildListingEmbed at all) that was missed when this exact
+        // fix was applied everywhere else earlier tonight.
+        if(dbMeta?.image_url && isDiscordOk(dbMeta.image_url)){
+          embed._imageResult = { type:'url', url: dbMeta.image_url };
+        } else {
+          const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
+          embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+        }
       }catch(e){}
+      embed._imageLarge = !showTraits;
       return embed;
     }));
     const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
@@ -1193,7 +1205,7 @@ async function handleTraitBrowseInteraction(interaction, ctx){
             payment: { symbol: 'ETH', token_address: '', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
             event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
           };
-          return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+          return buildSaleEmbed(syntheticSale, cfg, 'commands').catch(()=>null);
         }));
         await postEmbeds(interaction, saleEmbeds.filter(Boolean), `Found **${j.count}** sale${j.count===1?'':'s'} with **${matchLabel}**:`);
         return;
@@ -1217,7 +1229,7 @@ async function handleTraitBrowseInteraction(interaction, ctx){
             maker: t.seller||'', url: t.url||null, os_rank: t.os_rank||null,
             _dbToken: { traits: t.traits||{}, obs_rank: t.obs_rank||null, os_rank: t.os_rank||null, chain: chainInfo?.chain||null, contract: chainInfo?.contract||null },
           };
-          return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
+          return buildListingEmbed(fakeListingObj, cfg, 'commands').catch(()=>null);
         }
         const dbMeta = await fetchTokenMetaFromDb(tokenId, slug).catch(()=>null);
         return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
