@@ -300,6 +300,7 @@ function channelsRow(isOcas){
 // ── Verification screen ───────────────────────────────────────────────────────
 function buildVerificationEmbed(cfg){
   const deployed = !!cfg.verifyMessageId;
+  const hasAnyRole = !!(cfg.verifyRole || cfg.holderRole);
   return new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle('🔐 Wallet Verification')
@@ -311,7 +312,10 @@ function buildVerificationEmbed(cfg){
       `🚦 **Panel status:** ${deployed ? '✅ Deployed' : '❌ Not deployed'}\n\n` +
       (cfg.verifyChannel && cfg.verifyRole
         ? '*Any member who verifies gets the Verified role.\nMembers holding ≥1 token also get the Holder role.*'
-        : '*Don\'t need verification? That\'s fine — leave this unconfigured. Your alerts (sales, listings, burns) don\'t depend on it.*')
+        : '*Don\'t need verification? That\'s fine — leave this unconfigured. Your alerts (sales, listings, burns) don\'t depend on it.*') +
+      (hasAnyRole
+        ? '\n\n⚠️ **Important:** in Server Settings → Roles, drag this bot\'s own role **above** the role(s) set here. Discord only lets a bot assign roles ranked below its own — if it isn\'t, assignment silently fails with no error shown anywhere.'
+        : '')
     )
     .setFooter({ text: 'Only visible to you' });
 }
@@ -384,7 +388,10 @@ function buildRolesEmbed(traitRoles, collectionLabel){
     .setDescription(
       SEP + '\n\n' +
       list + '\n\n' +
-      '*Roles are assigned automatically when a member verifies\nand re-synced every 24 hours.*'
+      '*Roles are assigned automatically when a member verifies\nand re-synced every 24 hours.*' +
+      (traitRoles.length
+        ? '\n\n⚠️ **Important:** in Server Settings → Roles, drag this bot\'s own role **above** every role listed above. Discord only lets a bot assign roles ranked below its own — if it isn\'t, assignment silently fails with no error shown anywhere.'
+        : '')
     )
     .setFooter({ text: 'Only visible to you' });
 }

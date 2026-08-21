@@ -135,6 +135,7 @@ function buildChannelsEmbed(state){
 function buildVerificationEmbed(state){
   const cfg = state.config;
   const configured = !!(cfg.verifyChannel && cfg.verifyRole);
+  const hasAnyRole = !!(cfg.verifyRole || cfg.holderRole);
   return new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle('🔐 Wallet Verification')
@@ -147,7 +148,10 @@ function buildVerificationEmbed(state){
       `🏆 **Holder Role:** ${cfg.holderRole ? `<@&${cfg.holderRole}> ✅` : '⚪ Optional'}\n\n` +
       (configured
         ? '✅ Ready to deploy verification panel.'
-        : '*Don\'t need verification? No problem — skip this step and click Next. Your alerts (sales, listings, burns) work completely fine without it.*')
+        : '*Don\'t need verification? No problem — skip this step and click Next. Your alerts (sales, listings, burns) work completely fine without it.*') +
+      (hasAnyRole
+        ? '\n\n⚠️ **Important:** in Server Settings → Roles, drag this bot\'s own role **above** the role(s) picked here. Discord only lets a bot assign roles ranked below its own — if it isn\'t, role assignment will silently fail with no error shown anywhere.'
+        : '')
     )
     .setFooter({ text: 'Only visible to you' });
 }
@@ -195,7 +199,10 @@ function buildTraitRolesEmbed(state, roles){
       '**How it works:**\n' +
       '→ Member verifies → bot checks their tokens & traits\n' +
       '→ Matching roles assigned instantly, re-synced every 24h\n\n' +
-      '**Examples:** Own a Zombie → `@Zombie Holder` · Own 20+ → `@Whale`'
+      '**Examples:** Own a Zombie → `@Zombie Holder` · Own 20+ → `@Whale`' +
+      (roles.length
+        ? '\n\n⚠️ **Important:** in Server Settings → Roles, drag this bot\'s own role **above** every trait role listed above. Discord only lets a bot assign roles ranked below its own — if it isn\'t, assignment silently fails with no error shown anywhere.'
+        : '')
     )
     .setFooter({ text: 'Only visible to you — manage trait roles anytime with /config' });
 }
