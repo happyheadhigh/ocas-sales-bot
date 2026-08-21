@@ -16,7 +16,7 @@ const sharp = require('sharp');
 // ── Lib ───────────────────────────────────────────────────────────────────────
 const {
   DISCORD_TOKEN, OPENSEA_KEY, ALCHEMY_KEY, API_SECRET,
-  COLORS, OCAS_CONTRACT, BURN_CONTRACT,
+  COLORS, OCAS_CONTRACT, OCAS_SLUG, BURN_CONTRACT,
   POLL_MS, RANK_SYNC_INTERVAL, BOT_ENV,
   osHeaders, getRailwayApiUrl, getRankTierColor,
   PENDING_DRAW_SEED_PREFIX, DEFAULT_LOTTERY_TIMEZONE,
@@ -1654,57 +1654,90 @@ client.on('interactionCreate', async (interaction)=>{
 
   // ── Show Traits button — ephemeral, only visible to clicker ─────────────
   if(interaction.isButton() && interaction.customId.startsWith('ocas_traits:')){
-    const tokenId = parseInt(interaction.customId.split(':')[1]);
+    const parts = interaction.customId.split(':');
+    const tokenId = parseInt(parts[1]);
+    // 3rd segment (collection slug) added so this button works correctly
+    // for non-OCAS collections too — previously this customId only ever
+    // carried a tokenId (copied from the OCAS-only /ocas command's own
+    // identical button), so this handler had no way to know which
+    // collection a token belonged to and silently defaulted to OCAS every
+    // time. Confirmed live: /token showing "Chimps #5000" with the
+    // correct title still showed genuine OCAS traits when Show Traits was
+    // clicked. Empty/missing segment (e.g. from /ocas's own button, or any
+    // stale message from before this fix) still means OCAS, unchanged.
+    const slugFromButton = parts[2] ? decodeURIComponent(parts[2]) : '';
+    const isOcasToken = !slugFromButton || slugFromButton === OCAS_SLUG;
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const RAILWAY_URL = getRailwayApiUrl();
       const API_SECRET  = process.env.API_SECRET;
       let traits = null;
 
-      const cached = ocasTraitsCache.get(tokenId);
-      if(cached && Date.now() < cached.expires){
-        traits = cached.traits;
-      }
-
-      // For OCAS, current contract tokenURI is the true source and preserves
-      // duplicate trait categories through the raw attributes[] array.
-      // Try it before API/DB so stale flattened DB traits do not hide duplicates.
-      if(!traits || realTraitCount(traits) < 10){
-        const contractTraits = await fetchTokenUriFromContract(tokenId).catch(e => {
-          console.warn('[ShowTraits contract]', e.message);
-          return null;
-        });
-        if(contractTraits && realTraitCount(contractTraits)){
-          traits = contractTraits;
-          setCachedTraits(tokenId, traits);
+      if(isOcasToken){
+        const cached = ocasTraitsCache.get(tokenId);
+        if(cached && Date.now() < cached.expires){
+          traits = cached.traits;
         }
-      }
 
-      // API fallback for cases where contract RPC is temporarily unavailable.
-      if((!traits || !realTraitCount(traits)) && RAILWAY_URL){
-        try{
-          const tqs = new URLSearchParams({ key: API_SECRET||'' });
-          const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
-          if(tr.ok){
-            const tj = await tr.json();
-            if(tj.ok && tj.token?.traits) traits = tj.token.traits;
-          }
-          if(traits){
+        // For OCAS, current contract tokenURI is the true source and preserves
+        // duplicate trait categories through the raw attributes[] array.
+        // Try it before API/DB so stale flattened DB traits do not hide duplicates.
+        if(!traits || realTraitCount(traits) < 10){
+          const contractTraits = await fetchTokenUriFromContract(tokenId).catch(e => {
+            console.warn('[ShowTraits contract]', e.message);
+            return null;
+          });
+          if(contractTraits && realTraitCount(contractTraits)){
+            traits = contractTraits;
             setCachedTraits(tokenId, traits);
           }
-        }catch(apiErr){
-          console.warn('[ShowTraits API]', apiErr.message);
         }
-      }
 
-      if(!traits || !realTraitCount(traits)){
-        const local = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-        traits = local?.traits || null;
+        // API fallback for cases where contract RPC is temporarily unavailable.
+        if((!traits || !realTraitCount(traits)) && RAILWAY_URL){
+          try{
+            const tqs = new URLSearchParams({ key: API_SECRET||'' });
+            const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
+            if(tr.ok){
+              const tj = await tr.json();
+              if(tj.ok && tj.token?.traits) traits = tj.token.traits;
+            }
+            if(traits){
+              setCachedTraits(tokenId, traits);
+            }
+          }catch(apiErr){
+            console.warn('[ShowTraits API]', apiErr.message);
+          }
+        }
+
+        if(!traits || !realTraitCount(traits)){
+          const local = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+          traits = local?.traits || null;
+        }
+      } else {
+        // Non-OCAS collection — skip the OCAS-only on-chain tokenURI fast
+        // path entirely (that always reads OCAS's own contract regardless
+        // of which token is actually being viewed), and scope the DB
+        // lookup to the real collection instead of silently defaulting to
+        // OCAS.
+        if(RAILWAY_URL){
+          try{
+            const tqs = new URLSearchParams({ key: API_SECRET||'', slug: slugFromButton });
+            const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
+            if(tr.ok){
+              const tj = await tr.json();
+              if(tj.ok && tj.token?.traits) traits = tj.token.traits;
+            }
+          }catch(apiErr){
+            console.warn('[ShowTraits API]', apiErr.message);
+          }
+        }
       }
 
       if(!traits || !realTraitCount(traits)){ await interaction.editReply({ content: 'Could not load traits.' }); return; }
       const traitLines = traitDisplayLines(traits, 25).join('\n');
-      await interaction.editReply({ content: `**OCAS #${tokenId} Traits (${realTraitCount(traits)})**\n${traitLines}`.slice(0, 1900) });
+      const titleLabel = isOcasToken ? 'OCAS' : slugFromButton;
+      await interaction.editReply({ content: `**${titleLabel} #${tokenId} Traits (${realTraitCount(traits)})**\n${traitLines}`.slice(0, 1900) });
     } catch(e) {
       console.error('[ShowTraits]', e.message);
       try { await interaction.editReply({ content: 'Error loading traits.' }); } catch(_){}

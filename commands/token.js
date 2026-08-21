@@ -183,7 +183,14 @@ async function handleTokenCommand(commandName, ctx){
 
       const traitsRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-          .setCustomId(`ocas_traits:${tokenId}`)
+          // Collection slug appended as a 3rd segment — previously this was
+          // just `ocas_traits:${tokenId}` (borrowed from the OCAS-only
+          // command's own button), so the handler had no way to know which
+          // collection a token belonged to and silently defaulted to OCAS
+          // every time. Confirmed live: /token showing "Chimps #5000" with
+          // the correct title still showed genuine OCAS traits (Type,
+          // Clothes, Hat Hair...) when Show Traits was clicked.
+          .setCustomId(`ocas_traits:${tokenId}:${encodeURIComponent(activeCol.slug || activeCol.collectionSlug || '')}`)
           .setLabel('Show Traits')
           .setStyle(ButtonStyle.Secondary)
       );
