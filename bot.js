@@ -2171,8 +2171,35 @@ client.on('interactionCreate', async (interaction)=>{
     await interaction.deferReply({flags:64});
     if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
       return interaction.editReply({content:'❌ You need Manage Server permission.'});
-    await interaction.editReply({content:'⏳ Syncing trait roles for all verified members... This may take a moment.'});
+
+    // This makes one live OpenSea API call per verified member PER
+    // configured collection with trait roles — for a guild with hundreds
+    // of verified members, that's hundreds of calls per invocation, and
+    // there was no cooldown at all. Same policy as /config's re-backfill
+    // button: unlimited for the bot owner, 1 per 24h per guild for
+    // everyone else, since running this repeatedly doesn't get anyone
+    // anything a single run + the normal periodic re-sync wouldn't.
     const guildId = interaction.guildId;
+    const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+    if(!isOwner){
+      const cfg = getConfig(guildId) || {};
+      const COOLDOWN_MS = 24 * 60 * 60 * 1000;
+      const lastRun = cfg.lastTraitSyncAt ? new Date(cfg.lastTraitSyncAt).getTime() : 0;
+      const now = Date.now();
+      if(now - lastRun < COOLDOWN_MS){
+        const nextRun = new Date(lastRun + COOLDOWN_MS);
+        const hrs = Math.ceil((nextRun - now) / 3600000);
+        return interaction.editReply({content:`⏳ /synctraits is limited to once per 24h to avoid hammering the API on every server's behalf. Available again in **${hrs}h**.`});
+      }
+      // Store the timestamp before running (same reasoning as re-backfill's
+      // cooldown) — prevents a burst of rapid re-clicks before the first
+      // run finishes from all slipping through the check above.
+      const freshCfg = getConfig(guildId) || {};
+      freshCfg.lastTraitSyncAt = new Date().toISOString();
+      await setConfig(guildId, freshCfg).catch(()=>{});
+    }
+
+    await interaction.editReply({content:'⏳ Syncing trait roles for all verified members... This may take a moment.'});
     try{
       const regs = await pgPool.query(
         'SELECT discord_id, wallet FROM user_registrations WHERE guild_id=$1 AND verified=true',
