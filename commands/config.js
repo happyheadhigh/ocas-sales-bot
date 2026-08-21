@@ -62,6 +62,7 @@ function buildDashboardEmbed(cfg, traitRoles){
       `✅ **Verified Role:** ${rol(cfg.verifyRole)} ${ok(cfg.verifyRole)}\n` +
       `🏆 **Holder Role:** ${cfg.holderRole ? rol(cfg.holderRole) + ' ✅' : '`Not set` ⚪'}\n` +
       `🎭 **Trait Roles:** ${tCount} configured\n` +
+      `🖼️ **Embed Style:** ${cfg.embedShowTraits === false ? 'Large artwork (no traits shown)' : 'Traits + thumbnail (default)'}\n` +
       `\n\n` +
       SEP + '\n' +
       '*Select a category below to edit.*'
@@ -69,7 +70,8 @@ function buildDashboardEmbed(cfg, traitRoles){
     .setFooter({ text: 'Only visible to you' });
 }
 
-function dashboardRow(){
+function dashboardRow(cfg={}){
+  const artStyle = cfg.embedShowTraits === false;
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('📦 Collections').setStyle(ButtonStyle.Secondary),
@@ -81,6 +83,12 @@ function dashboardRow(){
       new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('🛡️ Access').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('🎰 Lotteries').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:nickname').setLabel('🏷️ Bot Nickname').setStyle(ButtonStyle.Secondary),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('cfg:toggle:embedstyle')
+        .setLabel(artStyle ? '📋 Switch to Traits + Thumbnail' : '🖼️ Switch to Large Artwork')
+        .setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -602,7 +610,7 @@ async function handleConfigCommand(interaction, ctx){
   ).catch(()=>({ rows:[] }));
   return interaction.editReply({
     embeds: [buildDashboardEmbed(cfg, trRes.rows)],
-    components: dashboardRow(),
+    components: dashboardRow(cfg),
   });
 }
 
@@ -749,13 +757,25 @@ async function handleConfigButton(interaction, ctx){
     colSlug ? [guildId, colSlug] : [guildId]
   ).catch(()=>({ rows:[] }));
 
+  // ── Embed style toggle (traits+thumbnail vs large artwork) ────────────────
+  if(customId === 'cfg:toggle:embedstyle'){
+    cfg.embedShowTraits = cfg.embedShowTraits === false ? true : false;
+    await setConfig(guildId, cfg);
+    const trRes = await traitRolesQ();
+    return interaction.editReply({
+      content: '',
+      embeds: [buildDashboardEmbed(cfg, trRes.rows)],
+      components: dashboardRow(cfg),
+    });
+  }
+
   // ── Back to dashboard ──────────────────────────────────────────────────────
   if(customId === 'cfg:back'){
     const trRes = await traitRolesQ();
     return interaction.editReply({
       content: '',
       embeds: [buildDashboardEmbed(cfg, trRes.rows)],
-      components: dashboardRow(),
+      components: dashboardRow(cfg),
     });
   }
 
