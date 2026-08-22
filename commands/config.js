@@ -2369,6 +2369,20 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
         if(field==='vaultalertchan') cfg.vaultAlertChannel = chId;
       }
       await setConfig(guildId, cfg);
+      // Cursor persists independently of channel configuration — confirmed
+      // live that (re-)setting a channel for a collection that had one
+      // configured at some earlier point resumes from a stale cursor
+      // position instead of "now", dumping every sale/listing that happened
+      // in the gap as if it were brand new. Always reset on (re-)configure
+      // so the next poll cycle starts clean.
+      {
+        const { resetSaleCursor, resetListingCursor } = require('../lib/poll');
+        const targetSlug = isPrimary ? (cfg.collectionSlug || cfg.slug) : cfg.collections[parseInt(colId)]?.slug;
+        if(targetSlug){
+          if(field==='saleschan') resetSaleCursor(guildId, targetSlug);
+          if(field==='listchan')  resetListingCursor(guildId, targetSlug);
+        }
+      }
       const col = isPrimary
         ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
         : cfg.collections[parseInt(colId)];
@@ -2398,6 +2412,15 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
       }
     }
     await setConfig(guildId, cfg);
+    // Same reset as the collection-scoped select above — see there for reasoning.
+    if(type === 'sales' || type === 'listings'){
+      const { resetSaleCursor, resetListingCursor } = require('../lib/poll');
+      const targetSlug = cfg.collectionSlug || cfg.slug;
+      if(targetSlug){
+        if(type === 'sales')    resetSaleCursor(guildId, targetSlug);
+        if(type === 'listings') resetListingCursor(guildId, targetSlug);
+      }
+    }
     if(type === 'rankalert'){
       const raColId = parts[2];
       const raIsPrimary = raColId === 'primary';

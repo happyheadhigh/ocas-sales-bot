@@ -478,6 +478,17 @@ async function handleSetupButtonInner(interaction, ctx){
           slug:              sc.collectionSlug  || sc.slug,
         };
         await setConfig(guildId, merged);
+        // Cursor persists independently of channel configuration — same
+        // reasoning as /config's channel-select handlers. If this wizard
+        // run set a sales/listings channel, always start the next poll
+        // cycle fresh from "now" rather than risk resuming from a stale
+        // cursor left over from an earlier configuration of this same
+        // collection.
+        if(merged.slug && (merged.channelId || merged.listingsChannelId)){
+          const { resetSaleCursor, resetListingCursor } = require('../lib/poll');
+          if(merged.channelId)         resetSaleCursor(guildId, merged.slug);
+          if(merged.listingsChannelId) resetListingCursor(guildId, merged.slug);
+        }
 
         // Always sync verification_panels with latest roles — no manual re-deploy needed
         try{
@@ -914,6 +925,12 @@ async function handleSetupButtonInner(interaction, ctx){
         const sc = state.config;
         const merged = { ...sc, channelId: sc.salesChannel||sc.channelId, listingsChannelId: sc.listingsChannel||sc.listingsChannelId, slug: sc.collectionSlug||sc.slug };
         await setConfig(guildId, merged);
+        // Same reset as the other commit path above — see there for reasoning.
+        if(merged.slug && (merged.channelId || merged.listingsChannelId)){
+          const { resetSaleCursor, resetListingCursor } = require('../lib/poll');
+          if(merged.channelId)         resetSaleCursor(guildId, merged.slug);
+          if(merged.listingsChannelId) resetListingCursor(guildId, merged.slug);
+        }
 
         // Always sync verification_panels with latest roles — no manual re-deploy needed
         try{
