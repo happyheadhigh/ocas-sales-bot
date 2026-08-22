@@ -974,45 +974,87 @@ app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
     let source = null;
     let abi = null;
     const attempts = [];
+    let abiAddress = address; // may get reassigned to a resolved proxy implementation below
 
-    // Try the modern v2 API first
-    try{
-      const v2Url = `https://robinhoodchain.blockscout.com/api/v2/smart-contracts/${address}`;
-      const r = await fetch(v2Url, { headers: { 'Accept': 'application/json' } });
-      const bodyText = await r.text();
-      attempts.push({ format: 'v2', url: v2Url, status: r.status, bodyPreview: bodyText.slice(0, 500) });
-      if(r.ok){
-        const data = JSON.parse(bodyText);
-        if(data.abi){
-          source = 'v2';
-          abi = data.abi;
-        }
-      }
-    }catch(e){
-      attempts.push({ format: 'v2', error: e.message });
-    }
-
-    // Fall back to the legacy etherscan-compatible format
-    if(!source){
+    async function tryFetchAbi(addr){
+      // Modern v2 API first
       try{
-        const legacyUrl = `https://robinhoodchain.blockscout.com/api?module=contract&action=getabi&address=${address}`;
+        const v2Url = `https://robinhoodchain.blockscout.com/api/v2/smart-contracts/${addr}`;
+        const r = await fetch(v2Url, { headers: { 'Accept': 'application/json' } });
+        const bodyText = await r.text();
+        attempts.push({ format: 'v2', url: v2Url, status: r.status, bodyPreview: bodyText.slice(0, 500) });
+        if(r.ok){
+          const data = JSON.parse(bodyText);
+          if(data.abi) return { source: 'v2', abi: data.abi };
+        }
+      }catch(e){
+        attempts.push({ format: 'v2', error: e.message });
+      }
+      // Legacy etherscan-compatible format
+      try{
+        const legacyUrl = `https://robinhoodchain.blockscout.com/api?module=contract&action=getabi&address=${addr}`;
         const r = await fetch(legacyUrl, { headers: { 'Accept': 'application/json' } });
         const bodyText = await r.text();
         attempts.push({ format: 'legacy', url: legacyUrl, status: r.status, bodyPreview: bodyText.slice(0, 500) });
         if(r.ok){
           const data = JSON.parse(bodyText);
-          if(data.status === '1' && data.result){
-            source = 'legacy';
-            abi = JSON.parse(data.result);
-          }
+          if(data.status === '1' && data.result) return { source: 'legacy', abi: JSON.parse(data.result) };
         }
       }catch(e){
         attempts.push({ format: 'legacy', error: e.message });
       }
+      return null;
     }
 
+    let result = await tryFetchAbi(address);
+
+    // Direct ABI fetch failed — check if this is an EIP-1967 proxy before
+    // giving up. Confirmed live on the new Stackers NFT contract: Blockscout
+    // reports "not verified" and the v2 API returns raw proxy bytecode
+    // (references the implementation() selector 0x52d1902d) instead of an
+    // ABI. The implementation address lives in a standard, well-known
+    // storage slot regardless of verification status -- reading it directly
+    // via eth_getStorageAt doesn't depend on Blockscout having indexed/linked
+    // the proxy at all, so it works even when Blockscout's own proxy
+    // detection hasn't caught up.
+    let resolvedImplementation = null;
+    if(!result){
+      try{
+        const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+        if(ALCHEMY_KEY){
+          const EIP1967_IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bb';
+          const rpcUrl = `https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+          const r = await fetch(rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getStorageAt', params: [address, EIP1967_IMPL_SLOT, 'latest'] }),
+          });
+          const j = await r.json();
+          const slotValue = j.result;
+          if(slotValue && slotValue !== '0x' + '0'.repeat(64)){
+            // Storage slot value is a left-padded 32-byte word; the address is the last 20 bytes.
+            resolvedImplementation = '0x' + slotValue.slice(-40);
+            attempts.push({ format: 'eip1967-proxy-detect', slot: EIP1967_IMPL_SLOT, resolvedImplementation });
+            result = await tryFetchAbi(resolvedImplementation);
+            if(result) abiAddress = resolvedImplementation;
+          }
+        }
+      }catch(e){
+        attempts.push({ format: 'eip1967-proxy-detect', error: e.message });
+      }
+    }
+
+    if(result){ source = result.source; abi = result.abi; }
+
     if(!source){
-      return res.status(502).json({ ok: false, error: 'Could not fetch a verified ABI from either Blockscout API format', attempts });
+      return res.status(502).json({
+        ok: false,
+        error: resolvedImplementation
+          ? `Detected EIP-1967 proxy pointing to ${resolvedImplementation}, but could not fetch a verified ABI for that implementation address either`
+          : 'Could not fetch a verified ABI from either Blockscout API format, and this does not appear to be a standard EIP-1967 proxy',
+        resolvedImplementation,
+        attempts,
+      });
     }
 
     // Default: just the assets-related functions/events, to keep this
@@ -1030,7 +1072,15 @@ app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
       );
     }
 
-    res.json({ ok: true, address, apiSource: source, fullAbiLength: abi.length, relevantEntries: relevant });
+    res.json({
+      ok: true,
+      address,
+      abiFetchedFrom: abiAddress,
+      wasProxy: abiAddress !== address,
+      apiSource: source,
+      fullAbiLength: abi.length,
+      relevantEntries: relevant,
+    });
   } catch(e) {
     console.error(`/db/stackers/contract-abi-debug/${req.params.address} error:`, e.message);
     res.status(500).json({ ok: false, error: e.message });
