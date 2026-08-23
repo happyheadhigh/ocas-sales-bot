@@ -1291,7 +1291,7 @@ app.get('/db/collection-registry-debug/:slug', auth, async (req, res) => {
 app.get('/db/alchemy-nft-test/:chain/:contract', auth, async (req, res) => {
   try {
     const { chain, contract } = req.params;
-    const SUPPORTED = { ethereum: 'eth-mainnet', base: 'base-mainnet', polygon: 'polygon-mainnet', robinhood: 'robinhood-mainnet' };
+    const SUPPORTED = { ethereum: 'eth-mainnet', base: 'base-mainnet', polygon: 'polygon-mainnet', robinhood: 'robinhood-mainnet', ink: 'ink-mainnet' };
     const subdomain = SUPPORTED[chain];
     if(!subdomain) return res.status(400).json({ ok: false, error: `Unsupported chain "${chain}"` });
 
