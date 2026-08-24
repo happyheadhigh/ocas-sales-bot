@@ -1098,10 +1098,16 @@ app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
     // for most checks. ?eventsOnly=true instead returns every event the
     // contract emits, unfiltered by name — needed to see the real full
     // picture (e.g. checking for vault-balance-related events) rather than
-    // guessing which name patterns might be relevant.
+    // guessing which name patterns might be relevant. ?functionsOnly=true
+    // is the same idea for functions — needed to check whether specific
+    // functions our code calls (tierBurned, isActive, splitOf, balancesOf)
+    // still exist with matching signatures on a migrated contract, not
+    // just ones with "asset"/"split" in the name.
     let relevant;
     if(req.query.eventsOnly === 'true'){
       relevant = abi.filter(item => item.type === 'event');
+    } else if(req.query.functionsOnly === 'true'){
+      relevant = abi.filter(item => item.type === 'function');
     } else {
       relevant = abi.filter(item =>
         (item.name || '').toLowerCase().includes('asset') || (item.name || '').toLowerCase().includes('split')
@@ -1219,6 +1225,83 @@ app.get('/db/stackers/raw-logs-check/:address', auth, async (req, res) => {
     });
   } catch(e) {
     console.error(`/db/stackers/raw-logs-check/${req.params.address} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/raw-function-probe/:address — checks whether specific
+// functions our code actually calls still exist with matching signatures,
+// entirely independent of Blockscout's verification status (same reasoning
+// as raw-logs-check above, applied to function calls instead of events).
+// Confirmed live: the new Stackers NFT proxy AND its resolved implementation
+// are both unverified on Blockscout, so this is the only way to check
+// whether tierBurned/isActive/splitOf/balancesOf still work before
+// completing the address migration -- a function call reverting outright
+// (not just returning different data) would be a much worse failure mode
+// than the event-name changes already confirmed on the engine, since these
+// specific functions are what the Stackers analytics snapshot job
+// (lib/stackers-analytics.js, runs every 15 min) actually depends on for
+// every stat it produces.
+app.get('/db/stackers/raw-function-probe/:address', auth, async (req, res) => {
+  try {
+    const address = req.params.address;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(address)) return res.status(400).json({ ok: false, error: 'valid contract address required' });
+
+    const tokenId = req.query.tokenId || '1';
+    const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    if(!ALCHEMY_KEY) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY' });
+    const rpcUrl = `https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+
+    const { Interface } = require('ethers'); // v6 (confirmed via package.json) -- Interface.encodeFunctionData/decodeFunctionResult verified working locally before deploying this
+
+    // Exact signatures pulled directly from our own existing ABI files
+    // (lib/stackers-abis/nft.json, engine.json, vault.json) -- confirmed
+    // each selector two independent ways (pycryptodome keccak256 + ethers
+    // v6's own id()) before using them here, matching the same discipline
+    // as the event-topic check, after hand-typed hex constants caused two
+    // real bugs earlier tonight.
+    const CANDIDATES = [
+      { name: 'tierBurned', sig: 'function tierBurned(uint256) view returns (uint256)' },
+      { name: 'isActive',   sig: 'function isActive(uint256) view returns (bool)' },
+      { name: 'splitOf',    sig: 'function splitOf(uint256) view returns (uint8[3],uint16[3],uint8)' },
+      { name: 'balancesOf', sig: 'function balancesOf(uint256) view returns (address[],uint256[])' },
+    ];
+
+    const results = [];
+    for(const { name, sig } of CANDIDATES){
+      const iface = new Interface([sig]);
+      const calldata = iface.encodeFunctionData(name, [tokenId]);
+      try{
+        const r = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: address, data: calldata }, 'latest'] }),
+        });
+        const j = await r.json();
+        if(j.error){
+          results.push({ name, sig, reverted: true, error: j.error.message || JSON.stringify(j.error) });
+          continue;
+        }
+        const raw = j.result;
+        let decoded = null, decodeError = null;
+        try{
+          decoded = iface.decodeFunctionResult(name, raw).toString();
+        }catch(e){
+          // A successful call with data that doesn't match our expected
+          // return shape (rather than an outright revert) still needs to be
+          // surfaced clearly -- it means SOMETHING responded at this
+          // selector, but not necessarily the function we think it is.
+          decodeError = e.message;
+        }
+        results.push({ name, sig, reverted: false, rawResult: raw, rawByteLength: (raw.length - 2) / 2, decoded, decodeError });
+      }catch(e){
+        results.push({ name, sig, reverted: true, error: e.message });
+      }
+    }
+
+    res.json({ ok: true, address, tokenId, results });
+  } catch(e) {
+    console.error(`/db/stackers/raw-function-probe/${req.params.address} error:`, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
