@@ -970,36 +970,72 @@ app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
     // Direct ABI fetch failed — check if this is an EIP-1967 proxy before
     // giving up. Confirmed live on the new Stackers NFT contract: Blockscout
     // reports "not verified" and the v2 API returns raw proxy bytecode
-    // (references the implementation() selector 0x52d1902d) instead of an
-    // ABI. The implementation address lives in a standard, well-known
-    // storage slot regardless of verification status -- reading it directly
-    // via eth_getStorageAt doesn't depend on Blockscout having indexed/linked
-    // the proxy at all, so it works even when Blockscout's own proxy
-    // detection hasn't caught up.
+    // (references the proxiableUUID() selector 0x52d1902d -- a UUPS-specific
+    // function; earlier called this "implementation()" in error, a wrong
+    // selector name, though the storage slot checked below is correct
+    // regardless of the mislabel) instead of an ABI. The implementation
+    // address lives in a standard, well-known storage slot regardless of
+    // verification status -- reading it directly via eth_getStorageAt
+    // doesn't depend on Blockscout having indexed/linked the proxy at all.
+    // Also checks the EIP-1967 BEACON slot as a fallback, in case this is a
+    // beacon proxy (implementation address stored on a separate beacon
+    // contract) rather than a direct-implementation proxy.
+    //
+    // Confirmed real bug in an earlier version of this check: the
+    // diagnostic attempt was only ever logged in the SUCCESS branch, so a
+    // failure for ANY reason (missing ALCHEMY_KEY on this specific
+    // deployment, an RPC error, or a genuinely zero slot) left zero trace
+    // in the response -- impossible to tell which of those actually
+    // happened. Now logs unconditionally regardless of outcome.
     let resolvedImplementation = null;
     if(!result){
-      try{
-        const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
-        if(ALCHEMY_KEY){
-          const EIP1967_IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bb';
-          const rpcUrl = `https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
-          const r = await fetch(rpcUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getStorageAt', params: [address, EIP1967_IMPL_SLOT, 'latest'] }),
-          });
-          const j = await r.json();
-          const slotValue = j.result;
-          if(slotValue && slotValue !== '0x' + '0'.repeat(64)){
-            // Storage slot value is a left-padded 32-byte word; the address is the last 20 bytes.
-            resolvedImplementation = '0x' + slotValue.slice(-40);
-            attempts.push({ format: 'eip1967-proxy-detect', slot: EIP1967_IMPL_SLOT, resolvedImplementation });
-            result = await tryFetchAbi(resolvedImplementation);
-            if(result) abiAddress = resolvedImplementation;
+      const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+      if(!ALCHEMY_KEY){
+        attempts.push({ format: 'eip1967-proxy-detect', skipped: true, reason: 'No ALCHEMY_API_KEY/ALCHEMY_KEY set on this deployment' });
+      } else {
+        const SLOTS = {
+          implementation: '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc',
+          beacon:         '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50',
+        };
+        const rpcUrl = `https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+        for(const [slotName, slot] of Object.entries(SLOTS)){
+          if(resolvedImplementation) break;
+          try{
+            const r = await fetch(rpcUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getStorageAt', params: [address, slot, 'latest'] }),
+            });
+            const j = await r.json();
+            const slotValue = j.result;
+            const isZero = !slotValue || slotValue === '0x' + '0'.repeat(64);
+            attempts.push({ format: 'eip1967-proxy-detect', slotChecked: slotName, slot, httpStatus: r.status, rpcError: j.error || null, slotValue, isZero });
+            if(!isZero){
+              const candidate = '0x' + slotValue.slice(-40);
+              // The beacon slot points at a BEACON contract, not the
+              // implementation itself — the beacon exposes its own
+              // implementation() to look up the real target.
+              if(slotName === 'beacon'){
+                const beaconR = await fetch(rpcUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: candidate, data: '0x5c60da1b' }, 'latest'] }),
+                });
+                const beaconJ = await beaconR.json();
+                attempts.push({ format: 'eip1967-proxy-detect', beaconAddress: candidate, beaconCallResult: beaconJ.result, beaconCallError: beaconJ.error || null });
+                if(beaconJ.result && beaconJ.result !== '0x') resolvedImplementation = '0x' + beaconJ.result.slice(-40);
+              } else {
+                resolvedImplementation = candidate;
+              }
+            }
+          }catch(e){
+            attempts.push({ format: 'eip1967-proxy-detect', slotChecked: slotName, error: e.message });
           }
         }
-      }catch(e){
-        attempts.push({ format: 'eip1967-proxy-detect', error: e.message });
+        if(resolvedImplementation){
+          result = await tryFetchAbi(resolvedImplementation);
+          if(result) abiAddress = resolvedImplementation;
+        }
       }
     }
 
