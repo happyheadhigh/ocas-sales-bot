@@ -1123,6 +1123,106 @@ app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/stackers/raw-logs-check/:address — checks which of our expected
+// event signatures actually appear in real, on-chain event logs, entirely
+// independent of Blockscout's verification status. Confirmed live: BOTH the
+// new Stackers NFT proxy and its resolved implementation are unverified on
+// Blockscout, a dead end for the ABI-fetch approach above. Logs are always
+// emitted under the calling (proxy) address regardless of delegatecall, so
+// querying eth_getLogs against the proxy address directly and comparing the
+// real topic0 values against our own code's expected event signatures
+// answers the actual question ("does this event still exist, unchanged")
+// without needing any verified source at all.
+app.get('/db/stackers/raw-logs-check/:address', auth, async (req, res) => {
+  try {
+    const address = req.params.address;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(address)) return res.status(400).json({ ok: false, error: 'valid contract address required' });
+
+    const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    if(!ALCHEMY_KEY) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY' });
+    const rpcUrl = `https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+
+    async function rpc(method, params){
+      const r = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+      const j = await r.json();
+      if(j.error) throw new Error(`${method} RPC error: ${JSON.stringify(j.error)}`);
+      return j.result;
+    }
+
+    // Signature -> topic0, computed fresh here rather than hardcoded, so
+    // this stays correct if our own ABI ever changes independent of this
+    // endpoint. Covers the event names our pollers actually depend on
+    // across both the NFT and engine contracts — same check works for
+    // either address.
+    // Only signatures we can actually stand behind: Activated/Deactivated/
+    // TierUpgraded are what this check is FOR (unconfirmed on the new NFT
+    // contract, which is the whole point). SplitSet and RoundSettled are
+    // included as a control/sanity-check -- both already confirmed present
+    // on the new engine via the real ABI fetch earlier, so seeing them
+    // match here (when checking the engine address) validates that this
+    // raw-log method itself works correctly, not just guessing blind.
+    // Deliberately NOT including Merged/Credited/Claimed -- those are
+    // confirmed ABSENT from the new engine's real ABI already, and I never
+    // had the OLD contract's actual signatures to compute a meaningful
+    // topic0 for them in the first place, so a guessed signature here would
+    // just be noise, not a real check.
+    const EXPECTED_EVENTS = {
+      'Activated(uint256,address,uint256)':  null,
+      'Deactivated(uint256)':                null,
+      'TierUpgraded(uint256,uint8,uint256)': null,
+      'SplitSet(uint256,uint8)':             null,
+      'RoundSettled(uint256,uint256,uint256)': null,
+    };
+    const { id: ethersId } = require('ethers'); // this project uses ethers v6 (confirmed via package.json) -- id() computes keccak256(toUtf8Bytes(sig)) in one call, the v6-native equivalent of v5's utils.id()
+    for(const sig of Object.keys(EXPECTED_EVENTS)){
+      EXPECTED_EVENTS[sig] = ethersId(sig);
+    }
+
+    const latestHex = await rpc('eth_blockNumber', []);
+    const latestBlock = parseInt(latestHex, 16);
+
+    // Robinhood Chain runs ~10 blocks/sec per its own docs, so recent
+    // windows cover meaningful wall-clock time without needing to scan the
+    // entire history. Tries a few windows, widening if nothing turns up,
+    // capped to stay well under typical eth_getLogs range limits (commonly
+    // ~10-50k blocks per call depending on provider).
+    const WINDOWS = [10000, 50000, 200000];
+    const foundTopics = new Set();
+    const windowsChecked = [];
+    for(const windowSize of WINDOWS){
+      const fromBlock = Math.max(0, latestBlock - windowSize);
+      const logs = await rpc('eth_getLogs', [{
+        address, fromBlock: '0x' + fromBlock.toString(16), toBlock: latestHex,
+      }]);
+      for(const log of logs) foundTopics.add(log.topics[0]);
+      windowsChecked.push({ windowSize, fromBlock, toBlock: latestBlock, logsFound: logs.length });
+      if(logs.length > 0) break; // no need to widen further once we've seen real activity
+    }
+
+    const matches = {};
+    for(const [sig, topic0] of Object.entries(EXPECTED_EVENTS)){
+      matches[sig] = { topic0, seenInLogs: foundTopics.has(topic0) };
+    }
+
+    res.json({
+      ok: true,
+      address,
+      latestBlock,
+      windowsChecked,
+      totalUniqueTopicsSeen: foundTopics.size,
+      allTopicsSeen: [...foundTopics],
+      expectedEventMatches: matches,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/raw-logs-check/${req.params.address} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/stackers/asset-count-only-debug — just assetCount(), nothing
 // else. Exists because assets(idx) on the new engine returned real data
 // our old ABI's 8-field struct couldn't decode, and the new contract isn't
