@@ -509,4 +509,4 @@ async function handleDownloadCommand(interaction, forced={}){
 
 const DOWNLOAD_COMMANDS = new Set(['download']);
 
-module.exports = { handleDownloadCommand, handleDownloadColPick, handleDownloadModalSubmit, DOWNLOAD_COMMANDS };
+module.exports = { handleDownloadCommand, handleDownloadColPick, handleDownloadModalSubmit, DOWNLOAD_COMMANDS, renderTokenPng };

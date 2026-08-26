@@ -867,7 +867,7 @@ client.on('interactionCreate', async (interaction)=>{
     return handleMaClearInteraction(interaction, macCtx);
   }
   if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
-    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser };
+    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser, osHeaders };
     return handleMeInteraction(interaction, meCtx);
   }
   if(interaction.isButton() && interaction.customId.startsWith('stackers:listings:page:')){

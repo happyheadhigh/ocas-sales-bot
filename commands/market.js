@@ -2790,7 +2790,7 @@ async function showMeTokens(interaction, ctx, slug, page = 0){
 
 // ── showMeTokenDetail — full detail for a single held token ───────────────────
 async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
-  const { pgPool, getRailwayApiUrl } = ctx;
+  const { pgPool, getRailwayApiUrl, osHeaders } = ctx;
   const userId = interaction.user.id;
 
   // Defer immediately — SVG→PNG rendering can exceed Discord's 3s window
@@ -3007,6 +3007,13 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   if(nextToken !== null) navBtns.push(
     new ButtonBuilder().setCustomId(`me_browse:wallet:token_detail:${slug}:${nextToken}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary)
   );
+  // High-res download — separate from the small thumbnail shown on this
+  // card (fixed at 500px, sized for a compact preview, not for saving).
+  // Posts as its own new message rather than replacing this card, so
+  // browsing/nav state isn't disturbed by requesting a download.
+  navBtns.push(
+    new ButtonBuilder().setCustomId(`me_browse:wallet:token_download:${slug}:${tokenId}`).setLabel('⬇️ Download').setStyle(ButtonStyle.Secondary)
+  );
 
   const typeLabel = t.type_trait ? `${t.type_trait} · ` : '';
   const unrealizedDisplay = displayEst && cost > 0 ? displayEst - cost : null;
@@ -3053,6 +3060,52 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   } else {
     if(imageResult?.type === 'url') embed.setThumbnail(imageResult.url);
     return interaction[updateFn]({ embeds: [embed], components, files: [] });
+  }
+}
+
+// ── High-res download from the wallet token detail card ─────────────────────
+// Separate from that card's own thumbnail (fixed at 500px, sized for a
+// compact preview, not for saving) — reuses download.js's renderTokenPng at
+// a meaningfully larger size, matching the exact rendering pipeline /download
+// already uses and just fixed for large on-chain SVGs (see lib/images.js/
+// api.js's POST /render/svg-token). Posts as a brand-new message (via a
+// fresh deferReply, not deferUpdate) so the browsing card/nav state is left
+// untouched — clicking Download doesn't interrupt cycling through tokens.
+async function handleMeTokenDownload(interaction, ctx, slug, tokenId){
+  await interaction.deferReply({ ephemeral: true }).catch(()=>{});
+  try{
+    const { pgPool, osHeaders } = ctx;
+    const serverCfg = ctx.getConfig ? ctx.getConfig(interaction.guildId) : null;
+    const allCols = serverCfg ? [
+      ...(serverCfg.contract ? [{ slug: serverCfg.collectionSlug || serverCfg.slug, contract: serverCfg.contract }] : []),
+      ...(serverCfg.collections || [])
+    ] : [];
+    const colCfg = allCols.find(c => c.slug === slug);
+    const contract = colCfg?.contract || null;
+    if(!contract) return interaction.editReply({ content: '❌ Could not resolve this collection\'s contract.' });
+
+    const colChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const chain = colChainRes.rows[0]?.chain || 'ethereum';
+
+    const { renderTokenPng } = require('./download');
+    const SIZE = 1500; // meaningfully larger than the 500px card thumbnail
+    const rendered = await renderTokenPng({ contract, tokenId, chain, size: SIZE, transparent: false, osHeaders, slug });
+    const ext = rendered.ext || 'png';
+    const filename = `${slug}-${tokenId}${ext === 'png' ? `-${SIZE}` : ''}.${ext}`.replace(/[^a-z0-9_.-]+/gi, '-');
+    const att = new AttachmentBuilder(rendered.buffer, { name: filename });
+
+    let content;
+    if(ext !== 'png'){
+      let rawUrl = rendered.animUrl || null;
+      if(rawUrl) rawUrl = rawUrl.replace('i2c.seadn.io', 'raw2.seadn.io').replace('i.seadn.io', 'raw2.seadn.io');
+      content = `${ext.toUpperCase()} download for **${slug} #${tokenId}**`;
+      if(rawUrl) content += `\n📥 *To save the full quality file: [tap here](${rawUrl})*`;
+    } else {
+      content = `PNG download for **${slug} #${tokenId}** · ${SIZE}px`;
+    }
+    return interaction.editReply({ content, files: [att] });
+  }catch(e){
+    return interaction.editReply({ content: 'Download failed: ' + e.message }).catch(()=>{});
   }
 }
 
@@ -3419,6 +3472,16 @@ async function handleMeInteraction(interaction, ctx){
     const slug = parts[3];
     const tokenId = parseInt(parts[4]);
     return showMeTokenDetail(interaction, ctx, slug, tokenId);
+  }
+
+  // High-res download button on the wallet token detail card — renders
+  // separately from (and larger than) the card's own 500px thumbnail,
+  // posted as a new message so it doesn't disturb the browsing card/nav.
+  if(customId.startsWith('me_browse:wallet:token_download:')){
+    const parts = customId.split(':');
+    const slug = parts[3];
+    const tokenId = parseInt(parts[4]);
+    return handleMeTokenDownload(interaction, ctx, slug, tokenId);
   }
 }
 
