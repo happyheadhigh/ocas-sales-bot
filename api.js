@@ -128,7 +128,18 @@ setInterval(() => {
   }
 }, 15 * 60 * 1000);
 
-app.use(express.json());
+// 5mb limit (default is 100kb) -- needed for POST /render/svg-token, which
+// accepts a base64 on-chain SVG data URI in the request body. Confirmed
+// live: a large embedded-PNG on-chain SVG failed with HTTP 431 when sent as
+// a GET query-string parameter (a request line has much tighter length
+// limits than a POST body almost everywhere) -- moving it to a POST body
+// fixes that, but only if the body-size limit is actually large enough to
+// hold it. Raised globally rather than as a second, route-specific
+// express.json() call: Express only reads the request body stream once, so
+// stacking a second json() middleware on top of this global one for a
+// single route risks silently no-op'ing or erroring on an already-consumed
+// stream, not actually widening anything.
+app.use(express.json({ limit: '5mb' }));
 
 // ── CORS — allow the production site, Cloudflare Pages previews, and local/
 // LAN dev testing; reject arbitrary third-party origins from embedding
@@ -3978,6 +3989,32 @@ const sharp = require('sharp');
 sharp.cache(false);
 sharp.concurrency(2);
 
+// Shared rendering logic used by both the GET (svgUrl, always short — no
+// size issue) and POST (svgData, can be large — the actual point of the
+// POST path) handlers below, so neither duplicates the sharp/compositing
+// work.
+async function renderSvgTextToPng(svgText){
+  const SIZE = 500;
+  const bgBuf = await sharp(Buffer.from(svgText))
+    .resize(SIZE, SIZE, { kernel: 'nearest', fit: 'fill' })
+    .png()
+    .toBuffer();
+
+  // Extract embedded character PNG and composite, same as original extractPngFromSvg
+  const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
+  let finalBuf = bgBuf;
+  if (pngMatch) {
+    try {
+      const rawPng = Buffer.from(pngMatch[1].replace(/\s/g, ''), 'base64');
+      const charBuf = await sharp(rawPng).resize(SIZE, SIZE, { kernel: 'nearest' }).png().toBuffer();
+      finalBuf = await sharp(bgBuf).composite([{ input: charBuf, blend: 'over' }]).png().toBuffer();
+    } catch (e) {
+      console.warn('[render/svg-token] char composite failed, using full SVG render:', e.message);
+    }
+  }
+  return finalBuf;
+}
+
 app.get('/render/svg-token', auth, async (req, res) => {
   try {
     const svgSource = req.query.svgUrl || req.query.svgData;
@@ -3994,28 +4031,11 @@ app.get('/render/svg-token', auth, async (req, res) => {
       svgText = await r.text();
     }
 
-    const SIZE = 500;
-    let bgBuf;
+    let finalBuf;
     try {
-      bgBuf = await sharp(Buffer.from(svgText))
-        .resize(SIZE, SIZE, { kernel: 'nearest', fit: 'fill' })
-        .png()
-        .toBuffer();
+      finalBuf = await renderSvgTextToPng(svgText);
     } catch (e) {
       return res.status(500).json({ ok: false, error: 'SVG render failed: ' + e.message });
-    }
-
-    // Extract embedded character PNG and composite, same as original extractPngFromSvg
-    const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
-    let finalBuf = bgBuf;
-    if (pngMatch) {
-      try {
-        const rawPng = Buffer.from(pngMatch[1].replace(/\s/g, ''), 'base64');
-        const charBuf = await sharp(rawPng).resize(SIZE, SIZE, { kernel: 'nearest' }).png().toBuffer();
-        finalBuf = await sharp(bgBuf).composite([{ input: charBuf, blend: 'over' }]).png().toBuffer();
-      } catch (e) {
-        console.warn('[/render/svg-token] char composite failed, using full SVG render:', e.message);
-      }
     }
 
     res.set('Content-Type', 'image/png');
@@ -4023,6 +4043,47 @@ app.get('/render/svg-token', auth, async (req, res) => {
     res.send(finalBuf);
   } catch (e) {
     console.error('[/render/svg-token]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── POST /render/svg-token — same rendering, but for svgData (base64 data
+// URIs) specifically instead of the GET route's query-string parameter.
+// Confirmed live: a large on-chain-generated SVG (e.g. one with an embedded
+// base64 PNG, same pattern this endpoint already handles via pngMatch above)
+// pushed the GET request's query string past whatever length limit sits in
+// front of this service, failing with HTTP 431 (Request Header Fields Too
+// Large) — a GET request's entire URL, including its query string, is part
+// of the request line, which has much tighter length limits than a POST
+// body does almost everywhere. svgUrl stays on the GET route unchanged,
+// since a URL itself is always short regardless of how large the SVG behind
+// it is — only svgData (which embeds the actual content) needed to move.
+// Route-specific body-size limit isn't needed here — the global
+// express.json() limit above was raised to 5mb specifically to cover this
+// route, avoiding a second, redundant json() call on the same request (see
+// that comment for why stacking two would be unsafe).
+app.post('/render/svg-token', auth, async (req, res) => {
+  try {
+    const svgData = req.body?.svgData;
+    if (!svgData) return res.status(400).json({ ok: false, error: 'missing svgData in request body' });
+    if (!svgData.startsWith('data:image/svg')) return res.status(400).json({ ok: false, error: 'svgData must be a data:image/svg URI' });
+
+    const b64 = svgData.split(',')[1];
+    if (!b64) return res.status(400).json({ ok: false, error: 'empty svg data' });
+    const svgText = Buffer.from(b64, 'base64').toString('utf-8');
+
+    let finalBuf;
+    try {
+      finalBuf = await renderSvgTextToPng(svgText);
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'SVG render failed: ' + e.message });
+    }
+
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(finalBuf);
+  } catch (e) {
+    console.error('[POST /render/svg-token]', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
