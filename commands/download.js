@@ -301,18 +301,19 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
   if(typeof src === 'string' && isSvgSource(src)){
   let buffer;
 
+  // Renders natively at the requested size in one pass now, instead of
+  // always rendering at 500 then separately upscaling — avoids compounding
+  // rounding artifacts across two sequential nearest-neighbor scales when
+  // the source (e.g. a small embedded on-chain bitmap) doesn't divide
+  // evenly into 500, and lets any genuine vector content in the SVG render
+  // with real anti-aliasing at the higher resolution rather than being
+  // rasterized small and then blockily scaled up.
+  const targetSize = size || 500;
   if(src.trim().startsWith('<svg')){
     const svgDataUri = 'data:image/svg+xml;base64,' + Buffer.from(src).toString('base64');
-    buffer = await extractPngFromSvg(svgDataUri);
+    buffer = await extractPngFromSvg(svgDataUri, targetSize);
   } else {
-    buffer = await extractPngFromSvg(src);
-  }
-
-  if(size && size !== 500){
-    buffer = await sharp(buffer)
-      .resize(size, size, { kernel:'nearest', fit:'fill' })
-      .png()
-      .toBuffer();
+    buffer = await extractPngFromSvg(src, targetSize);
   }
 
   return { buffer, meta };

@@ -3993,8 +3993,8 @@ sharp.concurrency(2);
 // size issue) and POST (svgData, can be large — the actual point of the
 // POST path) handlers below, so neither duplicates the sharp/compositing
 // work.
-async function renderSvgTextToPng(svgText){
-  const SIZE = 500;
+async function renderSvgTextToPng(svgText, size = 500){
+  const SIZE = size;
   const bgBuf = await sharp(Buffer.from(svgText))
     .resize(SIZE, SIZE, { kernel: 'nearest', fit: 'fill' })
     .png()
@@ -4020,6 +4020,12 @@ app.get('/render/svg-token', auth, async (req, res) => {
     const svgSource = req.query.svgUrl || req.query.svgData;
     if (!svgSource) return res.status(400).json({ ok: false, error: 'missing svgUrl or svgData' });
 
+    // Clamped to a sane range -- prevents an absurd request (e.g. size=100000)
+    // from exhausting memory/CPU on this shared service. Defaults to 500,
+    // matching the previous hardcoded behavior for any caller not specifying one.
+    let size = parseInt(req.query.size) || 500;
+    size = Math.max(50, Math.min(3000, size));
+
     let svgText;
     if (svgSource.startsWith('data:image/svg')) {
       const b64 = svgSource.split(',')[1];
@@ -4033,7 +4039,7 @@ app.get('/render/svg-token', auth, async (req, res) => {
 
     let finalBuf;
     try {
-      finalBuf = await renderSvgTextToPng(svgText);
+      finalBuf = await renderSvgTextToPng(svgText, size);
     } catch (e) {
       return res.status(500).json({ ok: false, error: 'SVG render failed: ' + e.message });
     }
@@ -4068,13 +4074,16 @@ app.post('/render/svg-token', auth, async (req, res) => {
     if (!svgData) return res.status(400).json({ ok: false, error: 'missing svgData in request body' });
     if (!svgData.startsWith('data:image/svg')) return res.status(400).json({ ok: false, error: 'svgData must be a data:image/svg URI' });
 
+    let size = parseInt(req.body?.size) || 500;
+    size = Math.max(50, Math.min(3000, size));
+
     const b64 = svgData.split(',')[1];
     if (!b64) return res.status(400).json({ ok: false, error: 'empty svg data' });
     const svgText = Buffer.from(b64, 'base64').toString('utf-8');
 
     let finalBuf;
     try {
-      finalBuf = await renderSvgTextToPng(svgText);
+      finalBuf = await renderSvgTextToPng(svgText, size);
     } catch (e) {
       return res.status(500).json({ ok: false, error: 'SVG render failed: ' + e.message });
     }
