@@ -3075,34 +3075,33 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   console.log(`[me] ${slug}#${tokenId} final imageResult: ${imageResult ? `type=${imageResult.type}` + (imageResult.type === 'url' ? ` url=${imageResult.url}` : '') : 'null (no thumbnail will be set)'}`);
 
   if(imageResult?.type === 'buffer'){
-    // Sent as a standalone attachment, NOT referenced via attachment://
-    // inside the embed's thumbnail field. This is the actual fix:
-    // Discord's own bot developer community has documented for years
-    // (2021-2025, across discord.js and other libraries/languages) that
-    // images referenced INSIDE an embed's thumbnail/image field can
-    // silently fail to render even with zero errors and a perfectly
-    // valid source. This /me flow's own Download button — a plain file
-    // attachment, never wrapped in an embed field at all — has already
-    // been confirmed working reliably. Matching that same pattern here
-    // instead of continuing to fight the embed-field version, which
-    // every layer of code/data was independently confirmed correct for
-    // and still didn't render.
     const att = new AttachmentBuilder(imageResult.buffer, { name: imageResult.filename });
+    embed.setThumbnail(`attachment://${imageResult.filename}`);
     return interaction[updateFn]({ embeds: [embed], components, files: [att] });
   } else if(imageResult?.type === 'url'){
-    // Fetch the URL ourselves into a buffer so it can be sent as a
-    // standalone attachment too, rather than referenced directly via
-    // .setThumbnail(url) — same reasoning as above.
+    // Confirmed via extensive testing that passing a raw URL straight to
+    // .setThumbnail(url) doesn't reliably render, despite the URL/code/data
+    // being independently confirmed correct at every layer. This tries a
+    // genuinely different mechanism instead of giving up the small-
+    // thumbnail layout: fetch the URL ourselves into a buffer, attach it as
+    // a file, and reference it via attachment://filename — the exact same
+    // pattern the buffer case above already uses. Untested until now
+    // whether attachment-referenced thumbnails are more reliable than raw-
+    // URL ones specifically for this flow; falls back to no image (not a
+    // large standalone one) if the fetch itself fails, preserving the
+    // compact card layout either way.
     try{
       const r = await fetch(imageResult.url, { timeout: 10000 });
       if(r.ok){
         const buf = Buffer.from(await r.arrayBuffer());
-        const att = new AttachmentBuilder(buf, { name: `token-${tokenId}.png` });
+        const filename = `token-${tokenId}.png`;
+        const att = new AttachmentBuilder(buf, { name: filename });
+        embed.setThumbnail(`attachment://${filename}`);
         return interaction[updateFn]({ embeds: [embed], components, files: [att] });
       }
-      console.warn(`[me] fetch of imageResult.url returned ${r.status} for ${slug}#${tokenId}, falling back to no image`);
+      console.warn(`[me] fetch of imageResult.url returned ${r.status} for ${slug}#${tokenId}, showing card with no image`);
     }catch(e){
-      console.warn(`[me] failed to fetch imageResult.url as standalone attachment for ${slug}#${tokenId}:`, e.message);
+      console.warn(`[me] failed to fetch imageResult.url for ${slug}#${tokenId}:`, e.message);
     }
     return interaction[updateFn]({ embeds: [embed], components, files: [] });
   } else {
