@@ -2869,6 +2869,8 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     const tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
     if(tokenImgUrl && isDiscordOk(tokenImgUrl)){
       imageResult = { type: 'url', url: tokenImgUrl };
+    } else if(tokenImgUrl){
+      console.log(`[me] ${slug}#${tokenId} has image_url but isDiscordOk rejected it: ${tokenImgUrl}`);
     }
   }
 
@@ -2880,8 +2882,17 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     ).catch(()=>({ rows: [] }));
     const svgData = svgRes.rows[0]?.image_data || null;
     if(svgData){
-      const buf = await extractPngFromSvg(svgData).catch(()=>null);
+      // Previously silently swallowed any render failure with no logging at
+      // all — if extractPngFromSvg fails for a reason OTHER than the 431
+      // bug fixed earlier, there'd be zero visibility into why the
+      // thumbnail is missing.
+      const buf = await extractPngFromSvg(svgData).catch(e => {
+        console.warn(`[me] token_svg_cache render failed for ${slug}#${tokenId}:`, e.message);
+        return null;
+      });
       if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+    } else {
+      console.log(`[me] no token_svg_cache row found for ${slug}#${tokenId} — falling through with no image`);
     }
   }
 
