@@ -2865,8 +2865,15 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     const tokenImgRes = await pgPool.query(
       `SELECT image_url FROM tokens WHERE id=$1 AND collection_slug=$2`,
       [tokenId, slug]
-    ).catch(()=>({ rows: [] }));
+    ).catch((e) => { console.error(`[me] tokens query threw for ${slug}#${tokenId}:`, e.message); return { rows: [] }; });
     const tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
+    // Unconditional — logs every time regardless of outcome, so there's no
+    // ambiguity about what THIS process's own database connection actually
+    // returned, as opposed to whatever a separate diagnostic elsewhere may
+    // have shown (confirmed live: the bot service and API service turned
+    // out to have different DATABASE_URL values entirely, so anything
+    // checked through the API told us nothing about what the bot itself sees).
+    console.log(`[me] ${slug}#${tokenId} tokens query returned ${tokenImgRes.rows.length} row(s), image_url=${JSON.stringify(tokenImgUrl)}`);
     if(tokenImgUrl && isDiscordOk(tokenImgUrl)){
       imageResult = { type: 'url', url: tokenImgUrl };
     } else if(tokenImgUrl){
@@ -2879,8 +2886,9 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     const svgRes = await pgPool.query(
       `SELECT image_data FROM token_svg_cache WHERE token_id=$1 AND collection_slug=$2 LIMIT 1`,
       [tokenId, slug]
-    ).catch(()=>({ rows: [] }));
+    ).catch((e) => { console.error(`[me] token_svg_cache query threw for ${slug}#${tokenId}:`, e.message); return { rows: [] }; });
     const svgData = svgRes.rows[0]?.image_data || null;
+    console.log(`[me] ${slug}#${tokenId} token_svg_cache query returned ${svgRes.rows.length} row(s), data length=${svgData ? svgData.length : 'null'}`);
     if(svgData){
       // Previously silently swallowed any render failure with no logging at
       // all — if extractPngFromSvg fails for a reason OTHER than the 431
@@ -3063,6 +3071,8 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     new ActionRowBuilder().addComponents(select),
     new ActionRowBuilder().addComponents(...navBtns),
   ];
+
+  console.log(`[me] ${slug}#${tokenId} final imageResult: ${imageResult ? `type=${imageResult.type}` + (imageResult.type === 'url' ? ` url=${imageResult.url}` : '') : 'null (no thumbnail will be set)'}`);
 
   if(imageResult?.type === 'buffer'){
     const att = new AttachmentBuilder(imageResult.buffer, { name: imageResult.filename });
