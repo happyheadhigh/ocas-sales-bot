@@ -799,8 +799,14 @@ async function handleConfigButton(interaction, ctx){
     cfg.embedShowTraits = cfg.embedShowTraits || {};
     cfg.embedShowTraits[key] = cfg.embedShowTraits[key] === false ? true : false;
     await setConfig(guildId, cfg);
+    const newState = cfg.embedShowTraits[key] === false ? 'Large artwork (no traits)' : 'Traits + thumbnail';
+    const keyLabel = key.charAt(0).toUpperCase() + key.slice(1);
     return interaction.editReply({
-      content: '',
+      // Explicit, unmissable confirmation — previously the only signal a
+      // toggle click actually landed was the embed's own text quietly
+      // reflecting the new state, easy to miss without directly comparing
+      // against the state before clicking.
+      content: `✅ **${keyLabel}** set to **${newState}**`,
       embeds: [buildEmbedStyleEmbed(cfg)],
       components: embedStyleRow(),
     });
