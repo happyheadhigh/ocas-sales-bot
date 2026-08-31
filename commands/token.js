@@ -15,7 +15,7 @@ async function handleTokenCommand(commandName, ctx){
     COLORS, OCAS_CONTRACT, sweepSessions, API_SECRET,
     getTraitIndex, chooseTraitGroupsFromQuery, getRankTierColor, traitGroupsLabel,
     fetchTokenMetaFromDb, buildEmbedPayload, traitObjectToArray,
-    timeSince, shortAddr, formatEth, isDiscordOk,
+    timeSince, shortAddr, formatEth, isDiscordOk, verifyImageIsRaster, extractPngFromSvg,
   } = ctx;
 
   if(commandName==='token'){
@@ -164,7 +164,18 @@ async function handleTokenCommand(commandName, ctx){
         // Prefer whatever the backfill already fetched and stored in
         // tokens.image_url over a live OpenSea call — see the comment in
         // fetchTokenMetaFromDb for why this matters for non-Ethereum chains.
-        imgResult = { type:'url', url: dbMeta.image_url };
+        // isDiscordOk alone isn't reliable, though — confirmed live that
+        // Alchemy's own CDN can serve genuine SVG content through a URL
+        // with zero textual indication of that (no .svg extension, no
+        // "image/svg" substring). Verify the real content-type before
+        // trusting the URL directly.
+        const isRaster = await verifyImageIsRaster(dbMeta.image_url);
+        if(isRaster){
+          imgResult = { type:'url', url: dbMeta.image_url };
+        } else {
+          const buf = await extractPngFromSvg(dbMeta.image_url).catch(() => null);
+          if(buf) imgResult = { type:'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+        }
       }
       if(!imgResult){
         imgResult = await resolveImage({identifier:String(tokenId)}, contract, tokenChain);

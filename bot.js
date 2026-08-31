@@ -93,7 +93,7 @@ const {
 const {
   normAddr, shortAddr, formatEth, formatListingEth,
   timeSince, lotteryTime, formatBurnLotteryWindow,
-  isSvg, isDiscordOk, matchesFilters,
+  isSvg, isDiscordOk, matchesFilters, verifyImageIsRaster,
 } = require('./utils/format');
 
 const {
@@ -185,7 +185,7 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     // Cache
     ocasTraitsCache,
     normAddr, shortAddr, formatEth, timeSince, lotteryTime,
-    formatBurnLotteryWindow, isSvg, isDiscordOk, matchesFilters,
+    formatBurnLotteryWindow, isSvg, isDiscordOk, matchesFilters, verifyImageIsRaster,
     // Rank sync
     rankSyncQueue, queueRankSync,
      // Wallet sync
@@ -1546,7 +1546,14 @@ client.on('interactionCreate', async (interaction)=>{
             if(buf) ir = { type:'buffer', buffer:buf, filename:embed._imageFilename||'token.png' };
           }catch(_){}
         } else if(src.startsWith('http') && isDiscordOk(src)){
-          ir = { type:'url', url:src };
+          if(await verifyImageIsRaster(src)){
+            ir = { type:'url', url:src };
+          } else {
+            try{
+              const buf = await extractPngFromSvg(src);
+              if(buf) ir = { type:'buffer', buffer:buf, filename:embed._imageFilename||'token.png' };
+            }catch(_){}
+          }
         }
       }
       if(ir?.type === 'buffer'){
@@ -2097,8 +2104,19 @@ client.on('interactionCreate', async (interaction)=>{
               }
             }catch(_){}
           } else if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)){
-            slideEmbed._imageResult = { type:'url', url:imgSrc };
-            slideEmbed._imageSource = imgSrc;
+            if(await verifyImageIsRaster(imgSrc)){
+              slideEmbed._imageResult = { type:'url', url:imgSrc };
+              slideEmbed._imageSource = imgSrc;
+            } else {
+              try{
+                const buf = await extractPngFromSvg(imgSrc);
+                if(buf){
+                  slideEmbed._imageResult = { type:'buffer', buffer:buf, filename:`token-${survivorId}-burn${burnNum}.png` };
+                  slideEmbed._imageSource = imgSrc;
+                  slideEmbed._imageFilename = `token-${survivorId}-burn${burnNum}.png`;
+                }
+              }catch(_){}
+            }
           }
         }
         embeds.push(slideEmbed);

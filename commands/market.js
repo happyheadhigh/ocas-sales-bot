@@ -8,7 +8,7 @@ const { getRecentRoundHistory } = require('../lib/stackers-analytics');
 const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS, OCAS_SLUG } = require('../lib/constants');
 const { extractPngFromSvg, resolveImage } = require('../lib/images');
-const { isDiscordOk } = require('../utils/format');
+const { isDiscordOk, verifyImageIsRaster } = require('../utils/format');
 const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
 
 /**
@@ -919,8 +919,23 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
         // this branch is a separate, hand-rolled embed builder (doesn't
         // reuse buildListingEmbed at all) that was missed when this exact
         // fix was applied everywhere else earlier tonight.
+        let dbUrlIsRaster = false;
         if(dbMeta?.image_url && isDiscordOk(dbMeta.image_url)){
+          dbUrlIsRaster = await verifyImageIsRaster(dbMeta.image_url);
+        }
+        if(dbUrlIsRaster){
           embed._imageResult = { type:'url', url: dbMeta.image_url };
+        } else if(dbMeta?.image_url){
+          // Confirmed URL is genuine SVG content despite passing isDiscordOk
+          // — render it directly rather than falling through to a live
+          // race that would just find the same non-raster URL again.
+          const buf = await extractPngFromSvg(dbMeta.image_url).catch(() => null);
+          if(buf){
+            embed._imageResult = { type:'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+          } else {
+            const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
+            embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+          }
         } else {
           const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
           embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
@@ -2874,9 +2889,14 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     // out to have different DATABASE_URL values entirely, so anything
     // checked through the API told us nothing about what the bot itself sees).
     console.log(`[me] ${slug}#${tokenId} tokens query returned ${tokenImgRes.rows.length} row(s), image_url=${JSON.stringify(tokenImgUrl)}`);
+    let tokenImgIsRaster = false;
     if(tokenImgUrl && isDiscordOk(tokenImgUrl)){
+      tokenImgIsRaster = await verifyImageIsRaster(tokenImgUrl);
+      if(!tokenImgIsRaster) console.log(`[me] ${slug}#${tokenId} image_url passed isDiscordOk but is actually SVG content (verified via HEAD): ${tokenImgUrl}`);
+    }
+    if(tokenImgIsRaster){
       imageResult = { type: 'url', url: tokenImgUrl };
-    } else if(tokenImgUrl){
+    } else if(tokenImgUrl && !isDiscordOk(tokenImgUrl)){
       console.log(`[me] ${slug}#${tokenId} has image_url but isDiscordOk rejected it: ${tokenImgUrl}`);
     }
   }
@@ -2899,6 +2919,18 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
         return null;
       });
       if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+    } else if(tokenImgUrl && !tokenImgIsRaster){
+      // token_svg_cache has no pre-rendered version either — confirmed the
+      // stored image_url is real SVG content (not just missing/rejected),
+      // so render it directly rather than leaving the card with no image.
+      const buf = await extractPngFromSvg(tokenImgUrl).catch(e => {
+        console.warn(`[me] direct SVG render of image_url failed for ${slug}#${tokenId}:`, e.message);
+        return null;
+      });
+      if(buf){
+        imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+        console.log(`[me] ${slug}#${tokenId} rendered image_url directly as SVG`);
+      }
     } else {
       console.log(`[me] no token_svg_cache row found for ${slug}#${tokenId} — falling through with no image`);
     }
@@ -2916,7 +2948,13 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     const imgData = imgRes.rows[0]?.image_data || null;
     if(imgData){
       if(imgData.startsWith('http') && isDiscordOk(imgData)){
-        imageResult = { type: 'url', url: imgData };
+        const isRaster = await verifyImageIsRaster(imgData);
+        if(isRaster){
+          imageResult = { type: 'url', url: imgData };
+        } else {
+          const buf = await extractPngFromSvg(imgData).catch(()=>null);
+          if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+        }
       } else if(imgData.startsWith('<svg') || imgData.startsWith('data:image/svg') || imgData.toLowerCase().includes('image/svg')){
         const buf = await extractPngFromSvg(imgData).catch(()=>null);
         if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
