@@ -19,7 +19,7 @@ async function handleBurnCommand(commandName, ctx){
     formatBurnLotteryWindow, pendingDrawSeed, resolveLotteryWindow,
     waitForEthBlock, fetchEthBlockHashSeed,
     lotteryPick, randomLotterySeed,
-    timeSince, shortAddr, formatEth, isDiscordOk, normAddr,
+    timeSince, shortAddr, formatEth, isDiscordOk, verifyImageIsRaster, normAddr,
     fetchTokenMetaFromDb, buildEmbedPayload, traitDisplayLines,
     fetchBurnDisplayTraits, fetchSnapshotImageForToken, burnTypeBreakdown,
     fetchTokenUriFromContract, extractPngFromSvg, clearCachedImage,
@@ -164,7 +164,11 @@ async function handleBurnCommand(commandName, ctx){
                 if(buf) return { type:'buffer', buffer:buf, filename:`token-${tid}.png` };
               }catch(_){}
             }
-            if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)) return { type:'url', url:imgSrc };
+            if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)){
+              if(await verifyImageIsRaster(imgSrc)) return { type:'url', url:imgSrc };
+              const buf = await extractPngFromSvg(imgSrc).catch(() => null);
+              if(buf) return { type:'buffer', buffer:buf, filename:`token-${tid}.png` };
+            }
           }
           return await resolveImage({ identifier: String(tid) }, contract, 'ethereum');
         }catch(e){ return null; }
