@@ -1155,9 +1155,18 @@ app.get('/db/stackers/raw-logs-check/:address', auth, async (req, res) => {
     const address = req.params.address;
     if(!/^0x[0-9a-fA-F]{40}$/.test(address)) return res.status(400).json({ ok: false, error: 'valid contract address required' });
 
+    // Generalized beyond Stackers/Robinhood Chain specifically -- chain and
+    // events are now both parameters instead of hardcoded, so this same
+    // endpoint works for checking any contract on any of our supported
+    // chains for any event signatures, not just this one original use case.
+    const CHAIN_SUBDOMAINS = { ethereum: 'eth-mainnet', base: 'base-mainnet', polygon: 'polygon-mainnet', robinhood: 'robinhood-mainnet' };
+    const chain = (req.query.chain || 'robinhood').toLowerCase();
+    const subdomain = CHAIN_SUBDOMAINS[chain];
+    if(!subdomain) return res.status(400).json({ ok: false, error: `Unsupported chain "${chain}". Supported: ${Object.keys(CHAIN_SUBDOMAINS).join(', ')}` });
+
     const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
     if(!ALCHEMY_KEY) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY' });
-    const rpcUrl = `https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+    const rpcUrl = `https://${subdomain}.g.alchemy.com/v2/${ALCHEMY_KEY}`;
 
     async function rpc(method, params){
       const r = await fetch(rpcUrl, {
@@ -1170,54 +1179,72 @@ app.get('/db/stackers/raw-logs-check/:address', auth, async (req, res) => {
       return j.result;
     }
 
-    // Signature -> topic0, computed fresh here rather than hardcoded, so
-    // this stays correct if our own ABI ever changes independent of this
-    // endpoint. Covers the event names our pollers actually depend on
-    // across both the NFT and engine contracts — same check works for
-    // either address.
-    // Only signatures we can actually stand behind: Activated/Deactivated/
-    // TierUpgraded are what this check is FOR (unconfirmed on the new NFT
-    // contract, which is the whole point). SplitSet and RoundSettled are
-    // included as a control/sanity-check -- both already confirmed present
-    // on the new engine via the real ABI fetch earlier, so seeing them
-    // match here (when checking the engine address) validates that this
-    // raw-log method itself works correctly, not just guessing blind.
-    // Deliberately NOT including Merged/Credited/Claimed -- those are
-    // confirmed ABSENT from the new engine's real ABI already, and I never
-    // had the OLD contract's actual signatures to compute a meaningful
-    // topic0 for them in the first place, so a guessed signature here would
-    // just be noise, not a real check.
-    const EXPECTED_EVENTS = {
-      'Activated(uint256,address,uint256)':  null,
-      'Deactivated(uint256)':                null,
-      'TierUpgraded(uint256,uint8,uint256)': null,
-      'SplitSet(uint256,uint8)':             null,
-      'RoundSettled(uint256,uint256,uint256)': null,
-    };
+    // ?events=Sig1(types),Sig2(types) — comma-separated, defaults to the
+    // original Stackers check for backward compatibility with any existing
+    // use of this endpoint without the new param.
+    const eventsParam = req.query.events
+      ? req.query.events.split(',').map(s => s.trim()).filter(Boolean)
+      : [
+          'Activated(uint256,address,uint256)',
+          'Deactivated(uint256)',
+          'TierUpgraded(uint256,uint8,uint256)',
+          'SplitSet(uint256,uint8)',
+          'RoundSettled(uint256,uint256,uint256)',
+        ];
+    const EXPECTED_EVENTS = {};
     const { id: ethersId } = require('ethers'); // this project uses ethers v6 (confirmed via package.json) -- id() computes keccak256(toUtf8Bytes(sig)) in one call, the v6-native equivalent of v5's utils.id()
-    for(const sig of Object.keys(EXPECTED_EVENTS)){
+    for(const sig of eventsParam){
       EXPECTED_EVENTS[sig] = ethersId(sig);
     }
 
     const latestHex = await rpc('eth_blockNumber', []);
     const latestBlock = parseInt(latestHex, 16);
 
-    // Robinhood Chain runs ~10 blocks/sec per its own docs, so recent
-    // windows cover meaningful wall-clock time without needing to scan the
-    // entire history. Tries a few windows, widening if nothing turns up,
-    // capped to stay well under typical eth_getLogs range limits (commonly
-    // ~10-50k blocks per call depending on provider).
-    const WINDOWS = [10000, 50000, 200000];
-    const foundTopics = new Set();
-    const windowsChecked = [];
-    for(const windowSize of WINDOWS){
-      const fromBlock = Math.max(0, latestBlock - windowSize);
-      const logs = await rpc('eth_getLogs', [{
-        address, fromBlock: '0x' + fromBlock.toString(16), toBlock: latestHex,
-      }]);
-      for(const log of logs) foundTopics.add(log.topics[0]);
-      windowsChecked.push({ windowSize, fromBlock, toBlock: latestBlock, logsFound: logs.length });
-      if(logs.length > 0) break; // no need to widen further once we've seen real activity
+    // Window sizes tuned for Robinhood Chain's fast ~10 blocks/sec by
+    // default -- Ethereum runs roughly 120x slower (~12s/block), so the
+    // same block-count windows cover far less wall-clock time there. An
+    // explicit ?fromBlock= always overrides the windowed search entirely,
+    // useful when checking whether an older contract has EVER emitted a
+    // given event (e.g. an EIP-4906 MetadataUpdate check on a collection
+    // that could have been deployed months before any of these windows
+    // would reach).
+    let windowsChecked = [];
+    let foundTopics = new Set();
+    if(req.query.fromBlock){
+      const fromBlock = parseInt(req.query.fromBlock);
+      if(isNaN(fromBlock) || fromBlock < 0) return res.status(400).json({ ok: false, error: 'fromBlock must be a non-negative integer' });
+      // Chunked to stay under typical eth_getLogs range limits (commonly
+      // ~10-50k blocks per call depending on provider) -- an arbitrary
+      // fromBlock could span millions of blocks on a long-lived Ethereum
+      // contract.
+      const CHUNK = 10000;
+      let cursor = fromBlock;
+      let callsMade = 0;
+      const MAX_CALLS = 50; // hard cap so a very old fromBlock can't run away
+      while(cursor <= latestBlock && callsMade < MAX_CALLS){
+        const chunkTo = Math.min(cursor + CHUNK - 1, latestBlock);
+        const logs = await rpc('eth_getLogs', [{
+          address, fromBlock: '0x' + cursor.toString(16), toBlock: '0x' + chunkTo.toString(16),
+        }]);
+        for(const log of logs) foundTopics.add(log.topics[0]);
+        windowsChecked.push({ fromBlock: cursor, toBlock: chunkTo, logsFound: logs.length });
+        callsMade++;
+        cursor = chunkTo + 1;
+      }
+      if(cursor <= latestBlock){
+        windowsChecked.push({ note: `stopped after ${MAX_CALLS} chunks (${MAX_CALLS * CHUNK} blocks) — did not reach latestBlock, results may be incomplete` });
+      }
+    } else {
+      const WINDOWS = [10000, 50000, 200000];
+      for(const windowSize of WINDOWS){
+        const fromBlock = Math.max(0, latestBlock - windowSize);
+        const logs = await rpc('eth_getLogs', [{
+          address, fromBlock: '0x' + fromBlock.toString(16), toBlock: latestHex,
+        }]);
+        for(const log of logs) foundTopics.add(log.topics[0]);
+        windowsChecked.push({ windowSize, fromBlock, toBlock: latestBlock, logsFound: logs.length });
+        if(logs.length > 0) break; // no need to widen further once we've seen real activity
+      }
     }
 
     const matches = {};
@@ -1228,6 +1255,7 @@ app.get('/db/stackers/raw-logs-check/:address', auth, async (req, res) => {
     res.json({
       ok: true,
       address,
+      chain,
       latestBlock,
       windowsChecked,
       totalUniqueTopicsSeen: foundTopics.size,
