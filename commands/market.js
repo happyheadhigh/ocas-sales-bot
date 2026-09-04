@@ -2868,6 +2868,8 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const colChain = colChainRes.rows[0]?.chain || 'ethereum';
 
   let imageResult = null;
+  let tokenImgUrl = null;
+  let tokenImgIsRaster = false;
 
   // Animated collection — call OpenSea for display_image_url (cached 2 min)
   if(isAnimated && colContract){
@@ -2881,7 +2883,7 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
       `SELECT image_url FROM tokens WHERE id=$1 AND collection_slug=$2`,
       [tokenId, slug]
     ).catch((e) => { console.error(`[me] tokens query threw for ${slug}#${tokenId}:`, e.message); return { rows: [] }; });
-    const tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
+    tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
     // Unconditional — logs every time regardless of outcome, so there's no
     // ambiguity about what THIS process's own database connection actually
     // returned, as opposed to whatever a separate diagnostic elsewhere may
@@ -2889,7 +2891,6 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     // out to have different DATABASE_URL values entirely, so anything
     // checked through the API told us nothing about what the bot itself sees).
     console.log(`[me] ${slug}#${tokenId} tokens query returned ${tokenImgRes.rows.length} row(s), image_url=${JSON.stringify(tokenImgUrl)}`);
-    let tokenImgIsRaster = false;
     if(tokenImgUrl && isDiscordOk(tokenImgUrl)){
       tokenImgIsRaster = await verifyImageIsRaster(tokenImgUrl);
       if(!tokenImgIsRaster) console.log(`[me] ${slug}#${tokenId} image_url passed isDiscordOk but is actually SVG content (verified via HEAD): ${tokenImgUrl}`);
