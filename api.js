@@ -1559,7 +1559,17 @@ app.get('/db/alchemy-nft-test/:chain/:contract', auth, async (req, res) => {
     const url = new URL(`https://${subdomain}.g.alchemy.com/nft/v3/${ALCHEMY_KEY}/getNFTsForContract`);
     url.searchParams.set('contractAddress', contract);
     url.searchParams.set('withMetadata', 'true');
-    url.searchParams.set('limit', '5');
+    url.searchParams.set('limit', req.query.tokenId ? '1' : '5');
+    // Confirmed live: a manual re-backfill with forceRefresh=true (added
+    // last commit) still showed stale traits even after running it twice --
+    // this directly checks whether ALCHEMY ITSELF is still serving stale
+    // data for one specific token with refreshCache explicitly set, rather
+    // than inferring it from our own backfill's downstream behavior.
+    // ?tokenId= targets one exact token via startToken instead of always
+    // returning the collection's first 5. ?refreshCache=true/false lets
+    // both be tested directly against the same token for comparison.
+    if(req.query.tokenId) url.searchParams.set('startToken', String(req.query.tokenId));
+    if(req.query.refreshCache != null) url.searchParams.set('refreshCache', req.query.refreshCache === 'true' ? 'true' : 'false');
 
     const r = await fetch(url.toString());
     const bodyText = await r.text();
@@ -1571,6 +1581,8 @@ app.get('/db/alchemy-nft-test/:chain/:contract', auth, async (req, res) => {
       httpStatus: r.status,
       subdomain,
       contract,
+      requestedTokenId: req.query.tokenId || null,
+      requestedRefreshCache: req.query.refreshCache || null,
       nftsReturned: Array.isArray(body?.nfts) ? body.nfts.length : null,
       totalCount: body?.totalCount ?? null,
       pageKey: body?.pageKey ?? null,
