@@ -1604,7 +1604,7 @@ async function handleConfigButton(interaction, ctx){
 
     await interaction.editReply({ content:`🔄 Re-backfilling **${col.name||col.slug}**... This may take a minute.`, embeds:[], components:[] });
 
-    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug, chain, totalSupply, guildId, guildName: interaction.guild?.name })
+    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug, chain, totalSupply, guildId, guildName: interaction.guild?.name, forceRefresh: true })
       .then(async stats => {
         await releaseBackfillLock(pgPool, col.slug, { success: true, tokensWritten: stats?.written || 0 });
         // Store animated detection result in collection config
