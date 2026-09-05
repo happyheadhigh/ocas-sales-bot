@@ -1540,6 +1540,65 @@ app.get('/db/collection-registry-debug/:slug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/eip4906-check/:chain/:contract — checks whether a contract
+// actually declares EIP-4906 support (MetadataUpdate/BatchMetadataUpdate
+// events) via the standard EIP-165 supportsInterface(0x49064906) call.
+// Built to independently verify a specific external claim before building
+// any architecture around it: does this contract genuinely support the
+// standard, or does it just happen to define events with matching names/
+// signatures without ever emitting them or declaring the interface at all.
+// A contract can define an event without implementing supportsInterface
+// correctly, so this check and a raw event-log check (raw-logs-check) are
+// complementary, not redundant — this confirms the contract SAYS it
+// supports the standard; that one confirms it has ACTUALLY fired the event
+// in practice.
+app.get('/db/eip4906-check/:chain/:contract', auth, async (req, res) => {
+  try {
+    const { chain, contract } = req.params;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(contract)) return res.status(400).json({ ok: false, error: 'valid contract address required' });
+
+    const CHAIN_SUBDOMAINS = { ethereum: 'eth-mainnet', base: 'base-mainnet', polygon: 'polygon-mainnet', robinhood: 'robinhood-mainnet' };
+    const subdomain = CHAIN_SUBDOMAINS[(chain || 'ethereum').toLowerCase()];
+    if(!subdomain) return res.status(400).json({ ok: false, error: `Unsupported chain "${chain}". Supported: ${Object.keys(CHAIN_SUBDOMAINS).join(', ')}` });
+
+    const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    if(!ALCHEMY_KEY) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY' });
+    const rpcUrl = `https://${subdomain}.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+
+    // supportsInterface(bytes4) selector 0x01ffc9a7 -- the well-known,
+    // standardized EIP-165 selector, independently verified via keccak256
+    // before use rather than trusted from memory (same discipline as every
+    // other selector/topic0 computed tonight, after two real bugs earlier
+    // from hand-typed hex constants).
+    // EIP-4906's own interface ID is 0x49064906, right-padded to a full
+    // 32-byte word as the bytes4 parameter.
+    const calldata = '0x01ffc9a7' + '4906490600000000000000000000000000000000000000000000000000000000';
+
+    const r = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: contract, data: calldata }, 'latest'] }),
+    });
+    const j = await r.json();
+
+    if(j.error){
+      // A revert here is itself informative -- many older/simpler contracts
+      // don't implement supportsInterface at all and revert on any call to
+      // it, which is different from implementing it and returning false.
+      return res.json({ ok: true, contract, chain, supportsEip4906: false, note: 'Call reverted or errored -- contract likely does not implement supportsInterface (EIP-165) at all, which is different from implementing it and returning false', rpcError: j.error });
+    }
+
+    const result = (j.result || '').toLowerCase();
+    // ABI-encoded bool: 32 bytes, all zero except the last byte (0 or 1).
+    const supportsEip4906 = result.endsWith('01') && result !== '0x';
+
+    res.json({ ok: true, contract, chain, supportsEip4906, rawResult: j.result });
+  } catch(e) {
+    console.error('/db/eip4906-check error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/alchemy-nft-test/:chain/:contract — calls Alchemy's
 // getNFTsForContract directly for a given chain/contract and shows the raw
 // result. Built to answer a real, live question: is the backfill writing
