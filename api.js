@@ -4352,35 +4352,11 @@ app.get('/db/all-traits', auth, async (req, res) => {
 // hours. This service is stateless and can be restarted independently.
 // Query params: svgUrl (or svgData for data: URIs)
 // Returns: image/png binary
-const sharp = require('sharp');
-sharp.cache(false);
-sharp.concurrency(2);
-
-// Shared rendering logic used by both the GET (svgUrl, always short — no
-// size issue) and POST (svgData, can be large — the actual point of the
-// POST path) handlers below, so neither duplicates the sharp/compositing
-// work.
-async function renderSvgTextToPng(svgText, size = 500){
-  const SIZE = size;
-  const bgBuf = await sharp(Buffer.from(svgText))
-    .resize(SIZE, SIZE, { kernel: 'nearest', fit: 'fill' })
-    .png()
-    .toBuffer();
-
-  // Extract embedded character PNG and composite, same as original extractPngFromSvg
-  const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
-  let finalBuf = bgBuf;
-  if (pngMatch) {
-    try {
-      const rawPng = Buffer.from(pngMatch[1].replace(/\s/g, ''), 'base64');
-      const charBuf = await sharp(rawPng).resize(SIZE, SIZE, { kernel: 'nearest' }).png().toBuffer();
-      finalBuf = await sharp(bgBuf).composite([{ input: charBuf, blend: 'over' }]).png().toBuffer();
-    } catch (e) {
-      console.warn('[render/svg-token] char composite failed, using full SVG render:', e.message);
-    }
-  }
-  return finalBuf;
-}
+// renderSvgTextToPng (and its sharp global config) moved to lib/svg-render.js
+// so it's reachable in-process by lib/images.js's extractPngFromSvg when
+// that code runs within this same service — not just via this route's own
+// HTTP interface.
+const { renderSvgTextToPng } = require('./lib/svg-render');
 
 app.get('/render/svg-token', auth, async (req, res) => {
   try {
