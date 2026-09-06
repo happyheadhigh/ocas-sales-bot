@@ -1599,6 +1599,43 @@ app.get('/db/eip4906-check/:chain/:contract', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/metadata-catchup/:slug — one-time historical scan for a
+// collection's own MetadataUpdate/BatchMetadataUpdate events, refreshing
+// every affected token once. The regular poller (lib/metadata-update-poller.js)
+// deliberately only watches forward from a small lookback window — it never
+// backfills history on its own. This exists specifically for tokens that
+// already changed before the poller existed (confirmed live: argonauts
+// #4210's updated glasses trait never got picked up by the regular cycle,
+// since nothing "new" happens to it going forward unless the project
+// pushes another change to that same token).
+//
+// Requires ?fromBlock= explicitly — deliberately no default to 0, since
+// scanning a contract's entire history unconditionally could be an
+// enormous number of chunked eth_getLogs calls for an old contract. Use
+// /db/stackers/raw-logs-check first (with ?events=MetadataUpdate(uint256),
+// BatchMetadataUpdate(uint256,uint256) and a wide fromBlock=) to find out
+// how far back this contract's first relevant event actually goes before
+// running this.
+app.get('/db/metadata-catchup/:slug', auth, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const fromBlock = parseInt(req.query.fromBlock);
+    if(isNaN(fromBlock) || fromBlock < 0) return res.status(400).json({ ok: false, error: 'valid ?fromBlock= required (non-negative integer) — see endpoint comment for how to determine it first' });
+
+    const { pgPool } = require('./lib/db');
+    const colRes = await pgPool.query('SELECT slug, contract, chain FROM collections WHERE slug=$1', [slug]);
+    if(!colRes.rows.length) return res.status(404).json({ ok: false, error: `No collection found with slug "${slug}"` });
+    const col = colRes.rows[0];
+
+    const { catchUpMetadataHistory } = require('./lib/metadata-update-poller');
+    const result = await catchUpMetadataHistory({ slug: col.slug, contract: col.contract, chain: col.chain, fromBlock });
+    res.json(result);
+  } catch(e) {
+    console.error('/db/metadata-catchup error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/alchemy-nft-test/:chain/:contract — calls Alchemy's
 // getNFTsForContract directly for a given chain/contract and shows the raw
 // result. Built to answer a real, live question: is the backfill writing
