@@ -58,6 +58,7 @@ const {
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
 const { setClient: setStackersFusionClient } = require('./lib/stackers-fusion-poller');
+const { startMetadataUpdatePoller } = require('./lib/metadata-update-poller');
 const { startLiveListeners: startStackersLiveListeners } = require('./lib/stackers-live-events');
 const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vault-listing-alerts');
 const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
@@ -2484,6 +2485,20 @@ client.once('clientReady', async ()=>{
     console.log('[Burn] OCAS_BURN_POLLER_ENABLED=false — burn poller disabled (this deployment isn\'t tracking OCAS)');
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
+  }
+
+  // EIP-4906 metadata-update poller — generic, not OCAS-specific, so this
+  // runs on any deployment with an Alchemy key configured (unlike the burn
+  // poller above, which is gated on OCAS_BURN_POLLER_ENABLED specifically
+  // for OCAS's own burn-lifecycle tracking). Only actually does anything for
+  // collections with metadata_updates_supported=true in the collections
+  // table (confirmed live so far: argonauts, via a direct
+  // supportsInterface(0x49064906) eth_call) — a no-op query against an empty
+  // result set otherwise, so safe to always start.
+  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL){
+    startMetadataUpdatePoller();
+  } else {
+    console.log('[MetadataUpdate] No ALCHEMY_API_KEY set — metadata-update poller disabled');
   }
   // Stackers live event listener — replaces the two separate 60s polling
   // intervals that used to run here. Confirmed live tonight that repeated

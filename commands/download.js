@@ -9,6 +9,7 @@ const { SUPPORTED_CHAINS } = require('../lib/collection-backfill');
 const { ipfsToHttp, fetchWithGatewayFallback } = require('../lib/ipfs-gateway');
 const { STACKERS_SLUG } = require('../lib/stackers');
 const { getOrCacheStackerImage } = require('../lib/stackers-image-cache');
+const { fetchTokenUri, loadJsonFromUri } = require('../lib/rpc');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
 const DOWNLOAD_GUILD_WINDOW_MS = Math.max(10000, parseInt(process.env.DOWNLOAD_GUILD_WINDOW_MS || '60000', 10));
@@ -136,56 +137,10 @@ function checkDownloadCooldown(interaction){
 
 
 // rpcUrlForChain replaced by burnRpcUrl from lib/rpc
-
-function strip0x(s){ return String(s || '').replace(/^0x/i, ''); }
-function pad64(hex){ return strip0x(hex).padStart(64, '0'); }
-function encodeTokenUriCall(tokenId){ return '0xc87b56dd' + pad64(BigInt(tokenId).toString(16)); }
-
-function decodeAbiString(hex){
-  const clean = strip0x(hex);
-  if(!clean || clean === '0') throw new Error('empty tokenURI result');
-  const offset = parseInt(clean.slice(0,64), 16) * 2;
-  const len = parseInt(clean.slice(offset, offset+64), 16) * 2;
-  const data = clean.slice(offset+64, offset+64+len);
-  return Buffer.from(data, 'hex').toString('utf8');
-}
-
-async function rpcCall(rpcUrl, method, params){
-  const r = await fetch(rpcUrl, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({jsonrpc:'2.0', id:Date.now(), method, params}) });
-  const j = await r.json();
-  if(j.error) throw new Error(j.error.message || JSON.stringify(j.error));
-  return j.result;
-}
-
-
-async function fetchTokenUri(contract, tokenId, chain=DEFAULT_CHAIN){
-  const alchemySubdomain = SUPPORTED_CHAINS[chain];
-  const envOverride = process.env.ALCHEMY_WEBSOCKET_URL || process.env.ETH_RPC_URL || process.env.ALCHEMY_RPC_URL || '';
-  // Env-var overrides are Ethereum-specific by their own naming (ETH_RPC_URL
-  // etc.) — only use them when we're actually on Ethereum, otherwise they'd
-  // silently point a non-Ethereum-chain call at an Ethereum RPC, the same
-  // class of bug this fix addresses.
-  const rpc = (chain === 'ethereum' || chain === DEFAULT_CHAIN) && envOverride
-    ? envOverride.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
-    : (process.env.ALCHEMY_API_KEY && alchemySubdomain ? `https://${alchemySubdomain}.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : '');
-
-  if(!rpc){
-    throw new Error(alchemySubdomain
-      ? 'No Ethereum RPC configured. Set ALCHEMY_WEBSOCKET_URL, ETH_RPC_URL, ALCHEMY_RPC_URL, or ALCHEMY_API_KEY.'
-      : `Unsupported chain "${chain}" — no Alchemy subdomain known for it.`);
-  }
-
-  const result = await rpcCall(rpc, 'eth_call', [{ to:contract, data:encodeTokenUriCall(tokenId) }, 'latest']);
-  return decodeAbiString(result);
-}
-
-async function loadJsonFromUri(uri){
-  const u = String(uri || '');
-  if(u.startsWith('data:application/json;base64,')) return JSON.parse(Buffer.from(u.split(',')[1], 'base64').toString('utf8'));
-  if(u.startsWith('data:application/json;utf8,')) return JSON.parse(decodeURIComponent(u.split(',').slice(1).join(',')));
-  const r = await fetchWithGatewayFallback(u);
-  return await r.json();
-}
+// strip0x/pad64/encodeTokenUriCall/decodeAbiString/rpcCall/fetchTokenUri
+// moved to lib/rpc.js — needed there too for the metadata-update poller's
+// single-token refresh, which reuses this exact same on-chain read path
+// rather than duplicating it a second time.
 
 async function imageSourceToSvgOrBuffer(image){
   const img = String(image || '');
