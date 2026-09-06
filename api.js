@@ -1179,11 +1179,18 @@ app.get('/db/stackers/raw-logs-check/:address', auth, async (req, res) => {
       return j.result;
     }
 
-    // ?events=Sig1(types),Sig2(types) — comma-separated, defaults to the
-    // original Stackers check for backward compatibility with any existing
-    // use of this endpoint without the new param.
+    // ?events=Sig1(types),Sig2(types) — comma-separated. Confirmed live: a
+    // naive split(',') breaks any signature with more than one parameter
+    // (BatchMetadataUpdate(uint256,uint256) got split into two garbage
+    // fragments — "BatchMetadataUpdate(uint256" and "uint256)" — silently
+    // producing wrong topic0 hashes for both, with no error to signal it).
+    // Splits only on a comma that's followed by what looks like the start
+    // of a new signature (an identifier immediately followed by '(') --
+    // never on a comma that's just separating two parameters within one
+    // signature's own parentheses. Verified independently against several
+    // multi-param cases before using it here.
     const eventsParam = req.query.events
-      ? req.query.events.split(',').map(s => s.trim()).filter(Boolean)
+      ? req.query.events.split(/,(?=[A-Za-z_][A-Za-z0-9_]*\()/).map(s => s.trim()).filter(Boolean)
       : [
           'Activated(uint256,address,uint256)',
           'Deactivated(uint256)',
@@ -1599,6 +1606,67 @@ app.get('/db/eip4906-check/:chain/:contract', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/contract-deploy-block/:chain/:contract — binary search for a
+// contract's earliest block via eth_getCode, so a historical event scan
+// (raw-logs-check / metadata-catchup) can start from the right place
+// instead of genesis. Confirmed live: starting a scan at block 0 for a
+// modern contract wastes the entire chunk budget on blocks from Ethereum's
+// genesis era (2015-2016), never reaching anywhere near where the contract
+// was actually deployed. ~25 eth_getCode calls narrows 26M+ blocks down to
+// the exact deployment block via binary search, rather than guessing a
+// starting point or scanning forward chunk by chunk from 0.
+app.get('/db/contract-deploy-block/:chain/:contract', auth, async (req, res) => {
+  try {
+    const { chain, contract } = req.params;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(contract)) return res.status(400).json({ ok: false, error: 'valid contract address required' });
+
+    const CHAIN_SUBDOMAINS = { ethereum: 'eth-mainnet', base: 'base-mainnet', polygon: 'polygon-mainnet', robinhood: 'robinhood-mainnet' };
+    const subdomain = CHAIN_SUBDOMAINS[(chain || 'ethereum').toLowerCase()];
+    if(!subdomain) return res.status(400).json({ ok: false, error: `Unsupported chain "${chain}". Supported: ${Object.keys(CHAIN_SUBDOMAINS).join(', ')}` });
+
+    const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    if(!ALCHEMY_KEY) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY' });
+    const rpcUrl = `https://${subdomain}.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+
+    async function rpc(method, params){
+      const r = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+      const j = await r.json();
+      if(j.error) throw new Error(`${method} RPC error: ${JSON.stringify(j.error)}`);
+      return j.result;
+    }
+
+    const latestBlock = parseInt(await rpc('eth_blockNumber', []), 16);
+
+    async function hasCodeAt(blockNum){
+      const code = await rpc('eth_getCode', [contract, '0x' + blockNum.toString(16)]);
+      return code && code !== '0x';
+    }
+
+    // Sanity check first — if the contract doesn't exist even at the
+    // latest block, there's no deployment block to find at all.
+    if(!(await hasCodeAt(latestBlock))){
+      return res.json({ ok: true, contract, chain, deployBlock: null, note: 'No code found at latest block — contract may not exist on this chain, or address may be wrong', callsUsed: 1 });
+    }
+
+    let low = 0, high = latestBlock, callsUsed = 1; // the latestBlock check above already used one call
+    while(low < high){
+      const mid = Math.floor((low + high) / 2);
+      const exists = await hasCodeAt(mid);
+      callsUsed++;
+      if(exists) high = mid; else low = mid + 1;
+    }
+
+    res.json({ ok: true, contract, chain, deployBlock: low, latestBlock, callsUsed });
+  } catch(e) {
+    console.error('/db/contract-deploy-block error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/metadata-catchup/:slug — one-time historical scan for a
 // collection's own MetadataUpdate/BatchMetadataUpdate events, refreshing
 // every affected token once. The regular poller (lib/metadata-update-poller.js)
@@ -1612,10 +1680,11 @@ app.get('/db/eip4906-check/:chain/:contract', auth, async (req, res) => {
 // Requires ?fromBlock= explicitly — deliberately no default to 0, since
 // scanning a contract's entire history unconditionally could be an
 // enormous number of chunked eth_getLogs calls for an old contract. Use
-// /db/stackers/raw-logs-check first (with ?events=MetadataUpdate(uint256),
-// BatchMetadataUpdate(uint256,uint256) and a wide fromBlock=) to find out
-// how far back this contract's first relevant event actually goes before
-// running this.
+// /db/contract-deploy-block first to find the right starting point, then
+// /db/stackers/raw-logs-check (with ?events=MetadataUpdate(uint256),
+// BatchMetadataUpdate(uint256,uint256) and that deploy block as fromBlock=)
+// to find out how far back this contract's first relevant event actually
+// goes before running this.
 app.get('/db/metadata-catchup/:slug', auth, async (req, res) => {
   try {
     const { slug } = req.params;
