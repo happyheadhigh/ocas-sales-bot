@@ -1705,6 +1705,36 @@ app.get('/db/metadata-catchup/:slug', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/metadata-refresh-one/:slug/:tokenId — manually refreshes exactly
+// one token, bypassing the MetadataUpdate/BatchMetadataUpdate event
+// mechanism entirely. Confirmed live: argonauts #3588's metadata clearly
+// changed on-chain (confirmed via /download's direct read) but was never
+// covered by either the full historical catch-up scan (deployment block to
+// now) or the ongoing 5-minute poller -- meaning the contract itself never
+// emitted the event for this specific token, despite reliably doing so for
+// 502 others. This is a real limitation of relying on the contract's own
+// signal: if it doesn't emit consistently for every change, no amount of
+// event-listening on our end will catch what it never announced. This
+// endpoint is the direct fix for exactly that gap -- refresh a specific
+// token immediately, on demand, without needing its own on-chain event at
+// all.
+app.get('/db/metadata-refresh-one/:slug/:tokenId', auth, async (req, res) => {
+  try {
+    const { slug, tokenId } = req.params;
+    const { pgPool } = require('./lib/db');
+    const colRes = await pgPool.query('SELECT slug, contract, chain FROM collections WHERE slug=$1', [slug]);
+    if(!colRes.rows.length) return res.status(404).json({ ok: false, error: `No collection found with slug "${slug}"` });
+    const col = colRes.rows[0];
+
+    const { refreshSingleTokenMetadata } = require('./lib/metadata-update-poller');
+    const result = await refreshSingleTokenMetadata({ contract: col.contract, tokenId, chain: col.chain, slug: col.slug });
+    res.json(result);
+  } catch(e) {
+    console.error('/db/metadata-refresh-one error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/alchemy-nft-test/:chain/:contract — calls Alchemy's
 // getNFTsForContract directly for a given chain/contract and shows the raw
 // result. Built to answer a real, live question: is the backfill writing
