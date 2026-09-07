@@ -3173,7 +3173,7 @@ async function handleMeTokenDownload(interaction, ctx, slug, tokenId){
     const chain = colChainRes.rows[0]?.chain || 'ethereum';
 
     const { renderTokenPng } = require('./download');
-    const SIZE = 1500; // meaningfully larger than the 500px card thumbnail
+    const SIZE = 2048; // matches the standalone /download command's own default (commands/download.js), previously inconsistent at 1500 here specifically
     const rendered = await renderTokenPng({ contract, tokenId, chain, size: SIZE, transparent: false, osHeaders, slug });
     const ext = rendered.ext || 'png';
     const filename = `${slug}-${tokenId}${ext === 'png' ? `-${SIZE}` : ''}.${ext}`.replace(/[^a-z0-9_.-]+/gi, '-');
