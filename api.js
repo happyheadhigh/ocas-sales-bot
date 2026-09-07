@@ -1735,6 +1735,41 @@ app.get('/db/metadata-refresh-one/:slug/:tokenId', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/metadata-verify-all/:slug — full-collection direct verification,
+// bypassing MetadataUpdate/BatchMetadataUpdate events entirely. Confirmed
+// live: this contract's own event signal missed what the user estimates as
+// hundreds to thousands of tokens whose traits changed prior to tonight's
+// work, well beyond the single-token gap (#3588) this was first noticed on.
+// Checks every token in the collection directly against the chain instead,
+// with zero dependency on the contract having announced anything.
+//
+// Runs in the background (not awaited before responding) since this is a
+// genuinely long operation for a large collection -- one on-chain read per
+// token means ~9,999 tokens realistically takes several minutes even at
+// reasonable concurrency, well past any sane HTTP response timeout. Progress
+// and completion are visible via this service's own logs
+// ([metadata-update] full verification ...), same as the catch-up scan.
+// Optional ?concurrency= to override the default of 10 if needed.
+app.get('/db/metadata-verify-all/:slug', auth, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { pgPool } = require('./lib/db');
+    const colRes = await pgPool.query('SELECT slug, contract, chain FROM collections WHERE slug=$1', [slug]);
+    if(!colRes.rows.length) return res.status(404).json({ ok: false, error: `No collection found with slug "${slug}"` });
+    const col = colRes.rows[0];
+    const concurrency = req.query.concurrency ? Math.max(1, parseInt(req.query.concurrency, 10)) : 10;
+
+    const { fullCollectionVerification } = require('./lib/metadata-update-poller');
+    fullCollectionVerification({ slug: col.slug, contract: col.contract, chain: col.chain, concurrency })
+      .catch(e => console.error(`[metadata-update] full verification for ${slug} failed:`, e.message));
+
+    res.json({ ok: true, started: true, slug: col.slug, concurrency, note: 'Running in the background — check this service\'s logs for progress ([metadata-update] full verification ...) and a completion summary when done.' });
+  } catch(e) {
+    console.error('/db/metadata-verify-all error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/alchemy-nft-test/:chain/:contract — calls Alchemy's
 // getNFTsForContract directly for a given chain/contract and shows the raw
 // result. Built to answer a real, live question: is the backfill writing
