@@ -1749,7 +1749,7 @@ app.get('/db/metadata-refresh-one/:slug/:tokenId', auth, async (req, res) => {
 // reasonable concurrency, well past any sane HTTP response timeout. Progress
 // and completion are visible via this service's own logs
 // ([metadata-update] full verification ...), same as the catch-up scan.
-// Optional ?concurrency= to override the default of 10 if needed.
+// Optional ?concurrency= to override the default of 4 if needed.
 app.get('/db/metadata-verify-all/:slug', auth, async (req, res) => {
   try {
     const { slug } = req.params;
@@ -1757,7 +1757,7 @@ app.get('/db/metadata-verify-all/:slug', auth, async (req, res) => {
     const colRes = await pgPool.query('SELECT slug, contract, chain FROM collections WHERE slug=$1', [slug]);
     if(!colRes.rows.length) return res.status(404).json({ ok: false, error: `No collection found with slug "${slug}"` });
     const col = colRes.rows[0];
-    const concurrency = req.query.concurrency ? Math.max(1, parseInt(req.query.concurrency, 10)) : 10;
+    const concurrency = req.query.concurrency ? Math.max(1, parseInt(req.query.concurrency, 10)) : 4;
 
     const { fullCollectionVerification } = require('./lib/metadata-update-poller');
     fullCollectionVerification({ slug: col.slug, contract: col.contract, chain: col.chain, concurrency })
