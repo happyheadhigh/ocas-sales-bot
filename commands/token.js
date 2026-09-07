@@ -159,7 +159,23 @@ async function handleTokenCommand(commandName, ctx){
       const tokenChain = dbMeta?.chain || 'ethereum';
 
       // ── Fetch + post image ────────────────────────────────────────────────
-      let imgResult = getCachedImage(`${contract}:${tokenId}`);
+      // For collections whose metadata can actually change after mint
+      // (metadata_updates_supported=true, tracked via the EIP-4906 poller),
+      // this in-memory cache can silently outlive a real, correct DB refresh
+      // -- confirmed live: an image cached here from an earlier /token call
+      // persisted for up to its own 1-hour TTL even after the token's actual
+      // artwork changed and the DB was already correctly updated, because
+      // this cache has no way to know the DB changed underneath it. Static
+      // collections (the overwhelming majority) keep the full caching
+      // benefit unchanged -- this only bypasses the cache for the specific
+      // collections where staleness is actually possible.
+      const dynamicColRes = await pgPool.query(
+        `SELECT metadata_updates_supported FROM collections WHERE slug=$1`,
+        [resolvedSlugForMeta]
+      ).catch(() => ({ rows: [] }));
+      const isDynamicCollection = dynamicColRes.rows[0]?.metadata_updates_supported === true;
+
+      let imgResult = isDynamicCollection ? null : getCachedImage(`${contract}:${tokenId}`);
       if(!imgResult && dbMeta?.image_url && isDiscordOk(dbMeta.image_url)){
         // Prefer whatever the backfill already fetched and stored in
         // tokens.image_url over a live OpenSea call — see the comment in
@@ -180,7 +196,7 @@ async function handleTokenCommand(commandName, ctx){
       if(!imgResult){
         imgResult = await resolveImage({identifier:String(tokenId)}, contract, tokenChain);
       }
-      if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
+      if(imgResult && !isDynamicCollection) setCachedImage(`${contract}:${tokenId}`, imgResult);
       const osUrl = `https://opensea.io/assets/${tokenChain}/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
 
