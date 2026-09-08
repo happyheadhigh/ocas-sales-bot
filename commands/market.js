@@ -505,6 +505,11 @@ async function handleMarketCommand(commandName, ctx){
         if(!tokenId || !listingPriceEth) continue;
         const result = await checkArbitrageOpportunity(slug, tokenId, parseFloat(listingPriceEth)).catch(() => null);
         if(result) results.push(result);
+        // Small spacing between sequential OpenSea calls — up to 30 of these
+        // back-to-back with zero delay risked hitting a 429 partway through,
+        // especially alongside whatever sales/listings polling is already
+        // hitting OpenSea concurrently at the same time.
+        await new Promise(res => setTimeout(res, 150));
       }
 
       if(!results.length){
