@@ -485,7 +485,11 @@ async function handleMarketCommand(commandName, ctx){
     const colInput = interaction.options.getString('collection') || null;
     const resolved = resolveCollectionFromServerCfg(config, colInput);
     const slug = resolved?.slug || config.slug;
+    const contract = resolved?.contract || config.contract;
     if(!slug) return interaction.editReply({ content: 'Run `/setup` first or provide a collection.' });
+
+    const colChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const chain = colChainRes.rows[0]?.chain || 'ethereum';
 
     const { checkArbitrageOpportunity, extractListingPriceEth, extractListingTokenId } = require('../lib/arbitrage');
 
@@ -534,7 +538,9 @@ async function handleMarketCommand(commandName, ctx){
 
       results.sort((a, b) => parseFloat(b.spreadEth) - parseFloat(a.spreadEth));
       const lines = results.slice(0, 15).map(r =>
-        `**#${r.tokenId}** — listed Ξ${r.listingPriceEth}, offer Ξ${r.offerPriceEth} → **gross spread Ξ${r.spreadEth}**`
+        contract
+          ? `**[#${r.tokenId}](https://opensea.io/assets/${chain}/${contract}/${r.tokenId})** — listed Ξ${r.listingPriceEth}, offer Ξ${r.offerPriceEth} → **gross spread Ξ${r.spreadEth}**`
+          : `**#${r.tokenId}** — listed Ξ${r.listingPriceEth}, offer Ξ${r.offerPriceEth} → **gross spread Ξ${r.spreadEth}**`
       );
       const embed = new EmbedBuilder()
         .setColor(COLORS.RANK_TOP_100)
