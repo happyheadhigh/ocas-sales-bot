@@ -487,8 +487,7 @@ async function handleMarketCommand(commandName, ctx){
     const slug = resolved?.slug || config.slug;
     if(!slug) return interaction.editReply({ content: 'Run `/setup` first or provide a collection.' });
 
-    const { checkArbitrageOpportunity } = require('../lib/arbitrage');
-    const { formatListingEth } = require('../utils/format');
+    const { checkArbitrageOpportunity, extractListingPriceEth, extractListingTokenId } = require('../lib/arbitrage');
 
     try{
       const qs = new URLSearchParams({ limit: '30' });
@@ -497,13 +496,27 @@ async function handleMarketCommand(commandName, ctx){
       const j = await r.json();
       const listings = j.listings || [];
       if(!listings.length) return interaction.editReply({ content: `No active listings found for **${slug}**.` });
+      // Unconditional, once per command run — confirmed live that
+      // formatListingEth (designed for a different OpenSea endpoint's
+      // event-shaped payload, not this one's actual Seaport orders) was
+      // silently returning null for every single listing, skipping the
+      // arbitrage check entirely for all 30 results with zero indication
+      // anything had gone wrong. Logs the very first listing's raw shape so
+      // that specific class of bug is checkable directly against real data,
+      // not just inferred after the fact.
+      console.log(`[arbitrage] /arbitrage command: raw first listing for ${slug}: ${JSON.stringify(listings[0]).slice(0, 500)}`);
 
       const results = [];
+      let checkedCount = 0;
       for(const l of listings){
-        const tokenId = String(l?.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria || l?.asset?.token_id || l?.asset?.identifier || '');
-        const listingPriceEth = formatListingEth(l);
-        if(!tokenId || !listingPriceEth) continue;
-        const result = await checkArbitrageOpportunity(slug, tokenId, parseFloat(listingPriceEth)).catch(() => null);
+        const tokenId = extractListingTokenId(l);
+        const listingPriceEth = extractListingPriceEth(l);
+        if(!tokenId || !listingPriceEth){
+          console.log(`[arbitrage] /arbitrage command: skipping a listing for ${slug} — tokenId=${JSON.stringify(tokenId)} listingPriceEth=${JSON.stringify(listingPriceEth)}`);
+          continue;
+        }
+        checkedCount++;
+        const result = await checkArbitrageOpportunity(slug, tokenId, listingPriceEth).catch(() => null);
         if(result) results.push(result);
         // Small spacing between sequential OpenSea calls — up to 30 of these
         // back-to-back with zero delay risked hitting a 429 partway through,
@@ -512,6 +525,9 @@ async function handleMarketCommand(commandName, ctx){
         await new Promise(res => setTimeout(res, 150));
       }
 
+      if(!checkedCount){
+        return interaction.editReply({ content: `Found ${listings.length} listing(s) for **${slug}**, but couldn't extract a token ID/price from any of them — see bot logs for the raw shape, this likely needs a parsing fix.` });
+      }
       if(!results.length){
         return interaction.editReply({ content: `Checked ${listings.length} listing(s) for **${slug}** — no offer currently exceeds its listing price.` });
       }
