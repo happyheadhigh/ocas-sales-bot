@@ -282,8 +282,10 @@ function buildChannelsEmbed(cfg){
       SEP + '\n\n' +
       `🟢 **Sales:** ${ch(cfg.salesChannel||cfg.channelId)} ${ok(cfg.salesChannel||cfg.channelId)}\n` +
       `📋 **Listings:** ${ch(cfg.listingsChannel||cfg.listingsChannelId)} ${ok(cfg.listingsChannel||cfg.listingsChannelId)}\n` +
+      `🔀 **Arbitrage:** ${ch(cfg.arbitrageChannelId)} ${ok(cfg.arbitrageChannelId)}\n` +
       (isOcas ? `🔥 **Burn Alerts:** ${ch(cfg.burnChannel)} ${ok(cfg.burnChannel)}\n` : '') +
-      '\n*Click a button to change that channel.\nLeave a channel unset to disable those alerts.*'
+      '\n*Click a button to change that channel.\nLeave a channel unset to disable those alerts.*\n' +
+      '*Arbitrage alerts (a listing priced below the best current offer) work independently of the Listings channel above — set this one on its own if you want arbitrage alerts without the full listings feed.*'
     )
     .setFooter({ text: 'Only visible to you' });
 }
@@ -292,6 +294,7 @@ function channelsRow(isOcas){
   const btns = [
     new ButtonBuilder().setCustomId('cfg:ch:sales').setLabel('🟢 Sales').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('cfg:ch:listings').setLabel('📋 Listings').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('cfg:ch:arbitrage').setLabel('🔀 Arbitrage').setStyle(ButtonStyle.Secondary),
   ];
   if(isOcas) btns.push(new ButtonBuilder().setCustomId('cfg:ch:burn').setLabel('🔥 Burn Alerts').setStyle(ButtonStyle.Secondary));
   btns.push(new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary));
@@ -1973,7 +1976,7 @@ async function handleConfigButton(interaction, ctx){
   // ── Channel edits (show channel select menu) ───────────────────────────────
   if(customId.startsWith('cfg:ch:')){
     const type  = customId.split(':')[2];
-    const label = type === 'sales' ? '🟢 Sales' : type === 'listings' ? '📋 Listings' : '🔥 Burn Alerts';
+    const label = type === 'sales' ? '🟢 Sales' : type === 'listings' ? '📋 Listings' : type === 'arbitrage' ? '🔀 Arbitrage' : '🔥 Burn Alerts';
     const menu  = new ChannelSelectMenuBuilder()
       .setCustomId('cfg_chsel:'+type)
       .setPlaceholder('Pick the '+label+' channel')
@@ -2399,6 +2402,7 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
     const type = parts[1];
     if(type === 'sales')    { cfg.salesChannel = chId; cfg.channelId = chId; }
     if(type === 'listings') { cfg.listingsChannel = chId; cfg.listingsChannelId = chId; }
+    if(type === 'arbitrage') { cfg.arbitrageChannelId = chId; }
     if(type === 'burn'){     cfg.burnChannel    = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
     if(type === 'verify')   cfg.verifyChannel  = chId;
     if(type === 'rankalert'){
