@@ -3212,7 +3212,7 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
 // api.js's POST /render/svg-token). Posts as a brand-new message (via a
 // fresh deferReply, not deferUpdate) so the browsing card/nav state is left
 // untouched — clicking Download doesn't interrupt cycling through tokens.
-async function handleMeTokenDownload(interaction, ctx, slug, tokenId){
+async function handleMeTokenDownload(interaction, ctx, slug, tokenId, size = 2048, transparent = false){
   await interaction.deferReply({ ephemeral: true }).catch(()=>{});
   try{
     const { pgPool, osHeaders } = ctx;
@@ -3229,8 +3229,11 @@ async function handleMeTokenDownload(interaction, ctx, slug, tokenId){
     const chain = colChainRes.rows[0]?.chain || 'ethereum';
 
     const { renderTokenPng } = require('./download');
-    const SIZE = 2048; // matches the standalone /download command's own default (commands/download.js), previously inconsistent at 1500 here specifically
-    const rendered = await renderTokenPng({ contract, tokenId, chain, size: SIZE, transparent: false, osHeaders, slug });
+    // size/transparent now caller-supplied — matches the standalone
+    // /download command's own defaults (2048px, opaque) when the caller
+    // (the button handler below) doesn't show its own options modal first.
+    const SIZE = size;
+    const rendered = await renderTokenPng({ contract, tokenId, chain, size: SIZE, transparent, osHeaders, slug });
     const ext = rendered.ext || 'png';
     const filename = `${slug}-${tokenId}${ext === 'png' ? `-${SIZE}` : ''}.${ext}`.replace(/[^a-z0-9_.-]+/gi, '-');
     const att = new AttachmentBuilder(rendered.buffer, { name: filename });
@@ -3618,11 +3621,22 @@ async function handleMeInteraction(interaction, ctx){
   // High-res download button on the wallet token detail card — renders
   // separately from (and larger than) the card's own 500px thumbnail,
   // posted as a new message so it doesn't disturb the browsing card/nav.
+  // Shows a quick options modal (size + transparent background) first,
+  // matching the standalone /download command's own modal, instead of
+  // always using its fixed 2048px/opaque defaults silently.
   if(customId.startsWith('me_browse:wallet:token_download:')){
     const parts = customId.split(':');
     const slug = parts[3];
     const tokenId = parseInt(parts[4]);
-    return handleMeTokenDownload(interaction, ctx, slug, tokenId);
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+    const modal = new ModalBuilder()
+      .setCustomId(`me_modal:download:${slug}:${tokenId}`)
+      .setTitle('Download Options');
+    modal.addComponents(
+      new AR().addComponents(new TextInputBuilder().setCustomId('size').setLabel('Size in pixels (512-4096)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('2048')),
+      new AR().addComponents(new TextInputBuilder().setCustomId('transparent').setLabel('Transparent background? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('no')),
+    );
+    return interaction.showModal(modal);
   }
 }
 
@@ -3649,4 +3663,4 @@ async function showFloorAlertModal(interaction, slug){
   return interaction.showModal(modal);
 }
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, showStackerOptimizeResult };
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, showStackerOptimizeResult, handleMeTokenDownload };

@@ -106,7 +106,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, showStackerOptimizeResult }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, showStackerOptimizeResult, handleMeTokenDownload }   = require('./commands/market');
 const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
@@ -882,6 +882,27 @@ client.on('interactionCreate', async (interaction)=>{
   if(interaction.isModalSubmit() && interaction.customId.startsWith('me_modal:')){
     const parts = interaction.customId.split(':');
     const alertType = parts[1];
+
+    if(alertType === 'download'){
+      // customId is me_modal:download:slug:tokenId — 4 segments, unlike
+      // every other me_modal type below (3 segments: type:slug), so this
+      // is handled before the generic `const slug = parts.slice(2).join(':')`
+      // line further down would otherwise incorrectly merge the tokenId
+      // into the slug for this one case.
+      const dlSlug = parts[2];
+      const dlTokenId = parseInt(parts[3]);
+      const sizeInput = (interaction.fields.getTextInputValue('size')||'').trim();
+      const sizeRaw = sizeInput ? parseInt(sizeInput, 10) : 2048;
+      if(sizeInput && (isNaN(sizeRaw) || sizeRaw < 512 || sizeRaw > 4096)){
+        return interaction.reply({ content: '❌ Invalid size. Must be a number between 512 and 4096.', flags: MessageFlags.Ephemeral });
+      }
+      const dlSize = Math.max(512, Math.min(sizeRaw || 2048, 4096));
+      const transparentInput = (interaction.fields.getTextInputValue('transparent')||'').trim().toLowerCase();
+      const dlTransparent = transparentInput === 'yes' || transparentInput === 'y' || transparentInput === 'true';
+      const meCtx = { pgPool, osHeaders, getConfig };
+      return handleMeTokenDownload(interaction, meCtx, dlSlug, dlTokenId, dlSize, dlTransparent);
+    }
+
     const slug = parts.slice(2).join(':');
 
     if(alertType === 'stackeroptimize'){
