@@ -475,6 +475,57 @@ async function handleMarketCommand(commandName, ctx){
     return;
   }
 
+  // /arbitrage — checks current listings against the best applicable WETH
+  // offer for each token, surfacing any where the offer exceeds the listing
+  // price (a real, well-known "buy the listing, flip into the offer"
+  // strategy). Shows the GROSS spread only — see lib/arbitrage.js's own
+  // top comment for why fee/gas math isn't included.
+  if(commandName==='arbitrage'){
+    await interaction.deferReply({ ephemeral: true }).catch(()=>{});
+    const colInput = interaction.options.getString('collection') || null;
+    const resolved = resolveCollectionFromServerCfg(config, colInput);
+    const slug = resolved?.slug || config.slug;
+    if(!slug) return interaction.editReply({ content: 'Run `/setup` first or provide a collection.' });
+
+    const { checkArbitrageOpportunity } = require('../lib/arbitrage');
+    const { formatListingEth } = require('../utils/format');
+
+    try{
+      const qs = new URLSearchParams({ limit: '30' });
+      const r = await fetch(`https://api.opensea.io/api/v2/listings/collection/${encodeURIComponent(slug)}/all?${qs}`, { headers: osHeaders() });
+      if(!r.ok) return interaction.editReply({ content: `Couldn't fetch current listings for **${slug}** (HTTP ${r.status}).` });
+      const j = await r.json();
+      const listings = j.listings || [];
+      if(!listings.length) return interaction.editReply({ content: `No active listings found for **${slug}**.` });
+
+      const results = [];
+      for(const l of listings){
+        const tokenId = String(l?.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria || l?.asset?.token_id || l?.asset?.identifier || '');
+        const listingPriceEth = formatListingEth(l);
+        if(!tokenId || !listingPriceEth) continue;
+        const result = await checkArbitrageOpportunity(slug, tokenId, parseFloat(listingPriceEth)).catch(() => null);
+        if(result) results.push(result);
+      }
+
+      if(!results.length){
+        return interaction.editReply({ content: `Checked ${listings.length} listing(s) for **${slug}** — no offer currently exceeds its listing price.` });
+      }
+
+      results.sort((a, b) => parseFloat(b.spreadEth) - parseFloat(a.spreadEth));
+      const lines = results.slice(0, 15).map(r =>
+        `**#${r.tokenId}** — listed Ξ${r.listingPriceEth}, offer Ξ${r.offerPriceEth} → **gross spread Ξ${r.spreadEth}**`
+      );
+      const embed = new EmbedBuilder()
+        .setColor(COLORS.RANK_TOP_100)
+        .setTitle(`🔀 ${slug} — ${results.length} arbitrage opportunit${results.length === 1 ? 'y' : 'ies'} found`)
+        .setDescription(lines.join('\n') + `\n\n⚠️ Gross spread only — does not account for marketplace fees, creator royalties, or gas. Verify actual numbers on OpenSea before acting. Checked ${listings.length} of the collection's active listings.`);
+      return interaction.editReply({ embeds: [embed] });
+    }catch(e){
+      console.error('[arbitrage command]', e.message);
+      return interaction.editReply({ content: `Something went wrong checking arbitrage for **${slug}**: ${e.message}` });
+    }
+  }
+
   // /rankfind
   if(commandName==='rankfind'){
     if(isPaidFeature(config, 'rankfind', interaction.user.id))
@@ -771,7 +822,7 @@ async function handleMarketCommand(commandName, ctx){
 
 const MARKET_COMMANDS = new Set([
   'lastsale','recentsales','sale','traitfind','listings','debuglisting',
-  'myalert','myalertclear','myalertstatus','rankfind','sweep','me',
+  'myalert','myalertclear','myalertstatus','rankfind','sweep','me','arbitrage',
 ]);
 
 // ── /traitfind guided flow helpers ───────────────────────────────────────────
