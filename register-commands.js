@@ -56,7 +56,7 @@ const commands = [
   .addStringOption(o=>o.setName('search').setDescription('Example: ocas #337 2048 no bg').setRequired(false))
   .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(false).setMinValue(1))
   .addStringOption(o=>o.setName('collection').setDescription('Collection slug or alias. Defaults to OCAS').setRequired(false).setAutocomplete(true))
-  .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(512).setMaxValue(4096))
+  .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(50).setMaxValue(4096))
   .addBooleanOption(o=>o.setName('transparent').setDescription('Export with transparent/no background').setRequired(false)),
 
   new SlashCommandBuilder().setName('lastsale').setDescription('Show the most recent sale').addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false).setAutocomplete(true)),

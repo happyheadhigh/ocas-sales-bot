@@ -3633,7 +3633,7 @@ async function handleMeInteraction(interaction, ctx){
       .setCustomId(`me_modal:download:${slug}:${tokenId}`)
       .setTitle('Download Options');
     modal.addComponents(
-      new AR().addComponents(new TextInputBuilder().setCustomId('size').setLabel('Size in pixels (512-4096)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('2048')),
+      new AR().addComponents(new TextInputBuilder().setCustomId('size').setLabel('Size in pixels (50-4096)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('2048')),
       new AR().addComponents(new TextInputBuilder().setCustomId('transparent').setLabel('Transparent background? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('no')),
     );
     return interaction.showModal(modal);

@@ -893,10 +893,10 @@ client.on('interactionCreate', async (interaction)=>{
       const dlTokenId = parseInt(parts[3]);
       const sizeInput = (interaction.fields.getTextInputValue('size')||'').trim();
       const sizeRaw = sizeInput ? parseInt(sizeInput, 10) : 2048;
-      if(sizeInput && (isNaN(sizeRaw) || sizeRaw < 512 || sizeRaw > 4096)){
-        return interaction.reply({ content: '❌ Invalid size. Must be a number between 512 and 4096.', flags: MessageFlags.Ephemeral });
+      if(sizeInput && (isNaN(sizeRaw) || sizeRaw < 50 || sizeRaw > 4096)){
+        return interaction.reply({ content: '❌ Invalid size. Must be a number between 50 and 4096.', flags: MessageFlags.Ephemeral });
       }
-      const dlSize = Math.max(512, Math.min(sizeRaw || 2048, 4096));
+      const dlSize = Math.max(50, Math.min(sizeRaw || 2048, 4096));
       const transparentInput = (interaction.fields.getTextInputValue('transparent')||'').trim().toLowerCase();
       const dlTransparent = transparentInput === 'yes' || transparentInput === 'y' || transparentInput === 'true';
       const meCtx = { pgPool, osHeaders, getConfig };

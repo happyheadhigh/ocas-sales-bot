@@ -299,7 +299,7 @@ function showDlTokenModal(interaction, collectionSlug){
     .setTitle('Download — Token Details');
   modal.addComponents(
     new AR().addComponents(new TextInputBuilder().setCustomId('token_id').setLabel('Token ID').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('337')),
-    new AR().addComponents(new TextInputBuilder().setCustomId('size').setLabel('Size in pixels (512-4096)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('2048')),
+    new AR().addComponents(new TextInputBuilder().setCustomId('size').setLabel('Size in pixels (50-4096)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('2048')),
     new AR().addComponents(new TextInputBuilder().setCustomId('transparent').setLabel('Transparent background? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('no')),
   );
   return interaction.showModal(modal);
@@ -319,10 +319,10 @@ async function handleDownloadModalSubmit(interaction, ctx){
   }
   const sizeInput = (interaction.fields.getTextInputValue('size')||'').trim();
   const sizeRaw = sizeInput ? parseInt(sizeInput, 10) : 2048;
-  if(sizeInput && (isNaN(sizeRaw) || sizeRaw < 512 || sizeRaw > 4096)){
-    return interaction.reply({ content:'❌ Invalid size. Must be a number between 512 and 4096.', flags:MessageFlags.Ephemeral });
+  if(sizeInput && (isNaN(sizeRaw) || sizeRaw < 50 || sizeRaw > 4096)){
+    return interaction.reply({ content:'❌ Invalid size. Must be a number between 50 and 4096.', flags:MessageFlags.Ephemeral });
   }
-  const size = Math.max(512, Math.min(sizeRaw || 2048, 4096));
+  const size = Math.max(50, Math.min(sizeRaw || 2048, 4096));
   const transparentInput = (interaction.fields.getTextInputValue('transparent')||'').trim().toLowerCase();
   const transparent = transparentInput === 'yes' || transparentInput === 'y' || transparentInput === 'true';
 
@@ -421,7 +421,7 @@ async function handleDownloadCommand(interaction, forced={}){
 
   const tokenId = forced.tokenId || interaction.options?.getInteger?.('token') || parsed.tokenId;
   const sizeRaw = forced.size || interaction.options?.getInteger?.('size') || parsed.size || 2048;
-  const size = Math.max(512, Math.min(sizeRaw, 4096));
+  const size = Math.max(50, Math.min(sizeRaw, 4096));
   const transparent = forced.transparent ?? interaction.options?.getBoolean?.('transparent') ?? parsed.transparent ?? false;
   const collection = interaction.options?.getString?.('collection') || parsed.alias || 'ocas';
 
