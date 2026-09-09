@@ -3171,7 +3171,15 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
 
   // Token image
   const tvUrl = `https://traitview.com/token/${slug}/${tokenId}`;
-  const osUrl = `https://opensea.io/assets/${colChain}/${colContract || slug}/${tokenId}`;
+  // Confirmed live: colContract || slug put the collection SLUG (e.g.
+  // "argonauts") in the URL position OpenSea's asset URL format expects a
+  // contract address, producing a broken link whenever colContract was
+  // ever unavailable -- same bug class found and fixed in
+  // buildArbitrageEmbed earlier. Falls back to a collection-level link
+  // instead, same pattern used there.
+  const osUrl = colContract
+    ? `https://opensea.io/assets/${colChain}/${colContract}/${tokenId}`
+    : `https://opensea.io/collection/${slug}`;
   const embed = new EmbedBuilder()
     .setTitle(`🔍 Token #${tokenId}`)
     .setColor(unrealizedDisplay !== null && unrealizedDisplay >= 0 ? 0x57F287 : 0xED4245)
