@@ -4434,7 +4434,7 @@ app.get('/db/all-traits', auth, async (req, res) => {
       }
     }
 
-    const data = { ok: true, tokens, survivorCount: survivorIds.size };
+    const data = { ok: true, tokens, survivorCount: survivorIds.size, _debugVersion: 'svgcache-fix-610b9c5', _debugSvgCacheRows: svgCacheRes.rows.length, _debugSvgCacheHits: [...svgCacheById.values()].filter(v => v != null).length };
     _allTraitsCache.set(slug, { data, ts: now });
 
     res.json(data);
