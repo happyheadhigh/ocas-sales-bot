@@ -2917,10 +2917,21 @@ app.get('/db/rank-listings', auth, async (req, res) => {
 // Lightweight endpoint — returns os_rank for all tokens.
 // Used by TraitView to populate OS_RANK_MAP on init.
 // Returns: { ok, ranks: [[id, os_rank], ...] }  (compact array format)
+// Confirmed live: this query had ZERO collection scoping at all -- always
+// returned every token across every collection with an os_rank value
+// (in practice, only ever OCAS's, since no other collection has ever had
+// this populated), regardless of which collection was actually requesting.
+// TraitView's mobile fast-path trusts OS_RANK_MAP once it's non-empty,
+// so viewing Argonauts (or any other collection) silently pulled in
+// OCAS's own token IDs and ranks instead -- those then failed to match
+// the actual collection's live listings, producing "No matches" until
+// the user's next action happened to bypass this fast path entirely.
 app.get('/db/os-ranks', auth, async (req, res) => {
   try {
+    const slug = (req.query.slug || OCAS_SLUG).toString();
     const result = await pool.query(
-      `SELECT id, os_rank FROM tokens WHERE os_rank IS NOT NULL ORDER BY os_rank ASC`
+      `SELECT id, os_rank FROM tokens WHERE os_rank IS NOT NULL AND collection_slug = $1 ORDER BY os_rank ASC`,
+      [slug]
     );
     res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
     res.json({
