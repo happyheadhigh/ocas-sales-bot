@@ -4363,9 +4363,33 @@ app.get('/db/all-traits', auth, async (req, res) => {
     const survivorIds = new Set(survivorsRes.rows.map(r => parseInt(r.id)));
     const imageUrlById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), r.image_url || null]));
 
+    // Confirmed live: this endpoint's own comment below already documented
+    // this exact gap ("token_svg_cache, read separately by the frontend")
+    // but no such separate mechanism actually existed anywhere -- the
+    // frontend's multi-collection support work surfaced this directly:
+    // Argonauts tokens whose image is SVG-based (tokens.image_url
+    // deliberately set to NULL for those -- see refreshSingleTokenMetadata
+    // in lib/metadata-update-poller.js, which clears it precisely so
+    // token_svg_cache is what display code reaches for) never had an image
+    // at all in this response, only tokens with a raster URL did. Fixed by
+    // querying token_svg_cache directly here instead of relying on a
+    // frontend mechanism that was never built.
+    const svgCacheRes = isOcas
+      ? { rows: [] } // OCAS doesn't use token_svg_cache at all -- no-op query avoided entirely
+      : await pool.query(
+          `SELECT token_id, image_data FROM token_svg_cache WHERE collection_slug = $1 AND token_id = ANY($2::int[])`,
+          [slug, [...survivorIds]]
+        ).catch(e => {
+          console.warn('[/db/all-traits] token_svg_cache lookup failed (non-fatal):', e.message);
+          return { rows: [] };
+        });
+    const svgCacheById = new Map(svgCacheRes.rows.map(r => [parseInt(r.token_id), r.image_data || null]));
+
     // burn_state_snapshots is OCAS-only ground truth for post-burn survivor
     // images — skip entirely for other collections; tokens.image_url (or
-    // token_svg_cache, read separately by the frontend) is the only source.
+    // token_svg_cache, queried directly above -- was "read separately by
+    // the frontend" until that mechanism was confirmed to never actually
+    // exist) is the only source.
     const survivorSnapshotImages = isOcas
       ? await getSurvivorImageMap([...survivorIds]).catch(e => {
           console.warn('[/db/all-traits] survivor snapshot image lookup failed (non-fatal):', e.message);
@@ -4385,9 +4409,10 @@ app.get('/db/all-traits', auth, async (req, res) => {
     const tokens = {};
 
     // Initialize all survivors with empty traits + current image (snapshot
-    // preferred for OCAS, tokens.image_url as fallback/only-source otherwise)
+    // preferred for OCAS; tokens.image_url preferred otherwise, falling back
+    // to token_svg_cache for tokens whose image is SVG-based)
     for (const id of survivorIds) {
-      tokens[String(id)] = { traits: {}, image: survivorSnapshotImages[id] || imageUrlById.get(id) || null };
+      tokens[String(id)] = { traits: {}, image: survivorSnapshotImages[id] || imageUrlById.get(id) || svgCacheById.get(id) || null };
     }
 
     // Populate traits
