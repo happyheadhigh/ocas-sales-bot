@@ -3157,19 +3157,8 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     ? ` (${unrealizedDisplay >= 0 ? '+' : ''}${((unrealizedDisplay / cost) * 100).toFixed(0)}%)`
     : '';
 
-  const descLines = [
-    `**#${tokenId}** · ${typeLabel}${slug}`,
-    '',
-    `Cost: **Ξ ${cost > 0 ? cost.toFixed(4) : '—'}**`,
-    displayEst ? `${estLabel}: **Ξ ${displayEst.toFixed(4)}**` : 'Est. Value: —',
-    topTrait ? `Top trait: **${topTrait.trait_value}** · Ξ ${parseFloat(topTrait.trait_floor).toFixed(4)} floor` : '',
-    unrealizedDisplay !== null ? `Unrealized: **${unrealizedDisplay >= 0 ? '+' : ''}Ξ ${Math.abs(unrealizedDisplay).toFixed(4)}${pctDisplay}**` : '',
-    '',
-    isMinted ? '✨ Minted' : '🛒 Bought',
-    burnLine,
-  ].filter(Boolean).join('\n');
-
-  // Token image
+  // Token image / links — moved before descLines so the links line below can
+  // use both.
   const tvUrl = `https://traitview.com/token/${slug}/${tokenId}`;
   // Confirmed live: colContract || slug put the collection SLUG (e.g.
   // "argonauts") in the URL position OpenSea's asset URL format expects a
@@ -3180,11 +3169,28 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const osUrl = colContract
     ? `https://opensea.io/assets/${colChain}/${colContract}/${tokenId}`
     : `https://opensea.io/collection/${slug}`;
+
+  const descLines = [
+    `**#${tokenId}** · ${typeLabel}${slug}`,
+    '',
+    `Cost: **Ξ ${cost > 0 ? cost.toFixed(4) : '—'}**`,
+    displayEst ? `${estLabel}: **Ξ ${displayEst.toFixed(4)}**` : 'Est. Value: —',
+    topTrait ? `Top trait: **${topTrait.trait_value}** · Ξ ${parseFloat(topTrait.trait_floor).toFixed(4)} floor` : '',
+    unrealizedDisplay !== null ? `Unrealized: **${unrealizedDisplay >= 0 ? '+' : ''}Ξ ${Math.abs(unrealizedDisplay).toFixed(4)}${pctDisplay}**` : '',
+    '',
+    `[OpenSea](${osUrl}) · [TraitView](${tvUrl})`,
+    isMinted ? '✨ Minted' : '🛒 Bought',
+    burnLine,
+  ].filter(Boolean).join('\n');
+
+  // jv: clicking the thumbnail/title should go to OpenSea, not TraitView --
+  // TraitView is still one click away via the explicit link in descLines
+  // above.
   const embed = new EmbedBuilder()
     .setTitle(`🔍 Token #${tokenId}`)
     .setColor(unrealizedDisplay !== null && unrealizedDisplay >= 0 ? 0x57F287 : 0xED4245)
     .setDescription(descLines)
-    .setURL(tvUrl)
+    .setURL(osUrl)
     .setFooter({ text: `${currentIdx + 1} of ${sortedTokens.length} held tokens` });
 
   if(slug === STACKERS_SLUG){
