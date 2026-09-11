@@ -137,23 +137,53 @@ async function syncListings(collection) {
     const listingsMap = {}; // token_id -> {price_eth, url}
     let next = null;
     let pages = 0;
+    // Confirmed the actual bug jv reported (TraitView missing real, active
+    // listings that OpenSea itself shows -- not a price-accuracy issue,
+    // confirmed live prices matched for tokens that DID show up). Previously
+    // a single transient HTTP error on ANY page immediately broke out of
+    // pagination and used whatever had been collected so far -- this
+    // endpoint has no reason to be price-sorted (more likely sorted by
+    // listing time), so a page lost to a rate limit or timeout could easily
+    // be exactly the page holding the actual cheapest listings. Worse, the
+    // DB write below is a full DELETE + re-INSERT for this slug, so a
+    // partial fetch didn't just fail to add anything new -- it actively
+    // replaced a previously-complete set with an incomplete one.
+    // completedFully only becomes true if the loop's own `next` cursor runs
+    // out (a genuine end of the collection's listings) -- the DB write
+    // below is skipped entirely otherwise, leaving whatever the last
+    // successful full sync wrote in place until the next cycle (60s later)
+    // gets a clean run.
+    let completedFully = false;
 
     do {
       const qs = new URLSearchParams({ chain, limit: '100' });
       if (next) qs.set('next', next);
 
-      const resp = await fetch(
-        `https://api.opensea.io/api/v2/listings/collection/${slug}/all?${qs}`,
-        { headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' } }
-      );
-
-      if (!resp.ok) {
+      // Retry transient failures (rate limits, momentary server errors)
+      // instead of giving up on the whole sync the first time OpenSea's API
+      // hiccups on any single page -- a real, if occasional, occurrence
+      // that shouldn't cost every listing from every OTHER page already
+      // fetched successfully.
+      let resp = null;
+      let body = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        resp = await fetch(
+          `https://api.opensea.io/api/v2/listings/collection/${slug}/all?${qs}`,
+          { headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' } }
+        );
+        if (resp.ok) { body = await resp.json(); break; }
         const errText = await resp.text().catch(() => '');
-        console.warn(`[sync] [${slug}] OpenSea HTTP ${resp.status} on page ${pages}: ${errText.slice(0, 200)}`);
+        const retryable = resp.status === 429 || resp.status >= 500;
+        console.warn(`[sync] [${slug}] OpenSea HTTP ${resp.status} on page ${pages} (attempt ${attempt}/3): ${errText.slice(0, 200)}`);
+        if (!retryable || attempt === 3) break;
+        await new Promise(r => setTimeout(r, 500 * attempt)); // 500ms, 1000ms backoff
+      }
+
+      if (!body) {
+        console.warn(`[sync] [${slug}] Giving up on page ${pages} after retries -- sync incomplete, DB write will be skipped this cycle`);
         break;
       }
 
-      const body = await resp.json();
       if (pages === 0) {
         console.log(`[sync] [${slug}] First page: ${body.listings?.length ?? 0} listings, keys: ${Object.keys(body).join(', ')}`);
         if (body.listings?.length > 0) {
@@ -194,32 +224,59 @@ async function syncListings(collection) {
       // other sizes).
       const MAX_PLAUSIBLE_TOKEN_ID = 10_000_000;
 
+      let droppedThisPage = 0;
       for (const listing of (body.listings || [])) {
         const id = getTokenId(listing);
         const priceEth = getPriceEth(listing);
 
-        if (!id || isNaN(id) || id < 0 || id > MAX_PLAUSIBLE_TOKEN_ID) continue;
-        if (priceEth == null || isNaN(priceEth) || priceEth <= 0) continue;
+        if (!id || isNaN(id) || id < 0 || id > MAX_PLAUSIBLE_TOKEN_ID) { droppedThisPage++; continue; }
+        if (priceEth == null || isNaN(priceEth) || priceEth <= 0) { droppedThisPage++; continue; }
 
         const url = `https://opensea.io/assets/${chain}/${contract}/${id}`;
         if (!listingsMap[id] || priceEth < listingsMap[id].price_eth) {
           listingsMap[id] = { price_eth: priceEth, url };
         }
       }
+      // Visible in logs if a real fraction of a page is unparseable --
+      // distinct from the page-level HTTP retry above, this is about
+      // individual listings within an otherwise-successful page failing
+      // getTokenId()/getPriceEth()'s own parsing.
+      if (droppedThisPage > 0){
+        console.warn(`[sync] [${slug}] Dropped ${droppedThisPage}/${body.listings?.length ?? 0} listings on page ${pages} (unparseable id or price)`);
+      }
 
       next = body.next || null;
       pages++;
 
-      if (pages >= 25) break; // safety cap (25 × 100 = 2500 listings max)
+      // Raised from 25 -> 150 pages (2,500 -> 15,000 raw listings). 25 was
+      // never validated against actual collection sizes -- Argonauts alone
+      // has ~9,216 total tokens, and this endpoint can return more than one
+      // listing entry per token (competing offers, re-listings still
+      // present in a page before OpenSea's own indexing catches up), so
+      // the raw listing count this loop sees isn't the same as the unique,
+      // currently-listed token count it ends up keeping. Combined with the
+      // completedFully check below, hitting even this higher cap still
+      // means the DB write for this cycle gets skipped rather than writing
+      // a silently-incomplete set -- so this is about giving genuinely
+      // large or heavily-listed collections room to actually finish, not
+      // about removing the safety net itself.
+      if (pages >= 150) break;
       if (next) await new Promise(r => setTimeout(r, 80)); // rate limit
 
     } while (next);
 
+    completedFully = (next == null);
+
     const entries = Object.entries(listingsMap);
-    console.log(`[sync] [${slug}] Fetched ${entries.length} listings across ${pages} pages`);
+    console.log(`[sync] [${slug}] Fetched ${entries.length} listings across ${pages} pages (completedFully=${completedFully})`);
 
     if (entries.length === 0) {
       console.warn(`[sync] [${slug}] No listings returned — skipping DB write`);
+      return;
+    }
+
+    if (!completedFully) {
+      console.warn(`[sync] [${slug}] Sync did not complete fully (stopped early after retries or hit the page cap) -- skipping DB write this cycle to avoid replacing a complete set with a partial one. Will retry next cycle.`);
       return;
     }
 

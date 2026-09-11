@@ -1,7 +1,7 @@
 {
   "name": "nft-sales-bot",
   "version": "2.0.0",
-  "description": "Public multi-server NFT sales bot \u2014 works with any OpenSea collection",
+  "description": "Public multi-server NFT sales bot — works with any OpenSea collection",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
@@ -12,14 +12,16 @@
     "burn:repair": "node burn-backfill-repair.js"
   },
   "dependencies": {
+    "@opensea/sdk": "^12.8.0",
     "@supabase/supabase-js": "^2.39.0",
     "discord.js": "^14.14.0",
     "dotenv": "^16.4.5",
+    "ethers": "^6.17.0",
     "express": "^5.2.1",
     "node-fetch": "^2.7.0",
     "pg": "^8.20.0",
     "sharp": "^0.33.3",
-    "ethers": "^6.17.0"
+    "ws": "^8.21.3"
   },
   "engines": {
     "node": ">=18.0.0"

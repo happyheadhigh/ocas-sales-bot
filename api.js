@@ -13,6 +13,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const { OCAS_SLUG, BURN_CONTRACT } = require('./lib/constants');
 const { runMigrations, fetchAndStoreCollectionTraits } = require('./lib/db');
+const saleStream = require('./lib/sale-stream');
 
 // Loaded at module level (not lazily inside a route handler) specifically
 // so its setInterval-driven sync loops actually start the moment this
@@ -4541,6 +4542,17 @@ app.post('/render/svg-token', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/sales-stream ─────────────────────────────────────────────────────
+// Server-Sent Events endpoint TraitView connects to for live sale feedback.
+// See lib/sale-stream.js for the full architecture explanation -- this
+// route itself is deliberately thin, just handing off to that module.
+// Not wired through the auth() middleware used elsewhere in this file: SSE
+// requests come from an EventSource in the browser, which can't set custom
+// headers, so this relies on the same ?key= query-param path auth() itself
+// already supports for exactly this reason -- but delegates the actual
+// check to auth() rather than duplicating that logic here.
+app.get('/db/sales-stream', auth, saleStream.handleSseRequest);
+
 // Runs the same idempotent CREATE TABLE/INDEX IF NOT EXISTS migrations used
 // elsewhere -- ensures a brand-new database gets its full schema automatically
 // on first deploy, and self-heals if any table/index was ever missing,
@@ -4550,6 +4562,11 @@ runMigrations().then(() => {
     console.log(`TraitView API running on port ${PORT}`);
     console.log(`Auth: ${API_SECRET ? 'enabled' : (REQUIRE_API_AUTH ? 'REQUIRED BUT MISSING' : 'DISABLED (dev only; set API_SECRET to enable)')}`);
   });
+  // Live sale feed: subscribe to every fully-onboarded collection's
+  // item_sold events right away, so the stream is already running before
+  // any TraitView client connects -- not lazily on first request, which
+  // would miss whatever sold in the gap before the first viewer showed up.
+  saleStream.subscribeToAllReadyCollections();
 }).catch(e => {
   console.error('[Migrations] Failed to run on startup:', e.message);
   // Still start the server even if migrations failed -- an existing,
@@ -4557,5 +4574,6 @@ runMigrations().then(() => {
   app.listen(PORT, () => {
     console.log(`TraitView API running on port ${PORT} (migrations may be incomplete, check logs above)`);
   });
+  saleStream.subscribeToAllReadyCollections();
 });
 
