@@ -4591,7 +4591,7 @@ app.get('/diag/os-batch-rarity-test', async (req, res) => {
   if (!process.env.OPENSEA_KEY) return res.status(500).json({ ok: false, error: 'OPENSEA_KEY not configured on this service' });
   const CONTRACT = '0x387C41B0B2F1128dE44dB1Bcf8baad085f26392C'; // Argonauts
   const headers = { 'X-API-KEY': process.env.OPENSEA_KEY, 'Accept': 'application/json', 'Content-Type': 'application/json' };
-  const idsToIdentifiers = (ids) => ids.map(id => ({ chain: 'ethereum', address: CONTRACT, identifier: String(id) }));
+  const idsToIdentifiers = (ids) => ids.map(id => ({ chain: 'ethereum', contract_address: CONTRACT, identifier: String(id) }));
 
   async function callBatch(ids){
     const r = await fetch('https://api.opensea.io/api/v2/nfts/batch', {
