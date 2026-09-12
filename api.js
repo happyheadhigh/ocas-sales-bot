@@ -3328,7 +3328,24 @@ app.put('/db/wallet/:address/favorites', auth,
 app.get('/db/wallet/:address/summary', auth, async (req, res) => {
   const address = cleanAddress(req.params.address);
   if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  // Confirmed live: jv reported never getting any wallet holdings for
+  // Argonauts. Traced to this route specifically -- the note below (from
+  // 2026-07-02) already flagged this exact hardcoding as a known gap, but
+  // it was never actually applied here despite the fix landing on other
+  // endpoints (/db/traits-fast, /db/all-traits) the same day. The frontend's
+  // dbFetch() helper already sends the active collection's own slug on
+  // every request (confirmed in traitview/js/api.js) -- this route just
+  // never read it, so every wallet summary was silently computed against
+  // OCAS's own token/listing/interval rows regardless of which collection's
+  // site the request actually came from. Same (req.query.slug || OCAS_SLUG)
+  // convention already used elsewhere in this file (e.g. /db/traits-fast).
+  const slug = (req.query.slug || OCAS_SLUG).toString();
   try {
+    // wallet_analytics_cache has no collection_slug column and nothing in
+    // this codebase currently writes to it (confirmed) -- so this lookup is
+    // a guaranteed miss right now regardless of slug, and left as-is rather
+    // than touched as part of this fix (a real fix here would need a schema
+    // migration, out of scope for the bug actually being chased).
     const cache = await pool.query(
       `SELECT summary_json, updated_at FROM wallet_analytics_cache WHERE wallet_address = $1`,
       [address]
@@ -3338,12 +3355,6 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
       return res.json({ ok: true, address, synced: true, cached: true, updated_at: cache.rows[0].updated_at, summary: cache.rows[0].summary_json });
     }
 
-    // NOTE (2026-07-02): hardcoded to OCAS_SLUG for now, same reasoning as
-    // /db/traits-fast and /db/all-traits earlier today — this wasn't scoped
-    // at all before, so a wallet's holdings/traits/floor across EVERY
-    // configured collection were all merged together. The listings JOIN
-    // and the floor query were both unscoped too (token_id collisions +
-    // absolute cheapest listing across all collections, not just OCAS).
     const current = await pool.query(`
       SELECT w.token_id, t.os_rank, t.obs_rank, l.price_eth, w.cost_eth
       FROM wallet_token_intervals w
@@ -3352,12 +3363,12 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
       WHERE w.wallet_address = $1 AND w.collection_slug = $2 AND w.disposed_at IS NULL
       ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC
       LIMIT 10000
-    `, [address, OCAS_SLUG]);
+    `, [address, slug]);
 
     const owned = current.rows;
     const ranks = owned.map(r => parseInt(r.os_rank || r.obs_rank)).filter(Number.isFinite);
     const listed = owned.filter(r => r.price_eth != null);
-    const floor = await pool.query('SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug = $1', [OCAS_SLUG]);
+    const floor = await pool.query('SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug = $1', [slug]);
     const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
     const estimated = floorEth == null ? null : owned.length * floorEth;
 
@@ -3369,7 +3380,7 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
       FROM wallet_token_intervals
       WHERE wallet_address = $1 AND collection_slug = $2
         AND disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0
-    `, [address, OCAS_SLUG]);
+    `, [address, slug]);
     const realizedPnl = parseFloat(realizedRes.rows[0]?.realized_pnl || 0);
     const soldCount = parseInt(realizedRes.rows[0]?.sold_count || 0);
     const totalCostBasis = owned.reduce((s, r) => s + (parseFloat(r.cost_eth) || 0), 0);
@@ -3435,7 +3446,13 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
   if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
   const limit = intParam(req.query.limit, 100, 1000);
   const offset = intParam(req.query.offset, 0, 10000);
+  // Same hardcoded-to-OCAS bug as /db/wallet/:address/summary above, same
+  // fix pattern -- resolve the actual requested collection's own contract
+  // rather than assuming OCAS_CONTRACT/OCAS_SLUG.
+  const slug = (req.query.slug || OCAS_SLUG).toString();
   try {
+    const collRes = await pool.query('SELECT contract FROM collections WHERE slug = $1', [slug]);
+    const contract = collRes.rows[0]?.contract || OCAS_CONTRACT;
     const result = await pool.query(`
       SELECT nt.contract, nt.token_id, nt.from_address, nt.to_address, nt.tx_hash, nt.log_index,
              nt.block_number, COALESCE(nt.block_ts, nt.transferred_at) AS block_ts, nt.event_type,
@@ -3445,7 +3462,7 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
       WHERE nt.contract = $1 AND nt.collection_slug = $2 AND (nt.from_address = $3 OR nt.to_address = $3)
       ORDER BY nt.block_number DESC, nt.log_index DESC
       LIMIT $4 OFFSET $5
-    `, [OCAS_CONTRACT, OCAS_SLUG, address, limit, offset]);
+    `, [contract, slug, address, limit, offset]);
 
     // Burns live in their own purpose-built tables (burn_events/burn_event_inputs),
     // separate from nft_transfers entirely -- pull them directly rather than
@@ -3692,6 +3709,8 @@ app.get('/db/wallet/:address/traits', auth, async (req, res) => {
   const address = cleanAddress(req.params.address);
   if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
   const limit = intParam(req.query.limit, 100, 500);
+  // Same hardcoded-to-OCAS bug as /db/wallet/:address/summary, same fix.
+  const slug = (req.query.slug || OCAS_SLUG).toString();
   try {
     const result = await pool.query(`
       SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS count,
@@ -3703,7 +3722,7 @@ app.get('/db/wallet/:address/traits', auth, async (req, res) => {
       GROUP BY tt.trait_name, tt.trait_value
       ORDER BY count DESC, tt.trait_name ASC, tt.trait_value ASC
       LIMIT $2
-    `, [address, limit, OCAS_SLUG]);
+    `, [address, limit, slug]);
     res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.json({
       ok: true,
