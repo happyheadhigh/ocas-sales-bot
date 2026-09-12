@@ -4576,6 +4576,73 @@ app.get('/db/sales-stream', auth, saleStream.handleSseRequest);
 // on first deploy, and self-heals if any table/index was ever missing,
 // instead of relying on a separate manual step that's easy to forget.
 
+// ── TEMP DIAGNOSTIC — test OpenSea's real batch NFT endpoint (POST
+// /api/v2/nfts/batch, added in their SDK v10.5.0) as a possible replacement
+// for the one-call-per-token rolling sync in lib/rank-sync.js. If this
+// carries rarity.rank AND accepts a large batch size, a full Argonauts sync
+// could drop from ~9,999 calls to as few as ~50-100. Runs the exact sequence
+// requested: a 2-token detailed check first (known Argonauts ids), then
+// escalating batch sizes (10/25/50/100/200), stopping at the first rejection
+// and reporting the max accepted size. No auth on purpose -- read-only,
+// touches nothing in the DB, needs to be opened directly in a mobile
+// browser. Does NOT touch production rank-sync code either way -- remove
+// once this question is settled.
+app.get('/diag/os-batch-rarity-test', async (req, res) => {
+  if (!process.env.OPENSEA_KEY) return res.status(500).json({ ok: false, error: 'OPENSEA_KEY not configured on this service' });
+  const CONTRACT = '0x387C41B0B2F1128dE44dB1Bcf8baad085f26392C'; // Argonauts
+  const headers = { 'X-API-KEY': process.env.OPENSEA_KEY, 'Accept': 'application/json', 'Content-Type': 'application/json' };
+  const idsToIdentifiers = (ids) => ids.map(id => ({ chain: 'ethereum', address: CONTRACT, identifier: String(id) }));
+
+  async function callBatch(ids){
+    const r = await fetch('https://api.opensea.io/api/v2/nfts/batch', {
+      method: 'POST', headers, body: JSON.stringify({ nfts: idsToIdentifiers(ids) })
+    });
+    const text = await r.text();
+    let body = null; try { body = JSON.parse(text); } catch {}
+    return { status: r.status, ok: r.ok, body, raw_snippet: body ? null : text.slice(0, 300) };
+  }
+
+  try {
+    // Step 1: 2 known Argonauts tokens, full detailed response.
+    const twoTokenIds = [4210, 3588];
+    const twoTokenResult = await callBatch(twoTokenIds);
+    const nfts = twoTokenResult.body?.nfts || twoTokenResult.body?.results || [];
+    const detailedReport = nfts.map(n => ({
+      identifier: n.identifier ?? n.token_id ?? null,
+      has_rarity_field: !!n.rarity,
+      rarity: n.rarity ?? null,
+    }));
+
+    // Step 2: escalating batch sizes -- sequential token ids 1..N, stop at
+    // first non-2xx response.
+    const sizesToTry = [10, 25, 50, 100, 200];
+    const sizeResults = [];
+    let maxAcceptedSize = 0;
+    for (const size of sizesToTry) {
+      const ids = Array.from({ length: size }, (_, i) => i + 1);
+      const result = await callBatch(ids);
+      sizeResults.push({ requested_size: size, http_status: result.status, ok: result.ok, nfts_returned: result.body?.nfts?.length ?? result.body?.results?.length ?? null, error_snippet: result.ok ? null : (result.raw_snippet || JSON.stringify(result.body).slice(0, 300)) });
+      if (result.ok) maxAcceptedSize = size; else break; // stop at first rejection, per the requested test sequence
+      await new Promise(r => setTimeout(r, 200)); // small pacing delay between escalating tests
+    }
+
+    res.json({
+      ok: true,
+      contract: CONTRACT,
+      two_token_test: {
+        http_status: twoTokenResult.status,
+        top_level_keys: twoTokenResult.body ? Object.keys(twoTokenResult.body) : [],
+        per_token: detailedReport,
+        raw_full_response: twoTokenResult.body,
+      },
+      batch_size_escalation: sizeResults,
+      max_accepted_batch_size: maxAcceptedSize,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 runMigrations().then(() => {
   app.listen(PORT, () => {
     console.log(`TraitView API running on port ${PORT}`);
