@@ -4575,41 +4575,6 @@ app.get('/db/sales-stream', auth, saleStream.handleSseRequest);
 // elsewhere -- ensures a brand-new database gets its full schema automatically
 // on first deploy, and self-heals if any table/index was ever missing,
 // instead of relying on a separate manual step that's easy to forget.
-// ── TEMP DIAGNOSTIC — confirm whether OpenSea's bulk "NFTs by collection"
-// endpoint includes rarity rank data, before committing to using it for
-// multi-collection OS rank sync (currently lib/rank-sync.js is hardcoded to
-// OCAS_SLUG/OCAS_CONTRACT everywhere and only ever refreshes OCAS's own
-// os_rank values -- Argonauts' were set once at backfill and never since).
-// The bulk endpoint would mean ~50 calls per full sync instead of ~9,999
-// with the current single-token approach, IF it actually carries rarity --
-// third-party docs suggested it might not, unlike the single-token endpoint
-// which explicitly advertises a rarity field. This settles it directly
-// rather than guessing further. No auth on this route on purpose, since
-// it's read-only, touches nothing in the DB, and jv needs to open it
-// directly in a mobile browser -- remove once the question above is
-// answered either way.
-app.get('/diag/os-bulk-rarity-test', async (req, res) => {
-  const slug = (req.query.slug || 'argonauts').toString();
-  if (!process.env.OPENSEA_KEY) return res.status(500).json({ ok: false, error: 'OPENSEA_KEY not configured on this service' });
-  try {
-    const r = await fetch(`https://api.opensea.io/api/v2/collection/${encodeURIComponent(slug)}/nfts?limit=5`, {
-      headers: { 'X-API-KEY': process.env.OPENSEA_KEY, 'Accept': 'application/json' }
-    });
-    const body = await r.json().catch(() => null);
-    const first = body?.nfts?.[0] || null;
-    res.json({
-      ok: true,
-      slug,
-      opensea_http_status: r.status,
-      top_level_keys: body ? Object.keys(body) : [],
-      first_nft_has_rarity_field: !!(first && 'rarity' in first),
-      first_nft_rarity_value: first?.rarity ?? null,
-      first_nft_full: first,
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
 
 runMigrations().then(() => {
   app.listen(PORT, () => {
