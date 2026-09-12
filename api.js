@@ -4595,7 +4595,7 @@ app.get('/diag/os-batch-rarity-test', async (req, res) => {
 
   async function callBatch(ids){
     const r = await fetch('https://api.opensea.io/api/v2/nfts/batch', {
-      method: 'POST', headers, body: JSON.stringify({ nfts: idsToIdentifiers(ids) })
+      method: 'POST', headers, body: JSON.stringify({ identifiers: idsToIdentifiers(ids) })
     });
     const text = await r.text();
     let body = null; try { body = JSON.parse(text); } catch {}
