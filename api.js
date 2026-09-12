@@ -3341,20 +3341,19 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
   // convention already used elsewhere in this file (e.g. /db/traits-fast).
   const slug = (req.query.slug || OCAS_SLUG).toString();
   try {
-    // wallet_analytics_cache has no collection_slug column and nothing in
-    // this codebase currently writes to it (confirmed) -- so this lookup is
-    // a guaranteed miss right now regardless of slug, and left as-is rather
-    // than touched as part of this fix (a real fix here would need a schema
-    // migration, out of scope for the bug actually being chased).
-    const cache = await pool.query(
-      `SELECT summary_json, updated_at FROM wallet_analytics_cache WHERE wallet_address = $1`,
-      [address]
-    );
-    if (cache.rows.length) {
-      res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
-      return res.json({ ok: true, address, synced: true, cached: true, updated_at: cache.rows[0].updated_at, summary: cache.rows[0].summary_json });
-    }
-
+    // Removed the wallet_analytics_cache short-circuit that used to sit
+    // here. That table has no collection_slug column at all, keyed only by
+    // wallet_address -- so any wallet with a pre-existing cached row from
+    // earlier OCAS-only testing would keep getting that stale, OCAS-scoped
+    // row served back regardless of the slug fix below, since this check
+    // ran and returned before the fixed query ever executed. A previous
+    // session's own diagnostic script (diag-check-wallet-cache.js) was
+    // built to detect exactly this failure mode for a different symptom,
+    // which is exactly what jv just hit here: traits worked (no such cache
+    // check exists on that route) while summary silently kept serving an
+    // old cached response. Safe to drop entirely -- nothing in this
+    // codebase currently writes to this table, so removing the read here
+    // doesn't lose any live functionality, only a footgun.
     const current = await pool.query(`
       SELECT w.token_id, t.os_rank, t.obs_rank, l.price_eth, w.cost_eth
       FROM wallet_token_intervals w
