@@ -191,25 +191,34 @@ app.get('/db/tokens', auth, async (req, res) => {
     const rankMax   = req.query.rank_max ? parseInt(req.query.rank_max) : null;
     const listedOnly = req.query.listed === '1';
     const limit     = Math.min(parseInt(req.query.limit || '10000'), 10000);
+    // jv: same cross-collection bug class found and fixed across several
+    // other endpoints tonight (/db/token-sales, /db/floor-trend,
+    // /db/trait-sales, /db/rank-sales) -- this entire query joined
+    // tokens/token_traits/listings purely on token_id, with no
+    // collection_slug filter anywhere at all. Every collection's tokens
+    // were being mixed together in whatever generic token search/filter
+    // this backs. slug defaults to OCAS_SLUG, matching this file's
+    // existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
 
     const traitEntries = Object.entries(traitFilters).filter(([, vals]) => vals?.length > 0);
     const traitCountFilter = req.query.trait_count ? parseInt(req.query.trait_count) : null;
 
     let query = `SELECT t.id, t.obs_rank FROM tokens t`;
-    const params = [];
-    let p = 1;
+    const params = [slug];
+    let p = 2;
 
     // One JOIN per trait name — AND logic across names, OR within values
     traitEntries.forEach(([name, vals], i) => {
-      query += ` JOIN token_traits tt${i} ON tt${i}.token_id = t.id`
+      query += ` JOIN token_traits tt${i} ON tt${i}.token_id = t.id AND tt${i}.collection_slug = t.collection_slug`
              + ` AND tt${i}.trait_name = $${p++}`
              + ` AND tt${i}.trait_value = ANY($${p++}::text[])`;
       params.push(name, Array.isArray(vals) ? vals : [vals]);
     });
 
-    if (listedOnly) query += ` JOIN listings l ON l.token_id = t.id`;
+    if (listedOnly) query += ` JOIN listings l ON l.token_id = t.id AND l.collection_slug = t.collection_slug`;
 
-    const conditions = [ACTIVE_TOKEN_CONDITION];
+    const conditions = [ACTIVE_TOKEN_CONDITION, `t.collection_slug = $1`];
     if (rankMin !== null) { conditions.push(`t.obs_rank >= $${p++}`); params.push(rankMin); }
     if (rankMax !== null) { conditions.push(`t.obs_rank <= $${p++}`); params.push(rankMax); }
     if (traitCountFilter !== null) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCountFilter); }
@@ -292,22 +301,34 @@ app.get('/db/trait-floor', auth, async (req, res) => {
     if (!trait_name || !trait_value) {
       return res.status(400).json({ ok: false, error: 'missing trait_name or trait_value' });
     }
-
-    const result = await pool.query(`
-      SELECT t.id, t.obs_rank, l.price_eth, l.url
-      FROM tokens t
-      JOIN token_traits tt ON tt.token_id = t.id
-      JOIN listings l ON l.token_id = t.id
-      WHERE tt.trait_name = $1 AND tt.trait_value = $2
-        AND NOT EXISTS (
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- no collection_slug filter anywhere in this query at all.
+    // Also: the burn exclusion subquery ran unconditionally for every
+    // collection against OCAS-specific burn_event_inputs data -- a
+    // non-OCAS collection's token could be incorrectly excluded here if
+    // its numeric id happened to match an OCAS burned token's id (the same
+    // cross-collection numeric-id-collision class of bug, just via burn
+    // data specifically). Gated to isOcas only, same pattern already used
+    // in lib/rank-compute.js for this exact same subquery shape.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
+    const isOcas = slug === OCAS_SLUG;
+    const burnExclusion = isOcas ? `AND NOT EXISTS (
           SELECT 1 FROM burn_event_inputs active_burned
           JOIN burn_events active_be ON active_be.id = active_burned.burn_event_id
           WHERE active_burned.burned_token_id = t.id
             AND active_burned.burned_token_id != active_be.survivor_token_id
-        )
+        )` : '';
+
+    const result = await pool.query(`
+      SELECT t.id, t.obs_rank, l.price_eth, l.url
+      FROM tokens t
+      JOIN token_traits tt ON tt.token_id = t.id AND tt.collection_slug = t.collection_slug
+      JOIN listings l ON l.token_id = t.id AND l.collection_slug = t.collection_slug
+      WHERE t.collection_slug = $3 AND tt.trait_name = $1 AND tt.trait_value = $2
+        ${burnExclusion}
       ORDER BY l.price_eth ASC
       LIMIT 1
-    `, [trait_name, trait_value]);
+    `, [trait_name, trait_value, slug]);
 
     res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
     res.json({
@@ -2254,12 +2275,21 @@ app.get('/db/listings', auth, async (req, res) => {
 app.get('/db/floor-trend', auth, async (req, res) => {
   try {
     const days = Math.min(parseInt(req.query.days || '90'), 365);
+    // jv: same cross-collection bug class as /db/token-sales below -- no
+    // collection_slug filter at all, and the join to tokens matched purely
+    // on t.id = s.token_id with no collection_slug match either (tokens'
+    // own primary key is the composite (id, collection_slug), so this could
+    // also join a token row from a DIFFERENT collection that happens to
+    // share the same numeric id). Every collection's sales/floor history
+    // was being mixed together in this chart. slug defaults to OCAS_SLUG,
+    // matching this file's existing req.query.slug || OCAS_SLUG convention.
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
     const result = await pool.query(
       `SELECT s.token_id, s.price_eth, s.currency, s.sale_ts, t.obs_rank
-       FROM sales s JOIN tokens t ON t.id = s.token_id
-       WHERE s.sale_ts > NOW() - ($1 || ' days')::INTERVAL
+       FROM sales s JOIN tokens t ON t.id = s.token_id AND t.collection_slug = s.collection_slug
+       WHERE s.collection_slug = $2 AND s.sale_ts > NOW() - ($1 || ' days')::INTERVAL
        ORDER BY s.sale_ts DESC LIMIT 2000`,
-      [days]
+      [days, slug]
     );
     res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
     res.json({
@@ -2292,14 +2322,28 @@ app.get('/db/token-sales', auth, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'invalid token_id' });
     }
     const limit = Math.min(parseInt(req.query.limit || '200'), 500);
+    // jv: "for some argonauts tokens it's showing sales for OCAS." This
+    // query had no collection_slug filter at all -- WHERE token_id = $1
+    // alone, on a table that spans every collection. dbFetch() on the
+    // frontend already auto-injects slug on every single call (confirmed
+    // directly in js/api.js), so the caller was always sending it
+    // correctly; this endpoint simply never read it. Since OCAS and
+    // Argonauts both have roughly 10,000 tokens, most numeric IDs exist in
+    // both -- any token id present in both collections would return sales
+    // mixed together from whichever rows matched, regardless of which
+    // collection's modal was actually asking. slug defaults to OCAS_SLUG,
+    // matching every other endpoint in this file's own existing
+    // req.query.slug || OCAS_SLUG convention, so this doesn't change
+    // behavior for any caller that predates this fix and never sent one.
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
 
     const result = await pool.query(
       `SELECT token_id, price_eth, currency, buyer, seller, tx_hash, sale_ts
        FROM sales
-       WHERE token_id = $1
+       WHERE token_id = $1 AND collection_slug = $2
        ORDER BY sale_ts ASC
-       LIMIT $2`,
-      [tokenId, limit]
+       LIMIT $3`,
+      [tokenId, slug, limit]
     );
 
     res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
@@ -2341,17 +2385,26 @@ app.get('/db/trait-sales', auth, async (req, res) => {
     }
     const limit = Math.min(parseInt(req.query.limit || '50'), 200);
     const sort  = req.query.sort === 'asc' ? 'ASC' : 'DESC';
+    // jv: same cross-collection bug class as /db/token-sales and
+    // /db/floor-trend above -- token_traits AND sales both span every
+    // collection, and this join matched purely on token_id with no
+    // collection_slug anywhere. Two collections sharing the same trait
+    // name/value (e.g. a common "Background: Blue") would have their sales
+    // mixed together here. slug defaults to OCAS_SLUG, matching this
+    // file's existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
 
     // Join sales with token_traits — case-insensitive match on both trait and value
     const result = await pool.query(
       `SELECT s.token_id, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller
        FROM sales s
-       JOIN token_traits tt ON tt.token_id = s.token_id
-       WHERE LOWER(tt.trait_name)  = LOWER($1)
+       JOIN token_traits tt ON tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
+       WHERE s.collection_slug = $4
+         AND LOWER(tt.trait_name)  = LOWER($1)
          AND LOWER(tt.trait_value) = LOWER($2)
        ORDER BY s.sale_ts ${sort}
        LIMIT $3`,
-      [trait, value, limit]
+      [trait, value, limit, slug]
     );
 
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
@@ -2433,20 +2486,29 @@ app.get('/db/floor-before-sweep', auth, async (req, res) => {
     if (!sweptIds.length) {
       return res.status(400).json({ ok: false, error: 'no valid token IDs' });
     }
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- neither query here had a collection_slug filter at all,
+    // meaning floor_before/floor_after were computed across EVERY
+    // collection's listings combined, not just the requesting one. A much
+    // lower floor anywhere else on this service would silently corrupt
+    // this collection's own sweep-impact numbers. slug defaults to
+    // OCAS_SLUG, matching this file's existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
 
-    // Floor before = current minimum across ALL active listings
+    // Floor before = current minimum across ALL active listings for this collection
     const beforeResult = await pool.query(
-      `SELECT MIN(price_eth) AS floor_eth FROM listings`
+      `SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug = $1`,
+      [slug]
     );
     const floor_before = beforeResult.rows[0]?.floor_eth
       ? parseFloat(beforeResult.rows[0].floor_eth)
       : null;
 
-    // Floor after = minimum excluding swept token IDs
+    // Floor after = minimum excluding swept token IDs, still this collection only
     const afterResult = await pool.query(
       `SELECT MIN(price_eth) AS floor_eth FROM listings
-       WHERE token_id != ALL($1::int[])`,
-      [sweptIds]
+       WHERE collection_slug = $1 AND token_id != ALL($2::int[])`,
+      [slug, sweptIds]
     );
     const floor_after = afterResult.rows[0]?.floor_eth
       ? parseFloat(afterResult.rows[0].floor_eth)
@@ -2737,6 +2799,11 @@ app.get('/db/multi-trait-floor', auth, async (req, res) => {
     const rankMax = req.query.rank_max ? parseInt(req.query.rank_max) : null;
     const rankType = req.query.rank_type === 'obs' ? 'obs' : 'os';
     const rankCol = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- no collection_slug filter anywhere in this query, and the
+    // per-group token_traits EXISTS subquery matched purely on token_id
+    // too. slug defaults to OCAS_SLUG, matching this file's convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
 
     if (!matches.length && !traitCount && rankMin === null && rankMax === null) {
       return res.status(400).json({ ok: false, error: 'provide matches, trait_count, or rank filter' });
@@ -2745,18 +2812,18 @@ app.get('/db/multi-trait-floor', auth, async (req, res) => {
     let query = `SELECT l.token_id, l.price_eth, l.url,
                         t.trait_count, t.os_rank, t.obs_rank, t.os_score, t.rarity_score
                  FROM listings l
-                 JOIN tokens t ON t.id = l.token_id`;
-    const params = [];
-    let p = 1;
+                 JOIN tokens t ON t.id = l.token_id AND t.collection_slug = l.collection_slug`;
+    const params = [slug];
+    let p = 2;
 
-    const conditions = [ACTIVE_TOKEN_CONDITION];
+    const conditions = [ACTIVE_TOKEN_CONDITION, `t.collection_slug = $1`];
     groups.forEach((group, i) => {
       const ors = [];
       group.forEach(m => {
         ors.push(`(LOWER(g${i}.trait_name) = LOWER($${p++}) AND LOWER(g${i}.trait_value) = LOWER($${p++}))`);
         params.push(m.trait_name, m.trait_value);
       });
-      conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND (${ors.join(' OR ')}))`);
+      conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND g${i}.collection_slug = t.collection_slug AND (${ors.join(' OR ')}))`);
     });
     if (traitCount !== null && !isNaN(traitCount)) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCount); }
     if (rankMin !== null && !isNaN(rankMin)) { conditions.push(`${rankCol} >= $${p++}`); params.push(rankMin); }
@@ -2803,6 +2870,14 @@ app.get('/db/rank-sales', auth, async (req, res) => {
     const rankMax = req.query.rank_max ? parseInt(req.query.rank_max) : 100;
     const limit   = Math.min(parseInt(req.query.limit || '25'), 100);
     const sort    = req.query.sort === 'asc' ? 'ASC' : 'DESC';
+    // jv: same cross-collection bug class as the three fixes above --
+    // sales/tokens/token_traits all span every collection, and every join
+    // here matched purely on token_id. Every collection's own rank range
+    // starts back at 1, so this would mix sales from an unrelated
+    // collection whenever its os_rank happened to fall in the requested
+    // range too. slug defaults to OCAS_SLUG, matching this file's existing
+    // convention.
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
 
     const result = await pool.query(
       `SELECT s.token_id, t.os_rank, t.obs_rank, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller,
@@ -2817,13 +2892,13 @@ app.get('/db/rank-sales', auth, async (req, res) => {
                 )
               ) AS traits
        FROM sales s
-       JOIN tokens t ON t.id = s.token_id
-       LEFT JOIN token_traits tt ON tt.token_id = s.token_id
-       WHERE t.os_rank >= $1 AND t.os_rank <= $2
+       JOIN tokens t ON t.id = s.token_id AND t.collection_slug = s.collection_slug
+       LEFT JOIN token_traits tt ON tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
+       WHERE s.collection_slug = $4 AND t.os_rank >= $1 AND t.os_rank <= $2
        GROUP BY s.token_id, t.os_rank, t.obs_rank, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller
        ORDER BY s.sale_ts ${sort}
        LIMIT $3`,
-      [rankMin, rankMax, limit]
+      [rankMin, rankMax, limit, slug]
     );
 
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
@@ -2865,6 +2940,10 @@ app.get('/db/rank-listings', auth, async (req, res) => {
     const rankType = req.query.rank_type === 'obs' ? 'obs' : 'os';
     const limit    = Math.min(parseInt(req.query.limit || '25'), 100);
     const rankCol  = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- no collection_slug filter anywhere in this query at all.
+    // slug defaults to OCAS_SLUG, matching this file's existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
 
     // Include traits so the Discord bot doesn't need extra /db/token calls per result
     const result = await pool.query(
@@ -2881,14 +2960,14 @@ app.get('/db/rank-listings', auth, async (req, res) => {
                 )
               ) AS traits
        FROM tokens t
-       JOIN listings l ON l.token_id = t.id
-       LEFT JOIN token_traits tt ON tt.token_id = t.id
-       WHERE ${rankCol} >= $1 AND ${rankCol} <= $2
+       JOIN listings l ON l.token_id = t.id AND l.collection_slug = t.collection_slug
+       LEFT JOIN token_traits tt ON tt.token_id = t.id AND tt.collection_slug = t.collection_slug
+       WHERE t.collection_slug = $4 AND ${rankCol} >= $1 AND ${rankCol} <= $2
          AND ${ACTIVE_TOKEN_CONDITION}
        GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.trait_count, l.price_eth, l.url
        ORDER BY l.price_eth ASC
        LIMIT $3`,
-      [rankMin, rankMax, limit]
+      [rankMin, rankMax, limit, slug]
     );
 
     res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
@@ -2960,15 +3039,19 @@ app.get('/db/trait-count-floor', auth, async (req, res) => {
     if (!traitCount || isNaN(traitCount)) {
       return res.status(400).json({ ok: false, error: 'trait_count is required' });
     }
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- no collection_slug filter anywhere in this query. slug
+    // defaults to OCAS_SLUG, matching this file's existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
     const result = await pool.query(`
       SELECT l.token_id, l.price_eth, l.url,
              t.trait_count, t.os_rank, t.obs_rank
       FROM listings l
-      JOIN tokens t ON t.id = l.token_id
-      WHERE t.trait_count = $1
+      JOIN tokens t ON t.id = l.token_id AND t.collection_slug = l.collection_slug
+      WHERE l.collection_slug = $2 AND t.trait_count = $1
       ORDER BY l.price_eth ASC
       LIMIT 1
-    `, [traitCount]);
+    `, [traitCount, slug]);
 
     res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
     res.json({
