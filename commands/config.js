@@ -1580,6 +1580,7 @@ async function handleConfigButton(interaction, ctx){
     // protections meant no data got corrupted, just wasted duplicate work).
     const { backfillCollectionTraits } = require('../lib/collection-backfill');
     const { tryClaimBackfillLock, releaseBackfillLock } = require('../lib/auto-backfill');
+    const { computeObsRanks } = require('../lib/rank-compute');
     // chain/totalSupply were never passed here, so backfillCollectionTraits()
     // silently fell back to its own default of chain='ethereum' every time —
     // for a non-Ethereum collection (e.g. Robinhood Chain), that means Alchemy
@@ -1610,6 +1611,17 @@ async function handleConfigButton(interaction, ctx){
     backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug, chain, totalSupply, guildId, guildName: interaction.guild?.name, forceRefresh: true })
       .then(async stats => {
         await releaseBackfillLock(pgPool, col.slug, { success: true, tokensWritten: stats?.written || 0 });
+        // A re-backfill implies trait data may genuinely have changed
+        // (metadata reveal, corrections) -- re-running rank computation here
+        // too, not just at first onboarding, so ranks don't go stale relative
+        // to whatever changed. col.slug could be OCAS here (this command
+        // handles any collection a server has configured), so gate the
+        // burn-exclusion join the same way every other rank-aware endpoint
+        // does -- never assume non-OCAS just because most callers of this
+        // command are.
+        await computeObsRanks(pgPool, col.slug, { isOcas: col.slug === OCAS_SLUG }).catch(e => {
+          console.warn(`[config] [${col.slug}] TV Rank recompute failed after re-backfill (non-fatal):`, e.message);
+        });
         // Store animated detection result in collection config
         if(typeof stats?.animated === 'boolean'){
           const freshCfg = getConfig(guildId) || {};
