@@ -4740,7 +4740,35 @@ app.get('/diag/tokens-missing-traits', async (req, res) => {
        ORDER BY t.id`,
       [slug]
     );
-    res.json({ ok: true, slug, missingCount: r.rows.length, missingIds: r.rows.map(row => row.id) });
+    const missingIds = r.rows.map(row => row.id);
+
+    // For each missing token: pull its own tokens-table row (does it even
+    // exist as real data, or is it a bare placeholder row with nothing but
+    // an id?) and try a direct OpenSea lookup (does this token ID actually
+    // exist as a real, minted NFT at all, independent of anything in this
+    // DB) -- settles whether this is a real gap or just an artifact of how
+    // the range-based backfill iterates (e.g. starting from 0 even though
+    // minting actually starts at 1).
+    const details = [];
+    for (const id of missingIds) {
+      const rowRes = await pool.query(`SELECT * FROM tokens WHERE id=$1 AND collection_slug=$2`, [id, slug]);
+      const colRes = await pool.query(`SELECT contract, chain FROM collections WHERE slug=$1`, [slug]);
+      let openSeaExists = null;
+      if (colRes.rows[0] && process.env.OPENSEA_API_KEY) {
+        try {
+          const osRes = await fetch(
+            `https://api.opensea.io/api/v2/chain/${colRes.rows[0].chain || 'ethereum'}/contract/${colRes.rows[0].contract}/nfts/${id}`,
+            { headers: { 'X-API-KEY': process.env.OPENSEA_API_KEY } }
+          );
+          openSeaExists = osRes.ok;
+        } catch (e) {
+          openSeaExists = `fetch error: ${e.message}`;
+        }
+      }
+      details.push({ id, dbRow: rowRes.rows[0] || null, existsOnOpenSea: openSeaExists });
+    }
+
+    res.json({ ok: true, slug, missingCount: missingIds.length, details });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
