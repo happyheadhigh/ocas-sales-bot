@@ -4694,6 +4694,27 @@ app.get('/db/collections/recompute-ranks', async (req, res) => {
   }
 });
 
+// ── TEMP DIAGNOSTIC — recompute-ranks reported 9167 for Argonauts against a
+// total of 9168 tokens on file. computeObsRanks() only ranks tokens that
+// have at least one token_traits row, so this finds whichever token has
+// none at all (a metadata fetch failure, most likely) to confirm that's
+// really the gap rather than something else. Remove once this is settled.
+app.get('/diag/tokens-missing-traits', async (req, res) => {
+  const slug = (req.query.slug || 'argonauts').toString();
+  try {
+    const r = await pool.query(
+      `SELECT t.id FROM tokens t
+       WHERE t.collection_slug = $1
+       AND NOT EXISTS (SELECT 1 FROM token_traits tt WHERE tt.token_id = t.id AND tt.collection_slug = t.collection_slug)
+       ORDER BY t.id`,
+      [slug]
+    );
+    res.json({ ok: true, slug, missingCount: r.rows.length, missingIds: r.rows.map(row => row.id) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 runMigrations().then(() => {
   app.listen(PORT, () => {
     console.log(`TraitView API running on port ${PORT}`);
