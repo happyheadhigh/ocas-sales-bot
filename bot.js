@@ -59,6 +59,7 @@ const {
 } = require('./lib/burn-poller');
 const { setClient: setStackersFusionClient } = require('./lib/stackers-fusion-poller');
 const { startMetadataUpdatePoller } = require('./lib/metadata-update-poller');
+const { startBurnDetectionPoller } = require('./lib/burn-detect');
 const { startLiveListeners: startStackersLiveListeners } = require('./lib/stackers-live-events');
 const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vault-listing-alerts');
 const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
@@ -2520,6 +2521,15 @@ client.once('clientReady', async ()=>{
     startMetadataUpdatePoller();
   } else {
     console.log('[MetadataUpdate] No ALCHEMY_API_KEY set — metadata-update poller disabled');
+  }
+  // Generic burned-token detection (lib/burn-detect.js) -- jv: Argonauts has
+  // no protocol-level burn mechanic, a third-party account independently
+  // sent tokens to a dead address on its own. Same ALCHEMY_API_KEY gate as
+  // the metadata poller above (both need Alchemy for their respective bulk
+  // reads); a no-op query against an empty result set for any deployment
+  // with no 'ready' collections, so safe to always start alongside it.
+  if(process.env.ALCHEMY_API_KEY){
+    startBurnDetectionPoller();
   }
   // Stackers live event listener — replaces the two separate 60s polling
   // intervals that used to run here. Confirmed live tonight that repeated

@@ -26,6 +26,7 @@ const saleStream = require('./lib/sale-stream');
 const syncListingsModule = require('./sync-listings');
 const { onboardCollection } = require('./lib/collection-onboard');
 const { computeObsRanks } = require('./lib/rank-compute');
+const { refreshBurnedStatus } = require('./lib/burn-detect');
 const { fixCollectionImages, fetchRawTokenUri, diagnoseIpfsGateways } = require('./lib/collection-backfill');
 const { takeStackersSnapshot } = require('./lib/stackers-analytics');
 
@@ -4690,6 +4691,36 @@ app.get('/db/collections/recompute-ranks', async (req, res) => {
     res.json({ ok: true, slug, ...result });
   } catch (e) {
     console.error(`[/db/collections/recompute-ranks] ${slug} failed:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/refresh-burned-status — bulk on-chain ownership
+// check for tokens sent to a known dead address ─────────────────────────────
+// jv: Argonauts has no protocol-level burn mechanic -- a third-party account
+// independently sent ~15 tokens (and possibly more over time) to a dead
+// address on their own. See lib/burn-detect.js for why this needs its own,
+// separate mechanism from OCAS's burn_events tracking. Same admin gating as
+// the endpoints above. Chains straight into a rank recompute afterward,
+// since a token's burned status changing is exactly the kind of thing that
+// should shift every other token's rank too, same as any other trait-data
+// change -- running this without following it with a recompute would just
+// leave ranks stale relative to whatever this just found.
+app.get('/db/collections/refresh-burned-status', async (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  const slug = String(req.query.slug || '').toLowerCase().trim();
+  if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+  try {
+    const colRes = await pool.query(`SELECT contract, chain FROM collections WHERE slug = $1`, [slug]);
+    if (!colRes.rows[0]) return res.status(404).json({ ok: false, error: `no collection on file for slug "${slug}"` });
+    const { contract, chain } = colRes.rows[0];
+    const burnResult = await refreshBurnedStatus(pool, { slug, contract, chain: chain || 'ethereum' });
+    const rankResult = await computeObsRanks(pool, slug, { isOcas: slug === OCAS_SLUG });
+    res.json({ ok: true, slug, ...burnResult, ranked: rankResult.tokenCount });
+  } catch (e) {
+    console.error(`[/db/collections/refresh-burned-status] ${slug} failed:`, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
