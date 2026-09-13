@@ -25,6 +25,7 @@ const saleStream = require('./lib/sale-stream');
 // before today's rewrite.
 const syncListingsModule = require('./sync-listings');
 const { onboardCollection } = require('./lib/collection-onboard');
+const { computeObsRanks } = require('./lib/rank-compute');
 const { fixCollectionImages, fetchRawTokenUri, diagnoseIpfsGateways } = require('./lib/collection-backfill');
 const { takeStackersSnapshot } = require('./lib/stackers-analytics');
 
@@ -4664,6 +4665,31 @@ app.get('/diag/obs-rank-check', async (req, res) => {
     );
     res.json({ ok: true, slug, ...r.rows[0] });
   } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/recompute-ranks — (re)run TV Rank for an already-
+// onboarded collection ────────────────────────────────────────────────────
+// Same admin gating as /db/collections/onboard, same reasoning (this key is
+// already visible in TraitView's public frontend JS via devtools, so it
+// can't gate anything on its own). Exists specifically because Argonauts
+// (and potentially other collections onboarded before computeObsRanks()
+// existed) already went through onboarding with obs_rank left entirely
+// NULL -- this lets that be fixed without a full re-onboard. Safe to call
+// repeatedly; always a full recompute from current token_traits.
+app.get('/db/collections/recompute-ranks', async (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  const slug = String(req.query.slug || '').toLowerCase().trim();
+  if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+  const isOcas = slug === OCAS_SLUG;
+  try {
+    const result = await computeObsRanks(pool, slug, { isOcas });
+    res.json({ ok: true, slug, ...result });
+  } catch (e) {
+    console.error(`[/db/collections/recompute-ranks] ${slug} failed:`, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
