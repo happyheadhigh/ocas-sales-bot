@@ -24,7 +24,7 @@ const saleStream = require('./lib/sale-stream');
 // [sync] log lines were ever appearing, on this version or the version
 // before today's rewrite.
 const syncListingsModule = require('./sync-listings');
-const { onboardCollection } = require('./lib/collection-onboard');
+const { onboardCollection, backfillCollectionLinks } = require('./lib/collection-onboard');
 const { computeObsRanks } = require('./lib/rank-compute');
 const { refreshBurnedStatus } = require('./lib/burn-detect');
 const { fixCollectionImages, fetchRawTokenUri, diagnoseIpfsGateways } = require('./lib/collection-backfill');
@@ -4243,7 +4243,8 @@ app.get('/db/collections', auth, async (req, res) => {
     const result = await pool.query(`
       SELECT slug, contract, chain, name, status, token_standard, total_supply,
              is_animated, has_svg_images, error_message,
-             traits_synced_at, market_synced_at, created_at, updated_at
+             traits_synced_at, market_synced_at, created_at, updated_at,
+             opensea_url, website_url, twitter_url
       FROM collections
       ORDER BY (slug = $1) DESC, created_at ASC
     `, [OCAS_SLUG]);
@@ -4721,6 +4722,29 @@ app.get('/db/collections/refresh-burned-status', async (req, res) => {
     res.json({ ok: true, slug, ...burnResult, ranked: rankResult.tokenCount });
   } catch (e) {
     console.error(`[/db/collections/refresh-burned-status] ${slug} failed:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/backfill-links — fetch/update OpenSea/Website/
+// Twitter for an already-onboarded collection ───────────────────────────────
+// jv: hamburger menu links were hardcoded to OCAS for every collection.
+// New onboardings pick these up automatically (see lib/collection-onboard.js),
+// but Argonauts itself onboarded before these three columns existed at all --
+// this is specifically for backfilling it (and anything else onboarded
+// before now) without a full re-onboard. Same admin gating as the endpoints
+// above; safe to call repeatedly.
+app.get('/db/collections/backfill-links', async (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  const slug = String(req.query.slug || '').toLowerCase().trim();
+  if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+  try {
+    const result = await backfillCollectionLinks(pool, slug);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error(`[/db/collections/backfill-links] ${slug} failed:`, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
