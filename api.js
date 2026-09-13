@@ -2572,6 +2572,75 @@ app.get('/render/svg-token', auth, async (req, res) => {
 // elsewhere -- ensures a brand-new database gets its full schema automatically
 // on first deploy, and self-heals if any table/index was ever missing,
 // instead of relying on a separate manual step that's easy to forget.
+// ── TEMP DIAGNOSTIC — checking whether this branch (main) is what OCAS's
+// production service actually deploys from, since a route pushed to
+// public-bot returned 404 on the same URL jv tested. No auth, read-only --
+// meant to be opened directly in a mobile browser. Remove once this is
+// settled.
+app.get('/diag/listings-compare', async (req, res) => {
+  const slug = (req.query.slug || 'on-chain-all-stars').toString();
+  const OPENSEA_API_KEY = process.env.OPENSEA_KEY || process.env.OPENSEA_API_KEY;
+  try {
+    const dbResult = await pool.query(
+      `SELECT COUNT(*)::int AS count, MIN(updated_at) AS oldest_updated, MAX(updated_at) AS newest_updated
+       FROM listings WHERE collection_slug = $1`,
+      [slug]
+    );
+    const dbRow = dbResult.rows[0];
+
+    if (!OPENSEA_API_KEY) {
+      return res.json({ ok: true, deployedBranchGuess: 'main', slug, db: dbRow, opensea_live: { error: 'OPENSEA_KEY not configured on this service' } });
+    }
+
+    let next = null, pages = 0, totalRaw = 0;
+    const uniqueTokenIds = new Set();
+    do {
+      const qs = new URLSearchParams({ chain: 'ethereum', limit: '100' });
+      if (next) qs.set('next', next);
+      const r = await fetch(`https://api.opensea.io/api/v2/listings/collection/${slug}/all?${qs}`, {
+        headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' }
+      });
+      if (!r.ok) { return res.json({ ok: true, deployedBranchGuess: 'main', slug, db: dbRow, opensea_live: { error: `HTTP ${r.status} on page ${pages}`, pagesCompleted: pages } }); }
+      const body = await r.json();
+      const listings = body.listings || [];
+      totalRaw += listings.length;
+      for (const listing of listings) {
+        const cands = [
+          listing?.criteria?.nft?.identifier, listing?.nft?.identifier, listing?.asset?.token_id,
+          listing?.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria,
+          listing?.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria,
+        ];
+        for (let c of cands) {
+          if (!c) continue;
+          c = String(c);
+          const parts = c.includes('/') ? c.split('/') : c.split(':');
+          const last = parts[parts.length - 1];
+          if (last && /^\d+$/.test(last)) { uniqueTokenIds.add(parseInt(last, 10)); break; }
+        }
+      }
+      next = body.next || null;
+      pages++;
+      if (pages >= 150) break;
+      if (next) await new Promise(r2 => setTimeout(r2, 80));
+    } while (next);
+
+    res.json({
+      ok: true,
+      deployedBranchGuess: 'main',
+      slug,
+      db: dbRow,
+      opensea_live: {
+        pagesCompleted: pages,
+        totalRawListingsSeen: totalRaw,
+        uniqueTokenIdsSeen: uniqueTokenIds.size,
+        completedFully: next === null,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 runMigrations().then(() => {
   app.listen(PORT, () => {
     console.log(`TraitView API running on port ${PORT}`);
