@@ -2368,7 +2368,84 @@ app.get('/db/token-sales', auth, async (req, res) => {
 
 
 
-// ── GET /db/trait-sales ───────────────────────────────────────────────────────
+// ── GET /db/sales-search ──────────────────────────────────────────────────────
+// Full, non-paginated sales history matching a free-text trait search
+// and/or an exact trait count -- backs the Sales tab's trait search box and
+// trait-count filter, reading directly from this collection's own sales
+// history rather than being limited to whatever's currently loaded from
+// OpenSea's own paginated feed.
+// Query params:
+//   q           — free-text substring, matched against trait NAME or VALUE
+//                 (e.g. "gold" matches a "Crown: Gold Chain" trait) — optional
+//   trait_count — exact trait count match — optional
+//   limit       — default 100, max 500
+//   sort        — "desc" (newest first, default) or "asc"
+// At least one of q/trait_count is required.
+// Returns: { ok, sales: [{token_id, price_eth, currency, sale_ts, buyer, seller}], count }
+app.get('/db/sales-search', auth, async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    const traitCount = req.query.trait_count ? parseInt(req.query.trait_count) : null;
+    if (!q && traitCount == null) {
+      return res.status(400).json({ ok: false, error: 'q or trait_count is required' });
+    }
+    const limit = Math.min(parseInt(req.query.limit || '100'), 500);
+    const sort  = req.query.sort === 'asc' ? 'ASC' : 'DESC';
+    const slug  = (req.query.slug || OCAS_SLUG).toLowerCase();
+
+    const conditions = ['s.collection_slug = $1'];
+    const params = [slug];
+    let p = 2;
+    if (q) {
+      conditions.push(`EXISTS (
+        SELECT 1 FROM token_traits tt
+        WHERE tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
+        AND (tt.trait_name ILIKE $${p} OR tt.trait_value ILIKE $${p})
+      )`);
+      params.push(`%${q}%`);
+      p++;
+    }
+    if (traitCount != null) {
+      conditions.push(`EXISTS (
+        SELECT 1 FROM tokens t
+        WHERE t.id = s.token_id AND t.collection_slug = s.collection_slug AND t.trait_count = $${p}
+      )`);
+      params.push(traitCount);
+      p++;
+    }
+    params.push(limit);
+
+    const result = await pool.query(
+      `SELECT DISTINCT s.token_id, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller
+       FROM sales s
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY s.sale_ts ${sort}
+       LIMIT $${p}`,
+      params
+    );
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      q: q || null,
+      trait_count: traitCount,
+      sales: result.rows.map(r => ({
+        token_id:  parseInt(r.token_id),
+        price_eth: parseFloat(r.price_eth),
+        currency:  r.currency || 'ETH',
+        sale_ts:   r.sale_ts,
+        buyer:     r.buyer  || null,
+        seller:    r.seller || null,
+      })),
+      count: result.rows.length
+    });
+  } catch (e) {
+    console.error('/db/sales-search error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 // Sales history filtered by a trait value — full collection history, no pagination cap.
 // Query params:
 //   trait   — trait name  e.g. "Type"
