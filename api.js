@@ -4648,6 +4648,26 @@ app.get('/diag/listings-compare', async (req, res) => {
   }
 });
 
+// ── TEMP DIAGNOSTIC — checking whether Argonauts (or any non-OCAS
+// collection) actually has obs_rank populated in the DB, or whether it's
+// NULL for every row (meaning /db/traits-fast's ORDER BY obs_rank falls
+// back entirely to id order -- TV Rank effectively becoming "rank = token
+// ID", not a real rarity computation at all). Remove once this is settled.
+app.get('/diag/obs-rank-check', async (req, res) => {
+  const slug = (req.query.slug || 'argonauts').toString();
+  try {
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS total, COUNT(obs_rank)::int AS with_obs_rank,
+              MIN(obs_rank)::int AS min_rank, MAX(obs_rank)::int AS max_rank
+       FROM tokens WHERE collection_slug = $1`,
+      [slug]
+    );
+    res.json({ ok: true, slug, ...r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 runMigrations().then(() => {
   app.listen(PORT, () => {
     console.log(`TraitView API running on port ${PORT}`);
