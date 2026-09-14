@@ -110,6 +110,23 @@ const commands = [
     .addStringOption(o=>o.setName('renderer_contract').setDescription('The renderer contract address (0x...) — only needed the first time for a collection').setRequired(false))
     .addIntegerOption(o=>o.setName('max_id').setDescription('Override the highest token ID (default: tries on-chain MAX_ID, then stored supply)').setRequired(false).setMinValue(1)),
 
+  // jv: "this was fixed with the bot a while ago" -- this contract's own
+  // MetadataUpdate/BatchMetadataUpdate signal was confirmed unreliable at
+  // scale (missed hundreds to thousands of tokens whose traits changed
+  // before the event poller existed, or that it simply never announced).
+  // fullCollectionVerification() (lib/metadata-update-poller.js) already
+  // existed as the real fix -- a full direct on-chain re-check of every
+  // token, bypassing events entirely -- but was only ever reachable via a
+  // raw HTTP endpoint (/db/metadata-verify-all/:slug), never through
+  // Discord. That's exactly why this resurfaced with no way for jv to
+  // re-trigger it himself: staleness naturally re-accumulates over time
+  // since the underlying event signal never became reliable, and the fix
+  // was never wired up as something repeatable. Same owner-gating pattern
+  // as /predetermined and /globalstats.
+  new SlashCommandBuilder().setName('verifymetadata').setDescription('Owner only — re-check every token on-chain, bypassing the unreliable event signal').setDefaultMemberPermissions('0')
+    .addStringOption(o=>o.setName('slug').setDescription('Collection slug (must already be onboarded)').setRequired(true))
+    .addIntegerOption(o=>o.setName('concurrency').setDescription('Parallel on-chain reads (default: 4 — raise cautiously, this hits the RPC provider directly)').setRequired(false).setMinValue(1).setMaxValue(20)),
+
   new SlashCommandBuilder().setName('resetverify')
     .setDescription('Clear a member\'s verification so they can verify again (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)

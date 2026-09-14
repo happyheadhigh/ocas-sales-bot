@@ -292,10 +292,68 @@ if(commandName === 'predetermined'){
   }
 }
 
+if(commandName === 'verifymetadata'){
+  // Same hard owner gate as /predetermined and /globalstats.
+  const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+  if(!isOwner) return interaction.reply({ content:'Unknown command.', flags: MessageFlags.Ephemeral });
+
+  console.log(`[verifymetadata] command received from ${interaction.user.id} (slug=${interaction.options.getString('slug')})`);
+
+  try{
+    await Promise.race([
+      interaction.deferReply({ flags: MessageFlags.Ephemeral }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('deferReply timed out after 10s')), 10000)),
+    ]);
+  }catch(e){
+    console.error(`[verifymetadata] deferReply failed/timed out:`, e.message);
+    return;
+  }
+
+  const { pgPool } = ctx;
+  const slug = (interaction.options.getString('slug') || '').toLowerCase().trim();
+  const concurrency = interaction.options.getInteger('concurrency') || 4;
+
+  try{
+    const collRes = await pgPool.query(
+      `SELECT contract, chain FROM collections WHERE slug=$1`,
+      [slug]
+    );
+    if(!collRes.rows.length){
+      return interaction.editReply({ content: `❌ No collection found with slug \`${slug}\` — onboard it first.` });
+    }
+    const row = collRes.rows[0];
+    if(!row.contract){
+      return interaction.editReply({ content: `❌ \`${slug}\` has no contract on file.` });
+    }
+
+    await interaction.editReply({ content: `🔍 Running a full on-chain metadata re-check for **${slug}** (concurrency=${concurrency})... this reads every token directly from the chain (bypassing the contract's own change-event signal, which isn't reliable at scale for this architecture) and will take several minutes for a large collection. I'll follow up when it's done.` });
+
+    const { fullCollectionVerification } = require('../lib/metadata-update-poller');
+    fullCollectionVerification({ slug, contract: row.contract, chain: row.chain || 'ethereum', concurrency })
+      .then(async stats => {
+        if(!stats.ok){
+          interaction.followUp({ content: `⏳ ${stats.error}`, flags: MessageFlags.Ephemeral }).catch(()=>{});
+          return;
+        }
+        interaction.followUp({
+          content: `✅ Full metadata verification complete for **${slug}** — checked ${stats.totalTokens} token(s), ${stats.succeeded} ok, ${stats.failed} failed, in ${stats.elapsedSec}s.`,
+          flags: MessageFlags.Ephemeral,
+        }).catch(()=>{});
+      })
+      .catch(e => {
+        console.error(`[verifymetadata] ${slug} verification failed:`, e.message);
+        interaction.followUp({ content: `❌ Full metadata verification failed for **${slug}**: ${e.message}`, flags: MessageFlags.Ephemeral }).catch(()=>{});
+      });
+  }catch(e){
+    console.error('[verifymetadata]', e.message);
+    return interaction.editReply({ content: `❌ Failed: ${e.message}` });
+  }
+}
+
 }
 
 const ADMIN_COMMANDS = new Set([
-  'setuphere','setlistingshere','setlistings','verifydashboard','status','globalstats','predetermined',
+  'setuphere','setlistingshere','setlistings','verifydashboard','status','globalstats','predetermined','verifymetadata',
 ]);
 
 // ── /verifydashboard ──────────────────────────────────────────────────────────
