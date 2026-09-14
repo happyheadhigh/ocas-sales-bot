@@ -108,7 +108,7 @@ const commands = [
   new SlashCommandBuilder().setName('predetermined').setDescription('Owner only — set up or run the predetermined on-chain trait source for a collection').setDefaultMemberPermissions('0')
     .addStringOption(o=>o.setName('slug').setDescription('Collection slug (must already be onboarded)').setRequired(true))
     .addStringOption(o=>o.setName('renderer_contract').setDescription('The renderer contract address (0x...) — only needed the first time for a collection').setRequired(false))
-    .addIntegerOption(o=>o.setName('max_id').setDescription('Override the highest token ID to read (default: tries MAX_ID() on-chain, falls back to stored total_supply)').setRequired(false).setMinValue(1)),
+    .addIntegerOption(o=>o.setName('max_id').setDescription('Override the highest token ID (default: tries on-chain MAX_ID, then stored supply)').setRequired(false).setMinValue(1)),
 
   new SlashCommandBuilder().setName('resetverify')
     .setDescription('Clear a member\'s verification so they can verify again (Admin only)')
