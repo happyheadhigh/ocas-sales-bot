@@ -197,7 +197,31 @@ if(commandName === 'predetermined'){
   const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
   if(!isOwner) return interaction.reply({ content:'Unknown command.', flags: MessageFlags.Ephemeral });
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  // jv confirmed live: this got stuck on Discord's own "thinking..." state
+  // twice in a row with ZERO trace anywhere in the logs -- not even this
+  // line was printing, meaning either the interaction never reached this
+  // code at all, or it reached here and deferReply() itself hung/rejected
+  // silently (it was never wrapped in a try/catch, so a failure here had
+  // nowhere to go). This log line alone answers the first question for
+  // next time: if it's missing again, the interaction truly isn't
+  // reaching the bot at all (a Discord/gateway-side issue outside this
+  // code); if it prints but nothing after it does, deferReply() itself is
+  // the hang.
+  console.log(`[predetermined] command received from ${interaction.user.id} (slug=${interaction.options.getString('slug')})`);
+
+  try{
+    // A 10s race so a hung deferReply() surfaces as a clear, logged
+    // timeout instead of leaving the interaction (and jv) waiting
+    // indefinitely with no way to tell what happened.
+    await Promise.race([
+      interaction.deferReply({ flags: MessageFlags.Ephemeral }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('deferReply timed out after 10s')), 10000)),
+    ]);
+  }catch(e){
+    console.error(`[predetermined] deferReply failed/timed out:`, e.message);
+    return; // interaction is already unrecoverable at this point -- nothing to reply to
+  }
+
   const { pgPool } = ctx;
   const slug = (interaction.options.getString('slug') || '').toLowerCase().trim();
   const rendererInput = interaction.options.getString('renderer_contract');

@@ -2185,13 +2185,28 @@ client.on('interactionCreate', async (interaction)=>{
 
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
-  const config=getConfig(guildId);
-  const isAdmin=interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
-    || OWNER_DISCORD_IDS.has(String(interaction.user.id));
-
-  // /setup
-
-  const ctx = buildCtx(interaction, guildId, config, isAdmin);
+  // jv confirmed live: /predetermined got stuck on Discord's "thinking..."
+  // state twice in a row with literally nothing in the logs -- not even
+  // an error. This whole pre-routing block (getConfig/buildCtx, which
+  // every single slash command depends on before it can be routed
+  // anywhere) had no error handling at all -- a throw here would vanish
+  // silently with the interaction never even acknowledged, regardless of
+  // which command was being run. Purely defensive: unchanged behavior on
+  // success, but a failure here now actually gets logged and at least
+  // attempts to tell the user something went wrong instead of leaving
+  // them staring at "thinking..." until Discord's own interaction token
+  // quietly expires ~15 minutes later.
+  let config, isAdmin, ctx;
+  try{
+    config=getConfig(guildId);
+    isAdmin=interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
+      || OWNER_DISCORD_IDS.has(String(interaction.user.id));
+    ctx = buildCtx(interaction, guildId, config, isAdmin);
+  }catch(e){
+    console.error(`[Dispatch] getConfig/buildCtx failed for command "${commandName}":`, e.message);
+    try{ await interaction.reply({ content: 'Something went wrong handling this command. Please try again.', flags: MessageFlags.Ephemeral }); }catch(_){}
+    return;
+  }
 
   if(ADMIN_COMMANDS.has(commandName))   return handleAdminCommand(commandName, ctx);
   if(STACKERSTATS_COMMANDS.has(commandName)) return handleStackerStatsCommand(commandName, ctx);
