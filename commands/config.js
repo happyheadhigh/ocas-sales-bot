@@ -1578,7 +1578,7 @@ async function handleConfigButton(interaction, ctx){
     // same slug, running two full concurrent backfills that each burned
     // real Alchemy/OpenSea request volume for no benefit (ON CONFLICT
     // protections meant no data got corrupted, just wasted duplicate work).
-    const { backfillCollectionTraits } = require('../lib/collection-backfill');
+    const { backfillCollectionTraits, fetchOnChainTotalSupply } = require('../lib/collection-backfill');
     const { tryClaimBackfillLock, releaseBackfillLock } = require('../lib/auto-backfill');
     const { computeObsRanks } = require('../lib/rank-compute');
     // chain/totalSupply were never passed here, so backfillCollectionTraits()
@@ -1587,15 +1587,32 @@ async function handleConfigButton(interaction, ctx){
     // gets asked about the contract on the WRONG chain, finds nothing, and the
     // whole run finishes instantly with 0 tokens written and no error at all.
     // The other two call sites (auto-backfill.js, collection-onboard.js)
-    // already resolve chain correctly — this one just never did. Reading it
-    // straight from the collections table (already confirmed correct) avoids
-    // re-hitting OpenSea's API a second time, which is also where the
-    // total_supply mismatch came from in the first place.
+    // already resolve chain correctly — this one just never did. Reading
+    // chain straight from the collections table (already confirmed correct)
+    // avoids re-hitting OpenSea's API a second time.
+    //
+    // totalSupply is a different story: jv confirmed live on Argonauts that
+    // the stored value here (sourced from OpenSea's cached collection
+    // metadata, set once at initial onboarding) had drifted stale — 8626
+    // stored against a real, current on-chain count that's actually higher.
+    // A re-backfill is exactly the moment to correct that, so this now reads
+    // totalSupply() directly from the contract itself (one fast eth_call,
+    // same RPC path already used for tokenURI() reads) rather than trusting
+    // that cached number — falling back to it only if the on-chain read
+    // fails (not every ERC-721 implements totalSupply()). The corrected
+    // number is also written back to collections.total_supply so it stays
+    // right for anything else that reads it, not just this run.
     const collRow = await pgPool.query(
-      `SELECT chain, total_supply FROM collections WHERE slug=$1`, [col.slug]
+      `SELECT chain, contract, total_supply FROM collections WHERE slug=$1`, [col.slug]
     ).catch(()=>({ rows:[] }));
-    const chain       = collRow.rows[0]?.chain || 'ethereum';
-    const totalSupply = collRow.rows[0]?.total_supply || null;
+    const chain          = collRow.rows[0]?.chain || 'ethereum';
+    const cachedSupply   = collRow.rows[0]?.total_supply || null;
+    const onChainSupply  = await fetchOnChainTotalSupply(collRow.rows[0]?.contract || col.contract, chain, process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY);
+    const totalSupply    = onChainSupply || cachedSupply;
+    if(onChainSupply && onChainSupply !== cachedSupply){
+      console.log(`[config] ${col.slug} totalSupply corrected from cached ${cachedSupply} to on-chain ${onChainSupply}`);
+      await pgPool.query(`UPDATE collections SET total_supply=$1, updated_at=NOW() WHERE slug=$2`, [onChainSupply, col.slug]).catch(()=>{});
+    }
 
     const claim = await tryClaimBackfillLock(pgPool, col.slug, col.contract).catch(() => ({ claimed: true })); // fail open — a lock-check error shouldn't block a manual retry
     if(!claim.claimed){
