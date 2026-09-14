@@ -192,10 +192,86 @@ if(commandName === 'globalstats'){
   }
 }
 
+if(commandName === 'predetermined'){
+  // Hard owner gate — same reasoning as globalstats above.
+  const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+  if(!isOwner) return interaction.reply({ content:'Unknown command.', flags: MessageFlags.Ephemeral });
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const { pgPool } = ctx;
+  const slug = (interaction.options.getString('slug') || '').toLowerCase().trim();
+  const rendererInput = interaction.options.getString('renderer_contract');
+  const maxIdOverride = interaction.options.getInteger('max_id');
+
+  try{
+    const collRes = await pgPool.query(
+      `SELECT contract, chain, trait_source_mode, trait_source_renderer_contract, total_supply FROM collections WHERE slug=$1`,
+      [slug]
+    );
+    const row = collRes.rows[0];
+    if(!row){
+      return interaction.editReply({ content: `❌ No collection onboarded with slug \`${slug}\`. Onboard it first (any server's \`/config\` → Add Collection).` });
+    }
+
+    const renderer = rendererInput ? rendererInput.toLowerCase().trim() : (row.trait_source_renderer_contract || null);
+    if(!renderer){
+      return interaction.editReply({ content: `❌ No renderer contract on file for \`${slug}\` yet — pass \`renderer_contract\` the first time you set this up.` });
+    }
+    if(!/^0x[0-9a-f]{40}$/.test(renderer)){
+      return interaction.editReply({ content: `❌ \`${renderer}\` doesn't look like a valid contract address (expected 0x + 40 hex chars).` });
+    }
+
+    // Persist the config — this is what makes the setup reusable for future
+    // runs and future collections: after this, `/predetermined slug:${slug}`
+    // alone (no renderer_contract needed again) re-runs it, and any OTHER
+    // collection with the same architecture is just the same command with
+    // its own slug + renderer address, no code changes required.
+    await pgPool.query(
+      `UPDATE collections SET trait_source_mode='predetermined_onchain', trait_source_renderer_contract=$1, updated_at=NOW() WHERE slug=$2`,
+      [renderer, slug]
+    );
+
+    const { fetchOnChainMaxId, backfillPredeterminedTraits } = require('../lib/predetermined-traits');
+    const alchemyKey = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    let maxId = maxIdOverride || await fetchOnChainMaxId(row.contract, row.chain || 'ethereum', alchemyKey) || row.total_supply || null;
+    if(!maxId){
+      return interaction.editReply({ content: `❌ Couldn't resolve a max token ID for \`${slug}\` — no MAX_ID() on the contract, no stored total_supply, and no max_id override given. Pass \`max_id\` explicitly.` });
+    }
+
+    await interaction.editReply({ content: `🧬 Running predetermined-trait backfill for **${slug}** across 1–${maxId}... this reads every token via Multicall and will take a few minutes. I'll follow up when it's done.` });
+
+    backfillPredeterminedTraits(pgPool, {
+      slug, contract: row.contract, rendererContract: renderer, chain: row.chain || 'ethereum', maxId,
+      onProgress: (p) => {
+        if(p.chunks % 5 === 0){
+          console.log(`[predetermined] ${slug} progress: ids ${p.start}-${p.end}/${maxId} — living=${p.living} unminted=${p.unminted} written=${p.written} rendererFailed=${p.rendererFailed}`);
+        }
+      },
+    })
+      .then(async stats => {
+        const { computeObsRanks } = require('../lib/rank-compute');
+        await computeObsRanks(pgPool, slug, { isOcas: false }).catch(e => {
+          console.warn(`[predetermined] [${slug}] TV Rank recompute failed after predetermined backfill (non-fatal):`, e.message);
+        });
+        interaction.followUp({
+          content: `✅ Predetermined-trait backfill complete for **${slug}** — checked ${stats.checked} IDs, ${stats.living} living (${stats.minted} minted / ${stats.unminted} unclaimed), ${stats.written} written, ${stats.notLiving} not-yet-living, ${stats.rendererFailed} renderer failures.`,
+          flags: MessageFlags.Ephemeral,
+        }).catch(()=>{});
+      })
+      .catch(e => {
+        console.error(`[predetermined] ${slug} backfill failed:`, e.message);
+        interaction.followUp({ content: `❌ Predetermined-trait backfill failed for **${slug}**: ${e.message}`, flags: MessageFlags.Ephemeral }).catch(()=>{});
+      });
+  }catch(e){
+    console.error('[predetermined]', e.message);
+    return interaction.editReply({ content: `❌ Failed: ${e.message}` });
+  }
+}
+
 }
 
 const ADMIN_COMMANDS = new Set([
-  'setuphere','setlistingshere','setlistings','verifydashboard','status','globalstats',
+  'setuphere','setlistingshere','setlistings','verifydashboard','status','globalstats','predetermined',
 ]);
 
 // ── /verifydashboard ──────────────────────────────────────────────────────────

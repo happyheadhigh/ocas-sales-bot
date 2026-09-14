@@ -96,6 +96,19 @@ const commands = [
   new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('config').setDescription('Configure your bot — collections, channels, roles (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('globalstats').setDescription('Owner only').setDefaultMemberPermissions('0'),
+  // jv: Argonauts (and any future collection with the same architecture --
+  // traits predetermined on-chain, independent of minting, via a separate
+  // renderer contract's own tokenURI(id, traits, printed)) needs a one-time
+  // setup + backfill trigger, distinct from the normal per-server /config
+  // dashboard since this is a bot-wide data-source decision, not a server
+  // preference. Owner-gated the same way globalstats is -- default_member_permissions
+  // '0' hides it from every server's command picker; the real gate is the
+  // OWNER_DISCORD_IDS check in the handler, same as every other owner-only
+  // command here.
+  new SlashCommandBuilder().setName('predetermined').setDescription('Owner only — set up or run the predetermined on-chain trait source for a collection').setDefaultMemberPermissions('0')
+    .addStringOption(o=>o.setName('slug').setDescription('Collection slug (must already be onboarded)').setRequired(true))
+    .addStringOption(o=>o.setName('renderer_contract').setDescription('The renderer contract address (0x...) — only needed the first time for a collection').setRequired(false))
+    .addIntegerOption(o=>o.setName('max_id').setDescription('Override the highest token ID to read (default: tries MAX_ID() on-chain, falls back to stored total_supply)').setRequired(false).setMinValue(1)),
 
   new SlashCommandBuilder().setName('resetverify')
     .setDescription('Clear a member\'s verification so they can verify again (Admin only)')
