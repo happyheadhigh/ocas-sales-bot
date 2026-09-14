@@ -822,7 +822,17 @@ async function handleMarketCommand(commandName, ctx){
         const oldest = sweepSessions.keys().next().value;
         sweepSessions.delete(oldest);
       }
-      sweepSessions.set(sessionId, { listings: cleanSweepListings, page: 0 });
+      sweepSessions.set(sessionId, {
+        listings: cleanSweepListings, page: 0,
+        // jv: "make sure ... all links lead to correct links via it be
+        // OpenSea or traitview." sweepTokenUrl() (lib/burn-config.js) had
+        // OCAS's own contract address hardcoded directly -- harmless for
+        // OCAS itself, but /sweep is explicitly available for non-OCAS
+        // collections on a paid tier (see isPaidFeature check above), so
+        // any Argonauts (or other) sweep silently built an OpenSea link
+        // pointing at the wrong contract entirely.
+        contract: sweepConfig.contract || '', chain: sweepConfig.chain || 'ethereum', slug: sweepConfig.slug || sweepConfig.collectionSlug || '',
+      });
       setTimeout(() => sweepSessions.delete(sessionId), 30 * 60 * 1000);
       components.push(new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('sweep:showall:' + sessionId).setLabel('Show All Tokens').setStyle(ButtonStyle.Secondary)
@@ -973,7 +983,9 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
       const tokenChain = dbMeta?.chain || 'ethereum';
       const tokenContract = dbMeta?.contract || contract;
       const listingUrl = l.url || `https://opensea.io/assets/${tokenChain}/${tokenContract}/${tokenId}`;
-      const tvUrl = `https://traitview.com/?jump=${tokenId}`;
+      // Same fix as embeds.js/poll.js's identical tvUrl -- needs &collection=
+      // or it silently lands on the default (OCAS) collection instead.
+      const tvUrl = `https://traitview.com/?jump=${tokenId}&collection=${rfSlug}`;
       const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
       const embed = new EmbedBuilder()
         .setColor(rankColor)

@@ -48,7 +48,7 @@ const {
   checkCommandCooldown, fetchBotApiJson,
   buildNavRow, postEmbeds,
   getTraitIndex, chooseTraitGroupsFromQuery, normalizePhrase,
-  cachedFloors,
+  cachedFloors, formatSweepTokenLine,
 } = require('./lib/burn-config');
 
 const {
@@ -1681,7 +1681,7 @@ client.on('interactionCreate', async (interaction)=>{
     const page = Math.max(0, Math.min(session.page, totalPages - 1));
     session.page = page;
     const slice = listings.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-    const tokenLines = slice.map(formatSweepTokenLine);
+    const tokenLines = slice.map(item => formatSweepTokenLine(item, session));
     const navRow = new ActionRowBuilder();
     if(page > 0)            navRow.addComponents(new ButtonBuilder().setCustomId('sweep:prev:' + sessionId).setLabel('← Prev').setStyle(ButtonStyle.Secondary));
     if(page < totalPages-1) navRow.addComponents(new ButtonBuilder().setCustomId('sweep:next:' + sessionId).setLabel('Next →').setStyle(ButtonStyle.Secondary));
