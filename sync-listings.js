@@ -428,9 +428,29 @@ async function syncSales(collection) {
 
         const priceWei = ev?.payment?.quantity || ev?.total_price;
         if (!priceWei) continue;
-        const price_eth = parseFloat(priceWei) / 1e18;
+        // jv confirmed live on nekoadz (Robinhood Chain): a sale showing
+        // "8 ETH" that was actually 8 of the chain's real native/listing
+        // currency. This hardcoded 18 decimals unconditionally regardless
+        // of ev.payment.decimals -- same bug class already fixed for
+        // listing prices (getPriceEth's 8e-12 ETH incident). Reading the
+        // real decimals when OpenSea provides them, same as the already-
+        // correct pattern used for sale embeds elsewhere in this codebase
+        // (lib/embeds.js: `const dec = event.payment?.decimals ?? 18;`).
+        const decimals = ev?.payment?.decimals ?? 18;
+        const price_eth = parseFloat(priceWei) / Math.pow(10, decimals);
         if (isNaN(price_eth) || price_eth <= 0 || price_eth > MAX_PLAUSIBLE_PRICE_ETH) continue;
 
+        // jv: "Nekoadz is showing a sale for 8 eth but it's actually 8
+        // USDG." This already correctly reads ev.payment.symbol rather
+        // than assuming ETH -- if it's still showing "ETH" after this
+        // deploys, that means OpenSea's own event payload isn't actually
+        // populating .symbol for this chain's sales, not a bug in this
+        // read. Logging the full raw payment object once per sync run so
+        // the real field structure is visible without guessing further.
+        if (!global.__loggedSamplePayment) {
+          global.__loggedSamplePayment = true;
+          console.log(`[sync-sales] [${slug}] Sample sale payment object: ${JSON.stringify(ev?.payment)}`);
+        }
         const currency = ev?.payment?.symbol || 'ETH';
         const buyer  = ev?.buyer  || ev?.winner_account?.address || null;
         const seller = ev?.seller || ev?.from_account?.address   || null;
@@ -544,9 +564,29 @@ async function seedFullSalesHistory(collection) {
 
         const priceWei = ev?.payment?.quantity || ev?.total_price;
         if (!priceWei) continue;
-        const price_eth = parseFloat(priceWei) / 1e18;
+        // jv confirmed live on nekoadz (Robinhood Chain): a sale showing
+        // "8 ETH" that was actually 8 of the chain's real native/listing
+        // currency. This hardcoded 18 decimals unconditionally regardless
+        // of ev.payment.decimals -- same bug class already fixed for
+        // listing prices (getPriceEth's 8e-12 ETH incident). Reading the
+        // real decimals when OpenSea provides them, same as the already-
+        // correct pattern used for sale embeds elsewhere in this codebase
+        // (lib/embeds.js: `const dec = event.payment?.decimals ?? 18;`).
+        const decimals = ev?.payment?.decimals ?? 18;
+        const price_eth = parseFloat(priceWei) / Math.pow(10, decimals);
         if (isNaN(price_eth) || price_eth <= 0 || price_eth > MAX_PLAUSIBLE_PRICE_ETH) continue;
 
+        // jv: "Nekoadz is showing a sale for 8 eth but it's actually 8
+        // USDG." This already correctly reads ev.payment.symbol rather
+        // than assuming ETH -- if it's still showing "ETH" after this
+        // deploys, that means OpenSea's own event payload isn't actually
+        // populating .symbol for this chain's sales, not a bug in this
+        // read. Logging the full raw payment object once per sync run so
+        // the real field structure is visible without guessing further.
+        if (!global.__loggedSamplePayment) {
+          global.__loggedSamplePayment = true;
+          console.log(`[sync-sales] [${slug}] Sample sale payment object: ${JSON.stringify(ev?.payment)}`);
+        }
         const currency = ev?.payment?.symbol || 'ETH';
         const buyer  = ev?.buyer  || ev?.winner_account?.address || null;
         const seller = ev?.seller || ev?.from_account?.address   || null;
