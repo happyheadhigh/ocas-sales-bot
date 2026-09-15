@@ -2,6 +2,9 @@
 
 const { EmbedBuilder, MessageFlags } = require('discord.js');
 const { COLORS, OWNER_DISCORD_IDS } = require('../lib/constants');
+// jv: "want the 2 slash commands that were added to send me messages to my
+// webhook discord server so I gets message and I know when they get done."
+const { sendActivityWebhook, sendErrorWebhook } = require('../lib/error');
 
 /**
  * Handle admin configuration commands.
@@ -277,14 +280,17 @@ if(commandName === 'predetermined'){
         await computeObsRanks(pgPool, slug, { isOcas: false }).catch(e => {
           console.warn(`[predetermined] [${slug}] TV Rank recompute failed after predetermined backfill (non-fatal):`, e.message);
         });
+        const summary = `checked ${stats.checked} IDs, ${stats.living} living (${stats.minted} minted / ${stats.unminted} unclaimed), ${stats.written} written, ${stats.notLiving} not-yet-living, ${stats.rendererFailed} renderer failures.`;
         interaction.followUp({
-          content: `✅ Predetermined-trait backfill complete for **${slug}** — checked ${stats.checked} IDs, ${stats.living} living (${stats.minted} minted / ${stats.unminted} unclaimed), ${stats.written} written, ${stats.notLiving} not-yet-living, ${stats.rendererFailed} renderer failures.`,
+          content: `✅ Predetermined-trait backfill complete for **${slug}** — ${summary}`,
           flags: MessageFlags.Ephemeral,
         }).catch(()=>{});
+        sendActivityWebhook(`✅ /predetermined complete: "${slug}"`, summary).catch(()=>{});
       })
       .catch(e => {
         console.error(`[predetermined] ${slug} backfill failed:`, e.message);
         interaction.followUp({ content: `❌ Predetermined-trait backfill failed for **${slug}**: ${e.message}`, flags: MessageFlags.Ephemeral }).catch(()=>{});
+        sendErrorWebhook(`/predetermined failed: "${slug}"`, e).catch(()=>{});
       });
   }catch(e){
     console.error('[predetermined]', e.message);
@@ -335,14 +341,17 @@ if(commandName === 'verifymetadata'){
           interaction.followUp({ content: `⏳ ${stats.error}`, flags: MessageFlags.Ephemeral }).catch(()=>{});
           return;
         }
+        const summary = `checked ${stats.totalTokens} token(s), ${stats.succeeded} ok, ${stats.failed} failed, in ${stats.elapsedSec}s.`;
         interaction.followUp({
-          content: `✅ Full metadata verification complete for **${slug}** — checked ${stats.totalTokens} token(s), ${stats.succeeded} ok, ${stats.failed} failed, in ${stats.elapsedSec}s.`,
+          content: `✅ Full metadata verification complete for **${slug}** — ${summary}`,
           flags: MessageFlags.Ephemeral,
         }).catch(()=>{});
+        sendActivityWebhook(`✅ /verifymetadata complete: "${slug}"`, summary).catch(()=>{});
       })
       .catch(e => {
         console.error(`[verifymetadata] ${slug} verification failed:`, e.message);
         interaction.followUp({ content: `❌ Full metadata verification failed for **${slug}**: ${e.message}`, flags: MessageFlags.Ephemeral }).catch(()=>{});
+        sendErrorWebhook(`/verifymetadata failed: "${slug}"`, e).catch(()=>{});
       });
   }catch(e){
     console.error('[verifymetadata]', e.message);
