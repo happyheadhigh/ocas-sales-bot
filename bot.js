@@ -57,14 +57,8 @@ const {
   setClient, traitDisplayLines, fetchTokenUriFromContract,
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
-const { setClient: setStackersFusionClient } = require('./lib/stackers-fusion-poller');
 const { startMetadataUpdatePoller } = require('./lib/metadata-update-poller');
 const { startBurnDetectionPoller } = require('./lib/burn-detect');
-const { startLiveListeners: startStackersLiveListeners } = require('./lib/stackers-live-events');
-const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vault-listing-alerts');
-const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
-const { handleStackersCommand, STACKERS_COMMANDS, handleListingsPageButton, handleFusedPageButton } = require('./commands/stackers');
-const { takeStackersSnapshot, takeLiveVaultSnapshot } = require('./lib/stackers-analytics');
 
 const {
   buildBurnLotteryEmbed, buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
@@ -107,7 +101,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, showStackerOptimizeResult, handleMeTokenDownload }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, handleMeTokenDownload }   = require('./commands/market');
 const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
@@ -126,8 +120,6 @@ const client = new Client({ intents: [
 ] });
 setClient(client); // inject into burn-poller
 setPollClient(client); // inject into poll
-setStackersFusionClient(client); // inject into stackers fusion poller
-setStackersVaultAlertsClient(client); // inject into stackers vault-listing alerts
 
 // ── resolveDiscordChannel — needs client, defined here ───────────────────────
 // Inject client into burn-poller so it can resolve channels
@@ -872,12 +864,6 @@ client.on('interactionCreate', async (interaction)=>{
     const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser, osHeaders };
     return handleMeInteraction(interaction, meCtx);
   }
-  if(interaction.isButton() && interaction.customId.startsWith('stackers:listings:page:')){
-    return handleListingsPageButton(interaction, pgPool);
-  }
-  if(interaction.isButton() && interaction.customId.startsWith('stackers:fused:page:')){
-    return handleFusedPageButton(interaction, pgPool);
-  }
 
   // Modal submissions for price/floor alerts
   if(interaction.isModalSubmit() && interaction.customId.startsWith('me_modal:')){
@@ -905,16 +891,6 @@ client.on('interactionCreate', async (interaction)=>{
     }
 
     const slug = parts.slice(2).join(':');
-
-    if(alertType === 'stackeroptimize'){
-      const raw = interaction.fields.getTextInputValue('budget').trim().replace(/[,\s]/g, '');
-      const budget = parseInt(raw, 10);
-      if(isNaN(budget) || budget <= 0){
-        return interaction.reply({ content: '❌ Invalid budget. Enter a positive number of $STACK, e.g. 350000.', flags: MessageFlags.Ephemeral });
-      }
-      const meCtx = { pgPool };
-      return showStackerOptimizeResult(interaction, meCtx, budget);
-    }
 
     if(alertType === 'pricealert'){
       const tokenId = parseInt(interaction.fields.getTextInputValue('token_id').trim());
@@ -2209,8 +2185,6 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   if(ADMIN_COMMANDS.has(commandName))   return handleAdminCommand(commandName, ctx);
-  if(STACKERSTATS_COMMANDS.has(commandName)) return handleStackerStatsCommand(commandName, ctx);
-  if(STACKERS_COMMANDS.has(commandName)) return handleStackersCommand(commandName, ctx);
   if(MARKET_COMMANDS.has(commandName))  return handleMarketCommand(commandName, ctx);
   if(OCAS_COMMANDS.has(commandName))    return handleOcasCommand(commandName, ctx);
   if(TOKEN_COMMANDS.has(commandName))   return handleTokenCommand(commandName, ctx);
@@ -2546,58 +2520,6 @@ client.once('clientReady', async ()=>{
   if(process.env.ALCHEMY_API_KEY){
     startBurnDetectionPoller();
   }
-  // Stackers live event listener — replaces the two separate 60s polling
-  // intervals that used to run here. Confirmed live tonight that repeated
-  // small-block-range polling genuinely cannot keep pace with this chain's
-  // block rate (~598 blocks/minute against a confirmed 10-block eth_getLogs
-  // cap on this account) without either falling permanently behind or
-  // taking on rate-limit risk uncomfortable for a permanent background
-  // rate. A live WebSocket subscription sidesteps the block-range
-  // limitation entirely rather than continuing to tune around it — the
-  // two pollers below remain in place internally as a much-lower-frequency
-  // safety net, not the primary mechanism anymore.
-  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
-    console.log('[StackersLive] Starting live event listener');
-    startStackersLiveListeners(pgPool).catch(e =>
-      console.error('[StackersLive] Failed to start:', e.message)
-    );
-  } else {
-    console.log('[StackersLive] No ALCHEMY_API_KEY set — live listener disabled');
-  }
-  // Stackers live vault-totals snapshot — replaces the old 24h full
-  // on-chain sweep. This is a pure aggregation of the already-live
-  // stackers_token_status.vault_balances data (kept current via the
-  // Credited/Claimed live event listeners), not a fresh on-chain read at
-  // all -- no RPC cost, so unlike the old sweep this safely runs
-  // immediately on startup too, not just on the interval. 15 minutes gets
-  // the first real accrual comparison available within about that long,
-  // rather than needing up to 48h for two full sweeps under the old
-  // design -- the comparison's actual window (24h lookback, in
-  // getVaultAccrualComparison) is what determines the steady-state
-  // comparison length, not this interval; going faster than this
-  // wouldn't meaningfully improve anything further, just accumulate more
-  // rows for no real benefit, which is why snapshots older than 48h get
-  // pruned automatically inside takeLiveVaultSnapshot itself.
-  // The old full-sweep function (lib/stackers-analytics.js,
-  // takeStackersSnapshot) remains available but is no longer auto-
-  // scheduled -- it's now redundant given live tracking covers the same
-  // ground, and its real RPC cost isn't worth paying automatically anymore
-  // given tonight's confirmed account strain.
-  console.log('[StackersAnalytics] Live vault snapshot job scheduled (every 15min, runs immediately too)');
-  takeLiveVaultSnapshot(pgPool).catch(e =>
-    console.error('[StackersAnalytics] Initial live vault snapshot failed:', e.message)
-  );
-  setInterval(() => {
-    takeLiveVaultSnapshot(pgPool).catch(e =>
-      console.error('[StackersAnalytics] Live vault snapshot failed:', e.message)
-    );
-  }, 15 * 60 * 1000);
-  // Stackers vault-listings refresh — removed. /stackers listings now
-  // reads live: stackers_token_status.vault_balances (kept current via the
-  // Credited/Claimed live event listeners) joined directly against the
-  // listings table (already fresh via the existing sync pipeline). The
-  // periodic full sweep this used to run is no longer needed for this
-  // purpose and was just spending RPC calls on data nothing reads anymore.
   // Process pending burn alerts every 30s — waits for metadata to refresh before posting
   setInterval(processPendingBurnAlerts, 30_000);
   // Only run rank sync on production — staging shares the same codebase but shouldn't consume OS API quota

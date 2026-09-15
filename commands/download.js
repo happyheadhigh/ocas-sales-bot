@@ -7,8 +7,6 @@ const { extractPngFromSvg } = require('../lib/images');
 const { pgPool, dbLoad, dbSave } = require('../lib/db');
 const { SUPPORTED_CHAINS } = require('../lib/collection-backfill');
 const { ipfsToHttp, fetchWithGatewayFallback } = require('../lib/ipfs-gateway');
-const { STACKERS_SLUG } = require('../lib/stackers');
-const { getOrCacheStackerImage } = require('../lib/stackers-image-cache');
 const { fetchTokenUri, loadJsonFromUri } = require('../lib/rpc');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
@@ -225,14 +223,6 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
   }
 
   let src;
-  if(slug === STACKERS_SLUG){
-    try{
-      const cached = await getOrCacheStackerImage(pgPool, tokenId);
-      src = cached.data;
-    }catch(e){
-      console.warn(`[Download] Stacker image cache path failed for token ${tokenId}, falling back to generic resolution:`, e.message);
-    }
-  }
   if(src === undefined){
     src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
   }

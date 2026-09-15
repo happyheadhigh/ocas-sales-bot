@@ -193,10 +193,10 @@ async function syncListings(collection) {
           // TraitView, matching an earlier "8e-12 ETH" floor-price log this
           // exact bug already produced. getPriceEth() below falls back to
           // assuming 18 decimals (wei/1e18) whenever OpenSea doesn't hand
-          // it a pre-computed .decimal -- correct for ETH/WETH, but
-          // Stackers' own code (lib/stackers.js) had to explicitly stop
-          // assuming 18 decimals for Robinhood Chain assets and resolve the
-          // real decimals on-chain instead, which is a strong signal this
+          // it a pre-computed .decimal -- correct for ETH/WETH, but this
+          // chain's own assets have been confirmed elsewhere to NOT
+          // reliably use 18 decimals, resolved via an actual on-chain
+          // decimals() call rather than assumed -- a strong signal this
           // chain's native/listing currency may not be 18 decimals either.
           // Logging the full raw price object here (not just its top-level
           // keys) so the actual field names/values are visible without

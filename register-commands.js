@@ -26,31 +26,6 @@ const commands = [
 
   new SlashCommandBuilder().setName('status').setDescription('Show current bot configuration'),
 
-  new SlashCommandBuilder().setName('stackerstats').setDescription('Stackers collection-wide stats — tier distribution, asset popularity, vault totals'),
-
-  new SlashCommandBuilder()
-    .setName('stackers')
-    .setDescription('Browse Stackers — listings with unclaimed vault value, fused Stackers, or a specific token')
-    .addSubcommand(sub =>
-      sub.setName('listings')
-        .setDescription('Currently listed Stackers with unclaimed value sitting in their vault')
-    )
-    .addSubcommand(sub =>
-      sub.setName('token')
-        .setDescription('Full status for one specific Stacker — tier, split, vault balance, listing status')
-        .addIntegerOption(opt =>
-          opt.setName('id')
-            .setDescription('Token ID')
-            .setRequired(true)
-            .setMinValue(1)
-        )
-    )
-    .addSubcommand(sub =>
-      sub.setName('fused')
-        .setDescription('Browse currently listed fused Stackers — tier, vault balance, image, one at a time')
-    ),
-
-
   new SlashCommandBuilder().setName('download')
   .setDescription('Download a high-res PNG for OCAS or another configured collection — leave blank for a guided menu')
   .addStringOption(o=>o.setName('search').setDescription('Example: ocas #337 2048 no bg').setRequired(false))

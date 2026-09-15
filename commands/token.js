@@ -1,7 +1,6 @@
 'use strict';
 
 const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
-const { STACKERS_SLUG, formatStackersFields } = require('../lib/stackers');
 const fetch = require('node-fetch');
 
 async function handleTokenCommand(commandName, ctx){
@@ -237,11 +236,6 @@ async function handleTokenCommand(commandName, ctx){
         .setTitle(`${colLabel} #${tokenId}${rankBadge}`)
         .setColor(ocasColor)
         .setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
-
-      if((activeCol.slug || activeCol.collectionSlug) === STACKERS_SLUG){
-        const stackersFields = await formatStackersFields(tokenId);
-        if(stackersFields.length) embed.addFields(...stackersFields);
-      }
 
       if(imgResult?.type==='buffer'){
         const att=new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename});
