@@ -424,8 +424,7 @@ async function handleMarketCommand(commandName, ctx){
       `Listing DMs: ${alertListings?'on':'off'}`,
       '',
       'You will receive DMs when matching events happen.',
-      'Use `/myalert` again to add more trait filters.',
-      'Use `/myalertclear` to remove your alert.'
+      'Run `/me` → **Trait Alert** to add more filters, pause, or remove your alert.'
     ].join('\n');
 
     await interaction.reply({content:lines, flags: MessageFlags.Ephemeral});
@@ -460,7 +459,7 @@ async function handleMarketCommand(commandName, ctx){
   // /myalertstatus
   if(commandName==='myalertstatus'){
     const alert=getAlert(interaction.user.id);
-    if(!alert){await interaction.reply({content:'You have no personal alert set. Use `/myalert` to create one.', flags: MessageFlags.Ephemeral});return;}
+    if(!alert){await interaction.reply({content:'You have no personal alert set. Run `/me` → **Trait Alert** to create one.', flags: MessageFlags.Ephemeral});return;}
     const filterStr=alert.traitFilters&&Object.keys(alert.traitFilters).length>0?Object.entries(alert.traitFilters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n'):'none (all events)';
     const lines=[
       `Collection: **${alert.slug||'any'}**`,
@@ -1096,7 +1095,8 @@ async function showTfValuePicker(interaction, ctx, slug, traitName){
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){ console.warn('[traitfind] getCachedTraitIndex failed:', e.message); }
-  const matchingRows = traitIndex.filter(t => t.trait_name === traitName);
+  const matchingRows = traitIndex.filter(t => t.trait_name === traitName)
+    .sort((a, b) => (a.token_count||0) - (b.token_count||0));
   if(!matchingRows.length){
     return interaction.update({ content: `No values found for **${traitName}**.`, components: [] });
   }
@@ -1414,7 +1414,14 @@ async function showMaValuePicker(interaction, ctx, slug, traitName){
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){ console.warn('[traitfind] getCachedTraitIndex failed:', e.message); }
-  const valueRows = traitIndex.filter(t => t.trait_name === traitName).slice(0, 25);
+  // jv: "Noticed the traits are out of order. Traits should display as
+  // rarest at the top." traitIndex had no sort applied at all here --
+  // whatever order the underlying cached index happened to return was
+  // whatever displayed. Rarest first = ascending token_count (fewer
+  // tokens sharing a value = rarer).
+  const valueRows = traitIndex.filter(t => t.trait_name === traitName)
+    .sort((a, b) => (a.token_count||0) - (b.token_count||0))
+    .slice(0, 25);
   if(!valueRows.length){
     return interaction.update({ content: `No values found for **${traitName}**.`, components: [] });
   }
@@ -1562,8 +1569,7 @@ async function handleMyAlertInteraction(interaction, ctx){
         `**Filters:**`,
         fmtF(filters),
         '',
-        'Use `/myalert` again to add more filters.',
-        'Use `/myalertclear` to remove your alert.',
+        'Run `/me` → **Trait Alert** to add more filters, pause, or remove your alert.',
       ].join('\n'));
     const backRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),

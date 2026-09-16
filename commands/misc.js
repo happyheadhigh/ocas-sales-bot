@@ -33,9 +33,7 @@ async function handleMiscCommand(commandName, ctx){
       '`/burnrefresh token:1234` — Refresh metadata + re-post burn alert (5 min cooldown)',
     ].join('\n');
     const alertCmds=[
-      '`/myalert trait:Type value:Zombie` — DM when a Zombie sells or lists',
-      '`/myalertstatus` — See your current alert settings',
-      '`/myalertclear` — Remove your DM alert',
+      '`/me` → **Trait Alert** — Set up a DM alert (e.g. when a Zombie sells or lists), add filters, pause, or remove it',
     ].join('\n');
     const adminCmds=[
       '`/setup` — Initial configuration wizard (collection, channels, roles)',
