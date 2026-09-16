@@ -82,6 +82,7 @@ const {
   loadAllAlerts, loadSaleCursors, loadListingCursors,
   saveSaleCursors, saveListingCursors,
   setClient: setPollClient,
+  setSyncTraitRolesFn,
   traitGroupsLabel, buildTokenSearchEmbed,
   lastSaleIds, lastListingIds,
 } = require('./lib/poll');
@@ -121,6 +122,7 @@ const client = new Client({ intents: [
 ] });
 setClient(client); // inject into burn-poller
 setPollClient(client); // inject into poll
+setSyncTraitRolesFn(syncTraitRoles); // inject into poll — immediate role re-sync on sale (buyer/seller)
 
 // ── resolveDiscordChannel — needs client, defined here ───────────────────────
 // Inject client into burn-poller so it can resolve channels
