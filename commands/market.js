@@ -2281,6 +2281,21 @@ async function showMeWallet(interaction, ctx){
           [walletsForQuery]
         ).catch(() => ({ rows: [{ event_count: 0 }] }));
 
+        // jv: "it would be good to have the wallet address next to the
+        // collections that the wallets holds." Only meaningful (and only
+        // queried) when there's more than one linked wallet to
+        // disambiguate between -- a single-wallet user gains nothing from
+        // seeing their own one address repeated on every collection.
+        let holderWallets = [];
+        if(allLinked.length > 1){
+          const holderRes = await pgPool.query(
+            `SELECT DISTINCT wallet_address FROM wallet_token_intervals
+             WHERE wallet_address = ANY($1::text[]) AND collection_slug=$2 AND disposed_at IS NULL`,
+            [walletsForQuery, col.slug]
+          ).catch(() => ({ rows: [] }));
+          holderWallets = holderRes.rows.map(r => r.wallet_address);
+        }
+
         const burnEventCount = parseInt(burnEvents.rows[0]?.event_count || 0);
         const held   = parseInt(stats.rows[0]?.held   || 0);
         const sold   = parseInt(stats.rows[0]?.sold   || 0);
@@ -2478,7 +2493,7 @@ async function showMeWallet(interaction, ctx){
 
         cols.push({ name: col.name, slug: col.slug, held, sold, burned, burnEventCount,
                     floor, collFloorEst, estValue, bestEst, estMethod, avgCost,
-                    unrealizedPnl, realizedPnl, totalEarned, minted, boughtCount, totalBuyEth });
+                    unrealizedPnl, realizedPnl, totalEarned, minted, boughtCount, totalBuyEth, holderWallets });
       } catch(e){ console.warn('[WalletTab]', col.slug, e.message); }
     }
   }
@@ -2527,7 +2542,7 @@ async function showMeWallet(interaction, ctx){
       ? ` (${c.unrealizedPnl >= 0 ? '+' : ''}${((c.unrealizedPnl / (c.avgCost * c.held)) * 100).toFixed(0)}%)`
       : '';
 
-    lines.push(`**${c.name}**`);
+    lines.push(`**${c.name}**${c.holderWallets && c.holderWallets.length ? ` (${c.holderWallets.map(w=>'`'+w.slice(0,6)+'...'+w.slice(-4)+'`').join(', ')})` : ''}`);
 
     // Holdings + est value
     lines.push(`Holdings: **${c.held}** token${c.held === 1 ? '' : 's'}`);

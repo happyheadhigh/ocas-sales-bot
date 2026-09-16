@@ -142,11 +142,26 @@ async function verifyImageIsRaster(url){
 // ── Trait filter matching ─────────────────────────────────────────────────────
 function matchesFilters(traits, filters){
   if(!filters || Object.keys(filters).length === 0) return true;
+  // jv confirmed live: a trait alert set up through the guided wizard
+  // (ma_browse:confirm: in commands/market.js) never fired. Root cause --
+  // that flow saves the trait key straight from a Discord custom-ID
+  // string, in whatever case the collection's real trait name happens to
+  // use (e.g. "Type", "Background" -- extremely common for NFT trait
+  // names). This function already lowercased the token's own trait-type
+  // keys when building `lookup` below, but never lowercased the filter's
+  // own keys to match -- so a saved key of "Type" could never find
+  // lookup's "type", and the alert silently matched nothing, forever.
+  // The direct /myalert slash command happened to already lowercase its
+  // own input before saving, which is why that specific path worked. Now
+  // both sides are always lowercased here, so this is correct regardless
+  // of which alert-creation path saved the filter, and needs no data
+  // migration for already-saved alerts -- they read correctly the next
+  // time this runs.
   const lookup = {};
   for(const t of (traits || [])) lookup[t.trait_type?.toLowerCase()] = String(t.value).toLowerCase();
   for(const [k, v] of Object.entries(filters)){
     const allowed = Array.isArray(v) ? v : [v];
-    if(allowed.map(a => String(a).toLowerCase()).includes(lookup[k])) return true;
+    if(allowed.map(a => String(a).toLowerCase()).includes(lookup[k.toLowerCase()])) return true;
   }
   return false;
 }
