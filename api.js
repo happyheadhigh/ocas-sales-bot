@@ -1458,6 +1458,21 @@ function isEthAddress(addr) {
 function cleanAddress(addr) {
   return normalizeEthAddress(addr);
 }
+// jv: "figure that out" -- re: combining Wallet Analytics (P&L, cost
+// basis, top tokens) across every Discord-linked wallet, not just the
+// one connected in the browser. Every /db/wallet/:address/* endpoint
+// below took exactly one address in the path; this lets the frontend
+// pass a comma-separated list instead (:address stays one URL segment
+// either way, just potentially multi-valued), parsed into a clean,
+// deduplicated array here once rather than reimplementing this same
+// split/clean/validate logic in each of the 5 endpoints. Returns null
+// if ANY segment is invalid, so a typo'd address fails the whole
+// request loudly instead of silently querying a partial, wrong set.
+function parseWalletAddresses(param) {
+  const parts = String(param || '').split(',').map(s => cleanAddress(s.trim())).filter(Boolean);
+  if (!parts.length || !parts.every(isEthAddress)) return null;
+  return [...new Set(parts)];
+}
 function intParam(value, fallback, max) {
   const n = parseInt(value || fallback, 10);
   if (!Number.isFinite(n) || n < 0) return fallback;
@@ -1791,8 +1806,9 @@ app.put('/db/wallet/:address/favorites', auth,
 
 // Current derived wallet summary. Returns empty data if wallet sync has not run.
 app.get('/db/wallet/:address/summary', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0]; // kept for the response's own `address` field and error paths below
   // Confirmed live: jv reported never getting any wallet holdings for
   // Argonauts. Traced to this route specifically -- the note below (from
   // 2026-07-02) already flagged this exact hardcoding as a known gap, but
@@ -1824,10 +1840,10 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
       FROM wallet_token_intervals w
       LEFT JOIN tokens t ON t.id = w.token_id AND t.collection_slug = w.collection_slug
       LEFT JOIN listings l ON l.token_id = w.token_id AND l.collection_slug = w.collection_slug
-      WHERE w.wallet_address = $1 AND w.collection_slug = $2 AND w.disposed_at IS NULL
+      WHERE w.wallet_address = ANY($1::text[]) AND w.collection_slug = $2 AND w.disposed_at IS NULL
       ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC
       LIMIT 10000
-    `, [address, slug]);
+    `, [addresses, slug]);
 
     const owned = current.rows;
     const ranks = owned.map(r => parseInt(r.os_rank || r.obs_rank)).filter(Number.isFinite);
@@ -1842,9 +1858,9 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
     const realizedRes = await pool.query(`
       SELECT COALESCE(SUM(sale_eth - cost_eth), 0) AS realized_pnl, COUNT(*)::int AS sold_count
       FROM wallet_token_intervals
-      WHERE wallet_address = $1 AND collection_slug = $2
+      WHERE wallet_address = ANY($1::text[]) AND collection_slug = $2
         AND disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0
-    `, [address, slug]);
+    `, [addresses, slug]);
     const realizedPnl = parseFloat(realizedRes.rows[0]?.realized_pnl || 0);
     const soldCount = parseInt(realizedRes.rows[0]?.sold_count || 0);
     const totalCostBasis = owned.reduce((s, r) => s + (parseFloat(r.cost_eth) || 0), 0);
@@ -1906,8 +1922,9 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
 
 // ── GET /db/wallet/:address/transfers ────────────────────────────────────────
 app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0];
   const limit = intParam(req.query.limit, 100, 1000);
   const offset = intParam(req.query.offset, 0, 10000);
   // Same hardcoded-to-OCAS bug as /db/wallet/:address/summary above, same
@@ -1923,10 +1940,10 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
              s.price_eth AS sale_price, s.buyer, s.seller
       FROM nft_transfers nt
       LEFT JOIN sales s ON s.tx_hash = nt.tx_hash AND s.token_id = nt.token_id
-      WHERE nt.contract = $1 AND nt.collection_slug = $2 AND (nt.from_address = $3 OR nt.to_address = $3)
+      WHERE nt.contract = $1 AND nt.collection_slug = $2 AND (nt.from_address = ANY($3::text[]) OR nt.to_address = ANY($3::text[]))
       ORDER BY nt.block_number DESC, nt.log_index DESC
       LIMIT $4 OFFSET $5
-    `, [contract, slug, address, limit, offset]);
+    `, [contract, slug, addresses, limit, offset]);
 
     // Burns live in their own purpose-built tables (burn_events/burn_event_inputs),
     // separate from nft_transfers entirely -- pull them directly rather than
@@ -1934,13 +1951,13 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
     // every wallet's historical rows.
     const burnRes = await pool.query(`
       SELECT be.id AS burn_event_id, be.tx_hash, be.block_number, be.log_index, be.burned_at, be.survivor_token_id,
-             be.points_used, bei.burned_token_id
+             be.points_used, be.burner_wallet, bei.burned_token_id
       FROM burn_events be
       JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-      WHERE LOWER(be.burner_wallet) = LOWER($1)
+      WHERE LOWER(be.burner_wallet) = ANY($1::text[])
       ORDER BY be.block_number DESC
       LIMIT $2
-    `, [address, limit]).catch(() => ({ rows: [] })); // tolerate if burn tables aren't present in some env
+    `, [addresses, limit]).catch(() => ({ rows: [] })); // tolerate if burn tables aren't present in some env
 
     // Same reasoning as everywhere else burn rows get displayed: a destroyed
     // input token no longer represents its original self, so a "current"
@@ -1971,7 +1988,7 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
     const burnRows = burnRes.rows.map(r => ({
       contract: OCAS_CONTRACT,
       token_id: parseInt(r.burned_token_id),
-      from_address: address,
+      from_address: r.burner_wallet || address,
       to_address: null,
       tx_hash: r.tx_hash,
       log_index: r.log_index != null ? parseInt(r.log_index) : 0,
@@ -2012,16 +2029,17 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
 // / burn_event_inputs tables (confirmed live schema, not the CREATE TABLE
 // statement in lib/db.js which is missing several real columns).
 app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0];
   try {
     const eventsRes = await pool.query(`
       SELECT id, tx_hash, block_number, burned_at, survivor_token_id, points_used,
              result_is_angel, boost_chance, result_body_type, burn_type
       FROM burn_events
-      WHERE LOWER(burner_wallet) = LOWER($1)
+      WHERE LOWER(burner_wallet) = ANY($1::text[])
       ORDER BY block_number DESC
-    `, [address]);
+    `, [addresses]);
     const events = eventsRes.rows;
     if (!events.length) {
       return res.json({
@@ -2135,17 +2153,30 @@ app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
 
 // ── GET /db/wallet/:address/history ──────────────────────────────────────────
 app.get('/db/wallet/:address/history', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0];
   const days = intParam(req.query.days, 90, 365);
   try {
+    // wallet_daily_snapshots is one row per wallet per day -- a plain
+    // `wallet_address = ANY($1)` swap here would return N rows per date
+    // (one per linked wallet) instead of one combined row for the
+    // frontend's chart, which expects exactly one point per date. GROUP BY
+    // date and SUM the per-wallet counts/values (best_rank uses MIN, since
+    // a lower rank number is better -- this wallet SET's best rank is
+    // whichever single wallet's best rank was lowest that day, not a sum).
     const result = await pool.query(`
-      SELECT snapshot_date, owned_count, best_rank, listed_count, estimated_floor_value
+      SELECT snapshot_date,
+             SUM(owned_count)::int AS owned_count,
+             MIN(best_rank) AS best_rank,
+             SUM(listed_count)::int AS listed_count,
+             SUM(estimated_floor_value) AS estimated_floor_value
       FROM wallet_daily_snapshots
-      WHERE wallet_address = $1
+      WHERE wallet_address = ANY($1::text[])
         AND snapshot_date >= CURRENT_DATE - ($2 || ' days')::INTERVAL
+      GROUP BY snapshot_date
       ORDER BY snapshot_date ASC
-    `, [address, days]);
+    `, [addresses, days]);
     res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.json({
       ok: true,
@@ -2170,8 +2201,9 @@ app.get('/db/wallet/:address/history', auth, async (req, res) => {
 
 // ── GET /db/wallet/:address/traits ───────────────────────────────────────────
 app.get('/db/wallet/:address/traits', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0];
   const limit = intParam(req.query.limit, 100, 500);
   // Same hardcoded-to-OCAS bug as /db/wallet/:address/summary, same fix.
   const slug = (req.query.slug || OCAS_SLUG).toString();
@@ -2182,11 +2214,11 @@ app.get('/db/wallet/:address/traits', auth, async (req, res) => {
       FROM wallet_token_intervals w
       JOIN token_traits tt ON tt.token_id = w.token_id AND tt.collection_slug = w.collection_slug
       LEFT JOIN tokens t ON t.id = w.token_id AND t.collection_slug = w.collection_slug
-      WHERE w.wallet_address = $1 AND w.collection_slug = $3 AND w.disposed_at IS NULL
+      WHERE w.wallet_address = ANY($1::text[]) AND w.collection_slug = $3 AND w.disposed_at IS NULL
       GROUP BY tt.trait_name, tt.trait_value
       ORDER BY count DESC, tt.trait_name ASC, tt.trait_value ASC
       LIMIT $2
-    `, [address, limit, slug]);
+    `, [addresses, limit, slug]);
     res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.json({
       ok: true,
