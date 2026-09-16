@@ -1201,6 +1201,24 @@ client.on('interactionCreate', async (interaction)=>{
           }
         }catch(_){}
 
+        // jv confirmed live: verifying a second wallet showed "Tokens
+        // found: 0" and no role changes, even though an earlier-linked
+        // wallet genuinely holds tokens. Same root cause as the SVDone
+        // flow above -- allWallets here only ever reflected OpenSea's own
+        // profile-linking for knownWallet specifically, with no way to
+        // know about a wallet linked in an earlier, separate verification
+        // unless OpenSea itself considers them the same linked profile.
+        // Persisting first, then re-fetching the FULL combined set from
+        // linked_wallets (the actual source of truth across every
+        // verification attempt this user has ever completed), and using
+        // that for the token count and role sync below.
+        for(const w of allWallets){
+          await addLinkedWallet(pgPool, svUser, svGuild, w, true).catch(e =>
+            console.warn('[SVInstant] addLinkedWallet failed for', w, ':', e.message)
+          );
+        }
+        allWallets = await getLinkedWalletAddresses(pgPool, svUser, svGuild).catch(() => allWallets);
+
         // Fetch token holdings across all wallets
         let totalTokens = [];
         for(const w of allWallets){
@@ -1215,24 +1233,6 @@ client.on('interactionCreate', async (interaction)=>{
         const tokenCount = totalTokens.length;
 
         // Save to this guild
-        await pgPool.query(
-          `INSERT INTO user_registrations (discord_id,guild_id,wallet,verified,verified_at,updated_at)
-           VALUES ($1,$2,$3,true,NOW(),NOW())
-           ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,verified=true,verified_at=NOW(),updated_at=NOW()`,
-          [svUser, svGuild, knownWallet]
-        ).catch(()=>{});
-        // jv: bot should support multiple linked wallets. allWallets above
-        // already includes every address OpenSea's own profile linking
-        // reports for this user -- persisting all of them here (not just
-        // knownWallet) so role sync below can combine holdings across all
-        // of them, and so they show up as already-linked next time this
-        // user tries to add a wallet through /me.
-        for(const w of allWallets){
-          await addLinkedWallet(pgPool, svUser, svGuild, w, true).catch(e =>
-            console.warn('[SVInstant] addLinkedWallet failed for', w, ':', e.message)
-          );
-        }
-
         // Assign roles
         try{
           const panelR = await pgPool.query(
@@ -1444,10 +1444,33 @@ client.on('interactionCreate', async (interaction)=>{
 
     // Get all linked wallets from profile
     const addresses = profile.addresses || [];
-    const wallets = [wallet, ...addresses
+    const walletsFromThisProfile = [wallet, ...addresses
       .map(a => (a.address||'').toLowerCase())
       .filter(a => /^0x[0-9a-f]{40}$/.test(a) && a !== wallet)
     ];
+
+    // jv confirmed live: verified a second wallet, got "Tokens found: 0"
+    // and no role changes, even though the FIRST wallet (already verified
+    // earlier) genuinely holds tokens. Root cause -- everything below used
+    // to run entirely off walletsFromThisProfile (this one verification
+    // attempt's own wallet plus whatever OpenSea's own profile-linking
+    // reports for it specifically), which has no way to know about a
+    // wallet linked in an earlier, separate verification unless OpenSea
+    // itself considers them the same linked profile. The "Assign roles"
+    // block further down used to run BEFORE this wallet was even
+    // persisted to linked_wallets, compounding the problem. Persisting
+    // first, then re-fetching the FULL combined set from linked_wallets
+    // (the actual source of truth for "every wallet this user has ever
+    // linked, across all verification attempts"), and using that for the
+    // token count, the holder-role check, and syncTraitRoles below --
+    // walletsFromThisProfile is kept only for the display text describing
+    // what THIS attempt specifically discovered.
+    for(const w of walletsFromThisProfile){
+      await addLinkedWallet(pgPool, discordId, svGuild, w, true).catch(e =>
+        console.warn('[SVDone] addLinkedWallet failed for', w, ':', e.message)
+      );
+    }
+    const wallets = await getLinkedWalletAddresses(pgPool, discordId, svGuild).catch(() => walletsFromThisProfile);
 
     const cfg  = getConfig(svGuild) || {};
     const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
@@ -1527,18 +1550,6 @@ client.on('interactionCreate', async (interaction)=>{
     const walletSummary = wallets.length > 1
       ? `🔗 **${wallets.length} wallets** found (${wallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
       : `🔗 **Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``;
-
-    // jv: bot should support multiple linked wallets. wallets above already
-    // includes every address OpenSea's own profile linking reports for
-    // this user -- persisting all of them (not just the one just verified
-    // via the bio code) so role sync below combines holdings across all of
-    // them, and so they show up as already-linked next time this user
-    // tries to add a wallet through /me.
-    for(const w of wallets){
-      await addLinkedWallet(pgPool, discordId, svGuild, w, true).catch(e =>
-        console.warn('[SVDone] addLinkedWallet failed for', w, ':', e.message)
-      );
-    }
 
     // Sync trait roles immediately and collect summary
     const roleSummary = await syncTraitRoles(interaction.guild, discordId, wallets).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
