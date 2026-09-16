@@ -3320,12 +3320,13 @@ async function handleMeInteraction(interaction, ctx){
     if(!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(()=>{});
     const editWalletSync = payload => interaction.editReply(payload).catch(()=>{});
 
-    // Check if verified first
-    const reg = await pgPool.query(
-      `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
-      [userId]
-    ).catch(()=>null);
-    const wallet = reg?.rows[0]?.wallet;
+    // jv confirmed live: this only ever showed/synced "the latest one I
+    // had synced" -- one wallet, not all linked ones. Same root cause as
+    // syncWalletForUser itself (lib/wallet-backfill.js) -- reading only
+    // from user_registrations, which stays single-wallet-per-guild by
+    // design. linked_wallets is the actual multi-wallet source of truth.
+    const allWallets = await getLinkedWalletAddresses(pgPool, userId, guildId).catch(() => []);
+    const wallet = allWallets[0];
 
     if(!wallet){
       return editWalletSync({
@@ -3347,6 +3348,9 @@ async function handleMeInteraction(interaction, ctx){
     }
 
     // Show initial progress screen
+    const walletLine = allWallets.length > 1
+      ? `🔄 Syncing ${allWallets.length} wallets: ${allWallets.map(w=>'`'+w.slice(0,6)+'...'+w.slice(-4)+'`').join(', ')}`
+      : `🔄 Syncing wallet \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``;
     const progressLines = syncCols.map(n => `⏳ ${n}`);
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:wallet:progress').setLabel('🔃 Check Progress').setStyle(ButtonStyle.Primary),
@@ -3357,7 +3361,7 @@ async function handleMeInteraction(interaction, ctx){
         .setTitle('💼 Wallet — Syncing')
         .setColor(0x5865F2)
         .setDescription([
-          `🔄 Syncing wallet \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``,
+          walletLine,
           '',
           ...progressLines,
           '',
