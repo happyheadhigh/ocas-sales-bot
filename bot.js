@@ -5,6 +5,7 @@
 
 require('dotenv').config();
 
+const express = require('express');
 const {
   Client, GatewayIntentBits,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
@@ -59,6 +60,7 @@ const {
 } = require('./lib/burn-poller');
 const { startMetadataUpdatePoller } = require('./lib/metadata-update-poller');
 const { addLinkedWallet, getLinkedWalletAddresses } = require('./lib/linked-wallets');
+const { verifyAlchemySignature, processAddressActivityEvent } = require('./lib/alchemy-webhook');
 const { startBurnDetectionPoller } = require('./lib/burn-detect');
 
 const {
@@ -82,7 +84,7 @@ const {
   loadAllAlerts, loadSaleCursors, loadListingCursors,
   saveSaleCursors, saveListingCursors,
   setClient: setPollClient,
-  setSyncTraitRolesFn,
+  setSyncTraitRolesFn, shouldSyncRolesNow,
   traitGroupsLabel, buildTokenSearchEmbed,
   lastSaleIds, lastListingIds,
 } = require('./lib/poll');
@@ -2734,6 +2736,50 @@ async function migrateMarketCollectionsToServerConfigs(){
   }catch(e){
     console.error('[Migration] market_collections_v1 failed:', e.message);
   }
+}
+
+// ── Alchemy Address Activity webhook server ─────────────────────────────────
+// jv: real-time transfer detection for every linked wallet (not just
+// marketplace sales, already handled separately in lib/poll.js). This lives
+// in bot.js specifically -- not the separate api.js process -- because it
+// needs direct, in-memory access to the Discord client and syncTraitRoles,
+// neither of which exist in api.js's own process. bot.js has never run an
+// HTTP server before this, so this is a new public endpoint on this
+// service -- see the setup walkthrough for the Railway/Alchemy dashboard
+// steps this requires alongside the code.
+{
+  const webhookApp = express();
+  // Alchemy's HMAC signature is computed over the exact raw request body --
+  // a re-serialized JSON object will not match it, so this route needs the
+  // raw bytes, not express.json()'s parsed result. express.raw() gives us
+  // that; the route below parses it into JSON itself only after the
+  // signature is confirmed valid.
+  webhookApp.post('/webhooks/alchemy/address-activity', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
+    const signature = req.get('X-Alchemy-Signature');
+    const signingKey = process.env.ALCHEMY_WEBHOOK_SIGNING_KEY;
+    if(!signingKey){
+      console.warn('[AlchemyWebhook] ALCHEMY_WEBHOOK_SIGNING_KEY not configured — rejecting');
+      return res.status(500).send('not configured');
+    }
+    if(!verifyAlchemySignature(req.body, signature, signingKey)){
+      console.warn('[AlchemyWebhook] Invalid signature — rejecting');
+      return res.status(401).send('invalid signature');
+    }
+    // Acknowledge immediately — Alchemy expects a fast 2xx response and will
+    // retry on timeout. Processing continues after responding rather than
+    // making Alchemy wait on however long the DB writes/role sync take.
+    res.status(200).send('ok');
+    let payload;
+    try{ payload = JSON.parse(req.body.toString('utf8')); }
+    catch(e){ console.warn('[AlchemyWebhook] Failed to parse payload:', e.message); return; }
+    processAddressActivityEvent(payload, {
+      pgPool, client, syncTraitRolesFn: syncTraitRoles, shouldSyncRolesNow,
+    }).catch(e => console.error('[AlchemyWebhook] processAddressActivityEvent error:', e.message));
+  });
+  const webhookPort = process.env.PORT || 8081;
+  webhookApp.listen(webhookPort, () => {
+    console.log(`[AlchemyWebhook] Listening on port ${webhookPort} for /webhooks/alchemy/address-activity`);
+  });
 }
 
 client.login(DISCORD_TOKEN);
