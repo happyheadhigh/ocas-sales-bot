@@ -2749,6 +2749,18 @@ async function migrateMarketCollectionsToServerConfigs(){
 // steps this requires alongside the code.
 {
   const webhookApp = express();
+  // jv confirmed live: the bot started spam-posting old sales shortly
+  // after this server was added. Leading, plausible cause -- this express
+  // app previously had no route at all for a bare GET /, and Railway
+  // (or any platform-level health check hitting the root path) getting a
+  // 404 there could read as "unhealthy" and restart the service
+  // repeatedly. A restart mid-poll, before saveSaleCursors()'s fire-and-
+  // forget write (never awaited) actually finishes, would lose that
+  // cursor update -- the next poll after restart re-fetches and re-posts
+  // the same "new" sales again. Adding a real health-check route so
+  // there's something for a check to actually hit successfully.
+  webhookApp.get('/', (req, res) => res.status(200).send('ok'));
+  webhookApp.get('/healthz', (req, res) => res.status(200).send('ok'));
   // Alchemy's HMAC signature is computed over the exact raw request body --
   // a re-serialized JSON object will not match it, so this route needs the
   // raw bytes, not express.json()'s parsed result. express.raw() gives us
