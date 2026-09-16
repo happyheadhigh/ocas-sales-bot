@@ -6,6 +6,7 @@ const { OWNER_DISCORD_IDS, OCAS_SLUG } = require('../lib/constants');
 const { extractPngFromSvg, resolveImage } = require('../lib/images');
 const { isDiscordOk, verifyImageIsRaster } = require('../utils/format');
 const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
+const { getLinkedWalletAddresses } = require('../lib/linked-wallets');
 
 /**
  * Handle market/NFT lookup commands.
@@ -2214,6 +2215,15 @@ async function showMeWallet(interaction, ctx){
     ? 'editReply'
     : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
 
+  // jv: wanted a direct, visible way to confirm multi-wallet linking
+  // actually works, rather than only the indirect "click Verify Wallet
+  // again, see the already-verified message" path. linked_wallets is the
+  // real multi-wallet source of truth (user_registrations above stays
+  // single-wallet-per-guild by design) -- shown directly in this embed
+  // now, with its own Add Wallet button, whether or not this user has 1
+  // or several wallets linked.
+  const allLinked = pgPool ? await getLinkedWalletAddresses(pgPool, userId, guildId).catch(() => []) : [];
+
   // ── Unverified ──────────────────────────────────────────────────────────────
   if(!wallet){
     const embed = new EmbedBuilder()
@@ -2574,6 +2584,16 @@ async function showMeWallet(interaction, ctx){
   // of an actual wallet page.
   lines.push(`[📊 Full analytics on TraitView](https://traitview.com/?wallet=${wallet})`);
 
+  // jv: make multi-wallet linking directly visible here, not just
+  // discoverable indirectly. The P&L figures above still only reflect
+  // this one wallet's own activity -- fully combining that across every
+  // linked wallet is a separate, larger piece of work than this
+  // visibility fix.
+  if(allLinked.length > 1){
+    lines.push('');
+    lines.push(`🔗 **${allLinked.length} wallets linked:** ${allLinked.map(w => '`'+w.slice(0,6)+'...'+w.slice(-4)+'`').join(', ')}`);
+  }
+
   const embed = new EmbedBuilder()
     .setTitle('💼 Portfolio')
     .setColor(cols.some(c => c.unrealizedPnl > 0) ? 0x57F287 : 0x5865F2)
@@ -2591,6 +2611,7 @@ async function showMeWallet(interaction, ctx){
     new ActionRowBuilder().addComponents(...tokenBtns),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('start_verification_additional:'+guildId).setLabel('➕ Add Wallet').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     ),
   ];
