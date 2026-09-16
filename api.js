@@ -2690,7 +2690,33 @@ app.get('/tv/link-status-by-wallet', auth,
       [wallet]
     );
     if (!row.rows.length) return res.json({ linked: false });
-    res.json({ linked: true, discord_id: row.rows[0].discord_id, guild_id: row.rows[0].guild_id, linked_at: row.rows[0].linked_at });
+
+    // jv: "reconnected my wallets to traitview after our multi wallet
+    // verification and it's only showing the wallet connected that's
+    // holding argonauts. Should it show both wallets?" traitview_links
+    // (this table) is this website's own, separate verification record --
+    // one wallet per row, unrelated to the bot's own multi-wallet system.
+    // linked_wallets (the bot's actual multi-wallet source of truth) is
+    // keyed by discord_id, the field this query already resolves above,
+    // so once we know it, every wallet ever linked to this same Discord
+    // account -- across every guild they've verified in, not just the
+    // one traitview_links happened to record -- is a second, cheap
+    // lookup away. Deduplicated since the same wallet can appear under
+    // multiple guild_ids if verification cascaded across servers.
+    const discordId = row.rows[0].discord_id;
+    const linkedRows = await pool.query(
+      `SELECT DISTINCT wallet FROM linked_wallets WHERE discord_id=$1`,
+      [discordId]
+    ).catch(() => ({ rows: [] }));
+    const linkedWallets = linkedRows.rows.map(r => r.wallet);
+
+    res.json({
+      linked: true,
+      discord_id: discordId,
+      guild_id: row.rows[0].guild_id,
+      linked_at: row.rows[0].linked_at,
+      linkedWallets: linkedWallets.length ? linkedWallets : [wallet.toLowerCase()],
+    });
   } catch (e) {
     res.status(500).json({ error: 'server_error' });
   }
