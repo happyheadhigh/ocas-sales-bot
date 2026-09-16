@@ -2215,14 +2215,16 @@ async function showMeWallet(interaction, ctx){
     ? 'editReply'
     : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
 
-  // jv: wanted a direct, visible way to confirm multi-wallet linking
-  // actually works, rather than only the indirect "click Verify Wallet
-  // again, see the already-verified message" path. linked_wallets is the
-  // real multi-wallet source of truth (user_registrations above stays
-  // single-wallet-per-guild by design) -- shown directly in this embed
-  // now, with its own Add Wallet button, whether or not this user has 1
-  // or several wallets linked.
+  // jv confirmed live: the Sync fix worked (both wallets' data is now
+  // correctly backfilled), but the portfolio DISPLAY here still only
+  // ever queried this one wallet from user_registrations -- so a
+  // collection held only in a DIFFERENT linked wallet never showed up
+  // at all, even though the underlying data was correct. allLinked
+  // (fetched below) is the real combined wallet set; walletsForQuery
+  // falls back to just [wallet] if linked_wallets somehow has nothing
+  // for this user, so this never queries an empty array.
   const allLinked = pgPool ? await getLinkedWalletAddresses(pgPool, userId, guildId).catch(() => []) : [];
+  const walletsForQuery = allLinked.length ? allLinked : (wallet ? [wallet] : []);
 
   // ── Unverified ──────────────────────────────────────────────────────────────
   if(!wallet){
@@ -2267,16 +2269,16 @@ async function showMeWallet(interaction, ctx){
             COALESCE(SUM(sale_eth)  FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS total_earned,
             COALESCE(SUM(sale_eth - cost_eth) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS realized_pnl
            FROM wallet_token_intervals
-           WHERE LOWER(wallet_address)=$1 AND collection_slug=$2`,
-          [wallet, col.slug]
+           WHERE wallet_address = ANY($1::text[]) AND collection_slug=$2`,
+          [walletsForQuery, col.slug]
         );
 
         // Count distinct burn events for this wallet+collection
         const burnEvents = await pgPool.query(
           `SELECT COUNT(DISTINCT be.id) AS event_count
            FROM burn_events be
-           WHERE LOWER(be.burner_wallet) = $1`,
-          [wallet]
+           WHERE LOWER(be.burner_wallet) = ANY($1::text[])`,
+          [walletsForQuery]
         ).catch(() => ({ rows: [{ event_count: 0 }] }));
 
         const burnEventCount = parseInt(burnEvents.rows[0]?.event_count || 0);
@@ -2332,7 +2334,7 @@ async function showMeWallet(interaction, ctx){
             const traitSweepRes = await pgPool.query(
               `WITH held_tokens AS (
                  SELECT token_id FROM wallet_token_intervals
-                 WHERE LOWER(wallet_address)=$1 AND collection_slug=$2 AND disposed_at IS NULL
+                 WHERE wallet_address = ANY($1::text[]) AND collection_slug=$2 AND disposed_at IS NULL
                ),
                token_rarest_trait AS (
                  -- For each held token pick its rarest trait (fewest tokens share it)
@@ -2386,7 +2388,7 @@ async function showMeWallet(interaction, ctx){
                  SUM(held_count) AS tokens_covered,
                  SUM(CASE WHEN listings_available >= held_count THEN held_count ELSE listings_available END) AS fully_covered
                FROM trait_sweep`,
-              [wallet, col.slug]
+              [walletsForQuery, col.slug]
             ).catch(() => ({ rows: [] }));
 
             const traitSweepVal = traitSweepRes.rows[0]?.total_trait_sweep
@@ -2463,11 +2465,11 @@ async function showMeWallet(interaction, ctx){
              SELECT DISTINCT nt.token_id
              FROM nft_transfers nt
              WHERE nt.from_address = '0x0000000000000000000000000000000000000000'
-               AND LOWER(nt.to_address) = $1
+               AND LOWER(nt.to_address) = ANY($1::text[])
            ) is_first_recipient ON is_first_recipient.token_id = wti.token_id
-           WHERE LOWER(wti.wallet_address) = $1
+           WHERE wti.wallet_address = ANY($1::text[])
              AND wti.collection_slug = $2`,
-          [wallet, col.slug]
+          [walletsForQuery, col.slug]
         ).catch(() => ({ rows: [{ minted: 0, bought_intervals: 0, total_buy_eth: 0 }] }));
 
         const minted       = parseInt(acquisitionRes.rows[0]?.minted          || 0);
@@ -2623,6 +2625,7 @@ async function showMeWallet(interaction, ctx){
 async function showMeTokens(interaction, ctx, slug, page = 0){
   const { pgPool } = ctx;
   const userId = interaction.user.id;
+  const guildId = interaction.guildId;
   const updateFn = interaction.deferred || interaction.replied ? 'editReply'
     : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
 
@@ -2633,6 +2636,13 @@ async function showMeTokens(interaction, ctx, slug, page = 0){
   ).catch(()=>null);
   const wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
   if(!wallet) return interaction[updateFn]({ content: '❌ No wallet linked.', components: [] });
+
+  // jv confirmed live: the "Args tokens" button showed nothing for a
+  // collection held only in a different linked wallet -- same root
+  // cause as showMeWallet's own combined-holdings fix, applied the same
+  // way here (fall back to just [wallet] if linked_wallets has nothing).
+  const allLinked = await getLinkedWalletAddresses(pgPool, userId, guildId).catch(() => []);
+  const walletsForQuery = allLinked.length ? allLinked : [wallet];
 
   // Get collection name
   const cfgRow = await pgPool.query(
@@ -2648,11 +2658,11 @@ async function showMeTokens(interaction, ctx, slug, page = 0){
      LEFT JOIN token_traits tt ON tt.token_id = wti.token_id
        AND (tt.collection_slug = $2 OR tt.collection_slug IS NULL)
        AND LOWER(tt.trait_name) = 'type'
-     WHERE LOWER(wti.wallet_address) = $1
+     WHERE wti.wallet_address = ANY($1::text[])
        AND (wti.collection_slug = $2 OR wti.collection_slug IS NULL)
        AND wti.disposed_at IS NULL
      ORDER BY wti.token_id ASC`,
-    [wallet, slug]
+    [walletsForQuery, slug]
   ).catch(()=>({ rows: [] }));
 
   if(!tokensRes.rows.length){
@@ -2740,6 +2750,11 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
   if(!wallet) return interaction[updateFn]({ content: '❌ No wallet linked.', components: [] });
 
+  // jv confirmed live: same combined-holdings fix as showMeWallet/
+  // showMeTokens, applied here too for consistency across the whole flow.
+  const allLinked = await getLinkedWalletAddresses(pgPool, userId, interaction.guildId).catch(() => []);
+  const walletsForQuery = allLinked.length ? allLinked : [wallet];
+
   // Get interval data for this token — use OR for collection_slug to handle NULL rows
   const wtiRes = await pgPool.query(
     `SELECT wti.token_id, wti.cost_eth, wti.acquired_at,
@@ -2748,11 +2763,11 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
      LEFT JOIN token_traits tt ON tt.token_id = wti.token_id
        AND (tt.collection_slug = $3 OR tt.collection_slug IS NULL)
        AND LOWER(tt.trait_name) = 'type'
-     WHERE LOWER(wti.wallet_address) = $1
+     WHERE wti.wallet_address = ANY($1::text[])
        AND (wti.collection_slug = $3 OR wti.collection_slug IS NULL)
        AND wti.token_id = $2
        AND wti.disposed_at IS NULL`,
-    [wallet, tokenId, slug]
+    [walletsForQuery, tokenId, slug]
   ).catch(()=>({ rows: [] }));
 
   if(!wtiRes.rows.length){
