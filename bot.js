@@ -58,6 +58,7 @@ const {
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
 const { startMetadataUpdatePoller } = require('./lib/metadata-update-poller');
+const { addLinkedWallet, getLinkedWalletAddresses } = require('./lib/linked-wallets');
 const { startBurnDetectionPoller } = require('./lib/burn-detect');
 
 const {
@@ -281,7 +282,21 @@ function collectStringsDeep(obj, out=[]){
 }
 
 // ── Trait role sync ─────────────────────────────────────────────────────────
-async function syncTraitRoles(guild, discordId, wallet){
+async function syncTraitRoles(guild, discordId, walletOrWallets){
+  // jv: bot should support multiple linked wallets, combining holdings
+  // together for role purposes. Every existing caller passed a single
+  // wallet string -- normalizing to an array here keeps every one of them
+  // working unchanged while the real callers get updated to pass every
+  // linked wallet (lib/linked-wallets.js) instead of just one.
+  const wallets = (Array.isArray(walletOrWallets) ? walletOrWallets : [walletOrWallets])
+    .filter(Boolean)
+    .map(w => String(w).toLowerCase());
+  if(!wallets.length) return { assigned: [], skipped: [], alreadyHad: [], failed: [] };
+  // Kept for every log line and DB query below that expects a single
+  // "the wallet" value (burn-event lookups don't distinguish which of a
+  // user's wallets did the burning) -- first linked wallet, same as
+  // before this only ever had exactly one anyway.
+  const wallet = wallets[0];
   try{
     // Get all trait roles configured for this guild — collection_slug NULL means "primary collection"
     const traitRolesRes = await pgPool.query(
@@ -318,9 +333,9 @@ async function syncTraitRoles(guild, discordId, wallet){
           `SELECT bei.burn_event_id, COUNT(*)::int AS tokens_in_event
            FROM burn_event_inputs bei
            JOIN burn_events be ON be.id = bei.burn_event_id
-           WHERE LOWER(be.burner_wallet) = LOWER($1)
+           WHERE LOWER(be.burner_wallet) = ANY($1::text[])
            GROUP BY bei.burn_event_id`,
-          [wallet]
+          [wallets]
         );
         let max = 0;
         for(const r of burnRes.rows){ if(r.tokens_in_event > max) max = r.tokens_in_event; }
@@ -360,16 +375,25 @@ async function syncTraitRoles(guild, discordId, wallet){
       const rules = rulesBySlug[slug];
       const slugChain = traitSyncChainMap[slug] || 'ethereum';
 
-      const osRes = await fetch(
-        `https://api.opensea.io/api/v2/chain/${slugChain}/account/${wallet}/nfts?collection=${slug}&limit=200`,
-        { headers: osHeaders() }
-      );
-      if(!osRes.ok){
-        console.error('[TraitSync] OpenSea NFT fetch failed for', slug, ':', osRes.status);
-        continue;
+      // jv: combine holdings across every linked wallet for role purposes
+      // -- fetch each wallet's OpenSea holdings for this collection
+      // separately (that endpoint takes one account at a time) and
+      // concatenate the results, rather than just the first/only wallet
+      // this used to assume.
+      let allNfts = [];
+      for(const w of wallets){
+        const osRes = await fetch(
+          `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
+          { headers: osHeaders() }
+        );
+        if(!osRes.ok){
+          console.error('[TraitSync] OpenSea NFT fetch failed for', slug, 'wallet', w, ':', osRes.status);
+          continue;
+        }
+        const osData = await osRes.json();
+        allNfts = allNfts.concat(osData.nfts || []);
       }
-      const osData = await osRes.json();
-      const ownedTokenIds = (osData.nfts||[]).map(n => parseInt(n.identifier)).filter(Boolean);
+      const ownedTokenIds = [...new Set(allNfts.map(n => parseInt(n.identifier)).filter(Boolean))];
       totalOwnedAcrossCollections += ownedTokenIds.length;
 
       // Build trait count map for this collection's owned tokens.
@@ -386,7 +410,7 @@ async function syncTraitRoles(guild, discordId, wallet){
             traitCounts[r.trait_name+'::'+r.trait_value] = parseInt(r.count);
         }
       } else {
-        for(const nft of (osData.nfts || [])){
+        for(const nft of allNfts){
           for(const t of (nft.traits || [])){
             const key = t.trait_type + '::' + t.value;
             traitCounts[key] = (traitCounts[key] || 0) + 1;
@@ -475,19 +499,73 @@ async function syncTraitRoles(guild, discordId, wallet){
 async function runDailyTraitSync(){
   console.log('[TraitSync] Starting daily sync...');
   try{
-    // Get all verified registrations
+    // jv: combine holdings across every linked wallet for role purposes.
+    // linked_wallets (lib/linked-wallets.js) replaces user_registrations
+    // as the source here -- one row per (discord_id, guild_id, wallet)
+    // rather than one wallet per user, so a user with 2+ verified wallets
+    // gets every one of them grouped into a single array and passed to
+    // syncTraitRoles together, instead of only ever seeing their first.
     const regs = await pgPool.query(
-      'SELECT discord_id, guild_id, wallet FROM user_registrations WHERE verified=true'
+      `SELECT discord_id, guild_id, array_agg(wallet) AS wallets
+       FROM linked_wallets WHERE verified=true
+       GROUP BY discord_id, guild_id`
     );
     for(const reg of regs.rows){
       const guild = client.guilds.cache.get(reg.guild_id);
       if(!guild) continue;
-      await syncTraitRoles(guild, reg.discord_id, reg.wallet);
+      await syncTraitRoles(guild, reg.discord_id, reg.wallets);
       await new Promise(r=>setTimeout(r, 500)); // Rate limit buffer
     }
-    console.log('[TraitSync] Daily sync complete —', regs.rows.length, 'wallets synced');
+    console.log('[TraitSync] Daily sync complete —', regs.rows.length, 'users synced');
   }catch(e){
     console.error('[TraitSync] Daily sync error:', e.message);
+  }
+}
+
+// ── Daily wallet holdings re-sync ───────────────────────────────────────────
+// jv confirmed live: backfillWallet() only ever runs once per wallet+
+// collection (skips permanently once nft_transfers has any row at all --
+// by design, it's a one-time historical population, not an ongoing sync).
+// Nothing periodic ever forced a fresh check before this -- only the
+// initial verification and manually clicking "🔄 Sync" in /me did, so a
+// wallet whose holdings changed afterward stayed stale indefinitely
+// unless someone happened to click that. Reuses syncWalletForUser (the
+// same delete-nft_transfers-then-rebackfill logic the manual Sync button
+// already uses correctly) for every verified registration.
+async function runDailyWalletResync(){
+  console.log('[WalletResync] Starting daily wallet holdings re-sync...');
+  if(!process.env.ALCHEMY_API_KEY){
+    console.log('[WalletResync] No ALCHEMY_API_KEY — skipping');
+    return;
+  }
+  try{
+    // linked_wallets, not user_registrations: the source of truth for
+    // "who's verified" now supports multiple wallets per user. This job
+    // still re-syncs through syncWalletForUser's existing per-guild
+    // primary-wallet logic rather than every individual linked wallet's
+    // own P&L stats -- fully aggregating wallet_token_intervals itself
+    // across multiple wallets is a separate, larger piece of work than
+    // this staleness fix.
+    const regs = await pgPool.query(
+      `SELECT DISTINCT discord_id, guild_id FROM linked_wallets WHERE verified=true`
+    );
+    let synced = 0, failed = 0;
+    for(const reg of regs.rows){
+      try{
+        await _syncWalletForUser(reg.discord_id, reg.guild_id, pgPool, process.env.ALCHEMY_API_KEY, getConfig);
+        synced++;
+      }catch(e){
+        failed++;
+        console.warn('[WalletResync] Failed for', reg.discord_id, reg.guild_id, ':', e.message);
+      }
+      // Full transfer-history refetches are heavier than a role check --
+      // more spacing than runDailyTraitSync's 500ms to stay comfortable
+      // under Alchemy's rate limits across a whole verified user base.
+      await new Promise(r=>setTimeout(r, 2000));
+    }
+    console.log('[WalletResync] Daily re-sync complete —', synced, 'synced,', failed, 'failed');
+  }catch(e){
+    console.error('[WalletResync] Daily re-sync error:', e.message);
   }
 }
 
@@ -1056,23 +1134,40 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // ── Start Verification button ─────────────────────────────────────────────
-  if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
+  if(interaction.isButton() && (interaction.customId.startsWith('start_verification:') || interaction.customId.startsWith('start_verification_additional:'))){
+    const isAdditionalWallet = interaction.customId.startsWith('start_verification_additional:');
     const svGuild = interaction.guildId;
     const svUser  = interaction.user.id;
 
-    // Check if already verified in this server
+    // jv: "the bot should support multiple wallets." This used to fully
+    // block anyone already verified from going any further -- correct
+    // when a wallet could only ever be replaced, but that's exactly the
+    // case where someone wants to link a second one now. addLinkedWallet
+    // (lib/linked-wallets.js) is additive, so the actual verification flow
+    // below already safely supports adding another wallet -- this just
+    // needed to stop dead-ending before it could get there. Shows every
+    // currently-linked wallet (not only the one user_registrations
+    // happens to have) with the option to continue and add another.
     try{
-      const svEx = await pgPool.query(
-        'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true',
-        [svUser, svGuild]
-      );
-      if(svEx.rows.length){
-        const w = svEx.rows[0].wallet;
-        return interaction.reply({flags:64, content:'✅ Already verified in this server!\n🔗 Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+      const existingWallets = isAdditionalWallet ? [] : await getLinkedWalletAddresses(pgPool, svUser, svGuild);
+      if(existingWallets.length){
+        const list = existingWallets.map(w => '`'+w.slice(0,6)+'...'+w.slice(-4)+'`').join(', ');
+        return interaction.reply({
+          flags:64,
+          content: `✅ Already verified in this server with ${existingWallets.length} wallet${existingWallets.length>1?'s':''}: ${list}\n\nWant to link another one?`,
+          components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('start_verification_additional:'+svGuild).setLabel('Add Another Wallet').setStyle(ButtonStyle.Primary).setEmoji('➕'),
+          )],
+        });
       }
     }catch(_){}
 
-    // Check if already verified in ANY server (cross-server shortcut)
+    // Check if already verified in ANY server (cross-server shortcut) --
+    // skipped entirely for isAdditionalWallet: this shortcut exists to
+    // recognise "you're already verified elsewhere with the SAME wallet,
+    // no need to re-verify" -- exactly wrong for someone who explicitly
+    // wants to type in a DIFFERENT, new address instead.
+    if(!isAdditionalWallet)
     try{
       const globalEx = await pgPool.query(
         'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1',
@@ -1122,6 +1217,17 @@ client.on('interactionCreate', async (interaction)=>{
            ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,verified=true,verified_at=NOW(),updated_at=NOW()`,
           [svUser, svGuild, knownWallet]
         ).catch(()=>{});
+        // jv: bot should support multiple linked wallets. allWallets above
+        // already includes every address OpenSea's own profile linking
+        // reports for this user -- persisting all of them here (not just
+        // knownWallet) so role sync below can combine holdings across all
+        // of them, and so they show up as already-linked next time this
+        // user tries to add a wallet through /me.
+        for(const w of allWallets){
+          await addLinkedWallet(pgPool, svUser, svGuild, w, true).catch(e =>
+            console.warn('[SVInstant] addLinkedWallet failed for', w, ':', e.message)
+          );
+        }
 
         // Assign roles
         try{
@@ -1145,7 +1251,7 @@ client.on('interactionCreate', async (interaction)=>{
         }catch(e){ console.error('[SVInstant] role assign error:', e.message); }
 
         // Sync trait roles immediately and collect summary
-        const roleSummaryInst = await syncTraitRoles(interaction.guild, svUser, knownWallet).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
+        const roleSummaryInst = await syncTraitRoles(interaction.guild, svUser, allWallets).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
 
         const rolePartsInst = [];
         if(roleSummaryInst.assigned.length)   rolePartsInst.push(`✅ Roles assigned: ${roleSummaryInst.assigned.map(id=>`<@&${id}>`).join(', ')}`);
@@ -1418,8 +1524,20 @@ client.on('interactionCreate', async (interaction)=>{
       ? `🔗 **${wallets.length} wallets** found (${wallets.map(w=>w.slice(0,6)+'...'+w.slice(-4)).join(', ')})`
       : `🔗 **Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``;
 
+    // jv: bot should support multiple linked wallets. wallets above already
+    // includes every address OpenSea's own profile linking reports for
+    // this user -- persisting all of them (not just the one just verified
+    // via the bio code) so role sync below combines holdings across all of
+    // them, and so they show up as already-linked next time this user
+    // tries to add a wallet through /me.
+    for(const w of wallets){
+      await addLinkedWallet(pgPool, discordId, svGuild, w, true).catch(e =>
+        console.warn('[SVDone] addLinkedWallet failed for', w, ':', e.message)
+      );
+    }
+
     // Sync trait roles immediately and collect summary
-    const roleSummary = await syncTraitRoles(interaction.guild, discordId, wallet).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
+    const roleSummary = await syncTraitRoles(interaction.guild, discordId, wallets).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
 
     const roleParts = [];
     if(roleSummary.assigned.length)   roleParts.push(`✅ Roles assigned: ${roleSummary.assigned.map(id=>`<@&${id}>`).join(', ')}`);
@@ -2285,8 +2403,14 @@ client.on('interactionCreate', async (interaction)=>{
 
     await interaction.editReply({content:'⏳ Syncing trait roles for all verified members... This may take a moment.'});
     try{
+      // jv: combine holdings across every linked wallet for role purposes
+      // -- same linked_wallets source as runDailyTraitSync, grouped so
+      // each user's full set of verified wallets goes to syncTraitRoles
+      // together rather than only their first.
       const regs = await pgPool.query(
-        'SELECT discord_id, wallet FROM user_registrations WHERE guild_id=$1 AND verified=true',
+        `SELECT discord_id, array_agg(wallet) AS wallets
+         FROM linked_wallets WHERE guild_id=$1 AND verified=true
+         GROUP BY discord_id`,
         [guildId]
       );
       // Failures used to be completely invisible here — syncTraitRoles's
@@ -2300,7 +2424,7 @@ client.on('interactionCreate', async (interaction)=>{
       let totalFailed = 0;
       const failureReasons = new Set();
       for(const reg of regs.rows){
-        const result = await syncTraitRoles(interaction.guild, reg.discord_id, reg.wallet);
+        const result = await syncTraitRoles(interaction.guild, reg.discord_id, reg.wallets);
         if(result?.failed?.length){
           totalFailed += result.failed.length;
           for(const f of result.failed) failureReasons.add(f.reason);
@@ -2535,6 +2659,21 @@ client.once('clientReady', async ()=>{
   processDueGenericLotteries();
   setInterval(processDueGenericLotteries, 15_000);
   setTimeout(()=>{ runDailyTraitSync(); setInterval(runDailyTraitSync, 24*60*60*1000); }, 5*60*1000);
+  // jv confirmed live: moved Argonauts out of a wallet, but /me portfolio
+  // and TraitView's Connected Holder both kept showing them as still
+  // held, days later. Root cause -- backfillWallet() (lib/wallet-backfill.js)
+  // only ever runs once per wallet+collection: it checks nft_transfers for
+  // ANY existing row and, if found, skips the entire backfill permanently,
+  // by design (it's meant to be a one-time historical population, not an
+  // ongoing sync). The only things that ever forced a fresh re-check were
+  // the initial verification itself and manually clicking "🔄 Sync" in
+  // /me -- nothing periodic. A user who never happens to click that stays
+  // stale indefinitely, which is exactly what happened here. This adds
+  // the missing periodic path: reuses syncWalletForUser (the same delete-
+  // then-rebackfill logic the manual Sync button already uses correctly)
+  // for every verified registration, daily, so staleness self-corrects
+  // without anyone needing to know to click anything.
+  setTimeout(()=>{ runDailyWalletResync(); setInterval(runDailyWalletResync, 24*60*60*1000); }, 10*60*1000);
 });
 
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
