@@ -60,7 +60,7 @@ const {
 } = require('./lib/burn-poller');
 const { startMetadataUpdatePoller } = require('./lib/metadata-update-poller');
 const { addLinkedWallet, getLinkedWalletAddresses } = require('./lib/linked-wallets');
-const { verifyAlchemySignature, processAddressActivityEvent } = require('./lib/alchemy-webhook');
+const { verifyAgainstAnyConfiguredChain, getConfiguredWebhooks, processAddressActivityEvent } = require('./lib/alchemy-webhook');
 const { startBurnDetectionPoller } = require('./lib/burn-detect');
 
 const {
@@ -2768,12 +2768,13 @@ async function migrateMarketCollectionsToServerConfigs(){
   // signature is confirmed valid.
   webhookApp.post('/webhooks/alchemy/address-activity', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
     const signature = req.get('X-Alchemy-Signature');
-    const signingKey = process.env.ALCHEMY_WEBHOOK_SIGNING_KEY;
-    if(!signingKey){
-      console.warn('[AlchemyWebhook] ALCHEMY_WEBHOOK_SIGNING_KEY not configured — rejecting');
+    if(!getConfiguredWebhooks().length){
+      console.warn('[AlchemyWebhook] No chain webhooks configured — rejecting');
       return res.status(500).send('not configured');
     }
-    if(!verifyAlchemySignature(req.body, signature, signingKey)){
+    // One shared endpoint receives every configured chain's webhook --
+    // tries each chain's own signing key rather than assuming exactly one.
+    if(!verifyAgainstAnyConfiguredChain(req.body, signature)){
       console.warn('[AlchemyWebhook] Invalid signature — rejecting');
       return res.status(401).send('invalid signature');
     }
