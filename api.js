@@ -690,9 +690,16 @@ app.get('/db/sales-search', auth, async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
     const traitCount = req.query.trait_count ? parseInt(req.query.trait_count) : null;
-    if (!q && traitCount == null) {
-      return res.status(400).json({ ok: false, error: 'q or trait_count is required' });
-    }
+    // jv: sales tab shows "OpenSea API failed: 401 — Invalid API key" for
+    // the unfiltered/live view, while applying a trait-count filter (which
+    // already routes through this exact endpoint instead) works fine --
+    // confirmed this endpoint queries this repo's own already-synced sales
+    // table, with no dependency on the Cloudflare Worker or its separate,
+    // broken OPENSEA_API_KEY secret at all. Relaxing the previous
+    // q-or-trait_count requirement so the frontend can fall back to this
+    // same, healthy endpoint for the unfiltered case too (most recent
+    // sales for the slug, no filter applied) rather than being stuck with
+    // no working data source at all whenever that worker's key is down.
     const limit = Math.min(parseInt(req.query.limit || '100'), 500);
     const sort  = req.query.sort === 'asc' ? 'ASC' : 'DESC';
     const slug  = (req.query.slug || OCAS_SLUG).toLowerCase();
