@@ -502,7 +502,22 @@ async function syncSales(collection) {
         await client.query(`
           INSERT INTO sales (token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash, collection_slug)
           VALUES ${vals}
-          ON CONFLICT (token_id, sale_ts, collection_slug) DO NOTHING
+          -- jv reported (via cryptoadz-by-gremplin's retry logs): "duplicate
+          -- key value violates unique constraint 'sales_tx_hash...'" here,
+          -- even though this INSERT already targets ON CONFLICT (token_id,
+          -- sale_ts, collection_slug). Root cause: the sales table carries
+          -- TWO separate unique constraints -- the original UNIQUE(tx_hash,
+          -- token_id) from this table's very first CREATE TABLE, and a
+          -- later sales_token_ts_slug_unique index added for this exact
+          -- ON CONFLICT clause (see diag-check-conflict-constraints.js,
+          -- written for a similar earlier gap). A targeted ON CONFLICT only
+          -- suppresses a violation of the ONE constraint it names -- a
+          -- conflict on the older, still-active tx_hash+token_id constraint
+          -- was never covered by this clause at all. Targetless DO NOTHING
+          -- suppresses a violation of ANY unique/exclusion constraint on the
+          -- table, so this is safe regardless of which of the two is hit
+          -- (or if a third is ever added later).
+          ON CONFLICT DO NOTHING
         `, params);
       }
       await client.query('COMMIT');
@@ -628,7 +643,7 @@ async function seedFullSalesHistory(collection) {
             await client.query(`
               INSERT INTO sales (token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash, collection_slug)
               VALUES ${vals}
-              ON CONFLICT (token_id, sale_ts, collection_slug) DO NOTHING
+              ON CONFLICT DO NOTHING
             `, params);
           }
           await client.query('COMMIT');

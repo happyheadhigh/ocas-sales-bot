@@ -29,7 +29,7 @@ const {
   loadAllConfigs, getConfig, setConfig, deleteConfig, getAllConfigs, getUserAlerts,
 } = require('./lib/db');
 
-const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
+const { sendErrorWebhook, sendActivityWebhook, checkStartupEnvVars } = require('./lib/error');
 const { seedMarketHistory } = require('./sync-listings');
 
 const {
@@ -2652,9 +2652,21 @@ client.once('clientReady', async ()=>{
       );
       for(const row of stuckRes.rows){
         console.log(`[MarketRetry] Retrying seedMarketHistory for "${row.slug}"`);
-        await seedMarketHistory({ slug: row.slug, contract: row.contract }).catch(e => {
+        try{
+          await seedMarketHistory({ slug: row.slug, contract: row.contract });
+          // jv: "I didn't get any alert notification for the re try" -- this
+          // whole function only ever logged to console before, which is
+          // invisible unless someone happens to be watching Railway's own
+          // logs live (which is how jv found this in the first place).
+          // Matching the existing pattern from lib/auto-backfill.js's own
+          // seedMarketHistory calls: an activity webhook on success, an
+          // error webhook on failure, so either outcome actually reaches
+          // Discord instead of only the server console.
+          sendActivityWebhook(`✅ seedMarketHistory retry succeeded: "${row.slug}"`, 'Status should now be \'ready\' -- collection should appear on TraitView.').catch(()=>{});
+        }catch(e){
           console.warn(`[MarketRetry] [${row.slug}] retry failed (will back off further):`, e.message);
-        });
+          sendErrorWebhook(`seedMarketHistory retry failed: "${row.slug}"`, e, 'Will back off further and retry again automatically -- or re-run /config for this collection in any server to try again sooner.').catch(()=>{});
+        }
       }
     }catch(e){
       console.error('[MarketRetry] query failed:', e.message);
