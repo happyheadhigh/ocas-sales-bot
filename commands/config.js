@@ -368,6 +368,10 @@ function traitRuleLabel(r){
   if(r.trait_type === '_count') return `Own ${r.minimum_count}+ tokens`;
   if(r.trait_type === '_totalburns') return `${r.minimum_count}+ burn transactions, ever`;
   if(r.trait_type === '_maxburn') return `${r.minimum_count}+ tokens in a single burn`;
+  if(r.trait_type === '_tokenid'){
+    const ids = String(r.trait_value || '').split(',').filter(Boolean);
+    return ids.length > 1 ? `Owns token #${ids[0]} (or ${ids.length - 1} other${ids.length > 2 ? 's' : ''})` : `Owns token #${ids[0] || '?'}`;
+  }
   return `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`;
 }
 
@@ -2089,6 +2093,7 @@ async function handleConfigButton(interaction, ctx){
       _count:      'Minimum tokens owned (default: 1)',
       _totalburns: 'Minimum burn transactions (default: 1)',
       _maxburn:    'Minimum tokens in one burn (default: 1)',
+      _tokenid:    'Token ID(s), comma-separated',
     };
     const modal = new ModalBuilder()
       .setCustomId(`cfg_modal:trquick:${roleId}:${qColId}:${category}`)
@@ -2098,7 +2103,7 @@ async function handleConfigButton(interaction, ctx){
         new TextInputBuilder().setCustomId('tr_quick_count')
           .setLabel((fieldLabels[category] || 'Minimum count').slice(0, 45))
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. 1, 5, 10')
+          .setPlaceholder(category === '_tokenid' ? 'e.g. 1234 or 1234,5678' : 'e.g. 1, 5, 10')
           .setRequired(false)
       ),
     );
@@ -2153,7 +2158,7 @@ async function handleConfigButton(interaction, ctx){
     // burn tracking never applied to any other collection), so those two
     // options only show up when configuring the OCAS collection specifically.
     const isOcasSlug = slug === OCAS_SLUG;
-    const specialCount = isOcasSlug ? 3 : 1;
+    const specialCount = isOcasSlug ? 4 : 2;
     const CAT_CHUNK = 25;
     const catMenuCount = Math.min(4, Math.ceil((categories.length + specialCount) / CAT_CHUNK));
     const catRows = [];
@@ -2168,6 +2173,11 @@ async function handleConfigButton(interaction, ctx){
           .setLabel('🪙 Token Count')
           .setValue('_count')
           .setDescription('Assign role based on how many tokens the user holds')
+        );
+        opts.unshift(new StringSelectMenuOptionBuilder()
+          .setLabel('🔢 Specific Token #')
+          .setValue('_tokenid')
+          .setDescription('Assign role for owning one particular token ID')
         );
         if(isOcasSlug){
           opts.unshift(new StringSelectMenuOptionBuilder()
@@ -2215,11 +2225,12 @@ Step 2 of 3 — Pick the trait category:`,
     const suffix = catColId ? `:${catColId}` : '';
 
     // Token count / burn-based shortcuts — already deferred, so show a button that opens the modal next click
-    if(category === '_count' || category === '_totalburns' || category === '_maxburn'){
+    if(category === '_count' || category === '_totalburns' || category === '_maxburn' || category === '_tokenid'){
       const labels = {
         _count: ['Token Count Rule', 'Set Token Count', 'the minimum token count'],
         _totalburns: ['Total Burns Rule', 'Set Total Burns', 'the minimum number of burn transactions this wallet has ever done'],
         _maxburn: ['Biggest Single Burn Rule', 'Set Burn Size', 'the minimum tokens in any ONE burn transaction'],
+        _tokenid: ['Specific Token # Rule', 'Set Token ID', 'the token ID (or comma-separated list) that grants this role'],
       }[category];
       return interaction.editReply({
         content: `**${labels[0]}**\n\nClick below to set ${labels[2]} for this role.`,
@@ -2851,7 +2862,7 @@ async function handleConfigModal(interaction, ctx){
     const roleId   = qParts[2];
     const qColId   = qParts[3];
     const category = qParts[4];
-    const minCount = parseInt(interaction.fields.getTextInputValue('tr_quick_count').trim()) || 1;
+    const rawInput = interaction.fields.getTextInputValue('tr_quick_count').trim();
 
     const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     if(!role)
@@ -2866,12 +2877,31 @@ async function handleConfigModal(interaction, ctx){
       modColLabel = col?.name || col?.slug;
     }
 
-    await pgPool.query(
-      `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
-       VALUES ($1,$2,$3,'',$4,$5)
-       ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
-      [guildId, roleId, category, minCount, modCollectionSlug]
-    ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+    // jv: "the role manager/assignee should support specific token #'s as
+    // well as long as trait roles." Same as setup.js's identical quick-
+    // modal flow -- this category's own input IS the meaningful value
+    // (which token ID(s) grant the role), not a minimum count, so it's
+    // stored as trait_value with minimum_count fixed at 1.
+    if(category === '_tokenid'){
+      const tokenIds = rawInput.split(',').map(s => s.trim()).filter(Boolean);
+      if(!tokenIds.length || tokenIds.some(s => !/^\d+$/.test(s))){
+        return interaction.editReply({ content: '❌ Enter one or more numeric token IDs, comma-separated (e.g. 1234 or 1234,5678).' });
+      }
+      await pgPool.query(
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,'_tokenid',$3,1,$4)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$4`,
+        [guildId, roleId, tokenIds.join(','), modCollectionSlug]
+      ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+    } else {
+      const minCount = parseInt(rawInput) || 1;
+      await pgPool.query(
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,$3,'',$4,$5)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
+        [guildId, roleId, category, minCount, modCollectionSlug]
+      ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+    }
 
     const trRes = modColId
       ? await pgPool.query(

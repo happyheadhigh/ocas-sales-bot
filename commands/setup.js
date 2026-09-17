@@ -173,6 +173,10 @@ function traitRuleLabel(r){
   if(r.trait_type === '_count') return `Own ${r.minimum_count}+ tokens`;
   if(r.trait_type === '_totalburns') return `${r.minimum_count}+ burn transactions, ever`;
   if(r.trait_type === '_maxburn') return `${r.minimum_count}+ tokens in a single burn`;
+  if(r.trait_type === '_tokenid'){
+    const ids = String(r.trait_value || '').split(',').filter(Boolean);
+    return ids.length > 1 ? `Owns token #${ids[0]} (or ${ids.length - 1} other${ids.length > 2 ? 's' : ''})` : `Owns token #${ids[0] || '?'}`;
+  }
   return `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`;
 }
 
@@ -669,8 +673,8 @@ async function handleSetupButtonInner(interaction, ctx){
       });
     }
 
-    // Special options (Token Count + burn-based, when OCAS) go first, menu 0 only.
-    const specialCount = isOcas ? 3 : 1;
+    // Special options (Token Count + Specific Token # + burn-based, when OCAS) go first, menu 0 only.
+    const specialCount = isOcas ? 4 : 2;
     const CAT_CHUNK = 25;
     const catMenuCount = Math.min(4, Math.ceil((categories.length + specialCount) / CAT_CHUNK));
     const catRows = [];
@@ -684,6 +688,9 @@ async function handleSetupButtonInner(interaction, ctx){
         opts.unshift(new StringSelectMenuOptionBuilder()
           .setLabel('🪙 Token Count').setValue('_count')
           .setDescription('Assign role based on how many tokens the user holds'));
+        opts.unshift(new StringSelectMenuOptionBuilder()
+          .setLabel('🔢 Specific Token #').setValue('_tokenid')
+          .setDescription('Assign role for owning one particular token ID'));
         if(isOcas){
           opts.unshift(new StringSelectMenuOptionBuilder()
             .setLabel('🔥 Total Burns').setValue('_totalburns')
@@ -715,11 +722,12 @@ async function handleSetupButtonInner(interaction, ctx){
     const roleId   = parts[2];
     const category = interaction.values[0];
 
-    if(category === '_count' || category === '_totalburns' || category === '_maxburn'){
+    if(category === '_count' || category === '_totalburns' || category === '_maxburn' || category === '_tokenid'){
       const labels = {
         _count:      ['Token Count Rule', 'Set Token Count', 'the minimum token count'],
         _totalburns: ['Total Burns Rule', 'Set Total Burns', 'the minimum number of burn transactions this wallet has ever done'],
         _maxburn:    ['Biggest Single Burn Rule', 'Set Burn Size', 'the minimum tokens in any ONE burn transaction'],
+        _tokenid:    ['Specific Token # Rule', 'Set Token ID', 'the token ID (or comma-separated list) that grants this role'],
       }[category];
       return interaction.editReply({
         content: `**${labels[0]}**\n\nClick below to set ${labels[2]} for this role.`,
@@ -870,6 +878,7 @@ async function handleSetupButtonInner(interaction, ctx){
       _count:      'Minimum tokens owned (default: 1)',
       _totalburns: 'Minimum burn transactions (default: 1)',
       _maxburn:    'Minimum tokens in one burn (default: 1)',
+      _tokenid:    'Token ID(s), comma-separated',
     };
     const modal = new ModalBuilder()
       .setCustomId(`setup_modal:trquick:${roleId}:${category}`)
@@ -877,7 +886,7 @@ async function handleSetupButtonInner(interaction, ctx){
     modal.addComponents(new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('tr_quick_count')
         .setLabel((fieldLabels[category] || 'Minimum count').slice(0, 45))
-        .setStyle(TextInputStyle.Short).setPlaceholder('e.g. 1, 5, 10').setRequired(false)
+        .setStyle(TextInputStyle.Short).setPlaceholder(category === '_tokenid' ? 'e.g. 1234 or 1234,5678' : 'e.g. 1, 5, 10').setRequired(false)
     ));
     return interaction.showModal(modal);
   }
@@ -1032,10 +1041,35 @@ async function handleSetupModalInner(interaction, ctx){
     const parts    = customId.split(':');
     const roleId   = parts[2];
     const category = parts[3];
-    const minCount = parseInt(interaction.fields.getTextInputValue('tr_quick_count').trim()) || 1;
+    const rawInput = interaction.fields.getTextInputValue('tr_quick_count').trim();
 
     const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     if(!role) return interaction.editReply({ content:'❌ Role not found. Please try again.' });
+
+    // jv: "the role manager/assignee should support specific token #'s as
+    // well as long as trait roles." Unlike _count/_totalburns/_maxburn,
+    // this category's own input IS the meaningful value (which token ID(s)
+    // grant the role), not a minimum count -- stored as trait_value, with
+    // minimum_count fixed at 1 since syncTraitRoles treats ownership of
+    // any one of the listed IDs as binary (own it or don't), the same way
+    // owning any token with a given trait already grants a trait role.
+    if(category === '_tokenid'){
+      const tokenIds = rawInput.split(',').map(s => s.trim()).filter(Boolean);
+      if(!tokenIds.length || tokenIds.some(s => !/^\d+$/.test(s))){
+        return interaction.editReply({ content: '❌ Enter one or more numeric token IDs, comma-separated (e.g. 1234 or 1234,5678).' });
+      }
+      await pgPool.query(
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,'_tokenid',$3,1,NULL)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=NULL`,
+        [guildId, roleId, tokenIds.join(',')]
+      ).catch(e => console.warn('[Setup] trait_roles insert:', e.message));
+
+      const roles = await fetchWizardTraitRoles(guildId, pgPool);
+      return interaction.editReply({ content:'✅ Trait role added.', embeds:[buildTraitRolesEmbed(state, roles)], components:traitRolesRow(state, roles, interaction.guild) });
+    }
+
+    const minCount = parseInt(rawInput) || 1;
 
     await pgPool.query(
       `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)

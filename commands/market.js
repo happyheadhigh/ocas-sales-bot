@@ -1400,8 +1400,20 @@ async function showMaTraitPicker(interaction, ctx, slug, page = 0){
   const pageNote = totalPages > 1 ? ` (page ${safePage + 1} of ${totalPages})` : '';
   const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
   const replyOpts = {
-    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by${pageNote}:`,
-    components: [new ActionRowBuilder().addComponents(menu)],
+    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by${pageNote}, or watch a specific token # instead:`,
+    components: [
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        // jv: "Does the bot support personal alerts for specific token
+        // #'s? Or just traits?" -- it only supported traits until now.
+        // This opens a modal for one or more token IDs, stored as
+        // alert.tokenIds and checked in sendPersonalAlerts (lib/poll.js)
+        // as an independent match condition alongside trait filters, not
+        // instead of them -- a user can have both a trait filter and a
+        // specific-token watch active on the same alert.
+        new ButtonBuilder().setCustomId(`ma_browse:tokenidmodal:${slug}`).setLabel('🔢 Watch a Specific Token #').setStyle(ButtonStyle.Secondary)
+      ),
+    ],
     embeds: [],
   };
   if(replyFn !== 'update') replyOpts.flags = MessageFlags.Ephemeral;
@@ -1522,6 +1534,23 @@ async function handleMyAlertInteraction(interaction, ctx){
     const slug = customId.slice('ma_browse:skiptr:'.length);
     return showMaTypePicker(interaction, slug, null, null);
   }
+  if(customId.startsWith('ma_browse:tokenidmodal:')){
+    const slug = customId.slice('ma_browse:tokenidmodal:'.length);
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+    const existing = getAlert(interaction.user.id) || {};
+    const modal = new ModalBuilder()
+      .setCustomId(`ma_modal:tokenid:${slug}`)
+      .setTitle('Watch Specific Token #(s)');
+    modal.addComponents(new AR().addComponents(
+      new TextInputBuilder().setCustomId('ma_tokenids')
+        .setLabel('Token ID(s), comma-separated')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('e.g. 1234 or 1234,5678')
+        .setValue((existing.slug === slug && Array.isArray(existing.tokenIds)) ? existing.tokenIds.join(',') : '')
+        .setRequired(true)
+    ));
+    return interaction.showModal(modal);
+  }
   if(customId.startsWith('ma_browse:val:')){
     const parts = customId.slice('ma_browse:val:'.length).split(':');
     const slug = parts[0];
@@ -1581,6 +1610,55 @@ async function handleMyAlertInteraction(interaction, ctx){
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
     );
     return interaction.update({ content: 'Alert wizard cancelled.', embeds: [], components: [backRow] });
+  }
+}
+
+// ── /me → Trait Alert — "Watch a Specific Token #" modal submit ─────────────
+// jv: "Does the bot support personal alerts for specific token #'s? Or just
+// traits?" Sibling to handleMyAlertInteraction above (same ma_ prefix
+// family, same getAlert/setAlert dependency) but routed separately since
+// modal submissions are dispatched from bot.js by their own isModalSubmit()
+// check, distinct from the isButton()/isStringSelectMenu() check that
+// routes every ma_browse: interaction to that function.
+async function handleMyAlertModalSubmit(interaction, ctx){
+  const { getAlert, setAlert } = ctx;
+  const customId = interaction.customId;
+  if(customId.startsWith('ma_modal:tokenid:')){
+    const slug = customId.slice('ma_modal:tokenid:'.length);
+    const raw = interaction.fields.getTextInputValue('ma_tokenids').trim();
+    const tokenIds = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if(!tokenIds.length || tokenIds.some(s => !/^\d+$/.test(s))){
+      return interaction.reply({ content: '❌ Enter one or more numeric token IDs, comma-separated (e.g. 1234 or 1234,5678).', flags: MessageFlags.Ephemeral });
+    }
+    const idsInt = tokenIds.map(s => parseInt(s));
+    const existing = getAlert(interaction.user.id) || {};
+    // Preserve an existing alert's own sales/listings toggle and trait
+    // filters if one's already configured for this same collection --
+    // this modal only ever sets tokenIds, same as how trait filters and
+    // sales/listings toggles are independently additive elsewhere in this
+    // wizard. Defaults both DM types on for a brand new alert, since
+    // watching one specific token is a strong enough signal of interest
+    // that off-by-default (the trait-filter path's own default) would
+    // likely surprise someone expecting to hear about it either way.
+    const alertSales = existing.slug === slug ? (existing.alertSales ?? true) : true;
+    const alertListings = existing.slug === slug ? (existing.alertListings ?? true) : true;
+    const traitFilters = existing.slug === slug ? (existing.traitFilters || {}) : {};
+    setAlert(interaction.user.id, { slug, traitFilters, alertSales, alertListings, tokenIds: idsInt });
+    const embed = new EmbedBuilder()
+      .setTitle('✅ Alert Set!')
+      .setColor(0x57F287)
+      .setDescription([
+        `**Collection:** ${slug}`,
+        `**Sales DMs:** ${alertSales ? '✅ on' : '❌ off'}`,
+        `**Listing DMs:** ${alertListings ? '✅ on' : '❌ off'}`,
+        `**Watching token${idsInt.length > 1 ? 's' : ''}:** ${idsInt.map(id => `#${id}`).join(', ')}`,
+        '',
+        'Run `/me` → **Trait Alert** to add trait filters, pause, or remove your alert.',
+      ].join('\n'));
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.reply({ embeds: [embed], components: [backRow], flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -3562,4 +3640,4 @@ async function showFloorAlertModal(interaction, slug){
   return interaction.showModal(modal);
 }
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, handleMeTokenDownload };
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, handleMyAlertModalSubmit, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, handleMeTokenDownload };

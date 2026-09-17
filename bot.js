@@ -105,7 +105,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, handleMeTokenDownload }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, handleMyAlertModalSubmit, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, handleMeTokenDownload }   = require('./commands/market');
 const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
@@ -431,6 +431,18 @@ async function syncTraitRoles(guild, discordId, walletOrWallets){
           count = burnStats?.total || 0;
         } else if(tr.trait_type === '_maxburn'){
           count = burnStats?.max || 0;
+        } else if(tr.trait_type === '_tokenid'){
+          // jv: "the role manager/assignee should support specific token
+          // #'s as well as long as trait roles." Reuses this same table
+          // (trait_type/trait_value are already generic text columns, no
+          // schema change needed) and the same special-trait_type pattern
+          // already established by _count/_totalburns/_maxburn above --
+          // trait_value holds the specific token id as a string; a comma-
+          // separated list (e.g. "1234,5678") grants the role if the
+          // wallet owns ANY one of them, matching how a trait rule
+          // already grants a role for owning any token with that trait.
+          const wantedIds = String(tr.trait_value || '').split(',').map(s => parseInt(s.trim())).filter(Number.isFinite);
+          count = wantedIds.some(id => ownedTokenIds.includes(id)) ? 1 : 0;
         } else {
           count = traitCounts[tr.trait_type+'::'+tr.trait_value] || traitCounts[tr.trait_type+'::'+String(tr.trait_value||'')] || 0;
         }
@@ -937,6 +949,10 @@ client.on('interactionCreate', async (interaction)=>{
   if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('ma_browse:')){
     const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert };
     return handleMyAlertInteraction(interaction, maCtx);
+  }
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('ma_modal:')){
+    const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert };
+    return handleMyAlertModalSubmit(interaction, maCtx);
   }
   if(interaction.isButton() && interaction.customId.startsWith('mac_browse:')){
     const macCtx = { getAlert, setAlert, deleteAlert };
