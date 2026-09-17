@@ -232,6 +232,19 @@ async function syncListings(collection) {
         return dec != null ? parseFloat(dec) : null;
       }
 
+      // jv: "make the weth and eth wording through the page green for eth
+      // and red for weth" -- traced back to here: listings never tracked
+      // currency at all, only a numeric price_eth value, unlike sales
+      // (which already got this same fix earlier this session). OpenSea's
+      // listing price object carries its own currency symbol alongside
+      // the value/decimal fields getPriceEth above already reads --
+      // extracting it the same way, defaulting to 'ETH' only if truly
+      // absent (matching how every existing listing row -- inserted
+      // before this column existed -- should be read).
+      function getCurrency(listing) {
+        return listing?.price?.current?.currency || listing?.price?.currency || 'ETH';
+      }
+
       // Generous, collection-agnostic sanity bound against malformed parses —
       // not a real business rule about collection size (the old 10000 cap
       // was OCAS/CryptoPunks-coincidental, not meaningful for collections of
@@ -242,13 +255,14 @@ async function syncListings(collection) {
       for (const listing of (body.listings || [])) {
         const id = getTokenId(listing);
         const priceEth = getPriceEth(listing);
+        const currency = getCurrency(listing);
 
         if (!id || isNaN(id) || id < 0 || id > MAX_PLAUSIBLE_TOKEN_ID) { droppedThisPage++; continue; }
         if (priceEth == null || isNaN(priceEth) || priceEth <= 0) { droppedThisPage++; continue; }
 
         const url = `https://opensea.io/assets/${chain}/${contract}/${id}`;
         if (!listingsMap[id] || priceEth < listingsMap[id].price_eth) {
-          listingsMap[id] = { price_eth: priceEth, url };
+          listingsMap[id] = { price_eth: priceEth, url, currency };
         }
       }
       // Visible in logs if a real fraction of a page is unparseable --
@@ -308,15 +322,16 @@ async function syncListings(collection) {
       // Insert fresh listings, scoped by collection_slug
       for (let i = 0; i < entries.length; i += 100) {
         const batch = entries.slice(i, i + 100);
-        const vals  = batch.map((_, j) => `($${j*4+1}, $${j*4+2}, $${j*4+3}, $${j*4+4}, NOW())`).join(', ');
-        const params = batch.flatMap(([id, d]) => [parseInt(id), d.price_eth, d.url, slug]);
+        const vals  = batch.map((_, j) => `($${j*5+1}, $${j*5+2}, $${j*5+3}, $${j*5+4}, $${j*5+5}, NOW())`).join(', ');
+        const params = batch.flatMap(([id, d]) => [parseInt(id), d.price_eth, d.url, slug, d.currency || 'ETH']);
 
         await client.query(`
-          INSERT INTO listings (token_id, price_eth, url, collection_slug, updated_at)
+          INSERT INTO listings (token_id, price_eth, url, collection_slug, currency, updated_at)
           VALUES ${vals}
           ON CONFLICT (token_id, collection_slug) DO UPDATE
             SET price_eth = EXCLUDED.price_eth,
                 url       = EXCLUDED.url,
+                currency  = EXCLUDED.currency,
                 updated_at = NOW()
         `, params);
       }

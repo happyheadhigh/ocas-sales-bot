@@ -555,7 +555,7 @@ app.get('/db/listings', auth, async (req, res) => {
     // Default to OCAS slug for TraitView; pass ?slug= to override
     const slug = req.query.slug || 'on-chain-all-stars';
     const result = await pool.query(
-      `SELECT token_id, price_eth, url FROM listings WHERE collection_slug = $1 ORDER BY price_eth ASC`,
+      `SELECT token_id, price_eth, url, currency FROM listings WHERE collection_slug = $1 ORDER BY price_eth ASC`,
       [slug]
     );
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
@@ -564,7 +564,8 @@ app.get('/db/listings', auth, async (req, res) => {
       listings: result.rows.map(r => ({
         token_id: parseInt(r.token_id),
         price_eth: parseFloat(r.price_eth),
-        url: r.url
+        url: r.url,
+        currency: r.currency || 'ETH'
       })),
       count: result.rows.length
     });
