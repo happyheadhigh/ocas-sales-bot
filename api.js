@@ -756,6 +756,56 @@ app.get('/db/sales-search', auth, async (req, res) => {
   }
 });
 
+// jv: "Trait Pulse" -- serves the pre-computed rankings from
+// trait_pulse_cache (lib/trait-pulse.js does the actual computation, on a
+// schedule; this endpoint only ever reads the cache, never computes live).
+// ?window=1h|6h|24h|7d (default 1h), ?limit= (default 20, max 100).
+app.get('/db/trait-pulse', auth, async (req, res) => {
+  try {
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
+    const windowKey = ['1h','6h','24h','7d'].includes(req.query.window) ? req.query.window : '1h';
+    const limit = Math.min(parseInt(req.query.limit || '20'), 100);
+
+    const result = await pool.query(
+      `SELECT trait_name, trait_value, supply, sales_count, velocity_multiplier,
+              listed_count, listed_count_prior, listing_pressure_pct,
+              trait_floor_eth, trait_floor_eth_prior, floor_change_pct,
+              heat_score, computed_at
+       FROM trait_pulse_cache
+       WHERE collection_slug = $1 AND window_key = $2
+       ORDER BY heat_score DESC
+       LIMIT $3`,
+      [slug, windowKey, limit]
+    );
+
+    res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
+    res.json({
+      ok: true,
+      slug,
+      window: windowKey,
+      computed_at: result.rows[0]?.computed_at || null,
+      traits: result.rows.map(r => ({
+        trait_name:  r.trait_name,
+        trait_value: r.trait_value,
+        supply:      parseInt(r.supply),
+        sales_count: parseInt(r.sales_count),
+        velocity_multiplier: parseFloat(r.velocity_multiplier),
+        listed_count: r.listed_count != null ? parseInt(r.listed_count) : null,
+        listed_count_prior: r.listed_count_prior != null ? parseInt(r.listed_count_prior) : null,
+        listing_pressure_pct: r.listing_pressure_pct != null ? parseFloat(r.listing_pressure_pct) : null,
+        trait_floor_eth: r.trait_floor_eth != null ? parseFloat(r.trait_floor_eth) : null,
+        trait_floor_eth_prior: r.trait_floor_eth_prior != null ? parseFloat(r.trait_floor_eth_prior) : null,
+        floor_change_pct: r.floor_change_pct != null ? parseFloat(r.floor_change_pct) : null,
+        heat_score: parseFloat(r.heat_score),
+      })),
+      count: result.rows.length
+    });
+  } catch (e) {
+    console.error('/db/trait-pulse error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 // Sales history filtered by a trait value — full collection history, no pagination cap.
 // Query params:

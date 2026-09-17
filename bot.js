@@ -31,6 +31,7 @@ const {
 
 const { sendErrorWebhook, sendActivityWebhook, checkStartupEnvVars } = require('./lib/error');
 const { seedMarketHistory } = require('./sync-listings');
+const { computeTraitPulse } = require('./lib/trait-pulse');
 
 const {
   getCachedImage, setCachedImage, clearCachedImage,
@@ -2678,6 +2679,28 @@ client.once('clientReady', async ()=>{
   // jv wait 15 minutes for the first check, on top of everything above.
   retryFailedMarketHistory();
   setInterval(retryFailedMarketHistory, 15 * 60_000);
+
+  // Trait Pulse -- jv: "What traits are actually moving right now?" Runs
+  // every 20 minutes, once per known collection (from the collections
+  // registry table, the same source of truth used throughout this file for
+  // "which collections exist"). 20 minutes keeps the 1h window meaningfully
+  // fresh without recomputing every trait/value combination across every
+  // collection too often; the underlying data (sales, listings) only
+  // updates as fast as the existing sales/listings pollers anyway.
+  async function runTraitPulseForAllCollections(){
+    try{
+      const slugsRes = await pgPool.query(`SELECT slug FROM collections`);
+      for(const row of slugsRes.rows){
+        await computeTraitPulse(pgPool, row.slug).catch(e => {
+          console.warn(`[TraitPulse] [${row.slug}] failed:`, e.message);
+        });
+      }
+    }catch(e){
+      console.error('[TraitPulse] collection list query failed:', e.message);
+    }
+  }
+  runTraitPulseForAllCollections();
+  setInterval(runTraitPulseForAllCollections, 20 * 60_000);
 
   // Listing poller re-enabled with fix: caps fetch at 50 listings to prevent
   // loading 500-listing bursts into memory on restart (confirmed OOM cause).
