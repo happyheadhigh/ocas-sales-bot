@@ -675,17 +675,44 @@ async function seedMarketHistory(collection) {
     await seedFullSalesHistory(collection);
     await syncListings(collection);
 
+    // jv: "there should be an automatic retry, server admins shouldn't have
+    // to manually re run it if it fails." Reset retry state on success --
+    // this can be reached either as a first-try success or as the eventual
+    // successful attempt after one or more scheduled retries
+    // (retryFailedMarketHistory, bot.js), so both paths need it cleared.
     await pool.query(
-      `UPDATE collections SET status = 'ready', market_synced_at = NOW(), updated_at = NOW() WHERE slug = $1`,
+      `UPDATE collections SET status = 'ready', market_synced_at = NOW(), market_retry_count = 0, market_next_retry_at = NULL, updated_at = NOW() WHERE slug = $1`,
       [slug]
     );
     console.log(`[seed] [${slug}] Market history seed complete — status set to ready`);
   } catch (e) {
+    // Exponential backoff: 30min, 1hr, 2hr, 4hr, 8hr, capping at 24hr so a
+    // persistent failure still gets checked roughly once a day rather than
+    // retrying forever at the same short interval and re-hammering
+    // whatever's rate-limiting it. market_retry_count is read-then-written
+    // here (not an atomic increment) because this whole function only ever
+    // runs for one slug at a time, never concurrently with itself.
+    const priorRes = await pool.query(`SELECT market_retry_count FROM collections WHERE slug=$1`, [slug]).catch(() => null);
+    const priorCount = priorRes?.rows[0]?.market_retry_count || 0;
+    const newCount = priorCount + 1;
+    // Give up on scheduled retries after 10 attempts (roughly a week at the
+    // capped 24hr interval) rather than retrying an actually-broken
+    // collection forever -- market_next_retry_at stays NULL from here on,
+    // which retryFailedMarketHistory's own query (bot.js) already filters
+    // on, so this alone stops it from being picked up again. A manual
+    // /config re-run still resets market_retry_count to 0 on its next
+    // success, same as any other retry.
+    const giveUp = newCount >= 10;
+    const backoffMinutes = Math.min(30 * Math.pow(2, priorCount), 24 * 60);
     await pool.query(
-      `UPDATE collections SET status = 'failed', error_message = $2, updated_at = NOW() WHERE slug = $1`,
-      [slug, e.message]
+      `UPDATE collections SET status = 'failed', error_message = $2, market_retry_count = $3, market_next_retry_at = $4, updated_at = NOW() WHERE slug = $1`,
+      [slug, e.message, newCount, giveUp ? null : new Date(Date.now() + backoffMinutes * 60_000)]
     ).catch(dbErr => console.error(`[seed] [${slug}] Also failed to record error status:`, dbErr.message));
-    console.error(`[seed] [${slug}] Market history seed failed:`, e.message);
+    if(giveUp){
+      console.error(`[seed] [${slug}] Market history seed failed ${newCount} times -- giving up on automatic retries, needs manual attention:`, e.message);
+    } else {
+      console.error(`[seed] [${slug}] Market history seed failed (attempt ${newCount}, next retry in ${backoffMinutes}min):`, e.message);
+    }
     throw e;
   }
 }

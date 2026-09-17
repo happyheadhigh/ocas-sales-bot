@@ -30,6 +30,7 @@ const {
 } = require('./lib/db');
 
 const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
+const { seedMarketHistory } = require('./sync-listings');
 
 const {
   getCachedImage, setCachedImage, clearCachedImage,
@@ -2623,6 +2624,32 @@ client.once('clientReady', async ()=>{
     };
     console.log(`[MemoryDetail] ${JSON.stringify(caches)}`);
   }, 60_000);
+
+  // jv: "there should be an automatic retry, server admins shouldn't have
+  // to manually re run it if it fails." Runs every 15 minutes -- frequent
+  // enough that a 30-minute-backoff retry doesn't sit waiting much longer
+  // than it has to, without being so frequent it'd re-check every failed
+  // collection needlessly often. Only ever touches collections whose own
+  // market_next_retry_at (set by seedMarketHistory's own backoff logic,
+  // sync-listings.js) has actually arrived, so this never re-hammers a
+  // collection that just failed a minute ago.
+  async function retryFailedMarketHistory(){
+    try{
+      const stuckRes = await pgPool.query(
+        `SELECT slug, contract FROM collections
+         WHERE status = 'failed' AND market_next_retry_at IS NOT NULL AND market_next_retry_at <= NOW()`
+      );
+      for(const row of stuckRes.rows){
+        console.log(`[MarketRetry] Retrying seedMarketHistory for "${row.slug}"`);
+        await seedMarketHistory({ slug: row.slug, contract: row.contract }).catch(e => {
+          console.warn(`[MarketRetry] [${row.slug}] retry failed (will back off further):`, e.message);
+        });
+      }
+    }catch(e){
+      console.error('[MarketRetry] query failed:', e.message);
+    }
+  }
+  setInterval(retryFailedMarketHistory, 15 * 60_000);
 
   // Listing poller re-enabled with fix: caps fetch at 50 listings to prevent
   // loading 500-listing bursts into memory on restart (confirmed OOM cause).
