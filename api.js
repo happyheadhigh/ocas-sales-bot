@@ -2722,21 +2722,44 @@ app.get('/tv/link-status-by-wallet', auth,
        ORDER BY linked_at DESC LIMIT 1`,
       [wallet]
     );
-    if (!row.rows.length) return res.json({ linked: false });
 
-    // jv: "reconnected my wallets to traitview after our multi wallet
-    // verification and it's only showing the wallet connected that's
-    // holding argonauts. Should it show both wallets?" traitview_links
-    // (this table) is this website's own, separate verification record --
-    // one wallet per row, unrelated to the bot's own multi-wallet system.
+    let discordId, guildId = null, linkedAt = null;
+
+    if (row.rows.length) {
+      discordId = row.rows[0].discord_id;
+      guildId = row.rows[0].guild_id;
+      linkedAt = row.rows[0].linked_at;
+    } else {
+      // jv confirmed live: "on desktop, it's not picking up that I have 2
+      // wallets verified through the bot... I did the verification through
+      // mobile." Root cause -- traitview_links (this website's own separate
+      // verification record, populated only by claiming a code through
+      // /tv/claim-code) upserts on (discord_id, guild_id) alone, so it can
+      // only ever store ONE wallet per user at a time -- whichever wallet
+      // happened to be attached to the most recently claimed code. If the
+      // wallet connected on a different device/browser is a DIFFERENT one
+      // of the user's genuinely bot-linked wallets (linked_wallets, the
+      // bot's real multi-wallet source of truth, has no such single-wallet
+      // limit), the lookup above finds nothing and returns linked:false --
+      // even though this wallet is, in fact, one of theirs. Falling back to
+      // resolving discord_id directly from linked_wallets by wallet address
+      // when traitview_links has no row for this specific one, rather than
+      // requiring every one of a user's wallets to also happen to be the
+      // one traitview_links most recently recorded.
+      const fallback = await pool.query(
+        `SELECT discord_id FROM linked_wallets WHERE LOWER(wallet)=LOWER($1) ORDER BY linked_at DESC LIMIT 1`,
+        [wallet]
+      ).catch(() => ({ rows: [] }));
+      if (!fallback.rows.length) return res.json({ linked: false });
+      discordId = fallback.rows[0].discord_id;
+    }
+
     // linked_wallets (the bot's actual multi-wallet source of truth) is
-    // keyed by discord_id, the field this query already resolves above,
-    // so once we know it, every wallet ever linked to this same Discord
-    // account -- across every guild they've verified in, not just the
-    // one traitview_links happened to record -- is a second, cheap
-    // lookup away. Deduplicated since the same wallet can appear under
-    // multiple guild_ids if verification cascaded across servers.
-    const discordId = row.rows[0].discord_id;
+    // keyed by discord_id -- once known (either path above), every wallet
+    // ever linked to this same Discord account, across every guild
+    // they've verified in, is a second, cheap lookup away. Deduplicated
+    // since the same wallet can appear under multiple guild_ids if
+    // verification cascaded across servers.
     const linkedRows = await pool.query(
       `SELECT DISTINCT wallet FROM linked_wallets WHERE discord_id=$1`,
       [discordId]
@@ -2746,8 +2769,8 @@ app.get('/tv/link-status-by-wallet', auth,
     res.json({
       linked: true,
       discord_id: discordId,
-      guild_id: row.rows[0].guild_id,
-      linked_at: row.rows[0].linked_at,
+      guild_id: guildId,
+      linked_at: linkedAt,
       linkedWallets: linkedWallets.length ? linkedWallets : [wallet.toLowerCase()],
     });
   } catch (e) {
