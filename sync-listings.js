@@ -388,16 +388,43 @@ async function syncListings(collection) {
   }
 }
 
+// jv: "The listing totals are off" (794 shown vs. OpenSea's own live 816
+// for Argonauts). Investigated the sync itself thoroughly -- pagination
+// retries, per-listing parsing, the completedFully guard against writing
+// a partial set -- all already correct and already fixed for a prior,
+// similar report. What was NOT guarded: setInterval here has no
+// reentrancy protection at all. If one full pass (sequentially syncing
+// every configured collection, each its own multi-page OpenSea fetch)
+// ever takes longer than SYNC_INTERVAL -- plausible with retries, or a
+// collection with enough listings to need many pages -- the next tick
+// fires a second, fully concurrent syncAllListings() run before the
+// first has finished. Two overlapping syncListings() calls for the same
+// collection racing their own DELETE+INSERT against each other is
+// exactly the kind of gap that could produce a wrong count without ever
+// showing up as an error anywhere, since neither run would fail --
+// they'd just interleave.
+let _syncAllListingsRunning = false;
 async function syncAllListings() {
-  const collections = await discoverCollections();
-  console.log(`[sync] Syncing listings for ${collections.length} collection(s): ${collections.map(c => c.slug).join(', ')}`);
-  for (const collection of collections) {
-    await syncListings(collection);
-    if (collections.length > 1) await new Promise(r => setTimeout(r, COLLECTION_DELAY));
+  if(_syncAllListingsRunning){
+    console.warn('[sync] syncAllListings still running from a previous tick -- skipping this one rather than overlapping');
+    return;
+  }
+  _syncAllListingsRunning = true;
+  try{
+    const collections = await discoverCollections();
+    console.log(`[sync] Syncing listings for ${collections.length} collection(s): ${collections.map(c => c.slug).join(', ')}`);
+    for (const collection of collections) {
+      await syncListings(collection);
+      if (collections.length > 1) await new Promise(r => setTimeout(r, COLLECTION_DELAY));
+    }
+  } finally {
+    _syncAllListingsRunning = false;
   }
 }
 
-// Run immediately on startup, then every 3 minutes
+// Run immediately on startup, then every 60 seconds (SYNC_INTERVAL) -- a
+// tick that finds the previous pass still in flight skips itself instead
+// of overlapping it (see the reentrancy guard above).
 syncAllListings();
 setInterval(syncAllListings, SYNC_INTERVAL);
 
@@ -533,12 +560,25 @@ async function syncSales(collection) {
   }
 }
 
+// Same reentrancy guard as syncAllListings above -- less likely to matter
+// at a 15-minute interval, but the same class of risk exists in principle
+// if a pass ever runs long, so guarded the same way for consistency.
+let _syncAllSalesRunning = false;
 async function syncAllSales() {
-  const collections = await discoverCollections();
-  console.log(`[sync-sales] Syncing sales for ${collections.length} collection(s): ${collections.map(c => c.slug).join(', ')}`);
-  for (const collection of collections) {
-    await syncSales(collection);
-    if (collections.length > 1) await new Promise(r => setTimeout(r, COLLECTION_DELAY));
+  if(_syncAllSalesRunning){
+    console.warn('[sync-sales] syncAllSales still running from a previous tick -- skipping this one rather than overlapping');
+    return;
+  }
+  _syncAllSalesRunning = true;
+  try{
+    const collections = await discoverCollections();
+    console.log(`[sync-sales] Syncing sales for ${collections.length} collection(s): ${collections.map(c => c.slug).join(', ')}`);
+    for (const collection of collections) {
+      await syncSales(collection);
+      if (collections.length > 1) await new Promise(r => setTimeout(r, COLLECTION_DELAY));
+    }
+  } finally {
+    _syncAllSalesRunning = false;
   }
 }
 
