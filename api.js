@@ -579,20 +579,25 @@ app.get('/db/listings', auth, async (req, res) => {
 app.get('/db/floor-trend', auth, async (req, res) => {
   try {
     const days = Math.min(parseInt(req.query.days || '90'), 365);
-    // jv: same cross-collection bug class as /db/token-sales below -- no
-    // collection_slug filter at all, and the join to tokens matched purely
-    // on t.id = s.token_id with no collection_slug match either (tokens'
-    // own primary key is the composite (id, collection_slug), so this could
-    // also join a token row from a DIFFERENT collection that happens to
-    // share the same numeric id). Every collection's sales/floor history
-    // was being mixed together in this chart. slug defaults to OCAS_SLUG,
-    // matching this file's existing req.query.slug || OCAS_SLUG convention.
     const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
+    // jv: "when it does load it's all stacked in 1 spot" -- the daily
+    // floor line (from floor_history, a periodic snapshot with no row cap
+    // at all) correctly spanned the full 30 days, but the individual sale
+    // dots all crowded into the last few days only. Root cause: LIMIT 2000
+    // ordered by sale_ts DESC returns the MOST RECENT 2000 sales, not an
+    // even sample across whatever range was actually requested. This
+    // collection does roughly 100+ sales/day -- at that rate 2000 rows are
+    // consumed in well under 3 weeks, so a 30-day (or longer) request was
+    // silently getting truncated down to just its most recent few days,
+    // no matter which range the user had actually selected. Raised well
+    // past this collection's own current all-time sale count (order of
+    // 15k) so a genuinely full range comes back uncapped in practice
+    // rather than needing a cap increase again the next time volume grows.
     const result = await pool.query(
       `SELECT s.token_id, s.price_eth, s.currency, s.sale_ts, t.obs_rank
        FROM sales s JOIN tokens t ON t.id = s.token_id AND t.collection_slug = s.collection_slug
        WHERE s.collection_slug = $2 AND s.sale_ts > NOW() - ($1 || ' days')::INTERVAL
-       ORDER BY s.sale_ts DESC LIMIT 2000`,
+       ORDER BY s.sale_ts DESC LIMIT 20000`,
       [days, slug]
     );
     res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
