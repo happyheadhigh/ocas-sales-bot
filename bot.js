@@ -2633,11 +2633,22 @@ client.once('clientReady', async ()=>{
   // market_next_retry_at (set by seedMarketHistory's own backoff logic,
   // sync-listings.js) has actually arrived, so this never re-hammers a
   // collection that just failed a minute ago.
+  //
+  // jv: "when is the next retry cycle? I was trying to get the collection
+  // on traitview" -- caught a real gap answering that: any collection that
+  // failed BEFORE this feature existed (cryptoadz-by-gremplin included)
+  // has market_next_retry_at sitting at NULL, since the old code path that
+  // failed it never wrote to a column that didn't exist yet. The original
+  // WHERE here required market_next_retry_at IS NOT NULL, which would have
+  // silently excluded every pre-existing failure forever -- treating NULL
+  // as "never scheduled, so eligible right now" instead means this first
+  // cycle after deploy immediately retries every collection already stuck
+  // in 'failed', not just ones that fail from here on.
   async function retryFailedMarketHistory(){
     try{
       const stuckRes = await pgPool.query(
         `SELECT slug, contract FROM collections
-         WHERE status = 'failed' AND market_next_retry_at IS NOT NULL AND market_next_retry_at <= NOW()`
+         WHERE status = 'failed' AND (market_next_retry_at IS NULL OR market_next_retry_at <= NOW())`
       );
       for(const row of stuckRes.rows){
         console.log(`[MarketRetry] Retrying seedMarketHistory for "${row.slug}"`);
@@ -2649,6 +2660,11 @@ client.once('clientReady', async ()=>{
       console.error('[MarketRetry] query failed:', e.message);
     }
   }
+  // Run once immediately on startup/deploy (same pattern as pollSales/
+  // pollListings below), not just after the first 15-minute interval --
+  // otherwise a fresh deploy of this exact feature would still make
+  // jv wait 15 minutes for the first check, on top of everything above.
+  retryFailedMarketHistory();
   setInterval(retryFailedMarketHistory, 15 * 60_000);
 
   // Listing poller re-enabled with fix: caps fetch at 50 listings to prevent
