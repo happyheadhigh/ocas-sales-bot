@@ -557,15 +557,28 @@ setInterval(syncAllSales, 15 * 60 * 1000);
 // hitting the cap logs clearly rather than failing silently.
 async function seedFullSalesHistory(collection) {
   const { slug } = collection;
-  console.log(`[seed] Starting FULL sales history pull for ${slug} at ${new Date().toISOString()}`);
+
+  // jv: two consecutive retry-failure webhooks an hour apart, both dying at
+  // the exact same "page 180" -- confirmed this always restarted from page 1
+  // with no delay between requests at all, which is both why it keeps
+  // tripping the same rate limit and why every retry wastes the same ~180
+  // requests before dying at the same wall again. Resuming from wherever
+  // the last attempt actually got to, instead of starting over from zero.
+  const priorRes = await pool.query(
+    `SELECT sales_seed_cursor, sales_seed_written, sales_seed_pages FROM collections WHERE slug=$1`, [slug]
+  ).catch(() => null);
+  let cursor = priorRes?.rows[0]?.sales_seed_cursor || null;
+  let totalWritten = priorRes?.rows[0]?.sales_seed_written || 0;
+  let pages = priorRes?.rows[0]?.sales_seed_pages || 0;
+  if(cursor){
+    console.log(`[seed] [${slug}] Resuming FULL sales history pull from saved cursor (page ${pages}, ${totalWritten} sales already written) at ${new Date().toISOString()}`);
+  } else {
+    console.log(`[seed] Starting FULL sales history pull for ${slug} at ${new Date().toISOString()}`);
+  }
 
   const MAX_PLAUSIBLE_TOKEN_ID = 10_000_000;
   const MAX_PLAUSIBLE_PRICE_ETH = 100_000;
   const MAX_PAGES = 2000; // 2000 * 100 = 200,000 sales safety cap — raised from 50,000, which would have quietly truncated a ~44k-token collection trading at anywhere near OnChainHoodies' ~1.2 sales/token ratio
-
-  let cursor = null;
-  let pages = 0;
-  let totalWritten = 0;
 
   try {
     do {
@@ -658,14 +671,34 @@ async function seedFullSalesHistory(collection) {
 
       cursor = body.next || null;
       pages++;
+      // jv: two consecutive retries both died at the exact same "page 180"
+      // rate limit. There was already an 80ms delay here, which clearly
+      // wasn't enough spacing to avoid tripping OpenSea's limit across ~180
+      // consecutive requests -- raised to 300ms, matching the spacing
+      // already used for OpenSea pagination elsewhere in this codebase
+      // (lib/poll.js), and persisting progress every page (below) so if it
+      // DOES still get rate-limited somewhere, the next attempt resumes
+      // from here instead of restarting from page 1 and hitting the exact
+      // same wall again.
+      await pool.query(
+        `UPDATE collections SET sales_seed_cursor = $2, sales_seed_written = $3, sales_seed_pages = $4, updated_at = NOW() WHERE slug = $1`,
+        [slug, cursor, totalWritten, pages]
+      ).catch(e => console.warn(`[seed] [${slug}] Failed to persist sales-seed cursor (non-fatal, next retry will just restart from page 1):`, e.message));
       if (pages % 20 === 0) console.log(`[seed] [${slug}] ...${pages} pages, ${totalWritten} sales written so far`);
       if (pages >= MAX_PAGES) {
         console.warn(`[seed] [${slug}] Hit the ${MAX_PAGES}-page safety cap (${MAX_PAGES * 100} events) — history pull stopped early, not necessarily complete`);
         break;
       }
-      if (cursor) await new Promise(r => setTimeout(r, 80));
+      if (cursor) await new Promise(r => setTimeout(r, 300));
     } while (cursor);
 
+    // Pull complete -- clear the saved cursor so a future re-onboard of this
+    // same slug (unlikely, but possible) starts fresh rather than "resuming"
+    // from a pull that already finished.
+    await pool.query(
+      `UPDATE collections SET sales_seed_cursor = NULL, sales_seed_written = 0, sales_seed_pages = 0, updated_at = NOW() WHERE slug = $1`,
+      [slug]
+    ).catch(() => {});
     console.log(`[seed] [${slug}] ✓ Full sales history pull complete: ${totalWritten} sales across ${pages} pages`);
     return { ok: true, salesWritten: totalWritten, pages };
   } catch (e) {
