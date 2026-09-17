@@ -2743,6 +2743,14 @@ async function handleConfigModal(interaction, ctx){
         const { maybeStartBackfill } = require('../lib/auto-backfill');
         const result = await maybeStartBackfill(pgPool, { contract, slug, guildId, guildName: interaction.guild?.name });
         if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
+        // jv: re-submitted the same slug specifically to retry a stuck
+        // seedMarketHistory, then said "it didn't trigger it" -- this
+        // branch used to say nothing either way (result.needed is always
+        // false once trait data already exists), so there was no way to
+        // tell a silent no-op apart from a silent success or failure.
+        else if(result.seedAttempted) waitMsg = result.seedOk
+          ? '\n\n✅ Sales/listings history for this collection was not fully synced yet — refreshed it just now.'
+          : '\n\n⚠️ Tried to refresh sales/listings history for this collection just now, but it failed again (see #bot-errors for details). Will keep retrying automatically.';
       }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
     }
 
@@ -2779,6 +2787,14 @@ async function handleConfigModal(interaction, ctx){
             const { maybeStartBackfill } = require('../lib/auto-backfill');
             const result = await maybeStartBackfill(pgPool, { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, guildId, guildName: interaction.guild?.name });
             if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
+        // jv: re-submitted the same slug specifically to retry a stuck
+        // seedMarketHistory, then said "it didn't trigger it" -- this
+        // branch used to say nothing either way (result.needed is always
+        // false once trait data already exists), so there was no way to
+        // tell a silent no-op apart from a silent success or failure.
+        else if(result.seedAttempted) waitMsg = result.seedOk
+          ? '\n\n✅ Sales/listings history for this collection was not fully synced yet — refreshed it just now.'
+          : '\n\n⚠️ Tried to refresh sales/listings history for this collection just now, but it failed again (see #bot-errors for details). Will keep retrying automatically.';
           }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
         }
       }
