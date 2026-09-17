@@ -2817,6 +2817,28 @@ async function handleConfigModal(interaction, ctx){
             .then(r => backfillServerWallets(guildId, colContract, colSlug, pgPool, process.env.ALCHEMY_API_KEY, r.rows[0]?.chain || 'ethereum'))
             .catch(()=>{});
         }
+        // jv: re-submitted the same slug specifically to retry a stuck
+        // seedMarketHistory, then said "nothing is happening" -- traced
+        // to a real gap, not just missing UI feedback this time: THIS
+        // branch (an additional, non-primary collection -- cfg.collections
+        // rather than the server's primary cfg.contract/collectionSlug)
+        // never called maybeStartBackfill at all, unlike the isPrimary
+        // branch right above it. Wallet backfill and trait-data sync ran,
+        // but nothing ever retried the actual sales/listings history seed
+        // for a collection added this way -- so if cryptoadz-by-gremplin
+        // is configured here rather than as this server's primary
+        // collection, re-submitting the slug genuinely did nothing for
+        // that specific problem, no matter how many times it was tried.
+        if(cfg.collections[idx].contract && cfg.collections[idx].slug){
+          try{
+            const { maybeStartBackfill } = require('../lib/auto-backfill');
+            const result = await maybeStartBackfill(pgPool, { contract: cfg.collections[idx].contract, slug: cfg.collections[idx].slug, guildId, guildName: interaction.guild?.name });
+            if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
+            else if(result.seedAttempted) waitMsg = result.seedOk
+              ? '\n\n✅ Sales/listings history for this collection was not fully synced yet — refreshed it just now.'
+              : '\n\n⚠️ Tried to refresh sales/listings history for this collection just now, but it failed again (see #bot-errors for details). Will keep retrying automatically.';
+          }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
+        }
       }
     }
     await setConfig(guildId, cfg);
