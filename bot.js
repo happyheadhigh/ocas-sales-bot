@@ -61,6 +61,7 @@ const {
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
 const { startMetadataUpdatePoller } = require('./lib/metadata-update-poller');
+const { startNewTokenPoller } = require('./lib/new-token-poller');
 const { addLinkedWallet, getLinkedWalletAddresses } = require('./lib/linked-wallets');
 const { verifyAgainstAnyConfiguredChain, getConfiguredWebhooks, processAddressActivityEvent } = require('./lib/alchemy-webhook');
 const { startBurnDetectionPoller } = require('./lib/burn-detect');
@@ -2760,6 +2761,21 @@ client.once('clientReady', async ()=>{
     startMetadataUpdatePoller();
   } else {
     console.log('[MetadataUpdate] No ALCHEMY_API_KEY set — metadata-update poller disabled');
+  }
+  // jv: "new tokens are still being claimed in Argonauts... is there
+  // something that is capturing those events". The metadata-update
+  // poller right above only ever watches for CHANGES to tokens already
+  // known to exist -- nothing previously checked whether a collection's
+  // on-chain supply had grown and new token IDs now exist that were
+  // never backfilled at all. Runs for every 'ready' collection (not
+  // just argonauts), on the same ALCHEMY_API_KEY requirement as the
+  // poller above since it needs it for the same reasons (an on-chain
+  // totalSupply() read via Alchemy's RPC proxy, and the NFT-API calls to
+  // actually fetch any new tokens found).
+  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
+    startNewTokenPoller();
+  } else {
+    console.log('[NewTokenPoller] No ALCHEMY_API_KEY set — new-token poller disabled');
   }
   // Generic burned-token detection (lib/burn-detect.js) -- jv: Argonauts has
   // no protocol-level burn mechanic, a third-party account independently
