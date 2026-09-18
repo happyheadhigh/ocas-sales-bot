@@ -734,13 +734,39 @@ app.get('/db/sales-search', auth, async (req, res) => {
     const params = [slug];
     let p = 2;
     if (q) {
-      conditions.push(`EXISTS (
-        SELECT 1 FROM token_traits tt
-        WHERE tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
-        AND (tt.trait_name ILIKE $${p} OR tt.trait_value ILIKE $${p})
-      )`);
-      params.push(`%${q}%`);
-      p++;
+      // jv: tapping one of the search box's own datalist suggestions
+      // (built as "Category: value" strings, e.g. "Artifact: Vape
+      // (Dragon's Breath)" -- see the datalist-building comment in
+      // app.js) filled the box with that whole string, but this only
+      // ever tried matching it as ONE substring against trait_name OR
+      // trait_value separately -- the combined "Category: value" text
+      // can't appear whole in either column alone, so it silently
+      // matched nothing. A colon in the query is a strong, deliberate
+      // signal it's one of these suggestions rather than free-typed
+      // text (nobody types a literal colon searching for a trait by
+      // hand) -- split on the first one and require the category part
+      // AND the value part to both match, on the same trait row. Plain
+      // free-text search (no colon) is unchanged.
+      const colonIdx = q.indexOf(':');
+      if (colonIdx > 0) {
+        const cat = q.slice(0, colonIdx).trim();
+        const val = q.slice(colonIdx + 1).trim();
+        conditions.push(`EXISTS (
+          SELECT 1 FROM token_traits tt
+          WHERE tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
+          AND tt.trait_name ILIKE $${p} AND tt.trait_value ILIKE $${p + 1}
+        )`);
+        params.push(`%${cat}%`, `%${val}%`);
+        p += 2;
+      } else {
+        conditions.push(`EXISTS (
+          SELECT 1 FROM token_traits tt
+          WHERE tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
+          AND (tt.trait_name ILIKE $${p} OR tt.trait_value ILIKE $${p})
+        )`);
+        params.push(`%${q}%`);
+        p++;
+      }
     }
     if (traitCount != null) {
       conditions.push(`EXISTS (
