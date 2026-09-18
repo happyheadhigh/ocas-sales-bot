@@ -1400,23 +1400,17 @@ async function showMaTraitPicker(interaction, ctx, slug, page = 0){
   const pageNote = totalPages > 1 ? ` (page ${safePage + 1} of ${totalPages})` : '';
   const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
   const replyOpts = {
-    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by${pageNote}, or watch a specific token # instead:`,
+    content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by${pageNote}:`,
     components: [
       new ActionRowBuilder().addComponents(menu),
       new ActionRowBuilder().addComponents(
-        // jv: "Does the bot support personal alerts for specific token
-        // #'s? Or just traits?" -- it only supported traits until now.
-        // This opens a modal for one or more token IDs, stored as
-        // alert.tokenIds and checked in sendPersonalAlerts (lib/poll.js)
-        // as an independent match condition alongside trait filters, not
-        // instead of them -- a user can have both a trait filter and a
-        // specific-token watch active on the same alert.
-        new ButtonBuilder().setCustomId(`ma_browse:tokenidmodal:${slug}`).setLabel('🔢 Watch a Specific Token #').setStyle(ButtonStyle.Secondary),
         // jv: "is there any way to set personal alerts for trait counts".
-        // Same independent-condition pattern as the token-# watch right
-        // above -- stored as alert.traitCountFilters (an array of exact
-        // counts to watch for) and checked the same way in
-        // sendPersonalAlerts.
+        // Same independent-condition pattern as the token-# watch that
+        // used to live here (see /me → Token Alert now, a separate
+        // top-level section since jv found a non-trait alert type
+        // confusing to locate inside "Trait Alert") -- stored as
+        // alert.traitCountFilters (an array of exact counts to watch
+        // for) and checked the same way in sendPersonalAlerts.
         new ButtonBuilder().setCustomId(`ma_browse:traitcountmodal:${slug}`).setLabel('🔢 Watch a Trait Count').setStyle(ButtonStyle.Secondary)
       ),
     ],
@@ -1424,6 +1418,28 @@ async function showMaTraitPicker(interaction, ctx, slug, page = 0){
   };
   if(replyFn !== 'update') replyOpts.flags = MessageFlags.Ephemeral;
   return interaction[replyFn](replyOpts);
+}
+
+// Extracted from the button handler that used to trigger this from
+// inside the trait wizard (ma_browse:tokenidmodal:, now gone) so the new
+// standalone Token Alert entry point (/me → Token Alert →
+// ma_browse:tokencol's collection pick) can show the exact same modal.
+async function showMtaTokenIdModal(interaction, ctx, slug){
+  const { getAlert } = ctx;
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const existing = getAlert(interaction.user.id) || {};
+  const modal = new ModalBuilder()
+    .setCustomId(`ma_modal:tokenid:${slug}`)
+    .setTitle('Watch Specific Token #(s)');
+  modal.addComponents(new AR().addComponents(
+    new TextInputBuilder().setCustomId('ma_tokenids')
+      .setLabel('Token ID(s), comma-separated')
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder('e.g. 1234 or 1234,5678')
+      .setValue((existing.slug === slug && Array.isArray(existing.tokenIds)) ? existing.tokenIds.join(',') : '')
+      .setRequired(true)
+  ));
+  return interaction.showModal(modal);
 }
 
 async function showMaValuePicker(interaction, ctx, slug, traitName){
@@ -1540,22 +1556,14 @@ async function handleMyAlertInteraction(interaction, ctx){
     const slug = customId.slice('ma_browse:skiptr:'.length);
     return showMaTypePicker(interaction, slug, null, null);
   }
-  if(customId.startsWith('ma_browse:tokenidmodal:')){
-    const slug = customId.slice('ma_browse:tokenidmodal:'.length);
-    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
-    const existing = getAlert(interaction.user.id) || {};
-    const modal = new ModalBuilder()
-      .setCustomId(`ma_modal:tokenid:${slug}`)
-      .setTitle('Watch Specific Token #(s)');
-    modal.addComponents(new AR().addComponents(
-      new TextInputBuilder().setCustomId('ma_tokenids')
-        .setLabel('Token ID(s), comma-separated')
-        .setStyle(TextInputStyle.Short)
-        .setPlaceholder('e.g. 1234 or 1234,5678')
-        .setValue((existing.slug === slug && Array.isArray(existing.tokenIds)) ? existing.tokenIds.join(',') : '')
-        .setRequired(true)
-    ));
-    return interaction.showModal(modal);
+  if(customId.startsWith('ma_browse:tokencol')){
+    // jv: token-# watching's collection picker, now its own top-level
+    // entry point (/me → Token Alert) rather than a button inside the
+    // trait wizard -- goes straight to the modal below on collection
+    // pick, skipping trait selection entirely since it's not relevant
+    // here.
+    const slug = interaction.values[0];
+    return showMtaTokenIdModal(interaction, ctx, slug);
   }
   if(customId.startsWith('ma_browse:traitcountmodal:')){
     const slug = customId.slice('ma_browse:traitcountmodal:'.length);
@@ -1676,7 +1684,7 @@ async function handleMyAlertModalSubmit(interaction, ctx){
         `**Listing DMs:** ${alertListings ? '✅ on' : '❌ off'}`,
         `**Watching token${idsInt.length > 1 ? 's' : ''}:** ${idsInt.map(id => `#${id}`).join(', ')}`,
         '',
-        'Run `/me` → **Trait Alert** to add trait filters, pause, or remove your alert.',
+        'Run `/me` → **Token Alert** to pause or stop watching, or **Trait Alert** to also add trait filters.',
       ].join('\n'));
     const backRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
@@ -1929,8 +1937,23 @@ async function showMeHub(interaction, ctx){
     const pausedTag = alert.paused ? ' ⏸️ paused' : '';
     summaryLines.push(`📣 **Trait Alert** — ${alert.slug||'any'} · Sales: ${alert.alertSales?'✅':'❌'} · Listings: ${alert.alertListings?'✅':'❌'}${pausedTag}`);
     summaryLines.push(`  Filters: ${fmtF(alert.traitFilters)}`);
+    if(Array.isArray(alert.traitCountFilters) && alert.traitCountFilters.length){
+      summaryLines.push(`  Trait count(s): ${alert.traitCountFilters.join(', ')}`);
+    }
   } else {
     summaryLines.push('📣 **Trait Alert** — not set');
+  }
+
+  // jv: "it lives inside trait alerts and it should be its own separate
+  // alert, it's a little confusing to find it within trait alerts since
+  // it's not a trait" -- token-# watching shares the same underlying
+  // alert record as Trait Alert (alert.tokenIds, same setAlert/getAlert),
+  // just surfaced as its own top-level nav section now instead of a
+  // button buried inside the trait wizard.
+  if(alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length){
+    summaryLines.push(`🔢 **Token Alert** — ${alert.slug||'any'} · watching ${alert.tokenIds.map(id=>`#${id}`).join(', ')}`);
+  } else {
+    summaryLines.push('🔢 **Token Alert** — not set');
   }
 
   // Price alerts
@@ -1980,6 +2003,7 @@ async function showMeHub(interaction, ctx){
     .setPlaceholder('Select a section to manage...')
     .addOptions([
       new StringSelectMenuOptionBuilder().setLabel('📣 Trait Alert').setDescription('Sales & listing DMs by trait').setValue('trait_alert'),
+      new StringSelectMenuOptionBuilder().setLabel('🔢 Token Alert').setDescription('DM me when a specific token # sells or lists').setValue('token_alert'),
       new StringSelectMenuOptionBuilder().setLabel('🏷️ Price Alerts').setDescription('DM when a token drops below a price').setValue('price_alerts'),
       new StringSelectMenuOptionBuilder().setLabel('📉 Floor Alerts').setDescription('DM when a collection floor drops').setValue('floor_alerts'),
       new StringSelectMenuOptionBuilder().setLabel('💼 Wallet').setDescription('Verification & wallet analytics').setValue('wallet'),
@@ -2010,7 +2034,6 @@ async function showMeTraitAlert(interaction, ctx){
     `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
     `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
     alert.paused ? '**Status:** ⏸️ paused' : '',
-    Array.isArray(alert.tokenIds) && alert.tokenIds.length ? `**Watching tokens:** ${alert.tokenIds.map(id=>`#${id}`).join(', ')}` : '',
     Array.isArray(alert.traitCountFilters) && alert.traitCountFilters.length ? `**Watching trait count(s):** ${alert.traitCountFilters.join(', ')}` : '',
     `**Filters:**`,
     fmtF(alert.traitFilters),
@@ -2032,6 +2055,54 @@ async function showMeTraitAlert(interaction, ctx){
     }
     row.addComponents(
       new ButtonBuilder().setCustomId('me_browse:alert:clear').setLabel('Manage / Clear').setStyle(ButtonStyle.Danger),
+    );
+  }
+  row.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
+}
+
+async function showMeTokenAlert(interaction, ctx){
+  const { getAlert } = ctx;
+  const alert = getAlert(interaction.user.id);
+
+  // jv: token-# watching shares the same underlying alert record as
+  // Trait Alert (one alert per user -- alert.tokenIds alongside
+  // alert.traitFilters, alert.paused, etc.), just surfaced as its own
+  // top-level nav section now since a non-trait alert type living inside
+  // "Trait Alert" was confusing to find. Pause/Resume/Clear below still
+  // act on that one shared record, so the note in the description is
+  // honest about that rather than implying these are two fully
+  // independent alerts.
+  const desc = alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length ? [
+    `**Collection:** ${alert.slug||'any'}`,
+    `**Watching:** ${alert.tokenIds.map(id=>`#${id}`).join(', ')}`,
+    `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
+    `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+    alert.paused ? '**Status:** ⏸️ paused' : '',
+    '',
+    '_Pause/Resume/Clear here also affects your Trait Alert, if you have one set — they share one alert setup._',
+  ].filter(Boolean).join('\n') : 'No token alert set.';
+
+  const embed = new EmbedBuilder()
+    .setTitle('🔢 Token Alert')
+    .setColor(0x5865F2)
+    .setDescription(desc);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:tokenalert:set').setLabel('Set / Change Token Alert').setStyle(ButtonStyle.Success),
+  );
+  if(alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length){
+    if(alert.paused){
+      row.addComponents(new ButtonBuilder().setCustomId('me_browse:tokenalert:resume').setLabel('▶️ Resume').setStyle(ButtonStyle.Success));
+    } else {
+      row.addComponents(new ButtonBuilder().setCustomId('me_browse:tokenalert:pause').setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary));
+    }
+    row.addComponents(
+      new ButtonBuilder().setCustomId('me_browse:tokenalert:clear').setLabel('✕ Stop Watching').setStyle(ButtonStyle.Danger),
     );
   }
   row.addComponents(
@@ -3308,6 +3379,7 @@ async function handleMeInteraction(interaction, ctx){
   if(customId === 'me_browse:nav'){
     const section = interaction.values[0];
     if(section === 'trait_alert') return showMeTraitAlert(interaction, ctx);
+    if(section === 'token_alert') return showMeTokenAlert(interaction, ctx);
     if(section === 'price_alerts') return showMePriceAlerts(interaction, ctx);
     if(section === 'floor_alerts') return showMeFloorAlerts(interaction, ctx);
     if(section === 'wallet') return showMeWallet(interaction, ctx);
@@ -3335,6 +3407,39 @@ async function handleMeInteraction(interaction, ctx){
 
   if(customId === 'me_browse:alert:clear'){
     return showMaClearWizard(interaction, { getAlert, deleteAlert, setAlert });
+  }
+
+  // ── Token alert ──────────────────────────────────────────────────────────────
+  if(customId === 'me_browse:tokenalert:set'){
+    const guildId = interaction.guildId;
+    const config = getConfig(guildId) || {};
+    const allCols = [];
+    const primarySlug = config.collectionSlug || config.slug;
+    if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
+    for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+    if(!allCols.length) return interaction.update({ content: 'No collections configured on this server.', embeds:[], components:[] });
+    if(allCols.length === 1) return showMtaTokenIdModal(interaction, ctx, allCols[0].slug);
+    return interaction.update({ content: '**🔢 Token Alert** — Pick a collection:', embeds:[], components: buildCollectionPickerRows(allCols, 'ma_browse:tokencol') });
+  }
+
+  if(customId === 'me_browse:tokenalert:pause'){
+    setAlert(interaction.user.id, { paused: true });
+    return showMeTokenAlert(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:tokenalert:resume'){
+    setAlert(interaction.user.id, { paused: false });
+    return showMeTokenAlert(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:tokenalert:clear'){
+    // Simpler than Trait Alert's own Manage/Clear wizard (which manages
+    // several independent trait name/value filters one at a time) --
+    // tokenIds is just one short watch-list, so clearing it outright and
+    // letting the user re-add via "Set / Change" is the more direct
+    // action here.
+    setAlert(interaction.user.id, { tokenIds: [] });
+    return showMeTokenAlert(interaction, ctx);
   }
 
   if(customId === 'me_browse:alert:pause'){
