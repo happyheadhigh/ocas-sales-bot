@@ -2875,7 +2875,7 @@ app.get('/db/collections', auth, async (req, res) => {
       SELECT slug, contract, chain, name, status, token_standard, total_supply,
              is_animated, has_svg_images, error_message,
              traits_synced_at, market_synced_at, created_at, updated_at,
-             opensea_url, website_url, twitter_url
+             opensea_url, website_url, twitter_url, avatar_image_url, banner_image_url
       FROM collections
       ORDER BY (slug = $1) DESC, created_at ASC
     `, [OCAS_SLUG]);
