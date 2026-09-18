@@ -256,7 +256,7 @@ app.get('/db/token/:id', auth, async (req, res) => {
     const slug = (req.query.slug || OCAS_SLUG).toString();
 
     const [tokenRes, traitsRes, collRes] = await Promise.all([
-      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count, image_url FROM tokens WHERE id = $1 AND collection_slug = $2`, [tokenId, slug]),
+      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count, image_url, is_burned FROM tokens WHERE id = $1 AND collection_slug = $2`, [tokenId, slug]),
       pool.query(`SELECT trait_name, trait_value, COALESCE(trait_index,0) AS trait_index FROM token_traits WHERE token_id = $1 AND collection_slug = $2 ORDER BY COALESCE(trait_index,0), trait_name`, [tokenId, slug]),
       pool.query(`SELECT contract, chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }))
     ]);
@@ -279,6 +279,7 @@ app.get('/db/token/:id', auth, async (req, res) => {
         rarity_score: t.rarity_score != null ? parseFloat(t.rarity_score) : null,
         trait_count: actualTraitCount,
         image_url: t.image_url || null,
+        burned: !!t.is_burned,
         chain: collInfo?.chain || null,
         contract: collInfo?.contract || null,
         traits
@@ -3006,7 +3007,7 @@ app.get('/db/all-traits', auth, async (req, res) => {
     // never be excluded.
     const survivorsRes = isOcas
       ? await pool.query(`
-          SELECT t.id, t.image_url
+          SELECT t.id, t.image_url, t.is_burned
           FROM tokens t
           WHERE t.collection_slug = $1 AND NOT EXISTS (
             SELECT 1 FROM burn_event_inputs bei
@@ -3017,7 +3018,7 @@ app.get('/db/all-traits', auth, async (req, res) => {
           ORDER BY t.id
         `, [slug])
       : await pool.query(`
-          SELECT t.id, t.image_url
+          SELECT t.id, t.image_url, t.is_burned
           FROM tokens t
           WHERE t.collection_slug = $1
           ORDER BY t.id
@@ -3025,6 +3026,12 @@ app.get('/db/all-traits', auth, async (req, res) => {
 
     const survivorIds = new Set(survivorsRes.rows.map(r => parseInt(r.id)));
     const imageUrlById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), r.image_url || null]));
+    // is_burned (lib/burn-detect.js) — generic, contract-agnostic "sent to a
+    // known dead address" flag, refreshed every 6h for every ready collection.
+    // Separate concept from OCAS's own burn_events survivor mechanic (already
+    // excluded from this response entirely, above) -- this just tags tokens
+    // still present in the response so the frontend can badge/filter them.
+    const isBurnedById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), !!r.is_burned]));
 
     // Confirmed live: this endpoint's own comment below already documented
     // this exact gap ("token_svg_cache, read separately by the frontend")
@@ -3075,7 +3082,7 @@ app.get('/db/all-traits', auth, async (req, res) => {
     // preferred for OCAS; tokens.image_url preferred otherwise, falling back
     // to token_svg_cache for tokens whose image is SVG-based)
     for (const id of survivorIds) {
-      tokens[String(id)] = { traits: {}, image: survivorSnapshotImages[id] || imageUrlById.get(id) || svgCacheById.get(id) || null };
+      tokens[String(id)] = { traits: {}, image: survivorSnapshotImages[id] || imageUrlById.get(id) || svgCacheById.get(id) || null, burned: isBurnedById.get(id) || false };
     }
 
     // Populate traits
