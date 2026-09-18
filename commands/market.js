@@ -1425,9 +1425,9 @@ async function showMaTraitPicker(interaction, ctx, slug, page = 0){
 // standalone Token Alert entry point (/me → Token Alert →
 // ma_browse:tokencol's collection pick) can show the exact same modal.
 async function showMtaTokenIdModal(interaction, ctx, slug){
-  const { getAlert } = ctx;
+  const { getTokenAlert } = ctx;
   const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
-  const existing = getAlert(interaction.user.id) || {};
+  const existing = getTokenAlert(interaction.user.id) || {};
   const modal = new ModalBuilder()
     .setCustomId(`ma_modal:tokenid:${slug}`)
     .setTitle('Watch Specific Token #(s)');
@@ -1536,7 +1536,7 @@ async function showMaConfirm(interaction, ctx, slug, traitName, traitValues, ale
 
 // ── /myalert wizard — select menu + button follow-ups ────────────────────────
 async function handleMyAlertInteraction(interaction, ctx){
-  const { getAlert, setAlert } = ctx;
+  const { getAlert, setAlert, getTokenAlert, setTokenAlert } = ctx;
   const customId = interaction.customId;
 
   if(customId.startsWith('ma_browse:col')){
@@ -1652,7 +1652,7 @@ async function handleMyAlertInteraction(interaction, ctx){
 // check, distinct from the isButton()/isStringSelectMenu() check that
 // routes every ma_browse: interaction to that function.
 async function handleMyAlertModalSubmit(interaction, ctx){
-  const { getAlert, setAlert } = ctx;
+  const { getAlert, setAlert, getTokenAlert, setTokenAlert } = ctx;
   const customId = interaction.customId;
   if(customId.startsWith('ma_modal:tokenid:')){
     const slug = customId.slice('ma_modal:tokenid:'.length);
@@ -1662,19 +1662,19 @@ async function handleMyAlertModalSubmit(interaction, ctx){
       return interaction.reply({ content: '❌ Enter one or more numeric token IDs, comma-separated (e.g. 1234 or 1234,5678).', flags: MessageFlags.Ephemeral });
     }
     const idsInt = tokenIds.map(s => parseInt(s));
-    const existing = getAlert(interaction.user.id) || {};
-    // Preserve an existing alert's own sales/listings toggle and trait
-    // filters if one's already configured for this same collection --
-    // this modal only ever sets tokenIds, same as how trait filters and
-    // sales/listings toggles are independently additive elsewhere in this
-    // wizard. Defaults both DM types on for a brand new alert, since
+    // jv: "I want that too" -- Token Alert is a fully independent alert
+    // record now (getTokenAlert/setTokenAlert, its own collection scope
+    // and Sales/Listing DM toggle), not a field tacked onto the trait
+    // alert record. Preserves an existing token alert's own sales/
+    // listings toggle if one's already configured for this same
+    // collection; defaults both DM types on for a brand new one, since
     // watching one specific token is a strong enough signal of interest
-    // that off-by-default (the trait-filter path's own default) would
-    // likely surprise someone expecting to hear about it either way.
+    // that off-by-default would likely surprise someone expecting to
+    // hear about it either way.
+    const existing = getTokenAlert(interaction.user.id) || {};
     const alertSales = existing.slug === slug ? (existing.alertSales ?? true) : true;
     const alertListings = existing.slug === slug ? (existing.alertListings ?? true) : true;
-    const traitFilters = existing.slug === slug ? (existing.traitFilters || {}) : {};
-    setAlert(interaction.user.id, { slug, traitFilters, alertSales, alertListings, tokenIds: idsInt });
+    setTokenAlert(interaction.user.id, { slug, alertSales, alertListings, tokenIds: idsInt });
     const embed = new EmbedBuilder()
       .setTitle('✅ Alert Set!')
       .setColor(0x57F287)
@@ -1684,7 +1684,7 @@ async function handleMyAlertModalSubmit(interaction, ctx){
         `**Listing DMs:** ${alertListings ? '✅ on' : '❌ off'}`,
         `**Watching token${idsInt.length > 1 ? 's' : ''}:** ${idsInt.map(id => `#${id}`).join(', ')}`,
         '',
-        'Run `/me` → **Token Alert** to pause or stop watching, or **Trait Alert** to also add trait filters.',
+        'Run `/me` → **Token Alert** to pause or stop watching. This is fully independent from your Trait Alert now, if you have one.',
       ].join('\n'));
     const backRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
@@ -1708,8 +1708,7 @@ async function handleMyAlertModalSubmit(interaction, ctx){
     const alertSales = existing.slug === slug ? (existing.alertSales ?? true) : true;
     const alertListings = existing.slug === slug ? (existing.alertListings ?? true) : true;
     const traitFilters = existing.slug === slug ? (existing.traitFilters || {}) : {};
-    const tokenIds = existing.slug === slug ? (existing.tokenIds || undefined) : undefined;
-    setAlert(interaction.user.id, { slug, traitFilters, alertSales, alertListings, tokenIds, traitCountFilters: countsInt });
+    setAlert(interaction.user.id, { slug, traitFilters, alertSales, alertListings, traitCountFilters: countsInt });
     const embed = new EmbedBuilder()
       .setTitle('✅ Alert Set!')
       .setColor(0x57F287)
@@ -1923,7 +1922,7 @@ function formatCooldown(minutes){
 
 // ── /me hub — main entry ──────────────────────────────────────────────────────
 async function showMeHub(interaction, ctx){
-  const { getAlert, pgPool } = ctx;
+  const { getAlert, getTokenAlert, pgPool } = ctx;
   const userId = interaction.user.id;
   const fmtF = f => !f || Object.keys(f).length===0 ? 'none' :
     Object.entries(f).map(([k,v]) => `${k}: ${Array.isArray(v)?v.join(', '):v}`).join(' · ');
@@ -1945,13 +1944,14 @@ async function showMeHub(interaction, ctx){
   }
 
   // jv: "it lives inside trait alerts and it should be its own separate
-  // alert, it's a little confusing to find it within trait alerts since
-  // it's not a trait" -- token-# watching shares the same underlying
-  // alert record as Trait Alert (alert.tokenIds, same setAlert/getAlert),
-  // just surfaced as its own top-level nav section now instead of a
-  // button buried inside the trait wizard.
-  if(alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length){
-    summaryLines.push(`🔢 **Token Alert** — ${alert.slug||'any'} · watching ${alert.tokenIds.map(id=>`#${id}`).join(', ')}${alert.tokenAlertPaused ? ' ⏸️ paused' : ''}`);
+  // alert" -> "I want that too" (fully independent record, not just
+  // independent pause) -- Token Alert is its own alert type now
+  // (getTokenAlert/setTokenAlert/deleteTokenAlert), with its own
+  // collection scope, Sales/Listing DM toggle, and pause flag, entirely
+  // separate from Trait Alert's own record.
+  const tokenAlert = getTokenAlert(userId);
+  if(tokenAlert && Array.isArray(tokenAlert.tokenIds) && tokenAlert.tokenIds.length){
+    summaryLines.push(`🔢 **Token Alert** — ${tokenAlert.slug||'any'} · watching ${tokenAlert.tokenIds.map(id=>`#${id}`).join(', ')}${tokenAlert.paused ? ' ⏸️ paused' : ''}`);
   } else {
     summaryLines.push('🔢 **Token Alert** — not set');
   }
@@ -2066,21 +2066,18 @@ async function showMeTraitAlert(interaction, ctx){
 }
 
 async function showMeTokenAlert(interaction, ctx){
-  const { getAlert } = ctx;
-  const alert = getAlert(interaction.user.id);
+  const { getTokenAlert } = ctx;
+  const alert = getTokenAlert(interaction.user.id);
 
-  // jv: "I do want that too" -- token-# watching now pauses independently
-  // of Trait Alert (alert.tokenAlertPaused, separate from alert.paused).
-  // Still shares the collection/sales-listings-DM toggle and the same
-  // underlying alert record, so the note below stays honest about that.
+  // jv: "I want that too" -- Token Alert is a fully independent alert
+  // record now, with its own collection scope and Sales/Listing DM
+  // toggle, not shared with Trait Alert at all anymore.
   const desc = alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length ? [
     `**Collection:** ${alert.slug||'any'}`,
     `**Watching:** ${alert.tokenIds.map(id=>`#${id}`).join(', ')}`,
     `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
     `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
-    alert.tokenAlertPaused ? '**Status:** ⏸️ paused' : '',
-    '',
-    '_Pausing here only pauses this token watch — your Trait Alert (if any) keeps running. The collection and Sales/Listing DM toggle above are still shared with it._',
+    alert.paused ? '**Status:** ⏸️ paused' : '',
   ].filter(Boolean).join('\n') : 'No token alert set.';
 
   const embed = new EmbedBuilder()
@@ -2092,7 +2089,7 @@ async function showMeTokenAlert(interaction, ctx){
     new ButtonBuilder().setCustomId('me_browse:tokenalert:set').setLabel('Set / Change Token Alert').setStyle(ButtonStyle.Success),
   );
   if(alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length){
-    if(alert.tokenAlertPaused){
+    if(alert.paused){
       row.addComponents(new ButtonBuilder().setCustomId('me_browse:tokenalert:resume').setLabel('▶️ Resume').setStyle(ButtonStyle.Success));
     } else {
       row.addComponents(new ButtonBuilder().setCustomId('me_browse:tokenalert:pause').setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary));
@@ -3368,7 +3365,7 @@ async function handleMeTokenDownload(interaction, ctx, slug, tokenId, size = 204
 
 // ── /me interaction handler ───────────────────────────────────────────────────
 async function handleMeInteraction(interaction, ctx){
-  const { getAlert, setAlert, deleteAlert, getConfig, pgPool, getSyncStatus, syncWalletForUser } = ctx;
+  const { getAlert, setAlert, deleteAlert, getTokenAlert, setTokenAlert, deleteTokenAlert, getConfig, pgPool, getSyncStatus, syncWalletForUser } = ctx;
   const customId = interaction.customId;
 
   // Nav dropdown
@@ -3419,22 +3416,20 @@ async function handleMeInteraction(interaction, ctx){
   }
 
   if(customId === 'me_browse:tokenalert:pause'){
-    setAlert(interaction.user.id, { tokenAlertPaused: true });
+    setTokenAlert(interaction.user.id, { paused: true });
     return showMeTokenAlert(interaction, ctx);
   }
 
   if(customId === 'me_browse:tokenalert:resume'){
-    setAlert(interaction.user.id, { tokenAlertPaused: false });
+    setTokenAlert(interaction.user.id, { paused: false });
     return showMeTokenAlert(interaction, ctx);
   }
 
   if(customId === 'me_browse:tokenalert:clear'){
-    // Simpler than Trait Alert's own Manage/Clear wizard (which manages
-    // several independent trait name/value filters one at a time) --
-    // tokenIds is just one short watch-list, so clearing it outright and
-    // letting the user re-add via "Set / Change" is the more direct
-    // action here.
-    setAlert(interaction.user.id, { tokenIds: [] });
+    // jv: "I want that too" -- Token Alert is a fully independent alert
+    // record now, so this deletes that record outright rather than
+    // clearing one field on a record shared with Trait Alert.
+    deleteTokenAlert(interaction.user.id);
     return showMeTokenAlert(interaction, ctx);
   }
 

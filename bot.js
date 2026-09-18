@@ -83,6 +83,7 @@ const { resolveImage, sendEmbed, extractPngFromSvg, buildEmbedPayload, tokenMeta
 const {
   pollSales, pollListings,
   getAlert, setAlert, deleteAlert,
+  getTokenAlert, setTokenAlert, deleteTokenAlert,
   loadAllAlerts, loadSaleCursors, loadListingCursors,
   saveSaleCursors, saveListingCursors,
   setClient: setPollClient,
@@ -173,6 +174,7 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     randomLotterySeed, resolveLotteryWindow, LOTTERY_DURATION_RE,
     // Alerts
     getAlert, setAlert, deleteAlert,
+    getTokenAlert, setTokenAlert, deleteTokenAlert,
     // Format
     resolveDiscordChannel,
     // Trait/search helpers
@@ -949,11 +951,11 @@ client.on('interactionCreate', async (interaction)=>{
     return handleRankFindBrowseInteraction(interaction, rfCtx);
   }
   if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('ma_browse:')){
-    const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert };
+    const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert, getTokenAlert, setTokenAlert };
     return handleMyAlertInteraction(interaction, maCtx);
   }
   if(interaction.isModalSubmit() && interaction.customId.startsWith('ma_modal:')){
-    const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert };
+    const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert, getTokenAlert, setTokenAlert };
     return handleMyAlertModalSubmit(interaction, maCtx);
   }
   if(interaction.isButton() && interaction.customId.startsWith('mac_browse:')){
@@ -961,7 +963,7 @@ client.on('interactionCreate', async (interaction)=>{
     return handleMaClearInteraction(interaction, macCtx);
   }
   if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
-    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser, osHeaders };
+    const meCtx = { getAlert, setAlert, deleteAlert, getTokenAlert, setTokenAlert, deleteTokenAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser, osHeaders };
     return handleMeInteraction(interaction, meCtx);
   }
 
@@ -1742,23 +1744,38 @@ client.on('interactionCreate', async (interaction)=>{
     await pgPool.query(`DELETE FROM user_price_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
     return interaction.update({ content: '🗑️ Price alert deleted.', embeds: [], components: [] }).catch(()=>{});
   }
-  if(interaction.isButton() && interaction.customId === 'ta_pause'){
-    setAlert(interaction.user.id, { paused: true });
+  if(interaction.isButton() && interaction.customId.startsWith('ta_pause')){
+    // jv: "I want that too" -- Trait Alert and Token Alert are fully
+    // independent alert records now (see lib/poll.js), so these inline
+    // DM buttons need to know which kind of alert actually triggered
+    // this specific DM (encoded as ta_pause:trait / ta_pause:token by
+    // _sendAlertDM) rather than always acting on the trait alert record
+    // regardless of which one the DM was actually about.
+    const kind = interaction.customId.split(':')[1] || 'trait';
+    if(kind === 'token') setTokenAlert(interaction.user.id, { paused: true });
+    else setAlert(interaction.user.id, { paused: true });
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('ta_resume').setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId('ta_stop').setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`ta_resume:${kind}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`ta_stop:${kind}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
     );
     return interaction.update({ components: [row] }).catch(()=>{});
   }
-  if(interaction.isButton() && interaction.customId === 'ta_resume'){
-    setAlert(interaction.user.id, { paused: false });
+  if(interaction.isButton() && interaction.customId.startsWith('ta_resume')){
+    const kind = interaction.customId.split(':')[1] || 'trait';
+    if(kind === 'token') setTokenAlert(interaction.user.id, { paused: false });
+    else setAlert(interaction.user.id, { paused: false });
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('ta_pause').setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('ta_stop').setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`ta_pause:${kind}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`ta_stop:${kind}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
     );
     return interaction.update({ components: [row] }).catch(()=>{});
   }
-  if(interaction.isButton() && interaction.customId === 'ta_stop'){
+  if(interaction.isButton() && interaction.customId.startsWith('ta_stop')){
+    const kind = interaction.customId.split(':')[1] || 'trait';
+    if(kind === 'token'){
+      deleteTokenAlert(interaction.user.id);
+      return interaction.update({ content: '🗑️ Token alert deleted.', embeds: [], components: [] }).catch(()=>{});
+    }
     deleteAlert(interaction.user.id);
     return interaction.update({ content: '🗑️ Trait alert deleted.', embeds: [], components: [] }).catch(()=>{});
   }
