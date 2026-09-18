@@ -2911,17 +2911,21 @@ app.get('/tv/link-status-by-wallet', auth,
 });
 
 
-// jv: emoji reactions on the landing page -- open (no login) but one
-// per person, enforced by the collection_reactions table's UNIQUE(slug,
-// client_id) constraint (see lib/db.js's migration comment). A fixed,
-// curated emoji set rather than free-text input -- simpler UI (a plain
-// button row) and no need to validate arbitrary Unicode input against
-// anything.
+// jv: emoji reactions on the landing page -- "open, but still only 1 tap
+// per person if doable" -- then "yes i want multiple picks per person
+// just not the same one twice". So per person: any number of DISTINCT
+// emojis (🚀 AND ❤️ can both be active at once), enforced by
+// collection_reactions' UNIQUE(slug, client_id, emoji) constraint (see
+// lib/db.js's migration comment) -- never two rows for the same emoji,
+// nothing stopping several different ones. A fixed, curated emoji set
+// rather than free-text input -- simpler UI (a plain button row) and no
+// need to validate arbitrary Unicode input against anything.
 const REACTION_EMOJI = ['🚀', '❤️', '👀', '🚩'];
 
 // ── GET /db/collections/:slug/reactions ──────────────────────────────────────
 // Returns current counts for each allowed emoji, plus this client's own
-// current pick (if any) so the frontend can highlight it.
+// current picks (an array now, not a single value -- see above) so the
+// frontend can highlight all of them.
 app.get('/db/collections/:slug/reactions', auth, async (req, res) => {
   try {
     const slug = (req.params.slug || '').toLowerCase();
@@ -2935,13 +2939,13 @@ app.get('/db/collections/:slug/reactions', auth, async (req, res) => {
     for (const e of REACTION_EMOJI) countsByEmoji[e] = 0;
     for (const row of counts.rows) if (row.emoji in countsByEmoji) countsByEmoji[row.emoji] = row.count;
 
-    let mine = null;
+    let mine = [];
     if (clientId) {
       const mineRes = await pool.query(
         `SELECT emoji FROM collection_reactions WHERE slug = $1 AND client_id = $2`,
         [slug, clientId]
       );
-      mine = mineRes.rows[0]?.emoji || null;
+      mine = mineRes.rows.map(r => r.emoji);
     }
     res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
     res.json({ ok: true, slug, counts: countsByEmoji, mine });
@@ -2952,10 +2956,11 @@ app.get('/db/collections/:slug/reactions', auth, async (req, res) => {
 });
 
 // ── POST /db/collections/:slug/react ─────────────────────────────────────────
-// Tapping the emoji you already picked removes your reaction (a toggle);
-// tapping a different one switches your pick to it. Either way this is
-// a single upsert against the UNIQUE(slug, client_id) row, never more
-// than one reaction per client per collection.
+// Tapping an emoji you already picked removes just that one (a
+// per-emoji toggle); tapping one you haven't picked yet adds it
+// alongside whatever else you've already picked for this collection --
+// never replacing a different emoji's pick the way the earlier
+// one-per-person version did.
 app.post('/db/collections/:slug/react', auth, async (req, res) => {
   try {
     const slug = (req.params.slug || '').toLowerCase();
@@ -2965,30 +2970,28 @@ app.post('/db/collections/:slug/react', auth, async (req, res) => {
     if (!REACTION_EMOJI.includes(emoji)) return res.status(400).json({ ok: false, error: 'invalid emoji' });
 
     const existing = await pool.query(
-      `SELECT emoji FROM collection_reactions WHERE slug = $1 AND client_id = $2`,
-      [slug, clientId]
+      `SELECT 1 FROM collection_reactions WHERE slug = $1 AND client_id = $2 AND emoji = $3`,
+      [slug, clientId, emoji]
     );
-    let mine = emoji;
-    if (existing.rows[0]?.emoji === emoji) {
-      await pool.query(`DELETE FROM collection_reactions WHERE slug = $1 AND client_id = $2`, [slug, clientId]);
-      mine = null;
+    if (existing.rows.length) {
+      await pool.query(`DELETE FROM collection_reactions WHERE slug = $1 AND client_id = $2 AND emoji = $3`, [slug, clientId, emoji]);
     } else {
       await pool.query(
         `INSERT INTO collection_reactions (slug, client_id, emoji, updated_at)
          VALUES ($1, $2, $3, NOW())
-         ON CONFLICT (slug, client_id) DO UPDATE SET emoji = EXCLUDED.emoji, updated_at = NOW()`,
+         ON CONFLICT (slug, client_id, emoji) DO NOTHING`,
         [slug, clientId, emoji]
       );
     }
 
-    const counts = await pool.query(
-      `SELECT emoji, COUNT(*)::int AS count FROM collection_reactions WHERE slug = $1 GROUP BY emoji`,
-      [slug]
-    );
+    const [counts, mineRes] = await Promise.all([
+      pool.query(`SELECT emoji, COUNT(*)::int AS count FROM collection_reactions WHERE slug = $1 GROUP BY emoji`, [slug]),
+      pool.query(`SELECT emoji FROM collection_reactions WHERE slug = $1 AND client_id = $2`, [slug, clientId]),
+    ]);
     const countsByEmoji = {};
     for (const e of REACTION_EMOJI) countsByEmoji[e] = 0;
     for (const row of counts.rows) if (row.emoji in countsByEmoji) countsByEmoji[row.emoji] = row.count;
-    res.json({ ok: true, slug, counts: countsByEmoji, mine });
+    res.json({ ok: true, slug, counts: countsByEmoji, mine: mineRes.rows.map(r => r.emoji) });
   } catch (e) {
     console.error('/db/collections/:slug/react error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
