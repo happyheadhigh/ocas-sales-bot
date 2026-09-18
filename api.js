@@ -10,6 +10,7 @@
  */
 
 const express = require('express');
+const compression = require('compression');
 const { Pool } = require('pg');
 const { OCAS_SLUG, BURN_CONTRACT } = require('./lib/constants');
 const { runMigrations, fetchAndStoreCollectionTraits } = require('./lib/db');
@@ -30,6 +31,25 @@ const { refreshBurnedStatus } = require('./lib/burn-detect');
 const { fixCollectionImages, fetchRawTokenUri, diagnoseIpfsGateways } = require('./lib/collection-backfill');
 
 const app = express();
+// jv: argonauts' collection page took ~20s to load on mobile. Root cause:
+// /db/all-traits embeds every survivor's actual image inline per token --
+// a URL for OCAS/most collections, but full raw SVG markup for Argonauts
+// specifically (token_svg_cache, SVG-based on-chain art) since it has no
+// externally-hosted image at all. ~8,600 tokens' worth of pixel-art SVG
+// (lots of repeated, near-identical <rect> tags) in one uncompressed JSON
+// response is a genuinely huge, highly compressible payload -- this was
+// never gzipped at all. Mounted before every route (and before the CORS/
+// body-parser middleware below) so it applies uniformly to every
+// response this server sends, not just this one endpoint.
+app.use(compression({
+  // /db/sales-stream is a long-lived Server-Sent-Events connection
+  // (lib/sale-stream.js) -- small, frequent chunks (keep-alive pings,
+  // individual sale events) that need to reach the client immediately.
+  // Compression buffers/chunks output, which works against exactly that;
+  // excluding this one route rather than trusting the default filter to
+  // get it right on its own.
+  filter: (req, res) => req.path !== '/db/sales-stream' && compression.filter(req, res),
+}));
 const PORT = process.env.PORT || 3001;
 const DEFAULT_OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 
