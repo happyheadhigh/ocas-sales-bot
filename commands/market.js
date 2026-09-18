@@ -1411,7 +1411,13 @@ async function showMaTraitPicker(interaction, ctx, slug, page = 0){
         // as an independent match condition alongside trait filters, not
         // instead of them -- a user can have both a trait filter and a
         // specific-token watch active on the same alert.
-        new ButtonBuilder().setCustomId(`ma_browse:tokenidmodal:${slug}`).setLabel('🔢 Watch a Specific Token #').setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`ma_browse:tokenidmodal:${slug}`).setLabel('🔢 Watch a Specific Token #').setStyle(ButtonStyle.Secondary),
+        // jv: "is there any way to set personal alerts for trait counts".
+        // Same independent-condition pattern as the token-# watch right
+        // above -- stored as alert.traitCountFilters (an array of exact
+        // counts to watch for) and checked the same way in
+        // sendPersonalAlerts.
+        new ButtonBuilder().setCustomId(`ma_browse:traitcountmodal:${slug}`).setLabel('🔢 Watch a Trait Count').setStyle(ButtonStyle.Secondary)
       ),
     ],
     embeds: [],
@@ -1551,6 +1557,23 @@ async function handleMyAlertInteraction(interaction, ctx){
     ));
     return interaction.showModal(modal);
   }
+  if(customId.startsWith('ma_browse:traitcountmodal:')){
+    const slug = customId.slice('ma_browse:traitcountmodal:'.length);
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+    const existing = getAlert(interaction.user.id) || {};
+    const modal = new ModalBuilder()
+      .setCustomId(`ma_modal:traitcount:${slug}`)
+      .setTitle('Watch Exact Trait Count(s)');
+    modal.addComponents(new AR().addComponents(
+      new TextInputBuilder().setCustomId('ma_traitcounts')
+        .setLabel('Trait count(s), comma-separated')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('e.g. 3 or 3,4')
+        .setValue((existing.slug === slug && Array.isArray(existing.traitCountFilters)) ? existing.traitCountFilters.join(',') : '')
+        .setRequired(true)
+    ));
+    return interaction.showModal(modal);
+  }
   if(customId.startsWith('ma_browse:val:')){
     const parts = customId.slice('ma_browse:val:'.length).split(':');
     const slug = parts[0];
@@ -1654,6 +1677,41 @@ async function handleMyAlertModalSubmit(interaction, ctx){
         `**Watching token${idsInt.length > 1 ? 's' : ''}:** ${idsInt.map(id => `#${id}`).join(', ')}`,
         '',
         'Run `/me` → **Trait Alert** to add trait filters, pause, or remove your alert.',
+      ].join('\n'));
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.reply({ embeds: [embed], components: [backRow], flags: MessageFlags.Ephemeral });
+  }
+  if(customId.startsWith('ma_modal:traitcount:')){
+    const slug = customId.slice('ma_modal:traitcount:'.length);
+    const raw = interaction.fields.getTextInputValue('ma_traitcounts').trim();
+    const counts = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if(!counts.length || counts.some(s => !/^\d+$/.test(s))){
+      return interaction.reply({ content: '❌ Enter one or more whole numbers, comma-separated (e.g. 3 or 3,4).', flags: MessageFlags.Ephemeral });
+    }
+    const countsInt = [...new Set(counts.map(s => parseInt(s)))];
+    const existing = getAlert(interaction.user.id) || {};
+    // jv: "is there any way to set personal alerts for trait counts" --
+    // same independent-condition pattern as the token-ID modal above
+    // (preserve whatever else is already configured for this same
+    // collection rather than clobbering it, default both DM types on for
+    // a brand new alert).
+    const alertSales = existing.slug === slug ? (existing.alertSales ?? true) : true;
+    const alertListings = existing.slug === slug ? (existing.alertListings ?? true) : true;
+    const traitFilters = existing.slug === slug ? (existing.traitFilters || {}) : {};
+    const tokenIds = existing.slug === slug ? (existing.tokenIds || undefined) : undefined;
+    setAlert(interaction.user.id, { slug, traitFilters, alertSales, alertListings, tokenIds, traitCountFilters: countsInt });
+    const embed = new EmbedBuilder()
+      .setTitle('✅ Alert Set!')
+      .setColor(0x57F287)
+      .setDescription([
+        `**Collection:** ${slug}`,
+        `**Sales DMs:** ${alertSales ? '✅ on' : '❌ off'}`,
+        `**Listing DMs:** ${alertListings ? '✅ on' : '❌ off'}`,
+        `**Watching trait count${countsInt.length > 1 ? 's' : ''}:** ${countsInt.join(', ')}`,
+        '',
+        'Run `/me` → **Trait Alert** to add more filters, pause, or remove your alert.',
       ].join('\n'));
     const backRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
@@ -1952,6 +2010,8 @@ async function showMeTraitAlert(interaction, ctx){
     `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
     `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
     alert.paused ? '**Status:** ⏸️ paused' : '',
+    Array.isArray(alert.tokenIds) && alert.tokenIds.length ? `**Watching tokens:** ${alert.tokenIds.map(id=>`#${id}`).join(', ')}` : '',
+    Array.isArray(alert.traitCountFilters) && alert.traitCountFilters.length ? `**Watching trait count(s):** ${alert.traitCountFilters.join(', ')}` : '',
     `**Filters:**`,
     fmtF(alert.traitFilters),
   ].filter(Boolean).join('\n') : 'No trait alert set.';
