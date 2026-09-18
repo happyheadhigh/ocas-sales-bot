@@ -1951,7 +1951,7 @@ async function showMeHub(interaction, ctx){
   // just surfaced as its own top-level nav section now instead of a
   // button buried inside the trait wizard.
   if(alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length){
-    summaryLines.push(`🔢 **Token Alert** — ${alert.slug||'any'} · watching ${alert.tokenIds.map(id=>`#${id}`).join(', ')}`);
+    summaryLines.push(`🔢 **Token Alert** — ${alert.slug||'any'} · watching ${alert.tokenIds.map(id=>`#${id}`).join(', ')}${alert.tokenAlertPaused ? ' ⏸️ paused' : ''}`);
   } else {
     summaryLines.push('🔢 **Token Alert** — not set');
   }
@@ -2069,22 +2069,18 @@ async function showMeTokenAlert(interaction, ctx){
   const { getAlert } = ctx;
   const alert = getAlert(interaction.user.id);
 
-  // jv: token-# watching shares the same underlying alert record as
-  // Trait Alert (one alert per user -- alert.tokenIds alongside
-  // alert.traitFilters, alert.paused, etc.), just surfaced as its own
-  // top-level nav section now since a non-trait alert type living inside
-  // "Trait Alert" was confusing to find. Pause/Resume/Clear below still
-  // act on that one shared record, so the note in the description is
-  // honest about that rather than implying these are two fully
-  // independent alerts.
+  // jv: "I do want that too" -- token-# watching now pauses independently
+  // of Trait Alert (alert.tokenAlertPaused, separate from alert.paused).
+  // Still shares the collection/sales-listings-DM toggle and the same
+  // underlying alert record, so the note below stays honest about that.
   const desc = alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length ? [
     `**Collection:** ${alert.slug||'any'}`,
     `**Watching:** ${alert.tokenIds.map(id=>`#${id}`).join(', ')}`,
     `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
     `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
-    alert.paused ? '**Status:** ⏸️ paused' : '',
+    alert.tokenAlertPaused ? '**Status:** ⏸️ paused' : '',
     '',
-    '_Pause/Resume/Clear here also affects your Trait Alert, if you have one set — they share one alert setup._',
+    '_Pausing here only pauses this token watch — your Trait Alert (if any) keeps running. The collection and Sales/Listing DM toggle above are still shared with it._',
   ].filter(Boolean).join('\n') : 'No token alert set.';
 
   const embed = new EmbedBuilder()
@@ -2096,7 +2092,7 @@ async function showMeTokenAlert(interaction, ctx){
     new ButtonBuilder().setCustomId('me_browse:tokenalert:set').setLabel('Set / Change Token Alert').setStyle(ButtonStyle.Success),
   );
   if(alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length){
-    if(alert.paused){
+    if(alert.tokenAlertPaused){
       row.addComponents(new ButtonBuilder().setCustomId('me_browse:tokenalert:resume').setLabel('▶️ Resume').setStyle(ButtonStyle.Success));
     } else {
       row.addComponents(new ButtonBuilder().setCustomId('me_browse:tokenalert:pause').setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary));
@@ -3423,12 +3419,12 @@ async function handleMeInteraction(interaction, ctx){
   }
 
   if(customId === 'me_browse:tokenalert:pause'){
-    setAlert(interaction.user.id, { paused: true });
+    setAlert(interaction.user.id, { tokenAlertPaused: true });
     return showMeTokenAlert(interaction, ctx);
   }
 
   if(customId === 'me_browse:tokenalert:resume'){
-    setAlert(interaction.user.id, { paused: false });
+    setAlert(interaction.user.id, { tokenAlertPaused: false });
     return showMeTokenAlert(interaction, ctx);
   }
 
