@@ -1760,6 +1760,22 @@ app.get('/db/token/:id/burn-history', auth, async (req, res) => {
       } : null,
     });
   } catch (e) {
+    // Argonauts (and any other collection onboarded without OCAS's burn/
+    // rebirth game) gets its burn_events table from this same schema-init
+    // function, which only ever defines the small columns actually used
+    // there (id, tx_hash, block_number, burned_token_id, survivor_token_id,
+    // burn_type, created_at) -- OCAS's real production table has many more
+    // (burner_wallet, burned_at, points_used, etc.) added out-of-band over
+    // time and never backported here. Querying burned_at against one of
+    // those other, burn-game-less collections throws "column does not
+    // exist" (42703) -- correctly meaning "this collection has no burn
+    // game, so this token was never part of one," same as a real 0-row
+    // result would for OCAS itself. Treat it as exactly that instead of a
+    // 500, so the modal's pre-burn toggle stays silent rather than erroring
+    // on every open for every non-OCAS collection.
+    if (e?.code === '42703') {
+      return res.json({ ok: true, token_id: tokenId, timeline: [], survivor_count: 0, destroyed_in: null });
+    }
     console.error('/db/token/:id/burn-history error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -2307,19 +2323,26 @@ app.get('/db/token/:id/history', auth, async (req, res) => {
   const tokenId = parseInt(req.params.id, 10);
   if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) return res.status(400).json({ ok: false, error: 'invalid token id' }); // generous, collection-agnostic bound — see /db/token/:id above for why
   const limit = intParam(req.query.limit, 100, 200);
+  // Same hardcoded-to-OCAS bug as /db/wallet/:address/transfers had, same fix:
+  // resolve the actual requested collection's own contract via the collections
+  // registry rather than assuming OCAS_CONTRACT/OCAS_SLUG regardless of slug.
+  const slug = (req.query.slug || OCAS_SLUG).toString();
   try {
+    const collRes = await pool.query('SELECT contract FROM collections WHERE slug = $1', [slug]);
+    const contract = collRes.rows[0]?.contract || OCAS_CONTRACT;
     const result = await pool.query(`
-      SELECT contract, token_id, from_address, to_address, tx_hash, log_index, block_number, block_ts, event_type
+      SELECT contract, token_id, from_address, to_address, tx_hash, log_index, block_number,
+             COALESCE(block_ts, transferred_at) AS block_ts, event_type
       FROM nft_transfers
-      WHERE contract = $1 AND token_id = $2
+      WHERE contract = $1 AND collection_slug = $2 AND token_id = $3
       ORDER BY block_number ASC, log_index ASC
-      LIMIT $3
-    `, [OCAS_CONTRACT, tokenId, limit]);
+      LIMIT $4
+    `, [contract, slug, tokenId, limit]);
     res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.json({
       ok: true,
       token_id: tokenId,
-      contract: OCAS_CONTRACT,
+      contract,
       synced: true,
       history: result.rows.map(r => ({
         contract: r.contract,
@@ -2335,7 +2358,7 @@ app.get('/db/token/:id/history', auth, async (req, res) => {
       count: result.rows.length,
     });
   } catch (e) {
-    if (isMissingWalletAnalyticsTable(e)) return res.json({ ok: true, token_id: tokenId, synced: false, history: [], count: 0 });
+    if (isMissingWalletAnalyticsTable(e) || e?.code === '42703') return res.json({ ok: true, token_id: tokenId, synced: false, history: [], count: 0 });
     console.error('/db/token/:id/history error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
