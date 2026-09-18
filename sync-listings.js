@@ -227,9 +227,22 @@ async function syncListings(collection) {
 
       function getPriceEth(listing) {
         const wei = listing?.price?.current?.value || listing?.price?.value || null;
-        const dec = listing?.price?.current?.decimal ?? listing?.price?.decimal
-          ?? (wei ? Number(wei) / 1e18 : null);
-        return dec != null ? parseFloat(dec) : null;
+        if(wei == null) return null;
+        // jv: Nekoadz (Robinhood Chain, USDG) listings showing "Ξ0.0000"
+        // on the grid despite the floor pill (a different data source)
+        // showing the correct "12.000 USDG". This always fell through to
+        // a hardcoded /1e18 (ETH-style) conversion regardless of the
+        // listing's real currency -- .decimal (singular) isn't an actual
+        // OpenSea field at all, so that check never once matched
+        // anything; .decimals (plural, the real decimals COUNT OpenSea
+        // returns -- the same field name already correctly read on the
+        // sales side's own currency-decimals fix, sync-listings.js
+        // above) was never checked. Dividing a 6-decimal USDG raw value
+        // by 1e18 instead of 1e6 produces a number so tiny it rounds to
+        // 0.0000 at display precision -- looks like "no price" rather
+        // than a wrong one, which is why this wasn't obviously broken.
+        const decimals = listing?.price?.current?.decimals ?? listing?.price?.decimals ?? 18;
+        return parseFloat(wei) / Math.pow(10, decimals);
       }
 
       // jv: "make the weth and eth wording through the page green for eth
