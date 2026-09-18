@@ -2911,6 +2911,90 @@ app.get('/tv/link-status-by-wallet', auth,
 });
 
 
+// jv: emoji reactions on the landing page -- open (no login) but one
+// per person, enforced by the collection_reactions table's UNIQUE(slug,
+// client_id) constraint (see lib/db.js's migration comment). A fixed,
+// curated emoji set rather than free-text input -- simpler UI (a plain
+// button row) and no need to validate arbitrary Unicode input against
+// anything.
+const REACTION_EMOJI = ['🚀', '❤️', '👀', '🚩'];
+
+// ── GET /db/collections/:slug/reactions ──────────────────────────────────────
+// Returns current counts for each allowed emoji, plus this client's own
+// current pick (if any) so the frontend can highlight it.
+app.get('/db/collections/:slug/reactions', auth, async (req, res) => {
+  try {
+    const slug = (req.params.slug || '').toLowerCase();
+    const clientId = (req.query.client_id || '').toString().slice(0, 100);
+    if (!slug) return res.status(400).json({ ok: false, error: 'missing slug' });
+    const counts = await pool.query(
+      `SELECT emoji, COUNT(*)::int AS count FROM collection_reactions WHERE slug = $1 GROUP BY emoji`,
+      [slug]
+    );
+    const countsByEmoji = {};
+    for (const e of REACTION_EMOJI) countsByEmoji[e] = 0;
+    for (const row of counts.rows) if (row.emoji in countsByEmoji) countsByEmoji[row.emoji] = row.count;
+
+    let mine = null;
+    if (clientId) {
+      const mineRes = await pool.query(
+        `SELECT emoji FROM collection_reactions WHERE slug = $1 AND client_id = $2`,
+        [slug, clientId]
+      );
+      mine = mineRes.rows[0]?.emoji || null;
+    }
+    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    res.json({ ok: true, slug, counts: countsByEmoji, mine });
+  } catch (e) {
+    console.error('/db/collections/:slug/reactions error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── POST /db/collections/:slug/react ─────────────────────────────────────────
+// Tapping the emoji you already picked removes your reaction (a toggle);
+// tapping a different one switches your pick to it. Either way this is
+// a single upsert against the UNIQUE(slug, client_id) row, never more
+// than one reaction per client per collection.
+app.post('/db/collections/:slug/react', auth, async (req, res) => {
+  try {
+    const slug = (req.params.slug || '').toLowerCase();
+    const clientId = (req.body?.client_id || '').toString().slice(0, 100);
+    const emoji = (req.body?.emoji || '').toString();
+    if (!slug || !clientId) return res.status(400).json({ ok: false, error: 'missing slug or client_id' });
+    if (!REACTION_EMOJI.includes(emoji)) return res.status(400).json({ ok: false, error: 'invalid emoji' });
+
+    const existing = await pool.query(
+      `SELECT emoji FROM collection_reactions WHERE slug = $1 AND client_id = $2`,
+      [slug, clientId]
+    );
+    let mine = emoji;
+    if (existing.rows[0]?.emoji === emoji) {
+      await pool.query(`DELETE FROM collection_reactions WHERE slug = $1 AND client_id = $2`, [slug, clientId]);
+      mine = null;
+    } else {
+      await pool.query(
+        `INSERT INTO collection_reactions (slug, client_id, emoji, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (slug, client_id) DO UPDATE SET emoji = EXCLUDED.emoji, updated_at = NOW()`,
+        [slug, clientId, emoji]
+      );
+    }
+
+    const counts = await pool.query(
+      `SELECT emoji, COUNT(*)::int AS count FROM collection_reactions WHERE slug = $1 GROUP BY emoji`,
+      [slug]
+    );
+    const countsByEmoji = {};
+    for (const e of REACTION_EMOJI) countsByEmoji[e] = 0;
+    for (const row of counts.rows) if (row.emoji in countsByEmoji) countsByEmoji[row.emoji] = row.count;
+    res.json({ ok: true, slug, counts: countsByEmoji, mine });
+  } catch (e) {
+    console.error('/db/collections/:slug/react error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/collections ───────────────────────────────────────────────────────
 // Lists the collections registry. Read-only for now — the onboarding
 // trigger that inserts new rows (search an unknown slug -> kick off backfill)
