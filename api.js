@@ -3380,7 +3380,7 @@ app.get('/diag/listings-compare', async (req, res) => {
     const uniqueTokenIds = new Set();
     let firstPageKeys = null;
     do {
-      const qs = new URLSearchParams({ chain: 'ethereum', limit: '100' });
+      const qs = new URLSearchParams({ chain: 'ethereum', limit: '100', include_private_listings: 'true' });
       if (next) qs.set('next', next);
       const r = await fetch(`https://api.opensea.io/api/v2/listings/collection/${slug}/all?${qs}`, {
         headers: { 'x-api-key': process.env.OPENSEA_KEY, 'Accept': 'application/json' }

@@ -158,7 +158,20 @@ async function syncListings(collection) {
     let totalDuplicateTokenListings = 0;
 
     do {
-      const qs = new URLSearchParams({ chain, limit: '100' });
+      // jv: "Opensea is showing 29 more listings... traitview isn't
+      // catching those." Confirmed via OpenSea's own documented API
+      // reference for this exact endpoint: it takes an
+      // include_private_listings parameter that DEFAULTS TO FALSE when
+      // omitted -- which this always did. A private/restricted listing
+      // (one visible to a specific buyer, or otherwise not publicly
+      // browsable) never appeared in the response AT ALL, not even as a
+      // page it then failed to parse -- there was nothing to drop or
+      // warn about, since the API itself silently excluded it before
+      // this code ever saw it. OpenSea's own collection-page "Listed"
+      // stat very plausibly counts these regardless of visibility,
+      // which is exactly the kind of persistent, silent gap this
+      // produces with zero trace in the sync's own logs.
+      const qs = new URLSearchParams({ chain, limit: '100', include_private_listings: 'true' });
       if (next) qs.set('next', next);
 
       // Retry transient failures (rate limits, momentary server errors)

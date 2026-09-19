@@ -490,7 +490,7 @@ async function handleMarketCommand(commandName, ctx){
     const { checkArbitrageOpportunity, extractListingPriceEth, extractListingTokenId } = require('../lib/arbitrage');
 
     try{
-      const qs = new URLSearchParams({ limit: '30' });
+      const qs = new URLSearchParams({ limit: '30', include_private_listings: 'true' });
       const r = await fetch(`https://api.opensea.io/api/v2/listings/collection/${encodeURIComponent(slug)}/all?${qs}`, { headers: osHeaders() });
       if(!r.ok) return interaction.editReply({ content: `Couldn't fetch current listings for **${slug}** (HTTP ${r.status}).` });
       const j = await r.json();
