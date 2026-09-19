@@ -597,6 +597,41 @@ app.get('/db/listings', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/gondi-listings — active Gondi marketplace listings ──────────────
+// jv: "There are actually trades happening on Gondi as well. Is there
+// anyway to catch those in traitview?" Separate from OpenSea's own
+// listings table entirely -- see lib/gondi-sync.js for the full
+// integration and its own caveats (price_wei/currency_address may be
+// null; the SDK's documented listings() response doesn't show a price
+// field at all).
+app.get('/db/gondi-listings', auth, async (req, res) => {
+  try {
+    const slug = (req.query.slug || 'argonauts').toLowerCase();
+    const result = await pool.query(
+      `SELECT token_id, marketplace_name, seller_wallet, price_wei, currency_address, gondi_created_at
+       FROM gondi_listings WHERE collection_slug = $1 ORDER BY token_id ASC`,
+      [slug]
+    );
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      slug,
+      listings: result.rows.map(r => ({
+        token_id: parseInt(r.token_id),
+        marketplace: r.marketplace_name,
+        seller: r.seller_wallet,
+        price_wei: r.price_wei,
+        currency_address: r.currency_address,
+        created_at: r.gondi_created_at,
+      })),
+      count: result.rows.length
+    });
+  } catch(e) {
+    console.error('/db/gondi-listings error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/floor-trend — aggregated sales for chart ─────────────────────────
 app.get('/db/floor-trend', auth, async (req, res) => {
   try {

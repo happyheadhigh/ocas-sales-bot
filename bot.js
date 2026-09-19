@@ -62,6 +62,7 @@ const {
 } = require('./lib/burn-poller');
 const { startMetadataUpdatePoller } = require('./lib/metadata-update-poller');
 const { startNewTokenPoller } = require('./lib/new-token-poller');
+const { startGondiSync } = require('./lib/gondi-sync');
 const { addLinkedWallet, getLinkedWalletAddresses } = require('./lib/linked-wallets');
 const { verifyAgainstAnyConfiguredChain, getConfiguredWebhooks, processAddressActivityEvent } = require('./lib/alchemy-webhook');
 const { startBurnDetectionPoller } = require('./lib/burn-detect');
@@ -2776,6 +2777,17 @@ client.once('clientReady', async ()=>{
     startNewTokenPoller();
   } else {
     console.log('[NewTokenPoller] No ALCHEMY_API_KEY set — new-token poller disabled');
+  }
+  // jv: "There are actually trades happening on Gondi as well. Is there
+  // anyway to catch those in traitview?" Same ALCHEMY_API_KEY
+  // requirement as the pollers above -- Gondi's own SDK needs an RPC
+  // transport to even instantiate its client (a real wallet object is
+  // required by the SDK regardless of whether anything ever gets
+  // signed; see lib/gondi-sync.js for why).
+  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
+    startGondiSync();
+  } else {
+    console.log('[GondiSync] No ALCHEMY_API_KEY set — Gondi sync disabled');
   }
   // Generic burned-token detection (lib/burn-detect.js) -- jv: Argonauts has
   // no protocol-level burn mechanic, a third-party account independently
