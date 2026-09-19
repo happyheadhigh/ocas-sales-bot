@@ -154,6 +154,8 @@ async function syncListings(collection) {
     // successful full sync wrote in place until the next cycle (60s later)
     // gets a clean run.
     let completedFully = false;
+    let totalDropped = 0;
+    let totalDuplicateTokenListings = 0;
 
     do {
       const qs = new URLSearchParams({ chain, limit: '100' });
@@ -265,6 +267,7 @@ async function syncListings(collection) {
       const MAX_PLAUSIBLE_TOKEN_ID = 10_000_000;
 
       let droppedThisPage = 0;
+      let duplicateTokenListingsThisPage = 0;
       for (const listing of (body.listings || [])) {
         const id = getTokenId(listing);
         const priceEth = getPriceEth(listing);
@@ -274,8 +277,27 @@ async function syncListings(collection) {
         if (priceEth == null || isNaN(priceEth) || priceEth <= 0) { droppedThisPage++; continue; }
 
         const url = `https://opensea.io/assets/${chain}/${contract}/${id}`;
-        if (!listingsMap[id] || priceEth < listingsMap[id].price_eth) {
+        if (!listingsMap[id]) {
           listingsMap[id] = { price_eth: priceEth, url, currency };
+        } else {
+          // jv: "why 29 listings are missing from OpenSea's listings"
+          // count. Confirmed this is a real, expected occurrence (see
+          // this loop's own comment further down about "more than one
+          // listing entry per token") -- counting it explicitly now so
+          // a gap between OpenSea's own displayed count and what this
+          // sync keeps is directly explainable from the very next
+          // sync's logs, instead of needing to reason about it after
+          // the fact. Every one of these is a listing for a token this
+          // page already saw once this cycle -- OpenSea's own "listed"
+          // count very plausibly counts each such entry separately
+          // (competing listings, or a re-list OpenSea hasn't retired the
+          // old entry for yet), while this sync deliberately keeps only
+          // the cheapest one per token, since that's the one that
+          // actually matters for floor/mispriced/grid display.
+          duplicateTokenListingsThisPage++;
+          if (priceEth < listingsMap[id].price_eth) {
+            listingsMap[id] = { price_eth: priceEth, url, currency };
+          }
         }
       }
       // Visible in logs if a real fraction of a page is unparseable --
@@ -285,6 +307,11 @@ async function syncListings(collection) {
       if (droppedThisPage > 0){
         console.warn(`[sync] [${slug}] Dropped ${droppedThisPage}/${body.listings?.length ?? 0} listings on page ${pages} (unparseable id or price)`);
       }
+      if (duplicateTokenListingsThisPage > 0){
+        console.log(`[sync] [${slug}] ${duplicateTokenListingsThisPage}/${body.listings?.length ?? 0} listings on page ${pages} were extra listings for a token already seen this cycle (kept the cheapest one per token)`);
+      }
+      totalDropped += droppedThisPage;
+      totalDuplicateTokenListings += duplicateTokenListingsThisPage;
 
       next = body.next || null;
       pages++;
@@ -309,7 +336,7 @@ async function syncListings(collection) {
     completedFully = (next == null);
 
     const entries = Object.entries(listingsMap);
-    console.log(`[sync] [${slug}] Fetched ${entries.length} listings across ${pages} pages (completedFully=${completedFully})`);
+    console.log(`[sync] [${slug}] Fetched ${entries.length} unique listed token(s) across ${pages} pages (completedFully=${completedFully}, ${totalDropped} unparseable dropped, ${totalDuplicateTokenListings} extra listings for an already-seen token collapsed)`);
 
     if (entries.length === 0) {
       console.warn(`[sync] [${slug}] No listings returned — skipping DB write`);
