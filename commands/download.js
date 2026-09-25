@@ -5,6 +5,10 @@ const sharp = require('sharp');
 const { AttachmentBuilder, MessageFlags } = require('discord.js');
 const { extractPngFromSvg } = require('../lib/images');
 const { pgPool, dbLoad, dbSave } = require('../lib/db');
+const { SUPPORTED_CHAINS } = require('../lib/collection-backfill');
+const { ipfsToHttp, fetchWithGatewayFallback } = require('../lib/ipfs-gateway');
+const { STACKERS_SLUG } = require('../lib/stackers');
+const { getOrCacheStackerImage } = require('../lib/stackers-image-cache');
 
 const DOWNLOAD_USER_COOLDOWN_MS = Math.max(0, parseInt(process.env.DOWNLOAD_USER_COOLDOWN_MS || '15000', 10));
 const DOWNLOAD_GUILD_WINDOW_MS = Math.max(10000, parseInt(process.env.DOWNLOAD_GUILD_WINDOW_MS || '60000', 10));
@@ -155,31 +159,31 @@ async function rpcCall(rpcUrl, method, params){
 
 
 async function fetchTokenUri(contract, tokenId, chain=DEFAULT_CHAIN){
-  const wsOrHttpRpc = process.env.ALCHEMY_WEBSOCKET_URL || process.env.ETH_RPC_URL || process.env.ALCHEMY_RPC_URL || '';
-  const rpc = wsOrHttpRpc
-    ? wsOrHttpRpc.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
-    : (process.env.ALCHEMY_API_KEY ? `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : '');
+  const alchemySubdomain = SUPPORTED_CHAINS[chain];
+  const envOverride = process.env.ALCHEMY_WEBSOCKET_URL || process.env.ETH_RPC_URL || process.env.ALCHEMY_RPC_URL || '';
+  // Env-var overrides are Ethereum-specific by their own naming (ETH_RPC_URL
+  // etc.) — only use them when we're actually on Ethereum, otherwise they'd
+  // silently point a non-Ethereum-chain call at an Ethereum RPC, the same
+  // class of bug this fix addresses.
+  const rpc = (chain === 'ethereum' || chain === DEFAULT_CHAIN) && envOverride
+    ? envOverride.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+    : (process.env.ALCHEMY_API_KEY && alchemySubdomain ? `https://${alchemySubdomain}.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : '');
 
   if(!rpc){
-    throw new Error('No Ethereum RPC configured. Set ALCHEMY_WEBSOCKET_URL, ETH_RPC_URL, ALCHEMY_RPC_URL, or ALCHEMY_API_KEY.');
+    throw new Error(alchemySubdomain
+      ? 'No Ethereum RPC configured. Set ALCHEMY_WEBSOCKET_URL, ETH_RPC_URL, ALCHEMY_RPC_URL, or ALCHEMY_API_KEY.'
+      : `Unsupported chain "${chain}" — no Alchemy subdomain known for it.`);
   }
 
   const result = await rpcCall(rpc, 'eth_call', [{ to:contract, data:encodeTokenUriCall(tokenId) }, 'latest']);
   return decodeAbiString(result);
 }
 
-function ipfsToHttp(url){
-  const s = String(url || '');
-  if(s.startsWith('ipfs://')) return 'https://ipfs.io/ipfs/' + s.replace('ipfs://','').replace(/^ipfs\//,'');
-  return s;
-}
-
 async function loadJsonFromUri(uri){
   const u = String(uri || '');
   if(u.startsWith('data:application/json;base64,')) return JSON.parse(Buffer.from(u.split(',')[1], 'base64').toString('utf8'));
   if(u.startsWith('data:application/json;utf8,')) return JSON.parse(decodeURIComponent(u.split(',').slice(1).join(',')));
-  const r = await fetch(ipfsToHttp(u));
-  if(!r.ok) throw new Error(`metadata HTTP ${r.status}`);
+  const r = await fetchWithGatewayFallback(u);
   return await r.json();
 }
 
@@ -189,8 +193,7 @@ async function imageSourceToSvgOrBuffer(image){
   if(img.startsWith('data:image/svg+xml;utf8,')) return decodeURIComponent(img.split(',').slice(1).join(','));
   if(img.trim().startsWith('<svg')) return img;
   if(img.startsWith('http') || img.startsWith('ipfs://')){
-    const r = await fetch(ipfsToHttp(img));
-    if(!r.ok) throw new Error(`image HTTP ${r.status}`);
+    const r = await fetchWithGatewayFallback(img);
     const buf = await r.buffer();
     const ct = r.headers.get('content-type') || '';
     if(ct.includes('svg') || buf.toString('utf8',0,20).includes('<svg')) return buf.toString('utf8');
@@ -218,7 +221,7 @@ function isSvgSource(src){
 }
 
 
-async function renderTokenPng({ contract, tokenId, chain, size, transparent, osHeaders }){
+async function renderTokenPng({ contract, tokenId, chain, size, transparent, osHeaders, slug }){
   const uri = await fetchTokenUri(contract, tokenId, chain);
   const meta = await loadJsonFromUri(uri);
 
@@ -228,7 +231,7 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
   // If no animation_url in on-chain metadata, try OpenSea API (gets CDN GIF)
   if(!animUrl && osHeaders && contract && tokenId){
     try{
-      const osNftUrl = `https://api.opensea.io/api/v2/chain/ethereum/contract/${contract}/nfts/${tokenId}`;
+      const osNftUrl = `https://api.opensea.io/api/v2/chain/${chain || 'ethereum'}/contract/${contract}/nfts/${tokenId}`;
       console.log('[Download] Fetching OS metadata for animation_url:', osNftUrl);
       const osRes = await fetch(osNftUrl, { headers: osHeaders() });
       if(osRes.ok){
@@ -250,7 +253,7 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
     if(isGif || isMp4){
       console.log('[Download] Fetching animated file:', ipfsToHttp(animUrl));
       // Request GIF explicitly — CDNs like seadn.io may serve WebP otherwise
-      const r = await fetch(ipfsToHttp(animUrl), { headers: { 'Accept': 'image/gif,image/*;q=0.9' } });
+      const r = await fetchWithGatewayFallback(animUrl, { headers: { 'Accept': 'image/gif,image/*;q=0.9' } });
       console.log('[Download] Fetch status:', r.status, 'content-type:', r.headers.get('content-type'));
       if(!r.ok) throw new Error('animation fetch HTTP ' + r.status);
       const buffer = await r.buffer();
@@ -266,30 +269,51 @@ async function renderTokenPng({ contract, tokenId, chain, size, transparent, osH
     }
   }
 
-  let src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
+  let src;
+  if(slug === STACKERS_SLUG){
+    try{
+      const cached = await getOrCacheStackerImage(pgPool, tokenId);
+      src = cached.data;
+    }catch(e){
+      console.warn(`[Download] Stacker image cache path failed for token ${tokenId}, falling back to generic resolution:`, e.message);
+    }
+  }
+  if(src === undefined){
+    src = await imageSourceToSvgOrBuffer(meta.image_data || meta.image || meta.image_url);
+  }
 
   if(typeof src === 'string' && transparent){
   src = makeSvgTransparent(src);
-  src = src.replace(/<rect\b[^>]*>/gi, '');
-  src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*>\s*<\/path>/gi, '');
-  src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*\/?>/gi, '');
+  // The broader rect/filled-path stripping below removes EVERY matching
+  // element in the whole SVG, not just a background — fine for OCAS
+  // specifically (its character art apparently isn't built from these),
+  // but destructive for a collection whose actual artwork IS made of rects
+  // (confirmed happening for onchainhoodies: pixel art is visibly built
+  // from rects, so this was stripping the character itself, not just the
+  // background, leaving nothing to render — hence the blank image).
+  if(contract?.toLowerCase() === OCAS_CONTRACT){
+    src = src.replace(/<rect\b[^>]*>/gi, '');
+    src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*>\s*<\/path>/gi, '');
+    src = src.replace(/<path\b[^>]*(?:fill=['"]#[0-9a-f]{3,8}['"]|fill=['"][^'"]+['"])[^>]*\/?>/gi, '');
+  }
 }
 
   if(typeof src === 'string' && isSvgSource(src)){
   let buffer;
 
+  // Renders natively at the requested size in one pass now, instead of
+  // always rendering at 500 then separately upscaling — avoids compounding
+  // rounding artifacts across two sequential nearest-neighbor scales when
+  // the source (e.g. a small embedded on-chain bitmap) doesn't divide
+  // evenly into 500, and lets any genuine vector content in the SVG render
+  // with real anti-aliasing at the higher resolution rather than being
+  // rasterized small and then blockily scaled up.
+  const targetSize = size || 500;
   if(src.trim().startsWith('<svg')){
     const svgDataUri = 'data:image/svg+xml;base64,' + Buffer.from(src).toString('base64');
-    buffer = await extractPngFromSvg(svgDataUri);
+    buffer = await extractPngFromSvg(svgDataUri, targetSize);
   } else {
-    buffer = await extractPngFromSvg(src);
-  }
-
-  if(size && size !== 500){
-    buffer = await sharp(buffer)
-      .resize(size, size, { kernel:'nearest', fit:'fill' })
-      .png()
-      .toBuffer();
+    buffer = await extractPngFromSvg(src, targetSize);
   }
 
   return { buffer, meta };
@@ -394,8 +418,21 @@ async function runDownload(interaction, ctx, { tokenId, size, transparent, colle
         if(resolved){ contract = resolved.cfg.contract || contract; slug = resolved.cfg.slug || slug; chain = resolved.cfg.chain || chain; alias = resolved.alias; }
       }
     }
+    // Authoritative chain lookup — server_configs' own collection entries
+    // (primary + extras) never carry a chain field at all, so the branches
+    // above leave `chain` at its default regardless of which collection was
+    // actually resolved. The collections registry (populated during
+    // onboarding via real OpenSea resolution) is the actual source of
+    // truth; only fall back to whatever chain was already set if this
+    // collection predates the registry (e.g. OCAS).
+    try{
+      const chainRow = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]);
+      if(chainRow.rows[0]?.chain) chain = chainRow.rows[0].chain;
+    }catch(e){
+      console.warn('[download] collections chain lookup failed:', e.message);
+    }
     const finalTransparent = transparent;
-    const rendered = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent, osHeaders: ctx.osHeaders });
+    const rendered = await renderTokenPng({ contract, tokenId, chain, size, transparent: finalTransparent, osHeaders: ctx.osHeaders, slug });
     const { buffer } = rendered;
     const ext = rendered.ext || 'png';
     const sizeStr = ext === 'png' ? `-${size}` : '';
@@ -473,4 +510,4 @@ async function handleDownloadCommand(interaction, forced={}){
 
 const DOWNLOAD_COMMANDS = new Set(['download']);
 
-module.exports = { handleDownloadCommand, handleDownloadColPick, handleDownloadModalSubmit, DOWNLOAD_COMMANDS };
+module.exports = { handleDownloadCommand, handleDownloadColPick, handleDownloadModalSubmit, DOWNLOAD_COMMANDS, renderTokenPng };

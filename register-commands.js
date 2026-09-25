@@ -26,6 +26,30 @@ const commands = [
 
   new SlashCommandBuilder().setName('status').setDescription('Show current bot configuration'),
 
+  new SlashCommandBuilder().setName('stackerstats').setDescription('Stackers collection-wide stats — tier distribution, asset popularity, vault totals'),
+
+  new SlashCommandBuilder()
+    .setName('stackers')
+    .setDescription('Browse Stackers — listings with unclaimed vault value, fused Stackers, or a specific token')
+    .addSubcommand(sub =>
+      sub.setName('listings')
+        .setDescription('Currently listed Stackers with unclaimed value sitting in their vault')
+    )
+    .addSubcommand(sub =>
+      sub.setName('token')
+        .setDescription('Full status for one specific Stacker — tier, split, vault balance, listing status')
+        .addIntegerOption(opt =>
+          opt.setName('id')
+            .setDescription('Token ID')
+            .setRequired(true)
+            .setMinValue(1)
+        )
+    )
+    .addSubcommand(sub =>
+      sub.setName('fused')
+        .setDescription('Browse currently listed fused Stackers — tier, vault balance, image, one at a time')
+    ),
+
 
   new SlashCommandBuilder().setName('download')
   .setDescription('Download a high-res PNG for OCAS or another configured collection — leave blank for a guided menu')
@@ -50,7 +74,7 @@ const commands = [
   new SlashCommandBuilder().setName('ocas').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false)),
   new SlashCommandBuilder().setName('token').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection to search (defaults to primary)').setRequired(false).setAutocomplete(true)),
-  new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep cheapest listed OCAS').addStringOption(o=>o.setName('search').setDescription('e.g. 10, 2eth, 0.05 floor, 10 zombie').setRequired(false)),
+  new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep the cheapest listed tokens in your collection').addStringOption(o=>o.setName('search').setDescription('e.g. 10, 2eth, 0.05 floor, 10 zombie').setRequired(false)).addStringOption(o=>o.setName('collection').setDescription('Collection to sweep (defaults to primary)').setRequired(false).setAutocomplete(true)),
 
   new SlashCommandBuilder().setName('burnstats').setDescription('Show OCAS Burn Machine stats — total burned, created, estimated supply'),
   new SlashCommandBuilder().setName('burnlatest').setDescription('Show recent finalized OCAS burn events').addIntegerOption(o=>o.setName('count').setDescription('Number of burns to show (max 10, default 1)').setRequired(false).setMinValue(1).setMaxValue(10)),

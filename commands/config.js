@@ -10,6 +10,7 @@ const {
 
 const OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 const { OWNER_DISCORD_IDS } = require('../lib/constants');
+const { STACKERS_SLUG } = require('../lib/stackers');
 const { isPaidFeature } = require('./market');
 const { buildRolePickerRows } = require('../lib/role-picker');
 const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
@@ -201,6 +202,7 @@ function collectionsRow(cfg){
 // Single collection edit embed
 function buildCollectionEditEmbed(col, isPrimary, cfg={}){
   const isOcas = col.contract?.toLowerCase() === OCAS_CONTRACT;
+  const isStackers = col.slug === STACKERS_SLUG;
   const ra = col.rankAlert;
   const raLabel = ra ? `#${ra.min}–#${ra.max} (${ra.rankType==='obs'?'TraitView':'OpenSea'})` : 'Not set';
   return new EmbedBuilder()
@@ -213,6 +215,8 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
       `**Sales Channel:** ${col.salesChannel ? `<#${col.salesChannel}>` : '`Not set`'} ${ok(col.salesChannel)}\n` +
       `**Listings Channel:** ${col.listingsChannel ? `<#${col.listingsChannel}>` : '`Not set`'} ${ok(col.listingsChannel)}\n` +
       (isOcas ? `**Burn Alerts Channel:** ${cfg.burnChannel ? `<#${cfg.burnChannel}>` : '`Not set`'} ${ok(cfg.burnChannel)}\n` : '') +
+      (isStackers ? `**Vault Alerts Channel:** ${cfg.vaultAlertChannel ? `<#${cfg.vaultAlertChannel}>` : '`Not set (uses Sales Channel)`'}\n` : '') +
+      (isStackers ? `**Fusion Alerts Channel:** ${cfg.fusionChannel ? `<#${cfg.fusionChannel}>` : '`Not set (uses Sales Channel)`'}\n` : '') +
       `**Listing Filters:** ${Object.keys(col.listingFilters||{}).length} active\n` +
       `**Sales Filters:** ${Object.keys(col.salesFilters||{}).length} active\n` +
       `**Rank Alert:** ${raLabel}${!isOcas ? ' 🔒' : ''}\n` +
@@ -224,7 +228,7 @@ function buildCollectionEditEmbed(col, isPrimary, cfg={}){
     .setFooter({ text: 'Only visible to you' });
 }
 
-function collectionEditRow(colId, isPrimary, isOcas=false){
+function collectionEditRow(colId, isPrimary, isOcas=false, isStackers=false){
   const options = [
     new StringSelectMenuOptionBuilder().setLabel('Name').setEmoji('✏️').setValue('name').setDescription('Edit the display name'),
     new StringSelectMenuOptionBuilder().setLabel('Slug').setEmoji('🔗').setValue('slug').setDescription('Edit the OpenSea collection slug'),
@@ -240,6 +244,10 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
   ];
   if(isOcas){
     options.push(new StringSelectMenuOptionBuilder().setLabel('Burn Alerts Channel').setEmoji('🔥').setValue('burnchan').setDescription('Where burn alerts post'));
+  }
+  if(isStackers){
+    options.push(new StringSelectMenuOptionBuilder().setLabel('Vault Alerts Channel').setEmoji('🏦').setValue('vaultalert').setDescription('Where new listings with unclaimed vault value post — defaults to Sales Channel'));
+    options.push(new StringSelectMenuOptionBuilder().setLabel('Fusion Alerts Channel').setEmoji('🔥').setValue('fusionchan').setDescription('Where fusion alerts post — defaults to Sales Channel if not set'));
   }
 
   const menu = new StringSelectMenuBuilder()
@@ -676,6 +684,8 @@ async function handleConfigButton(interaction, ctx){
       filters:       `cfg:col:filters:${colId}`,
       salesfilters:  `cfg:col:salesfilters:${colId}`,
       rankalert:     `cfg:col:rankalert:${colId}`,
+      vaultalert:    `cfg:col:vaultalertchan:${colId}`,
+      fusionchan:    `cfg:col:fusionchan:${colId}`,
       traitroles:    `cfg:col:traitroles:${colId}`,
       pause:         `cfg:col:pause:${colId}`,
       rebackfill:    `cfg:col:rebackfill:${colId}`,
@@ -756,7 +766,7 @@ async function handleConfigButton(interaction, ctx){
     if(allCols.length === 1){
       // Only one collection configured — skip the picker, go straight to editing it.
       const { col, isPrimary } = resolveColFromId(cfg, allCols[0]);
-      if(col) return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(allCols[0], isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+      if(col) return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(allCols[0], isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
     }
     return interaction.editReply({ content:'', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
@@ -778,7 +788,7 @@ async function handleConfigButton(interaction, ctx){
     const colId = interaction.values[0];
     const { col, isPrimary } = resolveColFromId(cfg, colId);
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // Add collection button
@@ -848,25 +858,38 @@ async function handleConfigButton(interaction, ctx){
     const field  = parts[3]; // 'sales' or 'listings'
     const colId  = parts[4];
     const isPrimary = colId === 'primary';
+    // Using `= null` here, not `delete` — setConfig() re-fetches the DB row
+    // and merges it under the incoming cfg (`{...dbCfg, ...cfg}`) to avoid
+    // clobbering fields the caller doesn't know about. That merge can only
+    // override a key that's actually PRESENT on the incoming object; a
+    // `delete`d key is simply absent, so the merge let the old DB value flow
+    // straight back through and the "disabled" channel came right back the
+    // next time any /config action re-saved the config. Every downstream
+    // reader already treats null exactly like unset (e.g. lib/poll.js's
+    // `if(!ctx.listingsChannelId) continue`), so this is a safe, real fix.
     if(isPrimary){
-      if(field === 'sales')    { delete cfg.channelId; delete cfg.salesChannel; }
-      if(field === 'listings') { delete cfg.listingsChannelId; delete cfg.listingsChannel; }
-      if(field === 'burn')     { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      if(field === 'sales')    { cfg.channelId = null; cfg.salesChannel = null; }
+      if(field === 'listings') { cfg.listingsChannelId = null; cfg.listingsChannel = null; }
+      if(field === 'burn')     { cfg.burnChannel = null; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      if(field === 'fusion')   { cfg.fusionChannel = null; }
+      if(field === 'vaultalert') { cfg.vaultAlertChannel = null; }
     } else {
       const idx = parseInt(colId);
       if(cfg.collections?.[idx]){
         if(field === 'sales')    cfg.collections[idx].salesChannel    = null;
         if(field === 'listings') cfg.collections[idx].listingsChannel = null;
       }
-      // burn channel is always top-level in cfg
-      if(field === 'burn') { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      // burn, fusion, and vault-alert channels are always top-level in cfg
+      if(field === 'burn') { cfg.burnChannel = null; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      if(field === 'fusion') { cfg.fusionChannel = null; }
+      if(field === 'vaultalert') { cfg.vaultAlertChannel = null; }
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : cfg.collections?.[parseInt(colId)] || {};
     return interaction.editReply({ content:'✅ Channel cleared.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)
-], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   if(customId.startsWith('cfg:col:saleschan:') || customId.startsWith('cfg:col:listchan:')){
@@ -903,6 +926,21 @@ async function handleConfigButton(interaction, ctx){
     ]});
   }
 
+  if(customId.startsWith('cfg:col:fusionchan:')){
+    const colId = customId.split(':')[3];
+    const menu = new ChannelSelectMenuBuilder()
+      .setCustomId(`cfg_chsel:col:fusionchan:${colId}`)
+      .setPlaceholder('Pick the Fusion Alerts channel')
+      .addChannelTypes(ChannelType.GuildText);
+    return interaction.editReply({ content:'**Select the 🔥 Fusion Alerts channel:**\n_Leave unset and fusion alerts post to the Sales Channel instead._', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`cfg:col:clearchan:fusion:${colId}`).setLabel('↩️ Reset to Sales Channel').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`cfg:col:view:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
+  }
+
   // ── Per-collection Trait Roles ──────────────────────────────────────────────
   if(customId.startsWith('cfg:col:traitroles:')){
     const colId = customId.split(':')[3];
@@ -930,7 +968,7 @@ async function handleConfigButton(interaction, ctx){
       ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // Remove extra collection
@@ -940,7 +978,7 @@ async function handleConfigButton(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   if(customId.startsWith('cfg:col:filters:')){
@@ -1001,7 +1039,7 @@ async function handleConfigButton(interaction, ctx){
       ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, salesChannel: cfg.channelId, listingsChannel: cfg.listingsChannelId, listingFilters: cfg.listingFilters||{}, salesFilters: cfg.salesFilters||{}, paused: cfg.paused }
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
-    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   if(customId.startsWith('cfg:col:salesfilters:')){
@@ -1346,6 +1384,22 @@ async function handleConfigButton(interaction, ctx){
   }
 
   // ── Pause/Resume toggle (per collection) ─────────────────────────────────
+  // ── Vault Listing Alerts channel (Stackers only) ──────────────────────────────
+  if(customId.startsWith('cfg:col:vaultalertchan:')){
+    const colId = customId.split(':')[3];
+    const menu = new ChannelSelectMenuBuilder()
+      .setCustomId(`cfg_chsel:col:vaultalertchan:${colId}`)
+      .setPlaceholder('Pick the Vault Listing Alerts channel')
+      .addChannelTypes(ChannelType.GuildText);
+    return interaction.editReply({ content:'**Select the 🏦 Vault Listing Alerts channel:**\n_Leave unset and vault listing alerts post to the Sales Channel instead._', embeds:[], components:[
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`cfg:col:clearchan:vaultalert:${colId}`).setLabel('↩️ Reset to Sales Channel').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`cfg:col:view:${colId}`).setLabel('← Cancel').setStyle(ButtonStyle.Secondary)
+      ),
+    ]});
+  }
+
   if(customId.startsWith('cfg:col:pause:')){
     const colId = customId.split(':')[3];
     const isPrimary = colId === 'primary';
@@ -1363,7 +1417,7 @@ async function handleConfigButton(interaction, ctx){
       : (cfg.collections||[])[parseInt(colId)];
     if(!col) return interaction.editReply({ content:'❌ Collection not found.', embeds:[], components:[] });
     const status = col.paused ? '⏸️ Paused' : '▶️ Resumed';
-    return interaction.editReply({ content:`${status} for ${col.name||col.slug}.`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:`${status} for ${col.name||col.slug}.`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // ── Animated toggle ──────────────────────────────────────────────────────────
@@ -1383,10 +1437,11 @@ async function handleConfigButton(interaction, ctx){
       ? { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, name: cfg.contractName, animated: cfg.animated }
       : (cfg.collections||[])[parseInt(colId)];
     const isOcasCol = col?.contract?.toLowerCase() === OCAS_CONTRACT;
+    const isStackersCol = col?.slug === STACKERS_SLUG;
     return interaction.editReply({
       content: `${col?.animated ? '🎞️ Animated ON' : '🖼️ Static'} for **${col?.name||col?.slug}**.`,
       embeds: [buildCollectionEditEmbed(col, isPrimary, isOcasCol)],
-      components: collectionEditRow(colId, isPrimary, isOcasCol)
+      components: collectionEditRow(colId, isPrimary, isOcasCol, isStackersCol)
     });
   }
 
@@ -1442,7 +1497,22 @@ async function handleConfigButton(interaction, ctx){
 
     // Run backfill directly — bypasses the "already backfilled" guard in maybeStartBackfill
     const { backfillCollectionTraits } = require('../lib/collection-backfill');
-    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug })
+    // chain/totalSupply were never passed here, so backfillCollectionTraits()
+    // silently fell back to its own default of chain='ethereum' every time —
+    // for a non-Ethereum collection (e.g. Robinhood Chain), that means Alchemy
+    // gets asked about the contract on the WRONG chain, finds nothing, and the
+    // whole run finishes instantly with 0 tokens written and no error at all.
+    // The other two call sites (auto-backfill.js, collection-onboard.js)
+    // already resolve chain correctly — this one just never did. Reading it
+    // straight from the collections table (already confirmed correct) avoids
+    // re-hitting OpenSea's API a second time, which is also where the
+    // total_supply mismatch came from in the first place.
+    const collRow = await pgPool.query(
+      `SELECT chain, total_supply FROM collections WHERE slug=$1`, [col.slug]
+    ).catch(()=>({ rows:[] }));
+    const chain       = collRow.rows[0]?.chain || 'ethereum';
+    const totalSupply = collRow.rows[0]?.total_supply || null;
+    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug, chain, totalSupply })
       .then(async stats => {
         // Store animated detection result in collection config
         if(typeof stats?.animated === 'boolean'){
@@ -2168,6 +2238,8 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
         if(field==='saleschan')  cfg.channelId         = chId;
         if(field==='listchan')   cfg.listingsChannelId = chId;
         if(field==='burnchan')   { cfg.burnChannel = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+        if(field==='fusionchan') cfg.fusionChannel = chId;
+        if(field==='vaultalertchan') cfg.vaultAlertChannel = chId;
       } else {
         const idx = parseInt(colId);
         if(!cfg.collections) cfg.collections = [];
@@ -2175,14 +2247,16 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
           if(field==='saleschan')  cfg.collections[idx].salesChannel    = chId;
           if(field==='listchan')   cfg.collections[idx].listingsChannel = chId;
         }
-        // burn channel is always top-level in cfg
+        // burn, fusion, and vault-alert channels are always top-level in cfg
         if(field==='burnchan') { cfg.burnChannel = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+        if(field==='fusionchan') cfg.fusionChannel = chId;
+        if(field==='vaultalertchan') cfg.vaultAlertChannel = chId;
       }
       await setConfig(guildId, cfg);
       const col = isPrimary
         ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
         : cfg.collections[parseInt(colId)];
-      return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+      return interaction.editReply({ content:'', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
     }
 
     // Standard channel edit
@@ -2351,7 +2425,7 @@ async function handleConfigModal(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId, listingFilters:cfg.listingFilters||{} }
       : (cfg.collections||[])[parseInt(colId)] || {};
-    return interaction.editReply({ content:'✅ Name updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:'✅ Name updated.', embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // ── Per-collection listing filter modal ────────────────────────────────────
@@ -2508,7 +2582,9 @@ async function handleConfigModal(interaction, ctx){
     // Backfill all verified wallets in this server for the new collection
     if(slug && contract){
       const { backfillServerWallets } = require('../lib/wallet-backfill');
-      backfillServerWallets(guildId, contract, slug, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+      pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug])
+        .then(r => backfillServerWallets(guildId, contract, slug, pgPool, process.env.ALCHEMY_API_KEY, r.rows[0]?.chain || 'ethereum'))
+        .catch(()=>{});
     }
 
     // Every server gets an automatic trait backfill for any new non-OCAS
@@ -2583,7 +2659,10 @@ async function handleConfigModal(interaction, ctx){
         // Trigger wallet backfill if both contract and slug are now set
         if(cfg.collections[idx].contract && cfg.collections[idx].slug){
           const { backfillServerWallets } = require('../lib/wallet-backfill');
-          backfillServerWallets(guildId, cfg.collections[idx].contract, cfg.collections[idx].slug, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+          const colContract = cfg.collections[idx].contract, colSlug = cfg.collections[idx].slug;
+          pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [colSlug])
+            .then(r => backfillServerWallets(guildId, colContract, colSlug, pgPool, process.env.ALCHEMY_API_KEY, r.rows[0]?.chain || 'ethereum'))
+            .catch(()=>{});
         }
       }
     }
@@ -2591,7 +2670,7 @@ async function handleConfigModal(interaction, ctx){
     const col = isPrimary
       ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
       : cfg.collections[parseInt(colId)];
-    return interaction.editReply({ content:`✅ Updated.${waitMsg}`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT) });
+    return interaction.editReply({ content:`✅ Updated.${waitMsg}`, embeds:[buildCollectionEditEmbed(col, isPrimary, cfg)], components:collectionEditRow(colId, isPrimary, col?.contract?.toLowerCase() === OCAS_CONTRACT, col?.slug === STACKERS_SLUG) });
   }
 
   // ── Add trait role ─────────────────────────────────────────────────────────

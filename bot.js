@@ -25,7 +25,7 @@ const {
 
 const {
   pgPool, runMigrations, dbLoad, dbSave,
-  loadAllConfigs, getConfig, setConfig, getAllConfigs, getUserAlerts,
+  loadAllConfigs, getConfig, setConfig, deleteConfig, getAllConfigs, getUserAlerts,
 } = require('./lib/db');
 
 const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
@@ -57,6 +57,12 @@ const {
   setClient, traitDisplayLines, fetchTokenUriFromContract,
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
+const { setClient: setStackersFusionClient } = require('./lib/stackers-fusion-poller');
+const { startLiveListeners: startStackersLiveListeners } = require('./lib/stackers-live-events');
+const { setClient: setStackersVaultAlertsClient } = require('./lib/stackers-vault-listing-alerts');
+const { handleStackerStatsCommand, STACKERSTATS_COMMANDS } = require('./commands/stackerstats');
+const { handleStackersCommand, STACKERS_COMMANDS, handleListingsPageButton, handleFusedPageButton } = require('./commands/stackers');
+const { takeStackersSnapshot, takeLiveVaultSnapshot } = require('./lib/stackers-analytics');
 
 const {
   buildBurnLotteryEmbed, buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
@@ -69,7 +75,7 @@ const {
 
 const { fetchTokenMetaFromDb, upsertTokenTraitRows, buildSaleEmbed, buildListingEmbed,
   traitObjectToArray, burnTypeBreakdown, fetchBurnDisplayTraits, fetchSnapshotImageForToken,
-  osRankBadge, titleTokenId, tokenMetaCache: embedsTokenMetaCache,
+  osRankBadge, titleTokenId, tokenMetaCache: embedsTokenMetaCache, resolveOnChainImage,
 } = require('./lib/embeds');
 const { resolveImage, sendEmbed, extractPngFromSvg, buildEmbedPayload, tokenMetaCache: imagesTokenMetaCache } = require('./lib/images');
 
@@ -87,7 +93,7 @@ const {
 const {
   normAddr, shortAddr, formatEth, formatListingEth,
   timeSince, lotteryTime, formatBurnLotteryWindow,
-  isSvg, isDiscordOk, matchesFilters,
+  isSvg, isDiscordOk, matchesFilters, verifyImageIsRaster,
 } = require('./utils/format');
 
 const {
@@ -99,7 +105,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, showStackerOptimizeResult }   = require('./commands/market');
 const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
@@ -118,6 +124,8 @@ const client = new Client({ intents: [
 ] });
 setClient(client); // inject into burn-poller
 setPollClient(client); // inject into poll
+setStackersFusionClient(client); // inject into stackers fusion poller
+setStackersVaultAlertsClient(client); // inject into stackers vault-listing alerts
 
 // ── resolveDiscordChannel — needs client, defined here ───────────────────────
 // Inject client into burn-poller so it can resolve channels
@@ -147,7 +155,7 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock,
     // Embeds
     buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
-    resolveImage, extractPngFromSvg, fetchTokenMetaFromDb,
+    resolveImage, extractPngFromSvg, fetchTokenMetaFromDb, resolveOnChainImage,
     buildBurnEmbed, buildBurnLotteryEmbed,
     buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
     buildGenericLotteryStartEmbed, buildGenericLotteryResultEmbed,
@@ -177,7 +185,7 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     // Cache
     ocasTraitsCache,
     normAddr, shortAddr, formatEth, timeSince, lotteryTime,
-    formatBurnLotteryWindow, isSvg, isDiscordOk, matchesFilters,
+    formatBurnLotteryWindow, isSvg, isDiscordOk, matchesFilters, verifyImageIsRaster,
     // Rank sync
     rankSyncQueue, queueRankSync,
      // Wallet sync
@@ -339,12 +347,27 @@ async function syncTraitRoles(guild, discordId, wallet){
     const rolesSummary = { assigned: [], skipped: [], alreadyHad: [] };
     let totalOwnedAcrossCollections = 0;
 
+    // Chain isn't in server config at all — resolve every collection in this
+    // loop from the collections registry in one batch query, same pattern
+    // used elsewhere tonight, rather than a lookup per collection.
+    const traitSyncChainMap = {};
+    try{
+      const chainRes = await pgPool.query(
+        `SELECT slug, chain FROM collections WHERE slug = ANY($1)`,
+        [Object.keys(rulesBySlug)]
+      );
+      for(const row of chainRes.rows) traitSyncChainMap[row.slug] = row.chain;
+    }catch(e){
+      console.warn('[TraitSync] chain lookup failed (defaulting to ethereum):', e.message);
+    }
+
     // Process each collection separately — fetch ownership + traits scoped to that slug
     for(const slug of Object.keys(rulesBySlug)){
       const rules = rulesBySlug[slug];
+      const slugChain = traitSyncChainMap[slug] || 'ethereum';
 
       const osRes = await fetch(
-        `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?collection=${slug}&limit=200`,
+        `https://api.opensea.io/api/v2/chain/${slugChain}/account/${wallet}/nfts?collection=${slug}&limit=200`,
         { headers: osHeaders() }
       );
       if(!osRes.ok){
@@ -670,13 +693,15 @@ client.on('interactionCreate', async (interaction)=>{
     const primaryWallet = wallets[0];
     const cfg = getConfig(guildId) || {};
     const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+    const slugChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const slugChain = slugChainRes.rows[0]?.chain || 'ethereum';
 
     // Fetch NFTs across all wallets combined
     let totalTokens = [];
     for(const w of wallets){
       try{
         const nftRes = await fetch(
-          `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+          `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
           { headers:osHeaders(), agent:osAgent }
         );
         if(nftRes.ok){
@@ -731,7 +756,7 @@ client.on('interactionCreate', async (interaction)=>{
   }
   // ── Setup wizard modal + button handlers ───────────────────────────────────
   if(interaction.isModalSubmit() && interaction.customId.startsWith('setup_modal:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupModal(interaction, setupCtx);
   }
   if(interaction.isModalSubmit() && (interaction.customId.startsWith('cfg_modal:') || interaction.customId.startsWith('cfg_modal:col_filter:'))){
@@ -746,7 +771,14 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   if(interaction.isButton() && interaction.customId.startsWith('setup:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
+  // Setup wizard's own paginated trait-value picker (distinct from /config's
+  // vpick:traitrole: / vpick:filtertrait: above — this one stays inside the
+  // wizard's embeds instead of exiting to /config's UI).
+  if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('vpick:wtraitrole:')){
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isButton() && (interaction.customId.startsWith('cfg:') || interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col_filter:'))){
@@ -764,17 +796,17 @@ client.on('interactionCreate', async (interaction)=>{
   }
   // Channel select menus from setup wizard (still native Discord component)
   if(interaction.isChannelSelectMenu() && interaction.customId.startsWith('setup_chsel:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   // Role select menus from setup wizard — now a manually-paginated StringSelectMenu
   // (see lib/role-picker.js); isRoleSelectMenu() kept as a harmless fallback.
   if((interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) && interaction.customId.startsWith('setup_rolesel:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_traitrole:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isStringSelectMenu() && (interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col:') || interaction.customId.startsWith('cfg_filter:') || interaction.customId.startsWith('cfg_col_filter:') || interaction.customId.startsWith('cfg_col_salesfilter:') || interaction.customId.startsWith('cfg_tzsel:'))){
@@ -820,8 +852,14 @@ client.on('interactionCreate', async (interaction)=>{
     return handleMaClearInteraction(interaction, macCtx);
   }
   if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
-    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser };
+    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser, osHeaders };
     return handleMeInteraction(interaction, meCtx);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('stackers:listings:page:')){
+    return handleListingsPageButton(interaction, pgPool);
+  }
+  if(interaction.isButton() && interaction.customId.startsWith('stackers:fused:page:')){
+    return handleFusedPageButton(interaction, pgPool);
   }
 
   // Modal submissions for price/floor alerts
@@ -829,6 +867,16 @@ client.on('interactionCreate', async (interaction)=>{
     const parts = interaction.customId.split(':');
     const alertType = parts[1];
     const slug = parts.slice(2).join(':');
+
+    if(alertType === 'stackeroptimize'){
+      const raw = interaction.fields.getTextInputValue('budget').trim().replace(/[,\s]/g, '');
+      const budget = parseInt(raw, 10);
+      if(isNaN(budget) || budget <= 0){
+        return interaction.reply({ content: '❌ Invalid budget. Enter a positive number of $STACK, e.g. 350000.', flags: MessageFlags.Ephemeral });
+      }
+      const meCtx = { pgPool };
+      return showStackerOptimizeResult(interaction, meCtx, budget);
+    }
 
     if(alertType === 'pricealert'){
       const tokenId = parseInt(interaction.fields.getTextInputValue('token_id').trim());
@@ -1021,6 +1069,8 @@ client.on('interactionCreate', async (interaction)=>{
         const knownWallet = globalEx.rows[0].wallet;
         const gCfg = getConfig(svGuild) || {};
         const slug = gCfg.collectionSlug || gCfg.slug || 'on-chain-all-stars';
+        const slugChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+        const slugChain = slugChainRes.rows[0]?.chain || 'ethereum';
 
         // Full OS profile fetch — get ALL linked wallets
         let allWallets = [knownWallet];
@@ -1043,7 +1093,7 @@ client.on('interactionCreate', async (interaction)=>{
         for(const w of allWallets){
           try{
             const nftRes = await fetch(
-              `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+              `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
               { headers:osHeaders() }
             );
             if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
@@ -1277,13 +1327,15 @@ client.on('interactionCreate', async (interaction)=>{
 
     const cfg  = getConfig(svGuild) || {};
     const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+    const slugChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const slugChain = slugChainRes.rows[0]?.chain || 'ethereum';
 
     // Fetch token holdings across all wallets
     let totalTokens = [];
     for(const w of wallets){
       try{
         const nftRes = await fetch(
-          `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+          `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
           { headers:osHeaders() }
         );
         if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
@@ -1479,7 +1531,14 @@ client.on('interactionCreate', async (interaction)=>{
             if(buf) ir = { type:'buffer', buffer:buf, filename:embed._imageFilename||'token.png' };
           }catch(_){}
         } else if(src.startsWith('http') && isDiscordOk(src)){
-          ir = { type:'url', url:src };
+          if(await verifyImageIsRaster(src)){
+            ir = { type:'url', url:src };
+          } else {
+            try{
+              const buf = await extractPngFromSvg(src);
+              if(buf) ir = { type:'buffer', buffer:buf, filename:embed._imageFilename||'token.png' };
+            }catch(_){}
+          }
         }
       }
       if(ir?.type === 'buffer'){
@@ -1991,8 +2050,19 @@ client.on('interactionCreate', async (interaction)=>{
               }
             }catch(_){}
           } else if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)){
-            slideEmbed._imageResult = { type:'url', url:imgSrc };
-            slideEmbed._imageSource = imgSrc;
+            if(await verifyImageIsRaster(imgSrc)){
+              slideEmbed._imageResult = { type:'url', url:imgSrc };
+              slideEmbed._imageSource = imgSrc;
+            } else {
+              try{
+                const buf = await extractPngFromSvg(imgSrc);
+                if(buf){
+                  slideEmbed._imageResult = { type:'buffer', buffer:buf, filename:`token-${survivorId}-burn${burnNum}.png` };
+                  slideEmbed._imageSource = imgSrc;
+                  slideEmbed._imageFilename = `token-${survivorId}-burn${burnNum}.png`;
+                }
+              }catch(_){}
+            }
           }
         }
         embeds.push(slideEmbed);
@@ -2047,6 +2117,8 @@ client.on('interactionCreate', async (interaction)=>{
   const ctx = buildCtx(interaction, guildId, config, isAdmin);
 
   if(ADMIN_COMMANDS.has(commandName))   return handleAdminCommand(commandName, ctx);
+  if(STACKERSTATS_COMMANDS.has(commandName)) return handleStackerStatsCommand(commandName, ctx);
+  if(STACKERS_COMMANDS.has(commandName)) return handleStackersCommand(commandName, ctx);
   if(MARKET_COMMANDS.has(commandName))  return handleMarketCommand(commandName, ctx);
   if(OCAS_COMMANDS.has(commandName))    return handleOcasCommand(commandName, ctx);
   if(TOKEN_COMMANDS.has(commandName))   return handleTokenCommand(commandName, ctx);
@@ -2163,12 +2235,11 @@ client.on('guildCreate', async (guild)=>{
         '`/setup` — initial configuration wizard\n' +
         '`/config` — manage channels, roles & listing filters\n' +
         '`/synctraits` — manually sync holder trait roles\n' +
-        '`/lotteries` — manage burn lotteries & giveaways\n' +
+        '`/traitfind` — search tokens, listings, or sales by trait\n' +
         '`/help` — full command list\n\n' +
         '**Recommended channel setup:**\n' +
         '`#sales` — auto-posts every sale\n' +
         '`#listings` — auto-posts new listings\n' +
-        '`#burns` — burn machine alerts\n' +
         '`#owner-verification` — wallet verification panel\n\n' +
         '*This bot will never DM members or ask for seed phrases.*'
       )
@@ -2199,6 +2270,38 @@ client.on('guildCreate', async (guild)=>{
       }
     }
   }catch(e){ console.warn('[Welcome]',guild.name,e.message); }
+});
+
+// ── Wipe server-scoped data on kick ───────────────────────────────────────────
+// Confirmed real gap: nothing cleaned up when the bot was removed from a
+// server, so re-inviting it left the entire prior setup (config, roles,
+// trait rules, verification panel) still fully intact -- a re-invited bot
+// looked "already configured" even though the person expected a clean slate.
+// Every table below was confirmed via lib/db.js to actually have a guild_id
+// column, rather than guessed. user_registrations/verification_codes also
+// have 'global' (cross-server, intentionally not guild-scoped) rows mixed
+// in with per-guild ones -- filtering by the real, specific guild.id here
+// naturally never touches those, since they only ever match the literal
+// string 'global', never an actual snowflake ID.
+client.on('guildDelete', async (guild)=>{
+  const gid = guild.id;
+  await deleteConfig(gid);
+  const tables = [
+    'user_alert_configs', 'verification_panels',
+    'trait_roles', 'traitview_links', 'tv_verify_codes',
+    'burn_lotteries', 'generic_lotteries', 'skipped_listing_batches',
+    'user_registrations', 'verification_codes',
+  ];
+  let cleaned = 0;
+  for(const table of tables){
+    try{
+      const res = await pgPool.query(`DELETE FROM ${table} WHERE guild_id=$1`, [gid]);
+      cleaned += res.rowCount || 0;
+    }catch(e){
+      console.warn(`[GuildDelete] Failed to clean ${table} for ${guild.name} (${gid}):`, e.message);
+    }
+  }
+  console.log(`[GuildDelete] Wiped config + ${cleaned} row(s) across ${tables.length + 1} tables for ${guild.name} (${gid})`);
 });
 
 
@@ -2266,13 +2369,76 @@ client.once('clientReady', async ()=>{
   setInterval(saveSaleCursors, 60_000);
   setInterval(saveListingCursors, 60_000);
   // Poll burn events every 2 minutes (blocks ~12s apart, no need to rush)
-  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL){
+  // Gated on OCAS_BURN_POLLER_ENABLED, a genuine, deployment-controlled
+  // flag -- OCAS_CONTRACT itself is hardcoded in lib/constants.js, not
+  // read from an env var at all, so checking it directly would always be
+  // true regardless of which deployment is running. Defaults to enabled
+  // (only disabled by explicitly setting the env var to 'false'), so the
+  // existing OCAS deployment needs zero changes to keep working exactly
+  // as before -- only a new deployment not meant to track OCAS needs to
+  // explicitly opt out.
+  const ocasBurnPollerEnabled = process.env.OCAS_BURN_POLLER_ENABLED !== 'false';
+  if(ocasBurnPollerEnabled && (process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL)){
     console.log('[Burn] Starting burn poller');
     pollBurnEvents();
     setInterval(pollBurnEvents, 30_000);
+  } else if(!ocasBurnPollerEnabled){
+    console.log('[Burn] OCAS_BURN_POLLER_ENABLED=false — burn poller disabled (this deployment isn\'t tracking OCAS)');
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
   }
+  // Stackers live event listener — replaces the two separate 60s polling
+  // intervals that used to run here. Confirmed live tonight that repeated
+  // small-block-range polling genuinely cannot keep pace with this chain's
+  // block rate (~598 blocks/minute against a confirmed 10-block eth_getLogs
+  // cap on this account) without either falling permanently behind or
+  // taking on rate-limit risk uncomfortable for a permanent background
+  // rate. A live WebSocket subscription sidesteps the block-range
+  // limitation entirely rather than continuing to tune around it — the
+  // two pollers below remain in place internally as a much-lower-frequency
+  // safety net, not the primary mechanism anymore.
+  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
+    console.log('[StackersLive] Starting live event listener');
+    startStackersLiveListeners(pgPool).catch(e =>
+      console.error('[StackersLive] Failed to start:', e.message)
+    );
+  } else {
+    console.log('[StackersLive] No ALCHEMY_API_KEY set — live listener disabled');
+  }
+  // Stackers live vault-totals snapshot — replaces the old 24h full
+  // on-chain sweep. This is a pure aggregation of the already-live
+  // stackers_token_status.vault_balances data (kept current via the
+  // Credited/Claimed live event listeners), not a fresh on-chain read at
+  // all -- no RPC cost, so unlike the old sweep this safely runs
+  // immediately on startup too, not just on the interval. 15 minutes gets
+  // the first real accrual comparison available within about that long,
+  // rather than needing up to 48h for two full sweeps under the old
+  // design -- the comparison's actual window (24h lookback, in
+  // getVaultAccrualComparison) is what determines the steady-state
+  // comparison length, not this interval; going faster than this
+  // wouldn't meaningfully improve anything further, just accumulate more
+  // rows for no real benefit, which is why snapshots older than 48h get
+  // pruned automatically inside takeLiveVaultSnapshot itself.
+  // The old full-sweep function (lib/stackers-analytics.js,
+  // takeStackersSnapshot) remains available but is no longer auto-
+  // scheduled -- it's now redundant given live tracking covers the same
+  // ground, and its real RPC cost isn't worth paying automatically anymore
+  // given tonight's confirmed account strain.
+  console.log('[StackersAnalytics] Live vault snapshot job scheduled (every 15min, runs immediately too)');
+  takeLiveVaultSnapshot(pgPool).catch(e =>
+    console.error('[StackersAnalytics] Initial live vault snapshot failed:', e.message)
+  );
+  setInterval(() => {
+    takeLiveVaultSnapshot(pgPool).catch(e =>
+      console.error('[StackersAnalytics] Live vault snapshot failed:', e.message)
+    );
+  }, 15 * 60 * 1000);
+  // Stackers vault-listings refresh — removed. /stackers listings now
+  // reads live: stackers_token_status.vault_balances (kept current via the
+  // Credited/Claimed live event listeners) joined directly against the
+  // listings table (already fresh via the existing sync pipeline). The
+  // periodic full sweep this used to run is no longer needed for this
+  // purpose and was just spending RPC calls on data nothing reads anymore.
   // Process pending burn alerts every 30s — waits for metadata to refresh before posting
   setInterval(processPendingBurnAlerts, 30_000);
   // Only run rank sync on production — staging shares the same codebase but shouldn't consume OS API quota

@@ -1,6 +1,7 @@
 'use strict';
 
 const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
+const { STACKERS_SLUG, formatStackersFields } = require('../lib/stackers');
 const fetch = require('node-fetch');
 
 async function handleTokenCommand(commandName, ctx){
@@ -14,7 +15,7 @@ async function handleTokenCommand(commandName, ctx){
     COLORS, OCAS_CONTRACT, sweepSessions, API_SECRET,
     getTraitIndex, chooseTraitGroupsFromQuery, getRankTierColor, traitGroupsLabel,
     fetchTokenMetaFromDb, buildEmbedPayload, traitObjectToArray,
-    timeSince, shortAddr, formatEth, isDiscordOk,
+    timeSince, shortAddr, formatEth, isDiscordOk, verifyImageIsRaster, extractPngFromSvg,
   } = ctx;
 
   if(commandName==='token'){
@@ -136,13 +137,35 @@ async function handleTokenCommand(commandName, ctx){
       // ── Random fallback ───────────────────────────────────────────────────
       if(!tokenId) tokenId = Math.floor(Math.random()*10000)+1;
 
+      // Fetch OS rank + chain for title badge, rank-tier sidebar color, and
+      // correct-chain image/URL below — one fetch, used for both.
+      const dbMeta  = await fetchTokenMetaFromDb(tokenId, activeCol.slug).catch(()=>null);
+      const tokenChain = dbMeta?.chain || 'ethereum';
+
       // ── Fetch + post image ────────────────────────────────────────────────
       let imgResult = getCachedImage(`${contract}:${tokenId}`);
+      if(!imgResult && dbMeta?.image_url && isDiscordOk(dbMeta.image_url)){
+        // Prefer whatever the backfill already fetched and stored in
+        // tokens.image_url over a live OpenSea call — see the comment in
+        // fetchTokenMetaFromDb for why this matters for non-Ethereum chains.
+        // isDiscordOk alone isn't reliable, though — confirmed live that
+        // Alchemy's own CDN can serve genuine SVG content through a URL
+        // with zero textual indication of that (no .svg extension, no
+        // "image/svg" substring). Verify the real content-type before
+        // trusting the URL directly.
+        const isRaster = await verifyImageIsRaster(dbMeta.image_url);
+        if(isRaster){
+          imgResult = { type:'url', url: dbMeta.image_url };
+        } else {
+          const buf = await extractPngFromSvg(dbMeta.image_url).catch(() => null);
+          if(buf) imgResult = { type:'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+        }
+      }
       if(!imgResult){
-        imgResult = await resolveImage({identifier:String(tokenId)}, contract, 'ethereum');
+        imgResult = await resolveImage({identifier:String(tokenId)}, contract, tokenChain);
         if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
       }
-      const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+      const osUrl = `https://opensea.io/assets/${tokenChain}/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
 
       // Description: trait values + count + rank only, no category labels
@@ -157,8 +180,6 @@ async function handleTokenCommand(commandName, ctx){
       const priceLine   = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${floorPrice >= 1 ? floorPrice.toFixed(3) : floorPrice.toFixed(4)}\n` : '';
       const contextLine = descParts.length ? `${descParts.join(' · ')}\n` : '';
 
-      // Fetch OS rank for title badge + rank-tier sidebar color
-      const dbMeta  = await fetchTokenMetaFromDb(tokenId, activeCol.slug).catch(()=>null);
       const osRank  = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
       const rankBadge = osRank ? ` ⬥${osRank.toLocaleString()}` : '';
       const ocasColor = getRankTierColor(osRank) ?? COLORS.OCAS_BG;
@@ -174,6 +195,11 @@ async function handleTokenCommand(commandName, ctx){
         .setTitle(`OCAS #${tokenId}${rankBadge}`)
         .setColor(ocasColor)
         .setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
+
+      if((activeCol.slug || activeCol.collectionSlug) === STACKERS_SLUG){
+        const stackersFields = await formatStackersFields(tokenId);
+        if(stackersFields.length) embed.addFields(...stackersFields);
+      }
 
       if(imgResult?.type==='buffer'){
         const att=new AttachmentBuilder(imgResult.buffer,{name:imgResult.filename});

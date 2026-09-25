@@ -1,6 +1,7 @@
 'use strict';
 
 const { DEFAULT_LOTTERY_TIMEZONE } = require('../lib/constants');
+const fetch = require('node-fetch');
 
 // ── Address helpers ───────────────────────────────────────────────────────────
 function normAddr(addr){
@@ -109,6 +110,35 @@ function isDiscordOk(url){
   return true;
 }
 
+// Confirmed live: the assumption baked into isDiscordOk above -- that
+// nft2-cdn.alchemy.com/nft3-cdn.alchemy.com always serve pre-rendered raster
+// images "even if URL ends in .svg" -- is not reliably true. Alchemy's CDN
+// can and does serve genuine SVG content through a URL with ZERO textual
+// indication of that at all (no .svg extension, no "image/svg" substring,
+// just a hash-like path) -- isDiscordOk's entire approach is pattern-
+// matching the URL string, which can never catch this, since there's
+// nothing in the URL itself to match against. The only reliable way to know
+// what a URL actually serves is to ask the server. isDiscordOk is still
+// useful as a fast, free first-pass filter (rejects non-http, data URIs,
+// raw markup, obviously-bad .svg links) -- this is the authoritative check
+// for anything that passes it and is about to be used directly, without a
+// render step as a fallback.
+//
+// A HEAD request (no body download) is enough. Falls back to treating a
+// URL as fine if the check itself fails for any reason (network hiccup, no
+// HEAD support) -- avoids losing a genuinely good image over an unrelated
+// verification failure.
+async function verifyImageIsRaster(url){
+  try{
+    const r = await fetch(url, { method: 'HEAD', timeout: 5000 });
+    const contentType = (r.headers.get('content-type') || '').toLowerCase();
+    if(!contentType) return true; // no header to go on — don't block over it
+    return contentType.startsWith('image/') && !contentType.includes('svg');
+  }catch(e){
+    return true;
+  }
+}
+
 // ── Trait filter matching ─────────────────────────────────────────────────────
 function matchesFilters(traits, filters){
   if(!filters || Object.keys(filters).length === 0) return true;
@@ -127,4 +157,5 @@ module.exports = {
   burnLotteryWindowDurationHours, burnLotteryWindowSummary,
   formatBurnLotteryWindow, formatBurnLotteryLocalTime,
   burnLotteryWindowStatusLine, isSvg, isDiscordOk, matchesFilters,
+  verifyImageIsRaster,
 };

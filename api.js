@@ -12,7 +12,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const { OCAS_SLUG, BURN_CONTRACT } = require('./lib/constants');
-const { runMigrations } = require('./lib/db');
+const { runMigrations, fetchAndStoreCollectionTraits } = require('./lib/db');
 
 // Loaded at module level (not lazily inside a route handler) specifically
 // so its setInterval-driven sync loops actually start the moment this
@@ -23,6 +23,9 @@ const { runMigrations } = require('./lib/db');
 // [sync] log lines were ever appearing, on this version or the version
 // before today's rewrite.
 const syncListingsModule = require('./sync-listings');
+const { onboardCollection } = require('./lib/collection-onboard');
+const { fixCollectionImages } = require('./lib/collection-backfill');
+const { takeStackersSnapshot } = require('./lib/stackers-analytics');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -125,7 +128,18 @@ setInterval(() => {
   }
 }, 15 * 60 * 1000);
 
-app.use(express.json());
+// 5mb limit (default is 100kb) -- needed for POST /render/svg-token, which
+// accepts a base64 on-chain SVG data URI in the request body. Confirmed
+// live: a large embedded-PNG on-chain SVG failed with HTTP 431 when sent as
+// a GET query-string parameter (a request line has much tighter length
+// limits than a POST body almost everywhere) -- moving it to a POST body
+// fixes that, but only if the body-size limit is actually large enough to
+// hold it. Raised globally rather than as a second, route-specific
+// express.json() call: Express only reads the request body stream once, so
+// stacking a second json() middleware on top of this global one for a
+// single route risks silently no-op'ing or erroring on an already-consumed
+// stream, not actually widening anything.
+app.use(express.json({ limit: '5mb' }));
 
 // ── CORS — allow the production site, Cloudflare Pages previews, and local/
 // LAN dev testing; reject arbitrary third-party origins from embedding
@@ -219,7 +233,7 @@ app.get('/db/tokens', auth, async (req, res) => {
 app.get('/db/token/:id', auth, async (req, res) => {
   try {
     const tokenId = parseInt(req.params.id);
-    if (!tokenId || tokenId < 1 || tokenId > 10000) {
+    if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) { // generous, collection-agnostic bound — was hardcoded to OCAS's ~10k supply and also rejected token id 0 (breaks 0-indexed collections like CryptoPunks)
       return res.status(400).json({ ok: false, error: 'invalid token id' });
     }
     // Defaults to OCAS when no slug is provided so any caller not yet updated
@@ -230,9 +244,10 @@ app.get('/db/token/:id', auth, async (req, res) => {
     // /traitfind garbled-trait bug.
     const slug = (req.query.slug || OCAS_SLUG).toString();
 
-    const [tokenRes, traitsRes] = await Promise.all([
-      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count FROM tokens WHERE id = $1 AND collection_slug = $2`, [tokenId, slug]),
-      pool.query(`SELECT trait_name, trait_value, COALESCE(trait_index,0) AS trait_index FROM token_traits WHERE token_id = $1 AND collection_slug = $2 ORDER BY COALESCE(trait_index,0), trait_name`, [tokenId, slug])
+    const [tokenRes, traitsRes, collRes] = await Promise.all([
+      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count, image_url FROM tokens WHERE id = $1 AND collection_slug = $2`, [tokenId, slug]),
+      pool.query(`SELECT trait_name, trait_value, COALESCE(trait_index,0) AS trait_index FROM token_traits WHERE token_id = $1 AND collection_slug = $2 ORDER BY COALESCE(trait_index,0), trait_name`, [tokenId, slug]),
+      pool.query(`SELECT contract, chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }))
     ]);
 
     if (!tokenRes.rows.length) return res.status(404).json({ ok: false, error: 'not found' });
@@ -240,6 +255,7 @@ app.get('/db/token/:id', auth, async (req, res) => {
     const t = tokenRes.rows[0];
     const traits = traitsFromRows(traitsRes.rows);
     const actualTraitCount = traits.__attributes?.length || parseInt(t.trait_count || 0);
+    const collInfo = collRes.rows[0] || null;
 
     res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
     res.json({
@@ -251,6 +267,9 @@ app.get('/db/token/:id', auth, async (req, res) => {
         os_score: t.os_score ? parseFloat(t.os_score) : null,
         rarity_score: t.rarity_score != null ? parseFloat(t.rarity_score) : null,
         trait_count: actualTraitCount,
+        image_url: t.image_url || null,
+        chain: collInfo?.chain || null,
+        contract: collInfo?.contract || null,
         traits
       }
     });
@@ -350,6 +369,1427 @@ app.get('/db/listings/sync', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/collections/onboard — full onboarding for a brand-new collection ──
+// Resolves the slug via OpenSea, validates it (rejects disabled/NSFW/non-
+// Ethereum/non-erc721 collections), creates the registry row, then runs
+// trait/image backfill followed by the market history seed in sequence.
+// Runs in background; poll /db/collections to watch status move through
+// pending -> backfilling_traits -> backfilling_market -> ready/failed.
+//
+// Admin-only, gated by a SEPARATE secret from the regular API key — that
+// key is already embedded in TraitView's public frontend JS (visible via
+// devtools), so it can't provide real gating for something that kicks off
+// OpenSea/Alchemy-heavy work. ADMIN_ONBOARD_SECRET must be set on Railway
+// and never given to the frontend; trigger manually (browser URL bar or
+// curl) until there's a considered decision to open this up more broadly.
+const ADMIN_ONBOARD_SECRET = process.env.ADMIN_ONBOARD_SECRET;
+app.get('/db/collections/onboard', async (req, res) => {
+  try {
+    if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+      return res.status(403).json({ ok: false, error: 'forbidden' });
+    }
+    const slug = String(req.query.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    res.json({ ok: true, message: `Onboarding started for "${slug}" — running in background, poll /db/collections to watch status` });
+    onboardCollection(pool, slug).catch(e => {
+      console.error(`[/db/collections/onboard] ${slug} failed:`, e.message);
+    });
+  } catch(e) {
+    console.error('/db/collections/onboard error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/:slug/sync-trait-index — populate collection_traits only ──
+// For collections onboarded before onboardCollection started calling this
+// automatically. Pulls trait-frequency stats directly from OpenSea's own
+// /v2/traits/{slug} endpoint (a separate data source from token_traits/
+// Alchemy) — this is specifically what /traitfind's dropdown depends on for
+// non-OCAS collections. Cheap and fast compared to a full re-backfill.
+app.get('/db/collections/:slug/sync-trait-index', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+    // This used to always report ok:true regardless of whether the OpenSea
+    // fetch actually succeeded, since fetchAndStoreCollectionTraits swallowed
+    // every error internally and returned nothing — making this endpoint
+    // useless as an actual diagnostic. It now returns what really happened.
+    const result = await fetchAndStoreCollectionTraits(slug, pool);
+    const countRes = await pool.query(`SELECT COUNT(*)::int AS n FROM collection_traits WHERE slug=$1`, [slug]).catch(()=>({rows:[{n:0}]}));
+    res.json({
+      ok: !!result.ok,
+      slug,
+      reason: result.reason || null,
+      opensea_status: result.status || null,
+      rows_in_collection_traits: countRes.rows[0]?.n || 0,
+      message: result.ok
+        ? `Trait index sync succeeded for "${slug}" — check /db/trait-index?slug=${slug} to confirm`
+        : `Trait index sync did NOT populate data for "${slug}": ${result.reason || 'unknown reason'}`,
+    });
+  } catch(e) {
+    console.error(`/db/collections/${req.params.slug}/sync-trait-index error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/:slug/fix-images — re-verify images for a non-Ethereum
+// collection backfilled before writePage started always checking non-Ethereum
+// images against the real on-chain source. One-time correction pass; skips
+// traits entirely (those are already correct). Runs in the background —
+// iterates every token individually, so this takes a while for a large
+// collection. Check server logs for progress.
+app.get('/db/collections/:slug/fix-images', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    const collRes = await pool.query(`SELECT slug, contract, chain FROM collections WHERE slug = $1`, [slug]);
+    if (!collRes.rows.length) {
+      return res.status(404).json({ ok: false, error: `No collections row for slug "${slug}"` });
+    }
+
+    res.json({ ok: true, message: `Image fix started for "${slug}" — running in background, check server logs for progress` });
+    fixCollectionImages(pool, collRes.rows[0]).catch(e => {
+      console.error(`[/db/collections/${slug}/fix-images] background fix failed:`, e.message);
+    });
+  } catch(e) {
+    console.error(`/db/collections/${req.params.slug}/fix-images error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/snapshot — manually trigger a Stackers analytics
+// snapshot. The scheduled job (bot.js) only runs once every 24h on purpose
+// — it iterates every token and takes real minutes, so it deliberately
+// doesn't run on every bot restart. Without a manual trigger there'd be no
+// way to actually test /stackerstats until a full day had passed. Runs in
+// the background — check server logs for progress ([StackersAnalytics] lines).
+app.get('/db/stackers/snapshot', auth, async (req, res) => {
+  try {
+    res.json({ ok: true, message: 'Stackers snapshot started — running in background, check server logs ([StackersAnalytics] lines) for progress' });
+    takeStackersSnapshot(pool).catch(e => {
+      console.error('[/db/stackers/snapshot] background snapshot failed:', e.message);
+    });
+  } catch(e) {
+    console.error('/db/stackers/snapshot error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/backfill-image-cache — proactively caches every
+// Stacker token's image, so /download can serve from Postgres instead of
+// a live IPFS fetch on every request. Safe to re-run — skips tokens
+// already cached. Runs in the background, same pattern as the snapshot
+// trigger; check server logs ([StackersImageCache] lines) for progress.
+app.get('/db/stackers/backfill-image-cache', auth, async (req, res) => {
+  try {
+    const { backfillStackerImageCache } = require('./lib/stackers-image-cache');
+    res.json({ ok: true, message: 'Stackers image cache backfill started — running in background, check server logs ([StackersImageCache] lines) for progress' });
+    backfillStackerImageCache(pool).catch(e => {
+      console.error('[/db/stackers/backfill-image-cache] background backfill failed:', e.message);
+    });
+  } catch(e) {
+    console.error('/db/stackers/backfill-image-cache error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/backfill-token-status — one-time seed for the
+// event-driven tier/active/split cache. The status poller only tracks
+// changes going forward from whenever it first starts; tokens already
+// activated/tiered/split before that need this initial full read once.
+// Deliberately skips vault balance entirely (getStackerStatusOnly, not
+// getStackerInfo), so this is meaningfully faster than the full analytics
+// snapshot. Safe to re-run — only touches tokens not already in the cache.
+app.get('/db/stackers/backfill-token-status', auth, async (req, res) => {
+  try {
+    const { backfillTokenStatus } = require('./lib/stackers-status-poller');
+    const force = req.query.force === 'true';
+    res.json({ ok: true, message: `Stackers token-status backfill started${force ? ' (force mode)' : ''} — running in background, check server logs ([StackersStatus] lines) for progress` });
+    backfillTokenStatus(pool, force).catch(e => {
+      console.error('[/db/stackers/backfill-token-status] background backfill failed:', e.message);
+    });
+  } catch(e) {
+    console.error('/db/stackers/backfill-token-status error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/backfill-vault-balances — one-time seed for vault
+// balance specifically, kept separate from the tier/status backfill above.
+// The live listener (Credited/Claimed events) only tracks changes going
+// forward; tokens with existing balance before it first started need this
+// initial read once. Safe to re-run — skips tokens that already have
+// vault_balances populated unless ?force=true.
+app.get('/db/stackers/backfill-vault-balances', auth, async (req, res) => {
+  try {
+    const { backfillVaultBalances } = require('./lib/stackers-status-poller');
+    const force = req.query.force === 'true';
+    res.json({ ok: true, message: `Stackers vault-balance backfill started${force ? ' (force mode)' : ''} — running in background, check server logs ([StackersStatus] lines) for progress` });
+    backfillVaultBalances(pool, force).catch(e => {
+      console.error('[/db/stackers/backfill-vault-balances] background backfill failed:', e.message);
+    });
+  } catch(e) {
+    console.error('/db/stackers/backfill-vault-balances error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/take-vault-snapshot — manually trigger a live vault
+// snapshot. Unlike the other backfill triggers, this is a pure aggregation
+// of already-live data (no on-chain reads at all), so it's essentially
+// instant -- returns the actual snapshot result directly rather than
+// running in the background, since there's no meaningful wait involved.
+app.get('/db/stackers/take-vault-snapshot', auth, async (req, res) => {
+  try {
+    const { takeLiveVaultSnapshot } = require('./lib/stackers-analytics');
+    const totals = await takeLiveVaultSnapshot(pool);
+    res.json({ ok: true, vaultTotals: totals });
+  } catch(e) {
+    console.error('/db/stackers/take-vault-snapshot error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/wallet-full-status-debug/:wallet — full tier/active/
+// split/vault detail for every Stacker a wallet holds, not just vault
+// totals. Reuses getHeldTokenIds (a single OpenSea call, not Alchemy RPC)
+// for the real, current owner list, then pulls per-token detail from the
+// already-live stackers_token_status data -- no on-chain reads for that
+// part at all. Built for strategy planning, where knowing each token's
+// current tier/active state (not just its vault balance) is what actually
+// matters for deciding what to burn or stake next.
+app.get('/db/stackers/wallet-full-status-debug/:wallet', auth, async (req, res) => {
+  try {
+    const wallet = req.params.wallet;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(wallet)) return res.status(400).json({ ok: false, error: 'valid wallet address required' });
+
+    const { getHeldTokenIds } = require('./lib/stackers-wallet-vault');
+    const tokenIds = await getHeldTokenIds(wallet.toLowerCase());
+
+    if(!tokenIds.length){
+      return res.json({ ok: true, wallet, tokenCount: 0, tokens: [] });
+    }
+
+    const statusRes = await pool.query(
+      `SELECT token_id, tier_index, is_active, split, vault_balances FROM stackers_token_status WHERE token_id = ANY($1)`,
+      [tokenIds]
+    );
+    const statusByToken = new Map(statusRes.rows.map(r => [r.token_id, r]));
+
+    const TIER_MULTIPLIERS = [1.0, 1.4, 1.9, 2.5, 3.5]; // confirmed from Stackers' own docs table, indexed by tier_index
+
+    const tokens = tokenIds.map(tokenId => {
+      const status = statusByToken.get(tokenId);
+      if(!status){
+        return { tokenId, hasStatusData: false };
+      }
+      return {
+        tokenId,
+        hasStatusData: true,
+        isActive: status.is_active,
+        tierIndex: status.tier_index,
+        multiplier: status.tier_index !== null ? TIER_MULTIPLIERS[status.tier_index] : null,
+        split: status.split,
+        vaultBalances: status.vault_balances,
+      };
+    });
+
+    res.json({ ok: true, wallet, tokenCount: tokenIds.length, tokens });
+  } catch(e) {
+    console.error(`/db/stackers/wallet-full-status-debug/${req.params.wallet} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/round-history-debug — real recorded RoundSettled
+// data, as it accumulates via the live listener. Exists to verify this is
+// actually working and building up real history, and to give a quick
+// sanity check on the numbers (average pot/weight) rather than needing to
+// query the table directly.
+app.get('/db/stackers/round-history-debug', auth, async (req, res) => {
+  try {
+    const { getRecentRoundHistory } = require('./lib/stackers-analytics');
+    const hours = parseInt(req.query.hours, 10) || 24;
+    const rows = await getRecentRoundHistory(pool, hours);
+
+    let avgPotWei = null, avgWeight = null;
+    if(rows.length){
+      const totalPot = rows.reduce((sum, r) => sum + BigInt(r.pot_wei), 0n);
+      const totalWeight = rows.reduce((sum, r) => sum + BigInt(r.total_weight), 0n);
+      avgPotWei = (totalPot / BigInt(rows.length)).toString();
+      avgWeight = (totalWeight / BigInt(rows.length)).toString();
+    }
+
+    res.json({
+      ok: true,
+      hoursRequested: hours,
+      roundsRecorded: rows.length,
+      averagePotWei: avgPotWei,
+      averageTotalWeight: avgWeight,
+      rounds: rows,
+    });
+  } catch(e) {
+    console.error('/db/stackers/round-history-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/engine-assets-debug — lists every asset the engine
+// currently knows about (assetCount + assets(idx) for each index), and
+// separately what's actually showing up in the live tier/asset cache's
+// split data. Distinguishes "a real asset exists that isn't showing" from
+// "an asset was added to the engine but no token has chosen it in their
+// split yet" — asset popularity counts chosen splits, not the engine's
+// available list, so those are two genuinely different things.
+app.get('/db/stackers/engine-assets-debug', auth, async (req, res) => {
+  try {
+    const { getContracts, resolveAsset, getProvider } = require('./lib/stackers');
+    const { engine } = getContracts();
+    const provider = getProvider();
+
+    const count = Number(await engine.assetCount());
+    const engineAssets = [];
+    for(let i = 0; i < count; i++){
+      const raw = await engine.assets(i);
+      const token1 = raw[0];
+      const isStock = raw[raw.length - 1];
+      const { symbol } = await resolveAsset(token1, provider).catch(() => ({ symbol: `unknown(${token1})` }));
+      engineAssets.push({
+        idx: i,
+        symbol,
+        isStock,
+        raw: raw.map(v => v?.toString?.() ?? v), // full raw tuple, for verifying field order if the interpreted symbol/isStock look wrong
+      });
+    }
+
+    const cachedRes = await pool.query(`SELECT split FROM stackers_token_status WHERE split IS NOT NULL`);
+    const chosenSymbols = new Set();
+    for(const row of cachedRes.rows){
+      for(const s of (row.split || [])){
+        if(s?.symbol) chosenSymbols.add(s.symbol);
+      }
+    }
+
+    res.json({
+      ok: true,
+      engineAssetCount: count,
+      engineAssets,
+      symbolsChosenByAnyToken: Array.from(chosenSymbols).sort(),
+      registeredButNeverChosen: engineAssets.map(a => a.symbol).filter(s => !chosenSymbols.has(s)),
+    });
+  } catch(e) {
+    console.error('/db/stackers/engine-assets-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/token-split-debug/:tokenId — raw splitOf() and
+// vault balance for one specific token, unresolved where symbol lookup
+// might fail silently. Exists because a real, personally-confirmed case
+// (actively earning STACK) contradicted the engine-assets-debug picture
+// (STACK not registered as asset idx 0-12) even on a fresh recheck --
+// rather than guess further, this looks at the actual raw data for a
+// specific token directly.
+app.get('/db/stackers/token-split-debug/:tokenId', auth, async (req, res) => {
+  try {
+    const tokenId = parseInt(req.params.tokenId, 10);
+    if(!tokenId) return res.status(400).json({ ok: false, error: 'valid tokenId required' });
+    const { getContracts, resolveAsset, getProvider } = require('./lib/stackers');
+    const { engine, vault } = getContracts();
+    const provider = getProvider();
+
+    const splitRaw = await engine.splitOf(tokenId);
+    const [assetIdxs, weightsBps, count] = splitRaw;
+    const splitDetail = [];
+    for(let i = 0; i < Number(count); i++){
+      const idx = Number(assetIdxs[i]);
+      let symbol = null, tokenAddress = null, resolveError = null;
+      try{
+        tokenAddress = await vault.assetToken(idx);
+        const resolved = await resolveAsset(tokenAddress, provider);
+        symbol = resolved.symbol;
+      }catch(e){
+        resolveError = e.message;
+      }
+      splitDetail.push({ assetIdx: idx, weightBps: Number(weightsBps[i]), symbol, tokenAddress, resolveError });
+    }
+
+    const balancesRaw = await vault.balancesOf(tokenId);
+    const [balanceTokens, balanceAmounts] = balancesRaw;
+    const balanceDetail = [];
+    for(let i = 0; i < balanceTokens.length; i++){
+      if(balanceAmounts[i] === 0n) continue;
+      let symbol = null;
+      try{
+        const resolved = await resolveAsset(balanceTokens[i], provider);
+        symbol = resolved.symbol;
+      }catch{}
+      balanceDetail.push({ tokenAddress: balanceTokens[i], symbol, amountRaw: balanceAmounts[i].toString() });
+    }
+
+    res.json({
+      ok: true,
+      tokenId,
+      rawSplitCount: Number(count),
+      splitDetail,
+      nonZeroVaultBalances: balanceDetail,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/token-split-debug/${req.params.tokenId} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/token-history-debug/:tokenId — a mobile-friendly
+// alternative to reading a block explorer directly. Searches recent
+// SplitSet events for one specific token, returning clean JSON: what was
+// actually set, when, and the transaction hash for independent
+// verification. Confirmed 10-block eth_getLogs cap on this account means a
+// deep lookback needs many sequential calls -- defaults to a bounded
+// window that should complete within a normal request rather than timing
+// out, and reports the actual block/time range covered so a "nothing
+// found" result is interpretable (genuinely never happened vs. simply
+// outside the window searched), not just a blind yes/no. ?blocks= can
+// widen the window if the default isn't deep enough.
+// (redeploy-trigger marker: forcing a fresh commit after two prior pushes
+// apparently didn't trigger Railway's auto-deploy webhook)
+app.get('/db/stackers/token-history-debug/:tokenId', auth, async (req, res) => {
+  try {
+    const tokenId = parseInt(req.params.tokenId, 10);
+    if(!tokenId) return res.status(400).json({ ok: false, error: 'valid tokenId required' });
+    const lookback = Math.min(parseInt(req.query.blocks, 10) || 1500, 5000);
+
+    const { getContracts, getProvider } = require('./lib/stackers');
+    const { engine } = getContracts();
+    const provider = getProvider();
+
+    const latest = await provider.getBlockNumber();
+    const fromBlock = Math.max(0, latest - lookback);
+
+    const [latestBlockInfo, fromBlockInfo] = await Promise.all([
+      provider.getBlock(latest),
+      provider.getBlock(fromBlock),
+    ]);
+    const hoursSpanned = ((latestBlockInfo.timestamp - fromBlockInfo.timestamp) / 3600).toFixed(1);
+
+    const CHUNK = 10; // confirmed cap on this account
+    const events = [];
+    for(let start = fromBlock; start <= latest; start += CHUNK){
+      const end = Math.min(start + CHUNK - 1, latest);
+      const chunkEvents = await engine.queryFilter(engine.filters.SplitSet(tokenId), start, end);
+      events.push(...chunkEvents);
+    }
+
+    const eventDetail = await Promise.all(events.map(async e => {
+      const block = await provider.getBlock(e.blockNumber);
+      return {
+        blockNumber: e.blockNumber,
+        timestamp: new Date(block.timestamp * 1000).toISOString(),
+        count: Number(e.args.count),
+        txHash: e.transactionHash,
+        explorerUrl: `https://robinhoodchain.blockscout.com/tx/${e.transactionHash}`,
+      };
+    }));
+
+    res.json({
+      ok: true,
+      tokenId,
+      searchedBlocks: `${fromBlock}-${latest}`,
+      approxHoursSpanned: hoursSpanned,
+      splitSetEventsFound: eventDetail.length,
+      events: eventDetail,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/token-history-debug/${req.params.tokenId} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/block-time-debug — precise seconds-per-block for
+// Robinhood Chain. Exists because token-history-debug's default 1500-block
+// lookback came back approxHoursSpanned: 0.0 live -- meaning this chain
+// produces blocks much faster than assumed when that default was picked,
+// and that search was nowhere near deep enough to be conclusive. Uses a
+// wide, well-separated sample (10,000 blocks apart) for an accurate
+// average rather than local variance from just two adjacent blocks.
+app.get('/db/stackers/block-time-debug', auth, async (req, res) => {
+  try {
+    const { getProvider } = require('./lib/stackers');
+    const provider = getProvider();
+
+    const latest = await provider.getBlockNumber();
+    const sampleBack = 10000;
+    const earlier = Math.max(0, latest - sampleBack);
+
+    const [latestBlock, earlierBlock] = await Promise.all([
+      provider.getBlock(latest),
+      provider.getBlock(earlier),
+    ]);
+
+    const blockSpan = latest - earlier;
+    const secondsSpan = latestBlock.timestamp - earlierBlock.timestamp;
+    const secondsPerBlock = secondsSpan / blockSpan;
+    const blocksPerHour = 3600 / secondsPerBlock;
+
+    res.json({
+      ok: true,
+      sampledBlocks: `${earlier}-${latest}`,
+      secondsSpan,
+      secondsPerBlock: secondsPerBlock.toFixed(3),
+      blocksPerHour: Math.round(blocksPerHour),
+      blocksNeededFor12Hours: Math.round(blocksPerHour * 12),
+      blocksNeededFor24Hours: Math.round(blocksPerHour * 24),
+    });
+  } catch(e) {
+    console.error('/db/stackers/block-time-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/wallet-tx-debug/:wallet — a wallet's recent
+// transactions to the Stackers engine contract, via Blockscout's own
+// indexed API rather than scanning raw blocks via RPC. Exists because
+// token-history-debug's RPC approach turned out completely impractical on
+// this chain (block-time-debug confirmed ~0.1s/block, meaning a real
+// 12-hour search would need 40,000+ sequential eth_getLogs calls at the
+// confirmed 10-block cap) -- Blockscout's API is a pre-built, indexed
+// database, a genuinely different mechanism that doesn't have this
+// problem at all. Tries the modern v2 API first, falls back to the
+// legacy etherscan-compatible format if that fails, since it's genuinely
+// unconfirmed which this specific instance supports.
+app.get('/db/stackers/wallet-tx-debug/:wallet', auth, async (req, res) => {
+  try {
+    const wallet = req.params.wallet;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(wallet)) return res.status(400).json({ ok: false, error: 'valid wallet address required' });
+    const { ENGINE_ADDRESS } = require('./lib/stackers');
+    const engineAddr = ENGINE_ADDRESS.toLowerCase();
+
+    let source = null;
+    let allTxs = [];
+
+    // Try the modern v2 API first
+    try{
+      const v2Url = `https://robinhoodchain.blockscout.com/api/v2/addresses/${wallet}/transactions`;
+      const r = await fetch(v2Url, { headers: { 'Accept': 'application/json' } });
+      if(r.ok){
+        const data = await r.json();
+        if(Array.isArray(data.items)){
+          source = 'v2';
+          allTxs = data.items.map(tx => ({
+            hash: tx.hash,
+            to: (tx.to?.hash || '').toLowerCase(),
+            timestamp: tx.timestamp,
+            status: tx.status,
+            methodCalled: tx.method || null,
+          }));
+        }
+      }
+    }catch{}
+
+    // Fall back to the legacy etherscan-compatible format
+    if(!source){
+      const legacyUrl = `https://robinhoodchain.blockscout.com/api?module=account&action=txlist&address=${wallet}&sort=desc`;
+      const r = await fetch(legacyUrl, { headers: { 'Accept': 'application/json' } });
+      if(r.ok){
+        const data = await r.json();
+        if(Array.isArray(data.result)){
+          source = 'legacy';
+          allTxs = data.result.map(tx => ({
+            hash: tx.hash,
+            to: (tx.to || '').toLowerCase(),
+            timestamp: new Date(Number(tx.timeStamp) * 1000).toISOString(),
+            status: tx.isError === '1' ? 'error' : 'ok',
+            methodCalled: tx.methodId || null,
+          }));
+        }
+      }
+    }
+
+    if(!source){
+      return res.status(502).json({ ok: false, error: 'Neither Blockscout API format returned usable data — may need to check the site directly' });
+    }
+
+    const txsToEngine = allTxs
+      .filter(tx => tx.to === engineAddr)
+      .slice(0, 20)
+      .map(tx => ({ ...tx, explorerUrl: `https://robinhoodchain.blockscout.com/tx/${tx.hash}` }));
+
+    res.json({
+      ok: true,
+      wallet,
+      apiSource: source,
+      totalTxsReturned: allTxs.length,
+      txsToEngineContract: txsToEngine,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/wallet-tx-debug/${req.params.wallet} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/contract-abi-debug/:address — fetches the actual
+// verified ABI from Blockscout for a given contract, rather than guessing
+// a struct's field layout from raw undecoded bytes. Exists specifically
+// because the new engine's assets() call returned real data that our old
+// ABI's expected 8-field struct couldn't decode -- Stackers' docs mark
+// this contract as "(live, verified)," so the real, authoritative
+// structure should be fetchable directly instead of reverse-engineered.
+app.get('/db/stackers/contract-abi-debug/:address', auth, async (req, res) => {
+  try {
+    const address = req.params.address;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(address)) return res.status(400).json({ ok: false, error: 'valid contract address required' });
+
+    let source = null;
+    let abi = null;
+    const attempts = [];
+    let abiAddress = address; // may get reassigned to a resolved proxy implementation below
+
+    async function tryFetchAbi(addr){
+      // Modern v2 API first
+      try{
+        const v2Url = `https://robinhoodchain.blockscout.com/api/v2/smart-contracts/${addr}`;
+        const r = await fetch(v2Url, { headers: { 'Accept': 'application/json' } });
+        const bodyText = await r.text();
+        attempts.push({ format: 'v2', url: v2Url, status: r.status, bodyPreview: bodyText.slice(0, 500) });
+        if(r.ok){
+          const data = JSON.parse(bodyText);
+          if(data.abi) return { source: 'v2', abi: data.abi };
+        }
+      }catch(e){
+        attempts.push({ format: 'v2', error: e.message });
+      }
+      // Legacy etherscan-compatible format
+      try{
+        const legacyUrl = `https://robinhoodchain.blockscout.com/api?module=contract&action=getabi&address=${addr}`;
+        const r = await fetch(legacyUrl, { headers: { 'Accept': 'application/json' } });
+        const bodyText = await r.text();
+        attempts.push({ format: 'legacy', url: legacyUrl, status: r.status, bodyPreview: bodyText.slice(0, 500) });
+        if(r.ok){
+          const data = JSON.parse(bodyText);
+          if(data.status === '1' && data.result) return { source: 'legacy', abi: JSON.parse(data.result) };
+        }
+      }catch(e){
+        attempts.push({ format: 'legacy', error: e.message });
+      }
+      return null;
+    }
+
+    let result = await tryFetchAbi(address);
+
+    // Direct ABI fetch failed — check if this is an EIP-1967 proxy before
+    // giving up. Confirmed live on the new Stackers NFT contract: Blockscout
+    // reports "not verified" and the v2 API returns raw proxy bytecode
+    // (references the proxiableUUID() selector 0x52d1902d -- a UUPS-specific
+    // function; earlier called this "implementation()" in error, a wrong
+    // selector name, though the storage slot checked below is correct
+    // regardless of the mislabel) instead of an ABI. The implementation
+    // address lives in a standard, well-known storage slot regardless of
+    // verification status -- reading it directly via eth_getStorageAt
+    // doesn't depend on Blockscout having indexed/linked the proxy at all.
+    // Also checks the EIP-1967 BEACON slot as a fallback, in case this is a
+    // beacon proxy (implementation address stored on a separate beacon
+    // contract) rather than a direct-implementation proxy.
+    //
+    // Confirmed real bug in an earlier version of this check: the
+    // diagnostic attempt was only ever logged in the SUCCESS branch, so a
+    // failure for ANY reason (missing ALCHEMY_KEY on this specific
+    // deployment, an RPC error, or a genuinely zero slot) left zero trace
+    // in the response -- impossible to tell which of those actually
+    // happened. Now logs unconditionally regardless of outcome.
+    let resolvedImplementation = null;
+    if(!result){
+      const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+      if(!ALCHEMY_KEY){
+        attempts.push({ format: 'eip1967-proxy-detect', skipped: true, reason: 'No ALCHEMY_API_KEY/ALCHEMY_KEY set on this deployment' });
+      } else {
+        const SLOTS = {
+          implementation: '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc',
+          beacon:         '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50',
+        };
+        const rpcUrl = `https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+        for(const [slotName, slot] of Object.entries(SLOTS)){
+          if(resolvedImplementation) break;
+          try{
+            const r = await fetch(rpcUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getStorageAt', params: [address, slot, 'latest'] }),
+            });
+            const j = await r.json();
+            const slotValue = j.result;
+            const isZero = !slotValue || slotValue === '0x' + '0'.repeat(64);
+            attempts.push({ format: 'eip1967-proxy-detect', slotChecked: slotName, slot, httpStatus: r.status, rpcError: j.error || null, slotValue, isZero });
+            if(!isZero){
+              const candidate = '0x' + slotValue.slice(-40);
+              // The beacon slot points at a BEACON contract, not the
+              // implementation itself — the beacon exposes its own
+              // implementation() to look up the real target.
+              if(slotName === 'beacon'){
+                const beaconR = await fetch(rpcUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: candidate, data: '0x5c60da1b' }, 'latest'] }),
+                });
+                const beaconJ = await beaconR.json();
+                attempts.push({ format: 'eip1967-proxy-detect', beaconAddress: candidate, beaconCallResult: beaconJ.result, beaconCallError: beaconJ.error || null });
+                if(beaconJ.result && beaconJ.result !== '0x') resolvedImplementation = '0x' + beaconJ.result.slice(-40);
+              } else {
+                resolvedImplementation = candidate;
+              }
+            }
+          }catch(e){
+            attempts.push({ format: 'eip1967-proxy-detect', slotChecked: slotName, error: e.message });
+          }
+        }
+        if(resolvedImplementation){
+          result = await tryFetchAbi(resolvedImplementation);
+          if(result) abiAddress = resolvedImplementation;
+        }
+      }
+    }
+
+    if(result){ source = result.source; abi = result.abi; }
+
+    if(!source){
+      return res.status(502).json({
+        ok: false,
+        error: resolvedImplementation
+          ? `Detected EIP-1967 proxy pointing to ${resolvedImplementation}, but could not fetch a verified ABI for that implementation address either`
+          : 'Could not fetch a verified ABI from either Blockscout API format, and this does not appear to be a standard EIP-1967 proxy',
+        resolvedImplementation,
+        attempts,
+      });
+    }
+
+    // Default: just the assets-related functions/events, to keep this
+    // readable — the full ABI can be large and most of it isn't relevant
+    // for most checks. ?eventsOnly=true instead returns every event the
+    // contract emits, unfiltered by name — needed to see the real full
+    // picture (e.g. checking for vault-balance-related events) rather than
+    // guessing which name patterns might be relevant. ?functionsOnly=true
+    // is the same idea for functions — needed to check whether specific
+    // functions our code calls (tierBurned, isActive, splitOf, balancesOf)
+    // still exist with matching signatures on a migrated contract, not
+    // just ones with "asset"/"split" in the name.
+    let relevant;
+    if(req.query.eventsOnly === 'true'){
+      relevant = abi.filter(item => item.type === 'event');
+    } else if(req.query.functionsOnly === 'true'){
+      relevant = abi.filter(item => item.type === 'function');
+    } else {
+      relevant = abi.filter(item =>
+        (item.name || '').toLowerCase().includes('asset') || (item.name || '').toLowerCase().includes('split')
+      );
+    }
+
+    res.json({
+      ok: true,
+      address,
+      abiFetchedFrom: abiAddress,
+      wasProxy: abiAddress !== address,
+      apiSource: source,
+      fullAbiLength: abi.length,
+      relevantEntries: relevant,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/contract-abi-debug/${req.params.address} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/raw-logs-check/:address — checks which of our expected
+// event signatures actually appear in real, on-chain event logs, entirely
+// independent of Blockscout's verification status. Confirmed live: BOTH the
+// new Stackers NFT proxy and its resolved implementation are unverified on
+// Blockscout, a dead end for the ABI-fetch approach above. Logs are always
+// emitted under the calling (proxy) address regardless of delegatecall, so
+// querying eth_getLogs against the proxy address directly and comparing the
+// real topic0 values against our own code's expected event signatures
+// answers the actual question ("does this event still exist, unchanged")
+// without needing any verified source at all.
+app.get('/db/stackers/raw-logs-check/:address', auth, async (req, res) => {
+  try {
+    const address = req.params.address;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(address)) return res.status(400).json({ ok: false, error: 'valid contract address required' });
+
+    const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    if(!ALCHEMY_KEY) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY' });
+    const rpcUrl = `https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+
+    async function rpc(method, params){
+      const r = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+      const j = await r.json();
+      if(j.error) throw new Error(`${method} RPC error: ${JSON.stringify(j.error)}`);
+      return j.result;
+    }
+
+    // Signature -> topic0, computed fresh here rather than hardcoded, so
+    // this stays correct if our own ABI ever changes independent of this
+    // endpoint. Covers the event names our pollers actually depend on
+    // across both the NFT and engine contracts — same check works for
+    // either address.
+    // Only signatures we can actually stand behind: Activated/Deactivated/
+    // TierUpgraded are what this check is FOR (unconfirmed on the new NFT
+    // contract, which is the whole point). SplitSet and RoundSettled are
+    // included as a control/sanity-check -- both already confirmed present
+    // on the new engine via the real ABI fetch earlier, so seeing them
+    // match here (when checking the engine address) validates that this
+    // raw-log method itself works correctly, not just guessing blind.
+    // Deliberately NOT including Merged/Credited/Claimed -- those are
+    // confirmed ABSENT from the new engine's real ABI already, and I never
+    // had the OLD contract's actual signatures to compute a meaningful
+    // topic0 for them in the first place, so a guessed signature here would
+    // just be noise, not a real check.
+    const EXPECTED_EVENTS = {
+      'Activated(uint256,address,uint256)':  null,
+      'Deactivated(uint256)':                null,
+      'TierUpgraded(uint256,uint8,uint256)': null,
+      'SplitSet(uint256,uint8)':             null,
+      'RoundSettled(uint256,uint256,uint256)': null,
+    };
+    const { id: ethersId } = require('ethers'); // this project uses ethers v6 (confirmed via package.json) -- id() computes keccak256(toUtf8Bytes(sig)) in one call, the v6-native equivalent of v5's utils.id()
+    for(const sig of Object.keys(EXPECTED_EVENTS)){
+      EXPECTED_EVENTS[sig] = ethersId(sig);
+    }
+
+    const latestHex = await rpc('eth_blockNumber', []);
+    const latestBlock = parseInt(latestHex, 16);
+
+    // Robinhood Chain runs ~10 blocks/sec per its own docs, so recent
+    // windows cover meaningful wall-clock time without needing to scan the
+    // entire history. Tries a few windows, widening if nothing turns up,
+    // capped to stay well under typical eth_getLogs range limits (commonly
+    // ~10-50k blocks per call depending on provider).
+    const WINDOWS = [10000, 50000, 200000];
+    const foundTopics = new Set();
+    const windowsChecked = [];
+    for(const windowSize of WINDOWS){
+      const fromBlock = Math.max(0, latestBlock - windowSize);
+      const logs = await rpc('eth_getLogs', [{
+        address, fromBlock: '0x' + fromBlock.toString(16), toBlock: latestHex,
+      }]);
+      for(const log of logs) foundTopics.add(log.topics[0]);
+      windowsChecked.push({ windowSize, fromBlock, toBlock: latestBlock, logsFound: logs.length });
+      if(logs.length > 0) break; // no need to widen further once we've seen real activity
+    }
+
+    const matches = {};
+    for(const [sig, topic0] of Object.entries(EXPECTED_EVENTS)){
+      matches[sig] = { topic0, seenInLogs: foundTopics.has(topic0) };
+    }
+
+    res.json({
+      ok: true,
+      address,
+      latestBlock,
+      windowsChecked,
+      totalUniqueTopicsSeen: foundTopics.size,
+      allTopicsSeen: [...foundTopics],
+      expectedEventMatches: matches,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/raw-logs-check/${req.params.address} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/raw-function-probe/:address — checks whether specific
+// functions our code actually calls still exist with matching signatures,
+// entirely independent of Blockscout's verification status (same reasoning
+// as raw-logs-check above, applied to function calls instead of events).
+// Confirmed live: the new Stackers NFT proxy AND its resolved implementation
+// are both unverified on Blockscout, so this is the only way to check
+// whether tierBurned/isActive/splitOf/balancesOf still work before
+// completing the address migration -- a function call reverting outright
+// (not just returning different data) would be a much worse failure mode
+// than the event-name changes already confirmed on the engine, since these
+// specific functions are what the Stackers analytics snapshot job
+// (lib/stackers-analytics.js, runs every 15 min) actually depends on for
+// every stat it produces.
+app.get('/db/stackers/raw-function-probe/:address', auth, async (req, res) => {
+  try {
+    const address = req.params.address;
+    if(!/^0x[0-9a-fA-F]{40}$/.test(address)) return res.status(400).json({ ok: false, error: 'valid contract address required' });
+
+    const tokenId = req.query.tokenId || '1';
+    const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    if(!ALCHEMY_KEY) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY' });
+    const rpcUrl = `https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+
+    const { Interface } = require('ethers'); // v6 (confirmed via package.json) -- Interface.encodeFunctionData/decodeFunctionResult verified working locally before deploying this
+
+    // Exact signatures pulled directly from our own existing ABI files
+    // (lib/stackers-abis/nft.json, engine.json, vault.json) -- confirmed
+    // each selector two independent ways (pycryptodome keccak256 + ethers
+    // v6's own id()) before using them here, matching the same discipline
+    // as the event-topic check, after hand-typed hex constants caused two
+    // real bugs earlier tonight.
+    const CANDIDATES = [
+      { name: 'tierBurned', sig: 'function tierBurned(uint256) view returns (uint256)' },
+      { name: 'isActive',   sig: 'function isActive(uint256) view returns (bool)' },
+      { name: 'splitOf',    sig: 'function splitOf(uint256) view returns (uint8[3],uint16[3],uint8)' },
+      { name: 'balancesOf', sig: 'function balancesOf(uint256) view returns (address[],uint256[])' },
+    ];
+
+    const results = [];
+    for(const { name, sig } of CANDIDATES){
+      const iface = new Interface([sig]);
+      const calldata = iface.encodeFunctionData(name, [tokenId]);
+      try{
+        const r = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: address, data: calldata }, 'latest'] }),
+        });
+        const j = await r.json();
+        if(j.error){
+          results.push({ name, sig, reverted: true, error: j.error.message || JSON.stringify(j.error) });
+          continue;
+        }
+        const raw = j.result;
+        let decoded = null, decodeError = null;
+        try{
+          decoded = iface.decodeFunctionResult(name, raw).toString();
+        }catch(e){
+          // A successful call with data that doesn't match our expected
+          // return shape (rather than an outright revert) still needs to be
+          // surfaced clearly -- it means SOMETHING responded at this
+          // selector, but not necessarily the function we think it is.
+          decodeError = e.message;
+        }
+        results.push({ name, sig, reverted: false, rawResult: raw, rawByteLength: (raw.length - 2) / 2, decoded, decodeError });
+      }catch(e){
+        results.push({ name, sig, reverted: true, error: e.message });
+      }
+    }
+
+    res.json({ ok: true, address, tokenId, results });
+  } catch(e) {
+    console.error(`/db/stackers/raw-function-probe/${req.params.address} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/asset-count-only-debug — just assetCount(), nothing
+// else. Exists because assets(idx) on the new engine returned real data
+// our old ABI's 8-field struct couldn't decode, and the new contract isn't
+// verified yet (confirmed directly: Blockscout returns "Contract source
+// code not verified"), so the real struct layout can't be pulled
+// authoritatively right now. assetCount() itself is a simple uint8 with no
+// struct to get wrong — far lower risk of a bad guess than reverse-
+// engineering assets()'s full layout from raw bytes would be.
+app.get('/db/stackers/asset-count-only-debug', auth, async (req, res) => {
+  try {
+    const { getContracts } = require('./lib/stackers');
+    const { engine } = getContracts();
+    const count = await engine.assetCount();
+    res.json({ ok: true, assetCount: Number(count) });
+  } catch(e) {
+    console.error('/db/stackers/asset-count-only-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/version-debug — which commit is actually running right now.
+// Exists because "just wait for deployment" was already guessed once and
+// turned out wrong -- a live check reported the old Vault Listing Alerts
+// wording even after the fix was confirmed pushed to GitHub. Railway
+// injects git commit info as environment variables automatically, so this
+// reports that directly rather than guessing about deployment timing again.
+app.get('/db/version-debug', auth, async (req, res) => {
+  res.json({
+    ok: true,
+    railwayGitCommitSha: process.env.RAILWAY_GIT_COMMIT_SHA || null,
+    railwayGitCommitMessage: process.env.RAILWAY_GIT_COMMIT_MESSAGE || null,
+    railwayDeploymentId: process.env.RAILWAY_DEPLOYMENT_ID || null,
+    serverTimeNow: new Date().toISOString(),
+  });
+});
+
+// ── GET /db/stackers/poller-status-debug — real cursor position for both
+// Stackers pollers vs. the current chain head. Exists to answer a
+// concrete question directly: is a poller still working through a real
+// backlog (expected, temporary, will resolve on its own) or has it
+// genuinely stopped advancing (a real problem worth digging into), rather
+// than guessing from a missing alert alone.
+app.get('/db/stackers/poller-status-debug', auth, async (req, res) => {
+  try {
+    const { dbLoad } = require('./lib/db');
+    const { getProvider } = require('./lib/stackers');
+    const provider = getProvider();
+
+    const [fusionCursorRaw, statusCursorRaw, latest] = await Promise.all([
+      dbLoad('stackers_fusion_last_block').catch(() => null),
+      dbLoad('stackers_status_last_block').catch(() => null),
+      provider.getBlockNumber(),
+    ]);
+
+    const fusionCursor = fusionCursorRaw ? parseInt(fusionCursorRaw, 10) : null;
+    const statusCursor = statusCursorRaw ? parseInt(statusCursorRaw, 10) : null;
+    const secondsPerBlock = 0.1; // confirmed live earlier tonight
+
+    res.json({
+      ok: true,
+      latestBlock: latest,
+      fusionPoller: fusionCursor === null ? null : {
+        cursor: fusionCursor,
+        blocksBehind: latest - fusionCursor,
+        approxMinutesBehind: ((latest - fusionCursor) * secondsPerBlock / 60).toFixed(1),
+      },
+      statusPoller: statusCursor === null ? null : {
+        cursor: statusCursor,
+        blocksBehind: latest - statusCursor,
+        approxMinutesBehind: ((latest - statusCursor) * secondsPerBlock / 60).toFixed(1),
+      },
+    });
+  } catch(e) {
+    console.error('/db/stackers/poller-status-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/vault-listings-funnel-debug — breaks down exactly
+// where the /stackers listings count narrows, step by step. Exists
+// because a small result count (6 tokens) raised a real question of
+// whether that's genuinely correct or a bug somewhere in the join/filter
+// -- rather than guess either way, this shows the real number at each
+// stage: total listed, of those how many have any status row at all, of
+// those how many have vault_balances populated, of those how many are
+// actually non-empty (the real filter used), and for context how many
+// listed tokens are marked active at all (since an inactive token has no
+// way to be earning anything in the first place).
+app.get('/db/stackers/vault-listings-funnel-debug', auth, async (req, res) => {
+  try {
+    const { STACKERS_SLUG } = require('./lib/stackers');
+
+    const totalListed = await pool.query(
+      `SELECT COUNT(*) FROM listings WHERE collection_slug = $1`, [STACKERS_SLUG]
+    );
+    const hasAnyStatusRow = await pool.query(
+      `SELECT COUNT(*) FROM listings l JOIN stackers_token_status s ON s.token_id = l.token_id WHERE l.collection_slug = $1`,
+      [STACKERS_SLUG]
+    );
+    const hasNonNullBalances = await pool.query(
+      `SELECT COUNT(*) FROM listings l JOIN stackers_token_status s ON s.token_id = l.token_id WHERE l.collection_slug = $1 AND s.vault_balances IS NOT NULL`,
+      [STACKERS_SLUG]
+    );
+    const hasNonEmptyBalances = await pool.query(
+      `SELECT COUNT(*) FROM listings l JOIN stackers_token_status s ON s.token_id = l.token_id WHERE l.collection_slug = $1 AND s.vault_balances IS NOT NULL AND jsonb_array_length(s.vault_balances) > 0`,
+      [STACKERS_SLUG]
+    );
+    const isActive = await pool.query(
+      `SELECT COUNT(*) FROM listings l JOIN stackers_token_status s ON s.token_id = l.token_id WHERE l.collection_slug = $1 AND s.is_active = true`,
+      [STACKERS_SLUG]
+    );
+
+    res.json({
+      ok: true,
+      totalCurrentlyListed: parseInt(totalListed.rows[0].count, 10),
+      listedWithAnyStatusRow: parseInt(hasAnyStatusRow.rows[0].count, 10),
+      listedWithNonNullVaultBalances: parseInt(hasNonNullBalances.rows[0].count, 10),
+      listedWithNonEmptyVaultBalances: parseInt(hasNonEmptyBalances.rows[0].count, 10),
+      listedAndActive: parseInt(isActive.rows[0].count, 10),
+    });
+  } catch(e) {
+    console.error('/db/stackers/vault-listings-funnel-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/trait-check-debug — checks whether Stackers trait
+// data exists in token_traits at all, and specifically whether a "Fused"
+// trait is present. Exists because a genuinely better data source might
+// already exist (Fused as a real OpenSea-filterable trait, confirmed via
+// screenshot) rather than needing forward-only event tracking from
+// scratch -- checking before building on an assumption either way.
+app.get('/db/stackers/trait-check-debug', auth, async (req, res) => {
+  try {
+    const totalRows = await pool.query(
+      `SELECT COUNT(*) FROM token_traits WHERE collection_slug = 'stackersxyz'`
+    );
+    const distinctTraitNames = await pool.query(
+      `SELECT DISTINCT trait_name FROM token_traits WHERE collection_slug = 'stackersxyz' ORDER BY trait_name`
+    );
+    const fusedValues = await pool.query(
+      `SELECT trait_value, COUNT(*) FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name ILIKE '%fused%' GROUP BY trait_value`
+    );
+    const fusedSample = await pool.query(
+      `SELECT token_id, trait_value FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name ILIKE '%fused%' AND trait_value != 'No' LIMIT 5`
+    );
+
+    res.json({
+      ok: true,
+      totalStackersTraitRows: parseInt(totalRows.rows[0].count, 10),
+      distinctTraitNames: distinctTraitNames.rows.map(r => r.trait_name),
+      fusedTraitValueCounts: fusedValues.rows,
+      fusedSample: fusedSample.rows,
+    });
+  } catch(e) {
+    console.error('/db/stackers/trait-check-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/fusion-trait-debug — checks the real shape of
+// Burned, $STACK Burned, and Rarity traits before building anything on
+// them. Includes the specific tokens from a real reference screenshot
+// (#511 absorbed into #107) so actual values can be cross-checked
+// against what Stackers' own official bot displayed for that exact fusion.
+app.get('/db/stackers/fusion-trait-debug', auth, async (req, res) => {
+  try {
+    const burnedValues = await pool.query(
+      `SELECT trait_value, COUNT(*) FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name = 'Burned' GROUP BY trait_value ORDER BY COUNT(*) DESC LIMIT 10`
+    );
+    const stackBurnedSample = await pool.query(
+      `SELECT token_id, trait_value FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name = '$STACK Burned' LIMIT 5`
+    );
+    const rarityValues = await pool.query(
+      `SELECT trait_value, COUNT(*) FROM token_traits WHERE collection_slug = 'stackersxyz' AND trait_name = 'Rarity' GROUP BY trait_value ORDER BY COUNT(*) DESC LIMIT 10`
+    );
+    const referenceTokens = await pool.query(
+      `SELECT token_id, trait_name, trait_value FROM token_traits WHERE collection_slug = 'stackersxyz' AND token_id IN (511, 107) AND trait_name IN ('Burned', '$STACK Burned', 'Rarity', 'Fused', 'Multiplier', 'Tier') ORDER BY token_id, trait_name`
+    );
+
+    res.json({
+      ok: true,
+      burnedTraitValueCounts: burnedValues.rows,
+      stackBurnedSample: stackBurnedSample.rows,
+      rarityValueCounts: rarityValues.rows,
+      referenceTokens: referenceTokens.rows,
+    });
+  } catch(e) {
+    console.error('/db/stackers/fusion-trait-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/catchup-fusion, /db/stackers/catchup-status —
+// manually-triggered catch-up bursts, separate from the automatic
+// background polling rate. Confirmed live the automatic rate alone cannot
+// realistically clear the actual backlog (fusion: ~46.7h behind at only
+// +2 blocks/min net; status: ~10h behind and actively getting WORSE at
+// -298 blocks/min net) -- a permanently higher automatic rate was
+// considered but rejected given the confirmed rate-limit sensitivity on
+// this account; a bounded, one-time burst is a safer way to actually
+// clear the backlog without raising the permanent baseline risk.
+// Loops repeatedly (no delay between iterations, unlike the 60s automatic
+// cadence) until caught up or a time budget is hit, logging progress
+// periodically. Runs in the background; check server logs for progress.
+const CATCHUP_TIME_BUDGET_MS = 60 * 60 * 1000; // 1 hour ceiling per trigger
+const CATCHUP_CHUNK_CAP = 500; // 5000 blocks per poll-function call during the burst
+
+app.get('/db/stackers/catchup-fusion', auth, async (req, res) => {
+  try {
+    const { pollFusionEvents } = require('./lib/stackers-fusion-poller');
+    res.json({ ok: true, message: 'Fusion catch-up burst started — running in background for up to 1 hour, check server logs ([StackersFusion] lines) for progress' });
+    (async () => {
+      const startedAt = Date.now();
+      let iterations = 0;
+      while(Date.now() - startedAt < CATCHUP_TIME_BUDGET_MS){
+        await pollFusionEvents(CATCHUP_CHUNK_CAP).catch(e => console.error('[FusionCatchup] iteration failed:', e.message));
+        iterations++;
+        if(iterations % 5 === 0) console.log(`[FusionCatchup] ${iterations} iterations completed so far`);
+      }
+      console.log(`[FusionCatchup] Time budget reached after ${iterations} iterations`);
+    })();
+  } catch(e) {
+    console.error('/db/stackers/catchup-fusion error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/db/stackers/catchup-status', auth, async (req, res) => {
+  try {
+    const { pollTokenStatusEvents } = require('./lib/stackers-status-poller');
+    res.json({ ok: true, message: 'Status catch-up burst started — running in background for up to 1 hour, check server logs ([StackersStatus] lines) for progress' });
+    (async () => {
+      const startedAt = Date.now();
+      let iterations = 0;
+      while(Date.now() - startedAt < CATCHUP_TIME_BUDGET_MS){
+        await pollTokenStatusEvents(pool, CATCHUP_CHUNK_CAP).catch(e => console.error('[StatusCatchup] iteration failed:', e.message));
+        iterations++;
+        if(iterations % 5 === 0) console.log(`[StatusCatchup] ${iterations} iterations completed so far`);
+      }
+      console.log(`[StatusCatchup] Time budget reached after ${iterations} iterations`);
+    })();
+  } catch(e) {
+    console.error('/db/stackers/catchup-status error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/websocket-debug — checks whether this Alchemy
+// account actually supports a live WebSocket connection to Robinhood
+// Chain, before committing to building anything on top of it (a live
+// eth_subscribe-based listener would sidestep the eth_getLogs block-range
+// limitation entirely, rather than continuing to work around it). Same
+// host as the existing HTTP RPC endpoint, wss:// instead of https:// --
+// Alchemy's standard convention. Times out after 10s rather than hanging
+// the request indefinitely, and always cleans up the connection via
+// provider.destroy() regardless of success or failure.
+app.get('/db/stackers/websocket-debug', auth, async (req, res) => {
+  const key = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+  if(!key) return res.status(500).json({ ok: false, error: 'Missing ALCHEMY_API_KEY/ALCHEMY_KEY env var' });
+
+  const wssUrl = `wss://robinhood-mainnet.g.alchemy.com/v2/${key}`;
+  let provider = null;
+
+  try{
+    const { ethers } = require('ethers');
+    provider = new ethers.WebSocketProvider(wssUrl);
+
+    const blockNumber = await Promise.race([
+      provider.getBlockNumber(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out after 10s waiting for a response')), 10000)),
+    ]);
+
+    res.json({ ok: true, connected: true, blockNumber });
+  }catch(e){
+    console.error('/db/stackers/websocket-debug error:', e.message);
+    res.status(500).json({ ok: false, connected: false, error: e.message });
+  }finally{
+    if(provider){
+      provider.destroy().catch(()=>{});
+    }
+  }
+});
+
+
+// ── GET /db/schema-debug/:table — direct ground-truth check of a table's
+// real, live columns. Exists specifically because code across this
+// codebase disagrees about the sales table's actual price column name
+// (price_eth vs sale_price) -- rather than guess which is real, checking
+// the live database directly.
+app.get('/db/schema-debug/:table', auth, async (req, res) => {
+  try {
+    const table = String(req.params.table || '').toLowerCase();
+    if(!/^[a-z_]+$/.test(table)) return res.status(400).json({ ok: false, error: 'invalid table name' });
+    const result = await pool.query(
+      `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
+      [table]
+    );
+    res.json({ ok: true, table, columns: result.rows });
+  } catch(e) {
+    console.error(`/db/schema-debug/${req.params.table} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/cost-basis-debug/:wallet — diagnoses a real cost-basis
+// gap (confirmed real secondary purchases showing Spent: Ξ0.0000). Checks
+// wallet_token_intervals (what we think this wallet holds and its current
+// cost_eth), our own sales table (does our cache have a matching row for
+// this wallet as buyer — using price_eth/currency, confirmed via
+// /db/schema-debug/sales to be the real live columns), and a live OpenSea
+// sale-events lookup for the first held token (does OpenSea itself have
+// the record, independent of whether it made it into our own cache) — to
+// see which specific layer is actually failing rather than guessing.
+app.get('/db/stackers/cost-basis-debug/:wallet', auth, async (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').toLowerCase();
+    if(!/^0x[0-9a-f]{40}$/.test(wallet)) return res.status(400).json({ ok: false, error: 'valid wallet address required' });
+
+    const intervalsRes = await pool.query(
+      `SELECT token_id, cost_eth, acquired_at FROM wallet_token_intervals
+       WHERE wallet_address = $1 AND collection_slug = 'stackersxyz' AND disposed_at IS NULL
+       ORDER BY token_id`,
+      [wallet]
+    );
+
+    const tokenIds = intervalsRes.rows.map(r => r.token_id);
+    const salesRes = tokenIds.length ? await pool.query(
+      `SELECT token_id, price_eth, currency, buyer, seller, sale_ts FROM sales
+       WHERE collection_slug = 'stackersxyz' AND token_id = ANY($1) AND LOWER(buyer) = $2`,
+      [tokenIds, wallet]
+    ) : { rows: [] };
+
+    let liveOpenSeaCheck = null;
+    if(tokenIds.length){
+      const testToken = tokenIds[0];
+      try{
+        const qs = new URLSearchParams({ event_type: 'sale', token_ids: testToken.toString() }).toString();
+        const osRes = await fetch(`https://api.opensea.io/api/v2/events/collection/stackersxyz?${qs}`, {
+          headers: { 'X-API-KEY': process.env.OPENSEA_KEY || '', 'Accept': 'application/json' }
+        });
+        const osData = osRes.ok ? await osRes.json() : { error: `HTTP ${osRes.status}` };
+        liveOpenSeaCheck = { testedTokenId: testToken, status: osRes.status, eventCount: osData?.asset_events?.length ?? null, raw: osData };
+      }catch(e){
+        liveOpenSeaCheck = { testedTokenId: testToken, error: e.message };
+      }
+    }
+
+    res.json({
+      ok: true,
+      wallet,
+      heldTokens: intervalsRes.rows,
+      matchingSalesInOurDb: salesRes.rows,
+      liveOpenSeaCheck,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/cost-basis-debug/${req.params.wallet} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/snapshots-debug — direct view of stackers_snapshots rows.
+// Diagnostic only, not used by any command. Exists specifically to resolve
+// a real discrepancy: server logs showed a snapshot completing successfully,
+// but /stackerstats (running in the bot service) reported no snapshot exists
+// at all — this checks the table directly rather than guessing why.
+app.get('/db/stackers/snapshots-debug', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, snapshot_at, total_tokens, tokens_processed, active_tokens FROM stackers_snapshots ORDER BY snapshot_at DESC LIMIT 10`
+    );
+    res.json({ ok: true, count: result.rows.length, rows: result.rows });
+  } catch(e) {
+    console.error('/db/stackers/snapshots-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/tier-weights-debug — raw TIER_BURN/TIER_WEIGHT values
+// straight from the contract. Diagnostic only. Real live data just showed
+// Tier 1 displaying as (0.0x) instead of the expected 1.0x for the base
+// tier — meaning the guessed basis-points conversion in formatTierWeight()
+// is wrong. This exists to see the actual raw numbers rather than guess at
+// a second conversion factor with no evidence.
+app.get('/db/stackers/tier-weights-debug', auth, async (req, res) => {
+  try {
+    const { getContracts, getTierThresholds } = require('./lib/stackers');
+    const { nft } = getContracts();
+    const thresholds = await getTierThresholds(nft);
+    res.json({
+      ok: true,
+      thresholds: thresholds.map(t => ({
+        index: t.index,
+        burnThreshold: t.burn.toString(),
+        weightRaw: t.weightRaw.toString(),
+      })),
+    });
+  } catch(e) {
+    console.error('/db/stackers/tier-weights-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/token-debug/:tokenId — checks whether a token's image
+// mismatch is actually a bug or expected behavior. Stackers' NFT contract
+// has an artworkOf(tokenId) function and an ArtworkAssigned event, separate
+// from the token ID itself -- a common reveal-shuffle pattern where the art
+// shown is deliberately decoupled from the token number. Testing directly
+// whether a reported tokenId's assigned artwork differs from the tokenId,
+// which would explain a served image that looks "wrong" at a glance but is
+// actually correct.
+app.get('/db/stackers/token-debug/:tokenId', auth, async (req, res) => {
+  try {
+    const tokenId = parseInt(req.params.tokenId, 10);
+    if(!tokenId) return res.status(400).json({ ok: false, error: 'valid tokenId required' });
+    const { getContracts } = require('./lib/stackers');
+    const { nft } = getContracts();
+    const [artworkId, fusedArtId, tokenUri] = await Promise.all([
+      nft.artworkOf(tokenId).catch(e => `ERROR: ${e.message}`),
+      nft.fusedArt(tokenId).catch(e => `ERROR: ${e.message}`),
+      nft.tokenURI(tokenId).catch(e => `ERROR: ${e.message}`),
+    ]);
+    res.json({
+      ok: true,
+      tokenId,
+      artworkOf: artworkId?.toString?.() ?? artworkId,
+      fusedArt: fusedArtId?.toString?.() ?? fusedArtId,
+      tokenURI: tokenUri,
+    });
+  } catch(e) {
+    console.error(`/db/stackers/token-debug/${req.params.tokenId} error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/stackers/deployment-block-debug — finds the vault contract's
+// real deployment block via binary search on eth_getCode (empty before
+// deployment, real bytecode after) rather than guessing. Deliberately
+// avoids eth_getLogs entirely for this -- getCode queries a single block
+// at a time, so it isn't subject to this account's confirmed 10-block
+// range cap on eth_getLogs specifically. O(log n) calls regardless of how
+// many total blocks exist, so this is cheap and fast either way. Exists to
+// answer a concrete question before deciding whether a full historical
+// Claimed-event backfill is actually practical: how many blocks would it
+// need to cover, and how many 10-block eth_getLogs calls would that mean.
+app.get('/db/stackers/deployment-block-debug', auth, async (req, res) => {
+  try {
+    const { getProvider, VAULT_ADDRESS } = require('./lib/stackers');
+    const provider = getProvider();
+
+    const latest = await provider.getBlockNumber();
+    const latestCode = await provider.getCode(VAULT_ADDRESS, latest);
+    if(latestCode === '0x'){
+      return res.status(500).json({ ok: false, error: 'Contract has no code at the latest block — wrong address, or something is off' });
+    }
+
+    let low = 0;
+    let high = latest;
+    let calls = 0;
+    while(low < high){
+      const mid = Math.floor((low + high) / 2);
+      const code = await provider.getCode(VAULT_ADDRESS, mid);
+      calls++;
+      if(code === '0x'){
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+
+    const deploymentBlock = low;
+    const totalBlocks = latest - deploymentBlock;
+    const chunksAt10PerCall = Math.ceil(totalBlocks / 10);
+
+    res.json({
+      ok: true,
+      deploymentBlock,
+      latestBlock: latest,
+      totalBlocksSinceDeployment: totalBlocks,
+      eth_getLogs_calls_needed_at_10_per_call: chunksAt10PerCall,
+      binarySearchCallsUsed: calls,
+    });
+  } catch(e) {
+    console.error('/db/stackers/deployment-block-debug error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/:slug/seed-market — one-time full sales history +
+// current listings pull for a newly onboarded collection. Runs in the
+// background; poll /db/collections (added in phase 1) to watch status go
+// pending -> backfilling_market -> ready/failed. Expects the collection row
+// to already exist (created by the trait/image backfill step) — this only
+// covers the market side.
+app.get('/db/collections/:slug/seed-market', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    const existing = await pool.query(`SELECT slug, contract FROM collections WHERE slug = $1`, [slug]);
+    if (!existing.rows.length) {
+      return res.status(404).json({ ok: false, error: `No collections row for slug "${slug}" — run the trait/image backfill first` });
+    }
+
+    res.json({ ok: true, message: `Market history seed started for ${slug} — running in background, poll /db/collections to watch status` });
+    syncListingsModule.seedMarketHistory(existing.rows[0]).catch(e => {
+      console.error(`[/db/collections/${slug}/seed-market] background seed failed:`, e.message);
+    });
+  } catch(e) {
+    console.error('/db/collections/:slug/seed-market error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/listings — all current listings from DB ───────────────────────────
 app.get('/db/listings', auth, async (req, res) => {
   try {
@@ -413,7 +1853,7 @@ app.get('/db/floor-trend', auth, async (req, res) => {
 app.get('/db/token-sales', auth, async (req, res) => {
   try {
     const tokenId = parseInt(req.query.token_id);
-    if (!tokenId || tokenId < 1 || tokenId > 10000) {
+    if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) { // generous, collection-agnostic bound — was hardcoded to OCAS's ~10k supply and also rejected token id 0 (breaks 0-indexed collections like CryptoPunks)
       return res.status(400).json({ ok: false, error: 'invalid token_id' });
     }
     const limit = Math.min(parseInt(req.query.limit || '200'), 500);
@@ -1843,7 +3283,7 @@ app.get('/db/wallet/:address/traits', auth, async (req, res) => {
 // ── GET /db/token/:id/history ────────────────────────────────────────────────
 app.get('/db/token/:id/history', auth, async (req, res) => {
   const tokenId = parseInt(req.params.id, 10);
-  if (!tokenId || tokenId < 1 || tokenId > 10000) return res.status(400).json({ ok: false, error: 'invalid token id' });
+  if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) return res.status(400).json({ ok: false, error: 'invalid token id' }); // generous, collection-agnostic bound — see /db/token/:id above for why
   const limit = intParam(req.query.limit, 100, 200);
   try {
     const result = await pool.query(`
@@ -2330,52 +3770,73 @@ app.get('/tv/link-status-by-wallet', auth,
 });
 
 
+// ── GET /db/collections ───────────────────────────────────────────────────────
+// Lists the collections registry. Read-only for now — the onboarding
+// trigger that inserts new rows (search an unknown slug -> kick off backfill)
+// is a later phase; this just exposes what's already in the table.
+app.get('/db/collections', auth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT slug, contract, chain, name, status, token_standard, total_supply,
+             is_animated, has_svg_images, error_message,
+             traits_synced_at, market_synced_at, created_at, updated_at
+      FROM collections
+      ORDER BY (slug = $1) DESC, created_at ASC
+    `, [OCAS_SLUG]);
+    res.json({ ok: true, collections: result.rows });
+  } catch (e) {
+    console.error('[/db/collections]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 // ── GET /db/traits-fast ───────────────────────────────────────────────────────
 // Serves traits_fast.json structure computed live from DB, excluding burned tokens.
-// Cached in memory for 5 minutes.
+// Cached in memory for 5 minutes, per collection_slug.
 // Returns: { ok, rank: [[id, score], ...], domain: {trait: [values]},
 //            buckets: {count: [ids]}, freq: {trait: {value: count}}, survivorCount }
-let _traitsFastCache = null;
-let _traitsFastCacheTs = 0;
+const _traitsFastCache = new Map(); // slug -> { data, ts }
 const TRAITS_FAST_TTL = 5 * 60 * 1000;
 
 app.get('/db/traits-fast', auth, async (req, res) => {
   try {
+    const slug = (req.query.slug || OCAS_SLUG).toString().toLowerCase();
+    const isOcas = slug === OCAS_SLUG;
     const now = Date.now();
-    if (_traitsFastCache && (now - _traitsFastCacheTs) < TRAITS_FAST_TTL) {
-      return res.json(_traitsFastCache);
+    const cached = _traitsFastCache.get(slug);
+    if (cached && (now - cached.ts) < TRAITS_FAST_TTL) {
+      return res.json(cached.data);
     }
 
-    const BURNED_EXCL = `NOT EXISTS (
+    // Burn mechanic only exists for OCAS — burn_event_inputs/burn_events have
+    // no collection_slug column, so this must never run for other slugs, or a
+    // numerically-colliding token_id in another collection (e.g. Fluxeto #81)
+    // could get wrongly excluded as "burned". See the cross-collection image
+    // collision bug fixed 2026-06-28 for the same underlying class of issue.
+    const BURNED_EXCL = isOcas ? `NOT EXISTS (
       SELECT 1 FROM burn_event_inputs bei
       JOIN burn_events be ON be.id = bei.burn_event_id
       WHERE bei.burned_token_id = t.id
       AND bei.burned_token_id != be.survivor_token_id
-    )`;
+    )` : 'TRUE';
 
-    const BURNED_EXCL_TT = `NOT EXISTS (
+    const BURNED_EXCL_TT = isOcas ? `NOT EXISTS (
       SELECT 1 FROM burn_event_inputs bei
       JOIN burn_events be ON be.id = bei.burn_event_id
       WHERE bei.burned_token_id = tt.token_id
       AND bei.burned_token_id != be.survivor_token_id
-    )`;
+    )` : 'TRUE';
 
     // 1. Surviving tokens sorted by obs_rank ASC (pre-computed rank in DB)
     // Falls back to id order if obs_rank not available
-    // NOTE: hardcoded to OCAS_SLUG for now — TraitView itself isn't
-    // multi-collection aware yet (no slug param sent), so without this
-    // filter, other configured collections' tokens/traits merge in here
-    // too (confirmed: Fluxeto traits appearing in TraitView's OCAS filter
-    // panel, same root cause as the /traitfind cross-collection bug fixed
-    // 2026-07-01 — the JOIN below also previously matched on token_id
-    // alone with no collection_slug check on either side).
     const [rankRes, traitRes] = await Promise.all([
       pool.query(`
         SELECT t.id, t.obs_rank, t.trait_count
         FROM tokens t
         WHERE t.collection_slug = $1 AND ${BURNED_EXCL}
         ORDER BY t.obs_rank ASC NULLS LAST, t.id ASC
-      `, [OCAS_SLUG]),
+      `, [slug]),
       // 2. Trait frequencies for surviving tokens
       pool.query(`
         SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS freq
@@ -2384,7 +3845,7 @@ app.get('/db/traits-fast', auth, async (req, res) => {
         WHERE tt.collection_slug = $1 AND ${BURNED_EXCL_TT}
         GROUP BY tt.trait_name, tt.trait_value
         ORDER BY tt.trait_name, tt.trait_value
-      `, [OCAS_SLUG])
+      `, [slug])
     ]);
 
     // rank array: [[id, obsRank], ...] sorted by obs_rank ASC
@@ -2416,9 +3877,9 @@ app.get('/db/traits-fast', auth, async (req, res) => {
       buckets[key].push(parseInt(id));
     }
 
-    _traitsFastCache = { ok: true, rank, domain, freq, buckets, survivorCount: rankRes.rows.length };
-    _traitsFastCacheTs = now;
-    res.json(_traitsFastCache);
+    const data = { ok: true, rank, domain, freq, buckets, survivorCount: rankRes.rows.length };
+    _traitsFastCache.set(slug, { data, ts: now });
+    res.json(data);
   } catch (e) {
     console.error('[/db/traits-fast]', e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -2429,165 +3890,56 @@ app.get('/db/traits-fast', auth, async (req, res) => {
 // ── GET /db/all-traits ────────────────────────────────────────────────────────
 // Returns all surviving tokens' traits in chunk-compatible format.
 // Used by TraitView to replace static chunk files with live DB data.
-// Server-side cache: 5 minutes. One DB query per 5 min regardless of visitors.
+// Server-side cache: 5 minutes per collection_slug.
 // Returns: { ok, tokens: { "1": { traits: {...} }, ... }, survivorCount }
-let _allTraitsCache = null;
-let _allTraitsCacheTs = 0;
+const _allTraitsCache = new Map(); // slug -> { data, ts }
 const ALL_TRAITS_TTL = 5 * 60 * 1000;
-
-// ── Lazy token images ─────────────────────────────────────────────────────────
-// jv: Argonauts "has been taking a little long to load the page when I first
-// open it" -> "Yes" (serve images separately). /db/all-traits inlined EVERY
-// token's full image -- for SVG / on-chain collections that's raw <svg...> or
-// a data: URI per token (tens of KB each x ~9,300 tokens) in one response the
-// page had to download and hold in memory before showing anything.
-// With ?lazyImages=1 (sent by current TraitView; older cached clients that
-// don't send it keep the full inline format), any INLINE image longer than a
-// short link is replaced by a URL to /db/token-image, versioned by a content
-// hash so it can be cached forever and still never go stale. Generic: any
-// collection whose images are inline SVG/data URIs (token_svg_cache or
-// tokens.image_url) gets this automatically; plain http(s)/ipfs image links
-// (e.g. OCAS) pass through unchanged.
-const _crypto = require('crypto');
-function _isInlineImage(v){
-  return typeof v === 'string' && v.length > 300 && (v.startsWith('<svg') || v.startsWith('<?xml') || v.startsWith('data:'));
-}
-function _inlineImageIsSvg(v){
-  return v.startsWith('<svg') || v.startsWith('<?xml') || v.startsWith('data:image/svg');
-}
-// main keeps a single OCAS-only all-traits cache (not a per-slug Map like
-// public-bot). Wrap it in the entry shape _allTraitsLazy expects; the
-// wrapper (and its memoized lazy token list) lives as long as that cache.
-let _ocasLazyEntryObj = null;
-function _ocasLazyEntry(){
-  if(!_ocasLazyEntryObj || _ocasLazyEntryObj.data !== _allTraitsCache) _ocasLazyEntryObj = { data: _allTraitsCache };
-  return _ocasLazyEntryObj;
-}
-function _allTraitsLazy(req, slug, entry){
-  if(!entry.lazyTokens){
-    const lazy = {};
-    for(const [id, t] of Object.entries(entry.data.tokens || {})){
-      if(t && _isInlineImage(t.image)){
-        const v = _crypto.createHash('sha1').update(t.image).digest('hex').slice(0, 12);
-        lazy[id] = { ...t, image: null, _imgV: v, _imgSvg: _inlineImageIsSvg(t.image) };
-      } else lazy[id] = t;
-    }
-    entry.lazyTokens = lazy; // built once per cache entry
-  }
-  const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
-  const base = `${proto}://${req.get('host')}/db/token-image?slug=${encodeURIComponent(slug)}`;
-  const key = req.query.key ? `&key=${encodeURIComponent(req.query.key)}` : '';
-  const tokens = {};
-  for(const [id, t] of Object.entries(entry.lazyTokens)){
-    tokens[id] = t && t._imgV
-      ? { traits: t.traits, burned: t.burned, animation: t.animation,
-          image: `${base}&id=${id}&v=${t._imgV}${t._imgSvg ? '&fmt=svg' : ''}${key}` }
-      : t;
-  }
-  return { ...entry.data, tokens, lazyImages: true };
-}
-function _svgCrispServer(svg){
-  if(!svg.startsWith('<svg')) return svg;
-  if(/\sshape-rendering\s*=/.test(svg.slice(0, 300))) return svg;
-  return svg.replace(/^<svg/, '<svg shape-rendering="crispEdges"'); // same as the frontend's _svgCrisp
-}
-
-// ── GET /db/token-image?slug=&id=&v= — one token's image ─────────────────────
-// Serves what /db/all-traits used to inline. With a content-hash ?v= the
-// response is immutable (cached for a year by browsers); a changed image gets
-// a new hash -> new URL. SVGs are served as image/svg+xml with a locked-down
-// CSP (no scripts) and nosniff; compression applies. PNG/other data URIs are
-// decoded to bytes; plain links redirect.
-app.get('/db/token-image', auth, async (req, res) => {
-  try{
-    const slug = (req.query.slug || OCAS_SLUG).toString().toLowerCase();
-    const id = parseInt(req.query.id, 10);
-    if(!Number.isFinite(id) || id < 0) return res.status(400).json({ ok: false, error: 'bad id' });
-    let img = (slug === OCAS_SLUG ? _allTraitsCache?.tokens?.[String(id)]?.image : null) || null;   // main: single OCAS cache
-    if(!img){
-      const r1 = await pool.query(`SELECT image_url FROM tokens WHERE id = $1 AND collection_slug = $2`, [id, slug]).catch(() => ({ rows: [] }));
-      img = r1.rows[0]?.image_url || null;
-      if(!_isInlineImage(img || '')){
-        const r2 = await pool.query(`SELECT image_data FROM token_svg_cache WHERE token_id = $1 AND collection_slug = $2`, [id, slug]).catch(() => ({ rows: [] }));
-        img = r2.rows[0]?.image_data || img;
-      }
-    }
-    if(!img) return res.status(404).json({ ok: false, error: 'no image' });
-    res.set('Cache-Control', req.query.v ? 'public, max-age=31536000, immutable' : 'public, max-age=3600');
-    res.set('X-Content-Type-Options', 'nosniff');
-    // Always CORS-open (public images): the grid loads these as plain <img>
-    // (no Origin), the PNG download re-loads them with crossOrigin for a
-    // canvas. With year-long caching, a cached copy lacking this header
-    // would make the download fail -- so every copy carries it.
-    res.set('Access-Control-Allow-Origin', '*');
-    if(/^https?:\/\//i.test(img) || img.startsWith('ipfs://')){
-      const url = img.startsWith('ipfs://') ? 'https://ipfs.io/ipfs/' + img.slice(7) : img;
-      return res.redirect(302, url);
-    }
-    let body, type;
-    if(img.startsWith('<svg') || img.startsWith('<?xml')){
-      body = _svgCrispServer(img); type = 'image/svg+xml; charset=utf-8';
-    } else if(img.startsWith('data:')){
-      const comma = img.indexOf(',');
-      const meta = img.slice(5, comma), payload = img.slice(comma + 1);
-      type = meta.split(';')[0] || 'application/octet-stream';
-      const isB64 = /;base64/i.test(meta);
-      if(type === 'image/svg+xml'){
-        const text = isB64 ? Buffer.from(payload, 'base64').toString('utf8') : decodeURIComponent(payload);
-        body = _svgCrispServer(text); type = 'image/svg+xml; charset=utf-8';
-      } else {
-        body = isB64 ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload), 'utf8');
-      }
-    } else {
-      return res.status(415).json({ ok: false, error: 'unsupported image format' });
-    }
-    // jv: desktop grid/gallery images blank while mobile was fine. The CSP
-    // allowed only data: images inside the SVG; on-chain SVGs often pull art
-    // or fonts from https/ipfs links, which Chrome blocks under that policy
-    // (iOS Safari is laxer). Scripts stay blocked (default-src 'none'); an
-    // SVG shown via <img> can't run scripts anyway -- this only matters if
-    // someone opens the image URL directly.
-    if(type.startsWith('image/svg')) res.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data: blob: https:; font-src data: https:");
-    res.type(type).send(body);
-  }catch(e){
-    console.error('[/db/token-image]', e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
 
 app.get('/db/all-traits', auth, async (req, res) => {
   try {
+    const slug = (req.query.slug || OCAS_SLUG).toString().toLowerCase();
+    const isOcas = slug === OCAS_SLUG;
     const now = Date.now();
-    if (_allTraitsCache && (now - _allTraitsCacheTs) < ALL_TRAITS_TTL) {
-      return res.json(req.query.lazyImages === '1' ? _allTraitsLazy(req, OCAS_SLUG, _ocasLazyEntry()) : _allTraitsCache);
+    const cached = _allTraitsCache.get(slug);
+    if (cached && (now - cached.ts) < ALL_TRAITS_TTL) {
+      return res.json(cached.data);
     }
 
-    // Get all surviving token IDs
-    // NOTE: hardcoded to OCAS_SLUG for now — same reasoning as /db/traits-fast above.
-    const survivorsRes = await pool.query(`
-      SELECT t.id, t.image_url
-      FROM tokens t
-      WHERE t.collection_slug = $1 AND NOT EXISTS (
-        SELECT 1 FROM burn_event_inputs bei
-        JOIN burn_events be ON be.id = bei.burn_event_id
-        WHERE bei.burned_token_id = t.id
-        AND bei.burned_token_id != be.survivor_token_id
-      )
-      ORDER BY t.id
-    `, [OCAS_SLUG]);
+    // Burn mechanic only exists for OCAS — see note in /db/traits-fast above.
+    // Gate explicitly on isOcas rather than relying on absence of burn rows,
+    // since a numerically colliding token_id in another collection must
+    // never be excluded.
+    const survivorsRes = isOcas
+      ? await pool.query(`
+          SELECT t.id, t.image_url
+          FROM tokens t
+          WHERE t.collection_slug = $1 AND NOT EXISTS (
+            SELECT 1 FROM burn_event_inputs bei
+            JOIN burn_events be ON be.id = bei.burn_event_id
+            WHERE bei.burned_token_id = t.id
+            AND bei.burned_token_id != be.survivor_token_id
+          )
+          ORDER BY t.id
+        `, [slug])
+      : await pool.query(`
+          SELECT t.id, t.image_url
+          FROM tokens t
+          WHERE t.collection_slug = $1
+          ORDER BY t.id
+        `, [slug]);
 
     const survivorIds = new Set(survivorsRes.rows.map(r => parseInt(r.id)));
     const imageUrlById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), r.image_url || null]));
-    // tokens.image_url is written live by burn-poller.js at burn-finalization
-    // time but has confirmed historical gaps (NULL/stale for some survivors —
-    // see check-live-metadata-gaps.js). burn_state_snapshots is the same
-    // ground-truth source /db/token/:id/burn-history already uses
-    // successfully, so prefer it here and only fall back to image_url where
-    // a snapshot doesn't exist yet.
-    const survivorSnapshotImages = await getSurvivorImageMap([...survivorIds]).catch(e => {
-      console.warn('[/db/all-traits] survivor snapshot image lookup failed (non-fatal):', e.message);
-      return {};
-    });
+
+    // burn_state_snapshots is OCAS-only ground truth for post-burn survivor
+    // images — skip entirely for other collections; tokens.image_url (or
+    // token_svg_cache, read separately by the frontend) is the only source.
+    const survivorSnapshotImages = isOcas
+      ? await getSurvivorImageMap([...survivorIds]).catch(e => {
+          console.warn('[/db/all-traits] survivor snapshot image lookup failed (non-fatal):', e.message);
+          return {};
+        })
+      : {};
 
     // Get all traits for surviving tokens in one query
     const traitsRes = await pool.query(`
@@ -2595,15 +3947,13 @@ app.get('/db/all-traits', auth, async (req, res) => {
       FROM token_traits tt
       WHERE tt.collection_slug = $2 AND tt.token_id = ANY($1::int[])
       ORDER BY tt.token_id, COALESCE(tt.trait_index, 0), tt.trait_name
-    `, [[...survivorIds], OCAS_SLUG]);
+    `, [[...survivorIds], slug]);
 
     // Build tokens object: { "1": { traits: { "Type": "Human 6", ... }, image: "..." }, ... }
     const tokens = {};
 
     // Initialize all survivors with empty traits + current image (snapshot
-    // preferred, tokens.image_url as fallback — most non-survivor tokens
-    // will have image:null here, which is fine, TraitView already falls
-    // back to its own static image source for those)
+    // preferred for OCAS, tokens.image_url as fallback/only-source otherwise)
     for (const id of survivorIds) {
       tokens[String(id)] = { traits: {}, image: survivorSnapshotImages[id] || imageUrlById.get(id) || null };
     }
@@ -2616,10 +3966,10 @@ app.get('/db/all-traits', auth, async (req, res) => {
       }
     }
 
-    _allTraitsCache = { ok: true, tokens, survivorCount: survivorIds.size };
-    _allTraitsCacheTs = now;
+    const data = { ok: true, tokens, survivorCount: survivorIds.size };
+    _allTraitsCache.set(slug, { data, ts: now });
 
-    res.json(req.query.lazyImages === '1' ? _allTraitsLazy(req, OCAS_SLUG, _ocasLazyEntry()) : _allTraitsCache);
+    res.json(data);
   } catch (e) {
     console.error('[/db/all-traits]', e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -2639,10 +3989,42 @@ const sharp = require('sharp');
 sharp.cache(false);
 sharp.concurrency(2);
 
+// Shared rendering logic used by both the GET (svgUrl, always short — no
+// size issue) and POST (svgData, can be large — the actual point of the
+// POST path) handlers below, so neither duplicates the sharp/compositing
+// work.
+async function renderSvgTextToPng(svgText, size = 500){
+  const SIZE = size;
+  const bgBuf = await sharp(Buffer.from(svgText))
+    .resize(SIZE, SIZE, { kernel: 'nearest', fit: 'fill' })
+    .png()
+    .toBuffer();
+
+  // Extract embedded character PNG and composite, same as original extractPngFromSvg
+  const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
+  let finalBuf = bgBuf;
+  if (pngMatch) {
+    try {
+      const rawPng = Buffer.from(pngMatch[1].replace(/\s/g, ''), 'base64');
+      const charBuf = await sharp(rawPng).resize(SIZE, SIZE, { kernel: 'nearest' }).png().toBuffer();
+      finalBuf = await sharp(bgBuf).composite([{ input: charBuf, blend: 'over' }]).png().toBuffer();
+    } catch (e) {
+      console.warn('[render/svg-token] char composite failed, using full SVG render:', e.message);
+    }
+  }
+  return finalBuf;
+}
+
 app.get('/render/svg-token', auth, async (req, res) => {
   try {
     const svgSource = req.query.svgUrl || req.query.svgData;
     if (!svgSource) return res.status(400).json({ ok: false, error: 'missing svgUrl or svgData' });
+
+    // Clamped to a sane range -- prevents an absurd request (e.g. size=100000)
+    // from exhausting memory/CPU on this shared service. Defaults to 500,
+    // matching the previous hardcoded behavior for any caller not specifying one.
+    let size = parseInt(req.query.size) || 500;
+    size = Math.max(50, Math.min(3000, size));
 
     let svgText;
     if (svgSource.startsWith('data:image/svg')) {
@@ -2655,28 +4037,11 @@ app.get('/render/svg-token', auth, async (req, res) => {
       svgText = await r.text();
     }
 
-    const SIZE = 500;
-    let bgBuf;
+    let finalBuf;
     try {
-      bgBuf = await sharp(Buffer.from(svgText))
-        .resize(SIZE, SIZE, { kernel: 'nearest', fit: 'fill' })
-        .png()
-        .toBuffer();
+      finalBuf = await renderSvgTextToPng(svgText, size);
     } catch (e) {
       return res.status(500).json({ ok: false, error: 'SVG render failed: ' + e.message });
-    }
-
-    // Extract embedded character PNG and composite, same as original extractPngFromSvg
-    const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
-    let finalBuf = bgBuf;
-    if (pngMatch) {
-      try {
-        const rawPng = Buffer.from(pngMatch[1].replace(/\s/g, ''), 'base64');
-        const charBuf = await sharp(rawPng).resize(SIZE, SIZE, { kernel: 'nearest' }).png().toBuffer();
-        finalBuf = await sharp(bgBuf).composite([{ input: charBuf, blend: 'over' }]).png().toBuffer();
-      } catch (e) {
-        console.warn('[/render/svg-token] char composite failed, using full SVG render:', e.message);
-      }
     }
 
     res.set('Content-Type', 'image/png');
@@ -2688,79 +4053,54 @@ app.get('/render/svg-token', auth, async (req, res) => {
   }
 });
 
-// Runs the same idempotent CREATE TABLE/INDEX IF NOT EXISTS migrations used
-// elsewhere -- ensures a brand-new database gets its full schema automatically
-// on first deploy, and self-heals if any table/index was ever missing,
-// instead of relying on a separate manual step that's easy to forget.
-// ── TEMP DIAGNOSTIC — checking whether this branch (main) is what OCAS's
-// production service actually deploys from, since a route pushed to
-// public-bot returned 404 on the same URL jv tested. No auth, read-only --
-// meant to be opened directly in a mobile browser. Remove once this is
-// settled.
-app.get('/diag/listings-compare', async (req, res) => {
-  const slug = (req.query.slug || 'on-chain-all-stars').toString();
-  const OPENSEA_API_KEY = process.env.OPENSEA_KEY || process.env.OPENSEA_API_KEY;
+// ── POST /render/svg-token — same rendering, but for svgData (base64 data
+// URIs) specifically instead of the GET route's query-string parameter.
+// Confirmed live: a large on-chain-generated SVG (e.g. one with an embedded
+// base64 PNG, same pattern this endpoint already handles via pngMatch above)
+// pushed the GET request's query string past whatever length limit sits in
+// front of this service, failing with HTTP 431 (Request Header Fields Too
+// Large) — a GET request's entire URL, including its query string, is part
+// of the request line, which has much tighter length limits than a POST
+// body does almost everywhere. svgUrl stays on the GET route unchanged,
+// since a URL itself is always short regardless of how large the SVG behind
+// it is — only svgData (which embeds the actual content) needed to move.
+// Route-specific body-size limit isn't needed here — the global
+// express.json() limit above was raised to 5mb specifically to cover this
+// route, avoiding a second, redundant json() call on the same request (see
+// that comment for why stacking two would be unsafe).
+app.post('/render/svg-token', auth, async (req, res) => {
   try {
-    const dbResult = await pool.query(
-      `SELECT COUNT(*)::int AS count, MIN(updated_at) AS oldest_updated, MAX(updated_at) AS newest_updated
-       FROM listings WHERE collection_slug = $1`,
-      [slug]
-    );
-    const dbRow = dbResult.rows[0];
+    const svgData = req.body?.svgData;
+    if (!svgData) return res.status(400).json({ ok: false, error: 'missing svgData in request body' });
+    if (!svgData.startsWith('data:image/svg')) return res.status(400).json({ ok: false, error: 'svgData must be a data:image/svg URI' });
 
-    if (!OPENSEA_API_KEY) {
-      return res.json({ ok: true, deployedBranchGuess: 'main', slug, db: dbRow, opensea_live: { error: 'OPENSEA_KEY not configured on this service' } });
+    let size = parseInt(req.body?.size) || 500;
+    size = Math.max(50, Math.min(3000, size));
+
+    const b64 = svgData.split(',')[1];
+    if (!b64) return res.status(400).json({ ok: false, error: 'empty svg data' });
+    const svgText = Buffer.from(b64, 'base64').toString('utf-8');
+
+    let finalBuf;
+    try {
+      finalBuf = await renderSvgTextToPng(svgText, size);
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'SVG render failed: ' + e.message });
     }
 
-    let next = null, pages = 0, totalRaw = 0;
-    const uniqueTokenIds = new Set();
-    do {
-      const qs = new URLSearchParams({ chain: 'ethereum', limit: '100' });
-      if (next) qs.set('next', next);
-      const r = await fetch(`https://api.opensea.io/api/v2/listings/collection/${slug}/all?${qs}`, {
-        headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' }
-      });
-      if (!r.ok) { return res.json({ ok: true, deployedBranchGuess: 'main', slug, db: dbRow, opensea_live: { error: `HTTP ${r.status} on page ${pages}`, pagesCompleted: pages } }); }
-      const body = await r.json();
-      const listings = body.listings || [];
-      totalRaw += listings.length;
-      for (const listing of listings) {
-        const cands = [
-          listing?.criteria?.nft?.identifier, listing?.nft?.identifier, listing?.asset?.token_id,
-          listing?.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria,
-          listing?.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria,
-        ];
-        for (let c of cands) {
-          if (!c) continue;
-          c = String(c);
-          const parts = c.includes('/') ? c.split('/') : c.split(':');
-          const last = parts[parts.length - 1];
-          if (last && /^\d+$/.test(last)) { uniqueTokenIds.add(parseInt(last, 10)); break; }
-        }
-      }
-      next = body.next || null;
-      pages++;
-      if (pages >= 150) break;
-      if (next) await new Promise(r2 => setTimeout(r2, 80));
-    } while (next);
-
-    res.json({
-      ok: true,
-      deployedBranchGuess: 'main',
-      slug,
-      db: dbRow,
-      opensea_live: {
-        pagesCompleted: pages,
-        totalRawListingsSeen: totalRaw,
-        uniqueTokenIdsSeen: uniqueTokenIds.size,
-        completedFully: next === null,
-      },
-    });
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(finalBuf);
   } catch (e) {
+    console.error('[POST /render/svg-token]', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+// Runs the same idempotent CREATE TABLE/INDEX IF NOT EXISTS migrations used
+// elsewhere -- ensures a brand-new database gets its full schema automatically
+// on first deploy, and self-heals if any table/index was ever missing,
+// instead of relying on a separate manual step that's easy to forget.
 runMigrations().then(() => {
   app.listen(PORT, () => {
     console.log(`TraitView API running on port ${PORT}`);

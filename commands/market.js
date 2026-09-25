@@ -1,10 +1,14 @@
 'use strict';
 
 const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
+const { STACKERS_SLUG, formatStackersFields } = require('../lib/stackers');
+const { getWalletVaultSummary, getHeldTokenIds } = require('../lib/stackers-wallet-vault');
+const { optimize } = require('../lib/stackers-optimizer');
+const { getRecentRoundHistory } = require('../lib/stackers-analytics');
 const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS, OCAS_SLUG } = require('../lib/constants');
 const { extractPngFromSvg, resolveImage } = require('../lib/images');
-const { isDiscordOk } = require('../utils/format');
+const { isDiscordOk, verifyImageIsRaster } = require('../utils/format');
 const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
 
 /**
@@ -906,9 +910,36 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
       if(tokenTraits.length){
         embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
       } else { embed.setDescription('**Links**\n' + tvLink); }
+      if(rfSlug === STACKERS_SLUG){
+        const stackersFields = await formatStackersFields(tokenId);
+        if(stackersFields.length) embed.addFields(...stackersFields);
+      }
       try{
-        const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
-        embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+        // Prefer the backfill's own cached image over a live gateway race —
+        // this branch is a separate, hand-rolled embed builder (doesn't
+        // reuse buildListingEmbed at all) that was missed when this exact
+        // fix was applied everywhere else earlier tonight.
+        let dbUrlIsRaster = false;
+        if(dbMeta?.image_url && isDiscordOk(dbMeta.image_url)){
+          dbUrlIsRaster = await verifyImageIsRaster(dbMeta.image_url);
+        }
+        if(dbUrlIsRaster){
+          embed._imageResult = { type:'url', url: dbMeta.image_url };
+        } else if(dbMeta?.image_url){
+          // Confirmed URL is genuine SVG content despite passing isDiscordOk
+          // — render it directly rather than falling through to a live
+          // race that would just find the same non-raster URL again.
+          const buf = await extractPngFromSvg(dbMeta.image_url).catch(() => null);
+          if(buf){
+            embed._imageResult = { type:'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+          } else {
+            const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
+            embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+          }
+        } else {
+          const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
+          embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+        }
       }catch(e){}
       return embed;
     }));
@@ -1725,6 +1756,7 @@ async function showMeHub(interaction, ctx){
       new StringSelectMenuOptionBuilder().setLabel('📣 Trait Alert').setDescription('Sales & listing DMs by trait').setValue('trait_alert'),
       new StringSelectMenuOptionBuilder().setLabel('🏷️ Price Alerts').setDescription('DM when a token drops below a price').setValue('price_alerts'),
       new StringSelectMenuOptionBuilder().setLabel('📉 Floor Alerts').setDescription('DM when a collection floor drops').setValue('floor_alerts'),
+      new StringSelectMenuOptionBuilder().setLabel('🥞 My Stackers').setDescription('Wallet summary, strategy optimizer, vault listing DMs').setValue('my_stackers'),
       new StringSelectMenuOptionBuilder().setLabel('💼 Wallet').setDescription('Verification & wallet analytics').setValue('wallet'),
       new StringSelectMenuOptionBuilder().setLabel('📊 TraitView').setDescription('Link your TraitView account').setValue('traitview'),
     ]);
@@ -1944,6 +1976,189 @@ function generateTVCode() {
   let code = '';
   for(let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
   return code;
+}
+
+async function showMeStackersHub(interaction, ctx) {
+  const { getVaultDmOptIns } = require('../lib/stackers-vault-listing-alerts');
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+
+  const updateFn = interaction.deferred || interaction.replied ? 'editReply'
+    : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
+
+  const optIns = await getVaultDmOptIns();
+  const isOn = !!optIns[userId];
+
+  const verifiedRes = pgPool ? await pgPool.query(
+    `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+    [userId]
+  ).catch(() => ({ rows: [] })) : { rows: [] };
+  const wallet = verifiedRes.rows[0]?.wallet || null;
+
+  const lines = [];
+
+  if(wallet){
+    const shortAddr = `${wallet.slice(0,6)}...${wallet.slice(-4)}`;
+    lines.push(`💼 **Wallet:** \`${shortAddr}\``);
+
+    const summary = await getWalletVaultSummary(wallet).catch(() => null);
+    if(summary && summary.tokenCount){
+      lines.push('');
+      lines.push(`🏦 **Unclaimed Vault** — across ${summary.tokenCount} held Stacker${summary.tokenCount === 1 ? '' : 's'}:`);
+      lines.push(summary.totals.length
+        ? summary.totals.map(t => `  ${t.amount.toFixed(4)} ${t.symbol}`).join('\n')
+        : '  Empty across all held tokens');
+      if(summary.failed) lines.push(`  _${summary.failed} token(s) couldn't be checked_`);
+    } else {
+      lines.push('');
+      lines.push('🏦 **Unclaimed Vault** — you don\'t currently hold any Stackers.');
+    }
+  } else {
+    lines.push('💼 **Wallet** — not verified. Verify a wallet to see your vault summary and use the strategy optimizer.');
+  }
+
+  lines.push('');
+  lines.push(`📬 **New-Listing Vault DMs:** ${isOn ? '✅ on' : '❌ off'} — a DM the moment a new listing appears with real, unclaimed value in its vault. Works independent of any server.`);
+
+  const embed = new EmbedBuilder()
+    .setTitle('🥞 My Stackers')
+    .setColor(isOn ? 0x57F287 : 0xF97316)
+    .setDescription(lines.join('\n'));
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:stackersvault:toggle').setLabel(isOn ? '🔕 Turn Off DMs' : '🔔 Turn On DMs').setStyle(isOn ? ButtonStyle.Secondary : ButtonStyle.Success),
+  );
+  if(wallet){
+    row.addComponents(new ButtonBuilder().setCustomId('me_browse:stackers:optimize').setLabel('🧮 Run Optimizer').setStyle(ButtonStyle.Primary));
+  }
+  row.addComponents(new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary));
+
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
+}
+
+async function showStackerOptimizeModal(interaction) {
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const modal = new ModalBuilder()
+    .setCustomId('me_modal:stackeroptimize')
+    .setTitle('Stacker Strategy Optimizer');
+
+  const budgetInput = new TextInputBuilder()
+    .setCustomId('budget')
+    .setLabel('How much $STACK do you have to spend?')
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder('e.g. 350000')
+    .setRequired(true);
+
+  modal.addComponents(new AR().addComponents(budgetInput));
+  return interaction.showModal(modal);
+}
+
+// Tier index -> display multiplier, matching Stackers' own docs table exactly
+const STACKER_TIER_MULTIPLIERS = [null, 1.0, 1.4, 1.9, 2.5, 3.5];
+
+// Ported from the old standalone /stackervaults optimize subcommand --
+// same logic, but always plans for the caller's own verified wallet
+// rather than an optional address override, since /me is inherently
+// personal.
+async function showStackerOptimizeResult(interaction, ctx, budget) {
+  const { pgPool } = ctx;
+  const userId = interaction.user.id;
+
+  const verifiedRes = await pgPool.query(
+    `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
+    [userId]
+  ).catch(() => ({ rows: [] }));
+  if(!verifiedRes.rows.length){
+    return interaction.reply({ content: 'You haven\'t verified a wallet yet — verify one first from the Wallet section.', flags: MessageFlags.Ephemeral });
+  }
+  const address = verifiedRes.rows[0].wallet.toLowerCase();
+
+  const tokenIds = await getHeldTokenIds(address).catch(e => {
+    console.error('[me stackers optimize] getHeldTokenIds failed:', e.message, e.stack);
+    return null;
+  });
+
+  if(tokenIds === null){
+    return interaction.reply({ content: 'Something went wrong looking up your wallet — try again in a moment.', flags: MessageFlags.Ephemeral });
+  }
+  if(!tokenIds.length){
+    return interaction.reply({ content: 'Your verified wallet doesn\'t hold any Stackers right now.', flags: MessageFlags.Ephemeral });
+  }
+
+  const statusRes = await pgPool.query(
+    `SELECT token_id, tier_index FROM stackers_token_status WHERE token_id = ANY($1)`,
+    [tokenIds]
+  ).catch(() => ({ rows: [] }));
+  const tierByToken = new Map(statusRes.rows.map(r => [r.token_id, r.tier_index]));
+
+  const tokens = tokenIds.map(id => {
+    const tierIndex = tierByToken.get(id);
+    return { id, tier: tierIndex !== undefined && tierIndex !== null ? tierIndex + 1 : 0 };
+  });
+
+  const result = optimize(tokens, budget);
+
+  const actionLines = result.actionsTaken.map((a, idx) => {
+    const step = idx + 1;
+    if(a.type === 'upgrade'){
+      const mult = STACKER_TIER_MULTIPLIERS[a.toTier];
+      const reforgeNote = a.componentId !== a.groupSurvivorId ? ` (Reforge, part of #${a.groupSurvivorId}'s fused group)` : '';
+      return `**${step}.** Upgrade #${a.componentId} to ${mult}×${reforgeNote} — **${a.cost.toLocaleString()}** $STACK`;
+    }
+    const verb = a.type === 'fusePair' ? 'Fuse' : 'Fuse (3-way)';
+    return `**${step}.** ${verb} #${a.survivorId} + #${a.absorbedIds.join(' + #')} → new weight **${a.resultingWeight}** — **${a.cost.toLocaleString()}** $STACK`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle('🧮 Stacker Strategy — Recommended Steps')
+    .setColor(0xF97316)
+    .setDescription(
+      actionLines.length
+        ? actionLines.join('\n') + '\n\n_A strong, reasoned allocation — not a mathematical guarantee of the single best possible one. Each step is a separate on-chain transaction, in the order shown._'
+        : '_No beneficial action found — either your budget is too small for anything meaningful, or everything you hold is already fully optimized._'
+    )
+    .addFields(
+      { name: 'Budget', value: `${budget.toLocaleString()} $STACK`, inline: true },
+      { name: 'Spent', value: `${result.totalSpent.toLocaleString()} $STACK`, inline: true },
+      { name: 'Unused', value: `${result.remainingBudget.toLocaleString()} $STACK`, inline: true },
+      { name: 'Resulting Total Weight', value: `${result.totalWeight}`, inline: false },
+    );
+
+  if(result.remainingBudget > 0 && actionLines.length){
+    embed.addFields({ name: 'Why budget is left over', value: 'Everything affordable with what remains is already at max tier or fully fused — more Stackers would be needed to usefully spend the rest.', inline: false });
+  }
+
+  const recentRounds = await getRecentRoundHistory(pgPool, 24).catch(() => []);
+  if(recentRounds.length >= 2){
+    const totalPotWei = recentRounds.reduce((sum, r) => sum + BigInt(r.pot_wei), 0n);
+    const totalWeightSum = recentRounds.reduce((sum, r) => sum + BigInt(r.total_weight), 0n);
+    const avgPotWei = totalPotWei / BigInt(recentRounds.length);
+    const avgTotalWeight = totalWeightSum / BigInt(recentRounds.length);
+
+    if(avgTotalWeight > 0n){
+      const myShareOfPotWei = (avgPotWei * BigInt(result.totalWeight)) / avgTotalWeight;
+      const estimatedEthPerHour = Number(myShareOfPotWei) / 1e18;
+      embed.addFields({
+        name: '📈 Estimated Earnings (based on real recent rounds)',
+        value: `~**${estimatedEthPerHour.toFixed(6)} ETH/hour** worth of assets, based on the last ${recentRounds.length} recorded round(s) — averaged to smooth out any single hour's volume being unusually high or low.\n\n_A real estimate, not a promise — trading volume drives the actual pot every hour and isn't guaranteed or predictable._`,
+        inline: false,
+      });
+    }
+  } else {
+    embed.addFields({
+      name: '📈 Estimated Earnings',
+      value: `_Not enough real round history yet to estimate — ${recentRounds.length} recorded so far, need at least 2. Check back in a couple hours._`,
+      inline: false,
+    });
+  }
+
+  embed.setFooter({ text: `Planning for ${address.slice(0,6)}...${address.slice(-4)} · ${tokens.length} Stacker(s) held` });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary)
+  );
+
+  return interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
 }
 
 async function showMeTraitView(interaction, ctx) {
@@ -2589,7 +2804,7 @@ async function showMeTokens(interaction, ctx, slug, page = 0){
 
 // ── showMeTokenDetail — full detail for a single held token ───────────────────
 async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
-  const { pgPool, getRailwayApiUrl } = ctx;
+  const { pgPool, getRailwayApiUrl, osHeaders } = ctx;
   const userId = interaction.user.id;
 
   // Defer immediately — SVG→PNG rendering can exceed Discord's 3s window
@@ -2648,6 +2863,8 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const colCfg = allCols.find(c => c.slug === slug);
   const colContract = colCfg?.contract || null;
   const isAnimated = colCfg?.animated === true;
+  const colChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+  const colChain = colChainRes.rows[0]?.chain || 'ethereum';
 
   let imageResult = null;
 
@@ -2664,8 +2881,22 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
       [tokenId, slug]
     ).catch(()=>({ rows: [] }));
     const tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
+    // Unconditional — logs every time regardless of outcome, so there's no
+    // ambiguity about what THIS process's own database connection actually
+    // returned, as opposed to whatever a separate diagnostic elsewhere may
+    // have shown (confirmed live: the bot service and API service turned
+    // out to have different DATABASE_URL values entirely, so anything
+    // checked through the API told us nothing about what the bot itself sees).
+    console.log(`[me] ${slug}#${tokenId} tokens query returned ${tokenImgRes.rows.length} row(s), image_url=${JSON.stringify(tokenImgUrl)}`);
+    let tokenImgIsRaster = false;
     if(tokenImgUrl && isDiscordOk(tokenImgUrl)){
+      tokenImgIsRaster = await verifyImageIsRaster(tokenImgUrl);
+      if(!tokenImgIsRaster) console.log(`[me] ${slug}#${tokenId} image_url passed isDiscordOk but is actually SVG content (verified via HEAD): ${tokenImgUrl}`);
+    }
+    if(tokenImgIsRaster){
       imageResult = { type: 'url', url: tokenImgUrl };
+    } else if(tokenImgUrl && !isDiscordOk(tokenImgUrl)){
+      console.log(`[me] ${slug}#${tokenId} has image_url but isDiscordOk rejected it: ${tokenImgUrl}`);
     }
   }
 
@@ -2679,6 +2910,20 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     if(svgData){
       const buf = await extractPngFromSvg(svgData).catch(()=>null);
       if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+    } else if(tokenImgUrl && !tokenImgIsRaster){
+      // token_svg_cache has no pre-rendered version either — confirmed the
+      // stored image_url is real SVG content (not just missing/rejected),
+      // so render it directly rather than leaving the card with no image.
+      const buf = await extractPngFromSvg(tokenImgUrl).catch(e => {
+        console.warn(`[me] direct SVG render of image_url failed for ${slug}#${tokenId}:`, e.message);
+        return null;
+      });
+      if(buf){
+        imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+        console.log(`[me] ${slug}#${tokenId} rendered image_url directly as SVG`);
+      }
+    } else {
+      console.log(`[me] no token_svg_cache row found for ${slug}#${tokenId} — falling through with no image`);
     }
   }
 
@@ -2694,7 +2939,13 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     const imgData = imgRes.rows[0]?.image_data || null;
     if(imgData){
       if(imgData.startsWith('http') && isDiscordOk(imgData)){
-        imageResult = { type: 'url', url: imgData };
+        const isRaster = await verifyImageIsRaster(imgData);
+        if(isRaster){
+          imageResult = { type: 'url', url: imgData };
+        } else {
+          const buf = await extractPngFromSvg(imgData).catch(()=>null);
+          if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+        }
       } else if(imgData.startsWith('<svg') || imgData.startsWith('data:image/svg') || imgData.toLowerCase().includes('image/svg')){
         const buf = await extractPngFromSvg(imgData).catch(()=>null);
         if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
@@ -2804,6 +3055,13 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   if(nextToken !== null) navBtns.push(
     new ButtonBuilder().setCustomId(`me_browse:wallet:token_detail:${slug}:${nextToken}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary)
   );
+  // High-res download — separate from the small thumbnail shown on this
+  // card (fixed at 500px, sized for a compact preview, not for saving).
+  // Posts as its own new message rather than replacing this card, so
+  // browsing/nav state isn't disturbed by requesting a download.
+  navBtns.push(
+    new ButtonBuilder().setCustomId(`me_browse:wallet:token_download:${slug}:${tokenId}`).setLabel('⬇️ Download').setStyle(ButtonStyle.Secondary)
+  );
 
   const typeLabel = t.type_trait ? `${t.type_trait} · ` : '';
   const unrealizedDisplay = displayEst && cost > 0 ? displayEst - cost : null;
@@ -2825,13 +3083,18 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
 
   // Token image
   const tvUrl = `https://traitview.com/token/${slug}/${tokenId}`;
-  const osUrl = `https://opensea.io/assets/ethereum/${slug}/${tokenId}`;
+  const osUrl = `https://opensea.io/assets/${colChain}/${colContract || slug}/${tokenId}`;
   const embed = new EmbedBuilder()
     .setTitle(`🔍 Token #${tokenId}`)
     .setColor(unrealizedDisplay !== null && unrealizedDisplay >= 0 ? 0x57F287 : 0xED4245)
     .setDescription(descLines)
     .setURL(tvUrl)
     .setFooter({ text: `${currentIdx + 1} of ${sortedTokens.length} held tokens` });
+
+  if(slug === STACKERS_SLUG){
+    const stackersFields = await formatStackersFields(tokenId);
+    if(stackersFields.length) embed.addFields(...stackersFields);
+  }
 
   const components = [
     new ActionRowBuilder().addComponents(select),
@@ -2848,6 +3111,52 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   }
 }
 
+// ── High-res download from the wallet token detail card ─────────────────────
+// Separate from that card's own thumbnail (fixed at 500px, sized for a
+// compact preview, not for saving) — reuses download.js's renderTokenPng at
+// a meaningfully larger size, matching the exact rendering pipeline /download
+// already uses and just fixed for large on-chain SVGs (see lib/images.js/
+// api.js's POST /render/svg-token). Posts as a brand-new message (via a
+// fresh deferReply, not deferUpdate) so the browsing card/nav state is left
+// untouched — clicking Download doesn't interrupt cycling through tokens.
+async function handleMeTokenDownload(interaction, ctx, slug, tokenId){
+  await interaction.deferReply({ ephemeral: true }).catch(()=>{});
+  try{
+    const { pgPool, osHeaders } = ctx;
+    const serverCfg = ctx.getConfig ? ctx.getConfig(interaction.guildId) : null;
+    const allCols = serverCfg ? [
+      ...(serverCfg.contract ? [{ slug: serverCfg.collectionSlug || serverCfg.slug, contract: serverCfg.contract }] : []),
+      ...(serverCfg.collections || [])
+    ] : [];
+    const colCfg = allCols.find(c => c.slug === slug);
+    const contract = colCfg?.contract || null;
+    if(!contract) return interaction.editReply({ content: '❌ Could not resolve this collection\'s contract.' });
+
+    const colChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const chain = colChainRes.rows[0]?.chain || 'ethereum';
+
+    const { renderTokenPng } = require('./download');
+    const SIZE = 1500; // meaningfully larger than the 500px card thumbnail
+    const rendered = await renderTokenPng({ contract, tokenId, chain, size: SIZE, transparent: false, osHeaders, slug });
+    const ext = rendered.ext || 'png';
+    const filename = `${slug}-${tokenId}${ext === 'png' ? `-${SIZE}` : ''}.${ext}`.replace(/[^a-z0-9_.-]+/gi, '-');
+    const att = new AttachmentBuilder(rendered.buffer, { name: filename });
+
+    let content;
+    if(ext !== 'png'){
+      let rawUrl = rendered.animUrl || null;
+      if(rawUrl) rawUrl = rawUrl.replace('i2c.seadn.io', 'raw2.seadn.io').replace('i.seadn.io', 'raw2.seadn.io');
+      content = `${ext.toUpperCase()} download for **${slug} #${tokenId}**`;
+      if(rawUrl) content += `\n📥 *To save the full quality file: [tap here](${rawUrl})*`;
+    } else {
+      content = `PNG download for **${slug} #${tokenId}** · ${SIZE}px`;
+    }
+    return interaction.editReply({ content, files: [att] });
+  }catch(e){
+    return interaction.editReply({ content: 'Download failed: ' + e.message }).catch(()=>{});
+  }
+}
+
 // ── /me interaction handler ───────────────────────────────────────────────────
 async function handleMeInteraction(interaction, ctx){
   const { getAlert, setAlert, deleteAlert, getConfig, pgPool, getSyncStatus, syncWalletForUser } = ctx;
@@ -2859,8 +3168,21 @@ async function handleMeInteraction(interaction, ctx){
     if(section === 'trait_alert') return showMeTraitAlert(interaction, ctx);
     if(section === 'price_alerts') return showMePriceAlerts(interaction, ctx);
     if(section === 'floor_alerts') return showMeFloorAlerts(interaction, ctx);
+    if(section === 'my_stackers') return showMeStackersHub(interaction, ctx);
     if(section === 'wallet') return showMeWallet(interaction, ctx);
     if(section === 'traitview') return showMeTraitView(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:stackersvault:toggle'){
+    const { setVaultDmOptIn, getVaultDmOptIns } = require('../lib/stackers-vault-listing-alerts');
+    const current = await getVaultDmOptIns();
+    const isOn = !!current[interaction.user.id];
+    await setVaultDmOptIn(interaction.user.id, !isOn);
+    return showMeStackersHub(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:stackers:optimize'){
+    return showStackerOptimizeModal(interaction);
   }
 
   // Back to hub
@@ -3199,6 +3521,16 @@ async function handleMeInteraction(interaction, ctx){
     const tokenId = parseInt(parts[4]);
     return showMeTokenDetail(interaction, ctx, slug, tokenId);
   }
+
+  // High-res download button on the wallet token detail card — renders
+  // separately from (and larger than) the card's own 500px thumbnail,
+  // posted as a new message so it doesn't disturb the browsing card/nav.
+  if(customId.startsWith('me_browse:wallet:token_download:')){
+    const parts = customId.split(':');
+    const slug = parts[3];
+    const tokenId = parseInt(parts[4]);
+    return handleMeTokenDownload(interaction, ctx, slug, tokenId);
+  }
 }
 
 // ── Modal launchers ───────────────────────────────────────────────────────────
@@ -3224,4 +3556,4 @@ async function showFloorAlertModal(interaction, slug){
   return interaction.showModal(modal);
 }
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick };
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, showStackerOptimizeResult };
