@@ -2,6 +2,9 @@
 
 const { EmbedBuilder, MessageFlags } = require('discord.js');
 const { COLORS, OWNER_DISCORD_IDS } = require('../lib/constants');
+// jv: "want the 2 slash commands that were added to send me messages to my
+// webhook discord server so I gets message and I know when they get done."
+const { sendActivityWebhook, sendErrorWebhook } = require('../lib/error');
 
 /**
  * Handle admin configuration commands.
@@ -192,10 +195,174 @@ if(commandName === 'globalstats'){
   }
 }
 
+if(commandName === 'predetermined'){
+  // Hard owner gate — same reasoning as globalstats above.
+  const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+  if(!isOwner) return interaction.reply({ content:'Unknown command.', flags: MessageFlags.Ephemeral });
+
+  // jv confirmed live: this got stuck on Discord's own "thinking..." state
+  // twice in a row with ZERO trace anywhere in the logs -- not even this
+  // line was printing, meaning either the interaction never reached this
+  // code at all, or it reached here and deferReply() itself hung/rejected
+  // silently (it was never wrapped in a try/catch, so a failure here had
+  // nowhere to go). This log line alone answers the first question for
+  // next time: if it's missing again, the interaction truly isn't
+  // reaching the bot at all (a Discord/gateway-side issue outside this
+  // code); if it prints but nothing after it does, deferReply() itself is
+  // the hang.
+  console.log(`[predetermined] command received from ${interaction.user.id} (slug=${interaction.options.getString('slug')})`);
+
+  try{
+    // A 10s race so a hung deferReply() surfaces as a clear, logged
+    // timeout instead of leaving the interaction (and jv) waiting
+    // indefinitely with no way to tell what happened.
+    await Promise.race([
+      interaction.deferReply({ flags: MessageFlags.Ephemeral }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('deferReply timed out after 10s')), 10000)),
+    ]);
+  }catch(e){
+    console.error(`[predetermined] deferReply failed/timed out:`, e.message);
+    return; // interaction is already unrecoverable at this point -- nothing to reply to
+  }
+
+  const { pgPool } = ctx;
+  const slug = (interaction.options.getString('slug') || '').toLowerCase().trim();
+  const rendererInput = interaction.options.getString('renderer_contract');
+  const maxIdOverride = interaction.options.getInteger('max_id');
+
+  try{
+    const collRes = await pgPool.query(
+      `SELECT contract, chain, trait_source_mode, trait_source_renderer_contract, total_supply FROM collections WHERE slug=$1`,
+      [slug]
+    );
+    const row = collRes.rows[0];
+    if(!row){
+      return interaction.editReply({ content: `❌ No collection onboarded with slug \`${slug}\`. Onboard it first (any server's \`/config\` → Add Collection).` });
+    }
+
+    const renderer = rendererInput ? rendererInput.toLowerCase().trim() : (row.trait_source_renderer_contract || null);
+    if(!renderer){
+      return interaction.editReply({ content: `❌ No renderer contract on file for \`${slug}\` yet — pass \`renderer_contract\` the first time you set this up.` });
+    }
+    if(!/^0x[0-9a-f]{40}$/.test(renderer)){
+      return interaction.editReply({ content: `❌ \`${renderer}\` doesn't look like a valid contract address (expected 0x + 40 hex chars).` });
+    }
+
+    // Persist the config — this is what makes the setup reusable for future
+    // runs and future collections: after this, `/predetermined slug:${slug}`
+    // alone (no renderer_contract needed again) re-runs it, and any OTHER
+    // collection with the same architecture is just the same command with
+    // its own slug + renderer address, no code changes required.
+    await pgPool.query(
+      `UPDATE collections SET trait_source_mode='predetermined_onchain', trait_source_renderer_contract=$1, updated_at=NOW() WHERE slug=$2`,
+      [renderer, slug]
+    );
+
+    const { fetchOnChainMaxId, backfillPredeterminedTraits } = require('../lib/predetermined-traits');
+    const alchemyKey = process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY;
+    let maxId = maxIdOverride || await fetchOnChainMaxId(row.contract, row.chain || 'ethereum', alchemyKey) || row.total_supply || null;
+    if(!maxId){
+      return interaction.editReply({ content: `❌ Couldn't resolve a max token ID for \`${slug}\` — no MAX_ID() on the contract, no stored total_supply, and no max_id override given. Pass \`max_id\` explicitly.` });
+    }
+
+    await interaction.editReply({ content: `🧬 Running predetermined-trait backfill for **${slug}** across 1–${maxId}... this reads every token via Multicall and will take a few minutes. I'll follow up when it's done.` });
+
+    backfillPredeterminedTraits(pgPool, {
+      slug, contract: row.contract, rendererContract: renderer, chain: row.chain || 'ethereum', maxId,
+      onProgress: (p) => {
+        if(p.chunks % 5 === 0){
+          console.log(`[predetermined] ${slug} progress: ids ${p.start}-${p.end}/${maxId} — living=${p.living} unminted=${p.unminted} written=${p.written} rendererFailed=${p.rendererFailed}`);
+        }
+      },
+    })
+      .then(async stats => {
+        const { computeObsRanks } = require('../lib/rank-compute');
+        await computeObsRanks(pgPool, slug, { isOcas: false }).catch(e => {
+          console.warn(`[predetermined] [${slug}] TV Rank recompute failed after predetermined backfill (non-fatal):`, e.message);
+        });
+        const summary = `checked ${stats.checked} IDs, ${stats.living} living (${stats.minted} minted / ${stats.unminted} unclaimed), ${stats.written} written, ${stats.notLiving} not-yet-living, ${stats.rendererFailed} renderer failures.`;
+        interaction.followUp({
+          content: `✅ Predetermined-trait backfill complete for **${slug}** — ${summary}`,
+          flags: MessageFlags.Ephemeral,
+        }).catch(()=>{});
+        sendActivityWebhook(`✅ /predetermined complete: "${slug}"`, summary).catch(()=>{});
+      })
+      .catch(e => {
+        console.error(`[predetermined] ${slug} backfill failed:`, e.message);
+        interaction.followUp({ content: `❌ Predetermined-trait backfill failed for **${slug}**: ${e.message}`, flags: MessageFlags.Ephemeral }).catch(()=>{});
+        sendErrorWebhook(`/predetermined failed: "${slug}"`, e).catch(()=>{});
+      });
+  }catch(e){
+    console.error('[predetermined]', e.message);
+    return interaction.editReply({ content: `❌ Failed: ${e.message}` });
+  }
+}
+
+if(commandName === 'verifymetadata'){
+  // Same hard owner gate as /predetermined and /globalstats.
+  const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+  if(!isOwner) return interaction.reply({ content:'Unknown command.', flags: MessageFlags.Ephemeral });
+
+  console.log(`[verifymetadata] command received from ${interaction.user.id} (slug=${interaction.options.getString('slug')})`);
+
+  try{
+    await Promise.race([
+      interaction.deferReply({ flags: MessageFlags.Ephemeral }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('deferReply timed out after 10s')), 10000)),
+    ]);
+  }catch(e){
+    console.error(`[verifymetadata] deferReply failed/timed out:`, e.message);
+    return;
+  }
+
+  const { pgPool } = ctx;
+  const slug = (interaction.options.getString('slug') || '').toLowerCase().trim();
+  const concurrency = interaction.options.getInteger('concurrency') || 4;
+
+  try{
+    const collRes = await pgPool.query(
+      `SELECT contract, chain FROM collections WHERE slug=$1`,
+      [slug]
+    );
+    if(!collRes.rows.length){
+      return interaction.editReply({ content: `❌ No collection found with slug \`${slug}\` — onboard it first.` });
+    }
+    const row = collRes.rows[0];
+    if(!row.contract){
+      return interaction.editReply({ content: `❌ \`${slug}\` has no contract on file.` });
+    }
+
+    await interaction.editReply({ content: `🔍 Running a full on-chain metadata re-check for **${slug}** (concurrency=${concurrency})... this reads every token directly from the chain (bypassing the contract's own change-event signal, which isn't reliable at scale for this architecture) and will take several minutes for a large collection. I'll follow up when it's done.` });
+
+    const { fullCollectionVerification } = require('../lib/metadata-update-poller');
+    fullCollectionVerification({ slug, contract: row.contract, chain: row.chain || 'ethereum', concurrency })
+      .then(async stats => {
+        if(!stats.ok){
+          interaction.followUp({ content: `⏳ ${stats.error}`, flags: MessageFlags.Ephemeral }).catch(()=>{});
+          return;
+        }
+        const summary = `checked ${stats.totalTokens} token(s), ${stats.succeeded} ok, ${stats.failed} failed, in ${stats.elapsedSec}s.`;
+        interaction.followUp({
+          content: `✅ Full metadata verification complete for **${slug}** — ${summary}`,
+          flags: MessageFlags.Ephemeral,
+        }).catch(()=>{});
+        sendActivityWebhook(`✅ /verifymetadata complete: "${slug}"`, summary).catch(()=>{});
+      })
+      .catch(e => {
+        console.error(`[verifymetadata] ${slug} verification failed:`, e.message);
+        interaction.followUp({ content: `❌ Full metadata verification failed for **${slug}**: ${e.message}`, flags: MessageFlags.Ephemeral }).catch(()=>{});
+        sendErrorWebhook(`/verifymetadata failed: "${slug}"`, e).catch(()=>{});
+      });
+  }catch(e){
+    console.error('[verifymetadata]', e.message);
+    return interaction.editReply({ content: `❌ Failed: ${e.message}` });
+  }
+}
+
 }
 
 const ADMIN_COMMANDS = new Set([
-  'setuphere','setlistingshere','setlistings','verifydashboard','status','globalstats',
+  'setuphere','setlistingshere','setlistings','verifydashboard','status','globalstats','predetermined','verifymetadata',
 ]);
 
 // ── /verifydashboard ──────────────────────────────────────────────────────────

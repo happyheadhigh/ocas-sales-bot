@@ -5,6 +5,7 @@
 
 require('dotenv').config();
 
+const express = require('express');
 const {
   Client, GatewayIntentBits,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
@@ -16,7 +17,7 @@ const sharp = require('sharp');
 // ── Lib ───────────────────────────────────────────────────────────────────────
 const {
   DISCORD_TOKEN, OPENSEA_KEY, ALCHEMY_KEY, API_SECRET,
-  COLORS, OCAS_CONTRACT, BURN_CONTRACT,
+  COLORS, OCAS_CONTRACT, OCAS_SLUG, BURN_CONTRACT,
   POLL_MS, RANK_SYNC_INTERVAL, BOT_ENV,
   osHeaders, getRailwayApiUrl, getRankTierColor,
   PENDING_DRAW_SEED_PREFIX, DEFAULT_LOTTERY_TIMEZONE,
@@ -25,10 +26,12 @@ const {
 
 const {
   pgPool, runMigrations, dbLoad, dbSave,
-  loadAllConfigs, getConfig, setConfig, getAllConfigs, getUserAlerts,
+  loadAllConfigs, getConfig, setConfig, deleteConfig, getAllConfigs, getUserAlerts,
 } = require('./lib/db');
 
-const { sendErrorWebhook, checkStartupEnvVars } = require('./lib/error');
+const { sendErrorWebhook, sendActivityWebhook, checkStartupEnvVars } = require('./lib/error');
+const { seedMarketHistory } = require('./sync-listings');
+const { computeTraitPulse } = require('./lib/trait-pulse');
 
 const {
   getCachedImage, setCachedImage, clearCachedImage,
@@ -48,7 +51,7 @@ const {
   checkCommandCooldown, fetchBotApiJson,
   buildNavRow, postEmbeds,
   getTraitIndex, chooseTraitGroupsFromQuery, normalizePhrase,
-  cachedFloors,
+  cachedFloors, formatSweepTokenLine,
 } = require('./lib/burn-config');
 
 const {
@@ -57,6 +60,14 @@ const {
   setClient, traitDisplayLines, fetchTokenUriFromContract,
   pendingBurns, pendingBurnAlerts, tokenMetaCache: burnPollerTokenMetaCache,
 } = require('./lib/burn-poller');
+const { startMetadataUpdatePoller } = require('./lib/metadata-update-poller');
+const { startNewTokenPoller } = require('./lib/new-token-poller');
+const { startCollectionTransferSync } = require('./lib/collection-transfers');
+const { startGondiSync } = require('./lib/gondi-sync');
+const { startGondiActivitySync } = require('./lib/gondi-activity-sync');
+const { addLinkedWallet, getLinkedWalletAddresses } = require('./lib/linked-wallets');
+const { verifyAgainstAnyConfiguredChain, getConfiguredWebhooks, processAddressActivityEvent } = require('./lib/alchemy-webhook');
+const { startBurnDetectionPoller } = require('./lib/burn-detect');
 
 const {
   buildBurnLotteryEmbed, buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
@@ -69,16 +80,18 @@ const {
 
 const { fetchTokenMetaFromDb, upsertTokenTraitRows, buildSaleEmbed, buildListingEmbed,
   traitObjectToArray, burnTypeBreakdown, fetchBurnDisplayTraits, fetchSnapshotImageForToken,
-  osRankBadge, titleTokenId, tokenMetaCache: embedsTokenMetaCache,
+  osRankBadge, titleTokenId, tokenMetaCache: embedsTokenMetaCache, resolveOnChainImage,
 } = require('./lib/embeds');
 const { resolveImage, sendEmbed, extractPngFromSvg, buildEmbedPayload, tokenMetaCache: imagesTokenMetaCache } = require('./lib/images');
 
 const {
   pollSales, pollListings,
   getAlert, setAlert, deleteAlert,
+  getTokenAlert, setTokenAlert, deleteTokenAlert,
   loadAllAlerts, loadSaleCursors, loadListingCursors,
   saveSaleCursors, saveListingCursors,
   setClient: setPollClient,
+  setSyncTraitRolesFn, shouldSyncRolesNow,
   traitGroupsLabel, buildTokenSearchEmbed,
   lastSaleIds, lastListingIds,
 } = require('./lib/poll');
@@ -87,7 +100,7 @@ const {
 const {
   normAddr, shortAddr, formatEth, formatListingEth,
   timeSince, lotteryTime, formatBurnLotteryWindow,
-  isSvg, isDiscordOk, matchesFilters,
+  isSvg, isDiscordOk, matchesFilters, verifyImageIsRaster,
 } = require('./utils/format');
 
 const {
@@ -99,7 +112,7 @@ const {
 
 // ── Command modules ───────────────────────────────────────────────────────────
 const { handleAdminCommand, ADMIN_COMMANDS }     = require('./commands/admin');
-const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick }   = require('./commands/market');
+const { handleMarketCommand, MARKET_COMMANDS, handleTraitBrowseInteraction, handleMyAlertInteraction, handleMyAlertModalSubmit, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, handleMeTokenDownload }   = require('./commands/market');
 const { backfillWallet, getSyncStatus, syncWalletForUser: _syncWalletForUser } = require('./lib/wallet-backfill');
 const { handleOcasCommand, OCAS_COMMANDS }       = require('./commands/ocas');
 const { handleTokenCommand, TOKEN_COMMANDS }     = require('./commands/token');
@@ -118,6 +131,7 @@ const client = new Client({ intents: [
 ] });
 setClient(client); // inject into burn-poller
 setPollClient(client); // inject into poll
+setSyncTraitRolesFn(syncTraitRoles); // inject into poll — immediate role re-sync on sale (buyer/seller)
 
 // ── resolveDiscordChannel — needs client, defined here ───────────────────────
 // Inject client into burn-poller so it can resolve channels
@@ -147,7 +161,7 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     burnRpc, burnRpcUrl, fetchEthBlockHashSeed, waitForEthBlock,
     // Embeds
     buildSaleEmbed, buildListingEmbed, sendEmbed, postEmbeds,
-    resolveImage, extractPngFromSvg, fetchTokenMetaFromDb,
+    resolveImage, extractPngFromSvg, fetchTokenMetaFromDb, resolveOnChainImage,
     buildBurnEmbed, buildBurnLotteryEmbed,
     buildActiveBurnLotteryComponents, buildBurnLotteryComponents,
     buildGenericLotteryStartEmbed, buildGenericLotteryResultEmbed,
@@ -164,6 +178,7 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     randomLotterySeed, resolveLotteryWindow, LOTTERY_DURATION_RE,
     // Alerts
     getAlert, setAlert, deleteAlert,
+    getTokenAlert, setTokenAlert, deleteTokenAlert,
     // Format
     resolveDiscordChannel,
     // Trait/search helpers
@@ -177,7 +192,7 @@ COLORS, OCAS_CONTRACT, BURN_CONTRACT, BURN_COLORS, E1_TYPE_NAMES, DEFAULT_LOTTER
     // Cache
     ocasTraitsCache,
     normAddr, shortAddr, formatEth, timeSince, lotteryTime,
-    formatBurnLotteryWindow, isSvg, isDiscordOk, matchesFilters,
+    formatBurnLotteryWindow, isSvg, isDiscordOk, matchesFilters, verifyImageIsRaster,
     // Rank sync
     rankSyncQueue, queueRankSync,
      // Wallet sync
@@ -279,7 +294,21 @@ function collectStringsDeep(obj, out=[]){
 }
 
 // ── Trait role sync ─────────────────────────────────────────────────────────
-async function syncTraitRoles(guild, discordId, wallet){
+async function syncTraitRoles(guild, discordId, walletOrWallets){
+  // jv: bot should support multiple linked wallets, combining holdings
+  // together for role purposes. Every existing caller passed a single
+  // wallet string -- normalizing to an array here keeps every one of them
+  // working unchanged while the real callers get updated to pass every
+  // linked wallet (lib/linked-wallets.js) instead of just one.
+  const wallets = (Array.isArray(walletOrWallets) ? walletOrWallets : [walletOrWallets])
+    .filter(Boolean)
+    .map(w => String(w).toLowerCase());
+  if(!wallets.length) return { assigned: [], skipped: [], alreadyHad: [], failed: [] };
+  // Kept for every log line and DB query below that expects a single
+  // "the wallet" value (burn-event lookups don't distinguish which of a
+  // user's wallets did the burning) -- first linked wallet, same as
+  // before this only ever had exactly one anyway.
+  const wallet = wallets[0];
   try{
     // Get all trait roles configured for this guild — collection_slug NULL means "primary collection"
     const traitRolesRes = await pgPool.query(
@@ -287,7 +316,7 @@ async function syncTraitRoles(guild, discordId, wallet){
       [guild.id]
     );
 
-    if(!traitRolesRes.rows.length) return { assigned: [], skipped: [], alreadyHad: [] }; // No trait roles configured
+    if(!traitRolesRes.rows.length) return { assigned: [], skipped: [], alreadyHad: [], failed: [] }; // No trait roles configured
 
     const cfg = getConfig(guild.id) || {};
     const primarySlug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
@@ -302,7 +331,7 @@ async function syncTraitRoles(guild, discordId, wallet){
     }
 
     const member = await guild.members.fetch(discordId).catch(()=>null);
-    if(!member) return { assigned: [], skipped: [], alreadyHad: [] };
+    if(!member) return { assigned: [], skipped: [], alreadyHad: [], failed: [] };
 
     // Burn-based rules (_totalburns/_maxburn) aren't tied to any one
     // collection's ownership data the way trait/count rules are -- compute
@@ -316,9 +345,9 @@ async function syncTraitRoles(guild, discordId, wallet){
           `SELECT bei.burn_event_id, COUNT(*)::int AS tokens_in_event
            FROM burn_event_inputs bei
            JOIN burn_events be ON be.id = bei.burn_event_id
-           WHERE LOWER(be.burner_wallet) = LOWER($1)
+           WHERE LOWER(be.burner_wallet) = ANY($1::text[])
            GROUP BY bei.burn_event_id`,
-          [wallet]
+          [wallets]
         );
         let max = 0;
         for(const r of burnRes.rows){ if(r.tokens_in_event > max) max = r.tokens_in_event; }
@@ -336,23 +365,47 @@ async function syncTraitRoles(guild, discordId, wallet){
       }
     }
 
-    const rolesSummary = { assigned: [], skipped: [], alreadyHad: [] };
+    const rolesSummary = { assigned: [], skipped: [], alreadyHad: [], failed: [] };
     let totalOwnedAcrossCollections = 0;
+
+    // Chain isn't in server config at all — resolve every collection in this
+    // loop from the collections registry in one batch query, same pattern
+    // used elsewhere tonight, rather than a lookup per collection.
+    const traitSyncChainMap = {};
+    try{
+      const chainRes = await pgPool.query(
+        `SELECT slug, chain FROM collections WHERE slug = ANY($1)`,
+        [Object.keys(rulesBySlug)]
+      );
+      for(const row of chainRes.rows) traitSyncChainMap[row.slug] = row.chain;
+    }catch(e){
+      console.warn('[TraitSync] chain lookup failed (defaulting to ethereum):', e.message);
+    }
 
     // Process each collection separately — fetch ownership + traits scoped to that slug
     for(const slug of Object.keys(rulesBySlug)){
       const rules = rulesBySlug[slug];
+      const slugChain = traitSyncChainMap[slug] || 'ethereum';
 
-      const osRes = await fetch(
-        `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?collection=${slug}&limit=200`,
-        { headers: osHeaders() }
-      );
-      if(!osRes.ok){
-        console.error('[TraitSync] OpenSea NFT fetch failed for', slug, ':', osRes.status);
-        continue;
+      // jv: combine holdings across every linked wallet for role purposes
+      // -- fetch each wallet's OpenSea holdings for this collection
+      // separately (that endpoint takes one account at a time) and
+      // concatenate the results, rather than just the first/only wallet
+      // this used to assume.
+      let allNfts = [];
+      for(const w of wallets){
+        const osRes = await fetch(
+          `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
+          { headers: osHeaders() }
+        );
+        if(!osRes.ok){
+          console.error('[TraitSync] OpenSea NFT fetch failed for', slug, 'wallet', w, ':', osRes.status);
+          continue;
+        }
+        const osData = await osRes.json();
+        allNfts = allNfts.concat(osData.nfts || []);
       }
-      const osData = await osRes.json();
-      const ownedTokenIds = (osData.nfts||[]).map(n => parseInt(n.identifier)).filter(Boolean);
+      const ownedTokenIds = [...new Set(allNfts.map(n => parseInt(n.identifier)).filter(Boolean))];
       totalOwnedAcrossCollections += ownedTokenIds.length;
 
       // Build trait count map for this collection's owned tokens.
@@ -369,7 +422,7 @@ async function syncTraitRoles(guild, discordId, wallet){
             traitCounts[r.trait_name+'::'+r.trait_value] = parseInt(r.count);
         }
       } else {
-        for(const nft of (osData.nfts || [])){
+        for(const nft of allNfts){
           for(const t of (nft.traits || [])){
             const key = t.trait_type + '::' + t.value;
             traitCounts[key] = (traitCounts[key] || 0) + 1;
@@ -386,6 +439,18 @@ async function syncTraitRoles(guild, discordId, wallet){
           count = burnStats?.total || 0;
         } else if(tr.trait_type === '_maxburn'){
           count = burnStats?.max || 0;
+        } else if(tr.trait_type === '_tokenid'){
+          // jv: "the role manager/assignee should support specific token
+          // #'s as well as long as trait roles." Reuses this same table
+          // (trait_type/trait_value are already generic text columns, no
+          // schema change needed) and the same special-trait_type pattern
+          // already established by _count/_totalburns/_maxburn above --
+          // trait_value holds the specific token id as a string; a comma-
+          // separated list (e.g. "1234,5678") grants the role if the
+          // wallet owns ANY one of them, matching how a trait rule
+          // already grants a role for owning any token with that trait.
+          const wantedIds = String(tr.trait_value || '').split(',').map(s => parseInt(s.trim())).filter(Number.isFinite);
+          count = wantedIds.some(id => ownedTokenIds.includes(id)) ? 1 : 0;
         } else {
           count = traitCounts[tr.trait_type+'::'+tr.trait_value] || traitCounts[tr.trait_type+'::'+String(tr.trait_value||'')] || 0;
         }
@@ -396,8 +461,23 @@ async function syncTraitRoles(guild, discordId, wallet){
         if(meetsMin && !hasRole){
           const conflict = await isRoleManagedByOtherBot(guild, tr.role_id);
           if(!conflict){
-            await member.roles.add(tr.role_id).catch(e=>console.error('[TraitSync] add role:', e.message));
-            rolesSummary.assigned.push(tr.role_id);
+            // Confirmed real bug: rolesSummary.assigned.push() used to happen
+            // unconditionally right after this call, regardless of whether
+            // roles.add() actually succeeded — .catch() only logged the
+            // error, it never stopped the push. A failed assignment (e.g.
+            // "Missing Permissions" from the bot's role sitting below the
+            // target role in the server's hierarchy) was silently counted
+            // as a success, so /synctraits's own "✅ synced" reply gave zero
+            // indication that anything had actually failed — confirmed live,
+            // the only way to discover this was checking Railway's own
+            // server logs directly, which no other server's admin can do.
+            try{
+              await member.roles.add(tr.role_id);
+              rolesSummary.assigned.push(tr.role_id);
+            }catch(e){
+              console.error('[TraitSync] add role failed:', e.message);
+              rolesSummary.failed.push({ roleId: tr.role_id, reason: e.message });
+            }
           } else {
             console.log('[TraitSync] SKIP add — role managed by other bot:', tr.role_id);
             rolesSummary.skipped.push(tr.role_id);
@@ -435,7 +515,7 @@ async function syncTraitRoles(guild, discordId, wallet){
     return rolesSummary;
   }catch(e){
     console.error('[TraitSync] Error:', e.message);
-    return { assigned: [], skipped: [], alreadyHad: [] };
+    return { assigned: [], skipped: [], alreadyHad: [], failed: [] };
   }
 }
 
@@ -443,19 +523,73 @@ async function syncTraitRoles(guild, discordId, wallet){
 async function runDailyTraitSync(){
   console.log('[TraitSync] Starting daily sync...');
   try{
-    // Get all verified registrations
+    // jv: combine holdings across every linked wallet for role purposes.
+    // linked_wallets (lib/linked-wallets.js) replaces user_registrations
+    // as the source here -- one row per (discord_id, guild_id, wallet)
+    // rather than one wallet per user, so a user with 2+ verified wallets
+    // gets every one of them grouped into a single array and passed to
+    // syncTraitRoles together, instead of only ever seeing their first.
     const regs = await pgPool.query(
-      'SELECT discord_id, guild_id, wallet FROM user_registrations WHERE verified=true'
+      `SELECT discord_id, guild_id, array_agg(wallet) AS wallets
+       FROM linked_wallets WHERE verified=true
+       GROUP BY discord_id, guild_id`
     );
     for(const reg of regs.rows){
       const guild = client.guilds.cache.get(reg.guild_id);
       if(!guild) continue;
-      await syncTraitRoles(guild, reg.discord_id, reg.wallet);
+      await syncTraitRoles(guild, reg.discord_id, reg.wallets);
       await new Promise(r=>setTimeout(r, 500)); // Rate limit buffer
     }
-    console.log('[TraitSync] Daily sync complete —', regs.rows.length, 'wallets synced');
+    console.log('[TraitSync] Daily sync complete —', regs.rows.length, 'users synced');
   }catch(e){
     console.error('[TraitSync] Daily sync error:', e.message);
+  }
+}
+
+// ── Daily wallet holdings re-sync ───────────────────────────────────────────
+// jv confirmed live: backfillWallet() only ever runs once per wallet+
+// collection (skips permanently once nft_transfers has any row at all --
+// by design, it's a one-time historical population, not an ongoing sync).
+// Nothing periodic ever forced a fresh check before this -- only the
+// initial verification and manually clicking "🔄 Sync" in /me did, so a
+// wallet whose holdings changed afterward stayed stale indefinitely
+// unless someone happened to click that. Reuses syncWalletForUser (the
+// same delete-nft_transfers-then-rebackfill logic the manual Sync button
+// already uses correctly) for every verified registration.
+async function runDailyWalletResync(){
+  console.log('[WalletResync] Starting daily wallet holdings re-sync...');
+  if(!process.env.ALCHEMY_API_KEY){
+    console.log('[WalletResync] No ALCHEMY_API_KEY — skipping');
+    return;
+  }
+  try{
+    // linked_wallets, not user_registrations: the source of truth for
+    // "who's verified" now supports multiple wallets per user. This job
+    // still re-syncs through syncWalletForUser's existing per-guild
+    // primary-wallet logic rather than every individual linked wallet's
+    // own P&L stats -- fully aggregating wallet_token_intervals itself
+    // across multiple wallets is a separate, larger piece of work than
+    // this staleness fix.
+    const regs = await pgPool.query(
+      `SELECT DISTINCT discord_id, guild_id FROM linked_wallets WHERE verified=true`
+    );
+    let synced = 0, failed = 0;
+    for(const reg of regs.rows){
+      try{
+        await _syncWalletForUser(reg.discord_id, reg.guild_id, pgPool, process.env.ALCHEMY_API_KEY, getConfig);
+        synced++;
+      }catch(e){
+        failed++;
+        console.warn('[WalletResync] Failed for', reg.discord_id, reg.guild_id, ':', e.message);
+      }
+      // Full transfer-history refetches are heavier than a role check --
+      // more spacing than runDailyTraitSync's 500ms to stay comfortable
+      // under Alchemy's rate limits across a whole verified user base.
+      await new Promise(r=>setTimeout(r, 2000));
+    }
+    console.log('[WalletResync] Daily re-sync complete —', synced, 'synced,', failed, 'failed');
+  }catch(e){
+    console.error('[WalletResync] Daily re-sync error:', e.message);
   }
 }
 
@@ -670,13 +804,15 @@ client.on('interactionCreate', async (interaction)=>{
     const primaryWallet = wallets[0];
     const cfg = getConfig(guildId) || {};
     const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+    const slugChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const slugChain = slugChainRes.rows[0]?.chain || 'ethereum';
 
     // Fetch NFTs across all wallets combined
     let totalTokens = [];
     for(const w of wallets){
       try{
         const nftRes = await fetch(
-          `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+          `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
           { headers:osHeaders(), agent:osAgent }
         );
         if(nftRes.ok){
@@ -731,7 +867,7 @@ client.on('interactionCreate', async (interaction)=>{
   }
   // ── Setup wizard modal + button handlers ───────────────────────────────────
   if(interaction.isModalSubmit() && interaction.customId.startsWith('setup_modal:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupModal(interaction, setupCtx);
   }
   if(interaction.isModalSubmit() && (interaction.customId.startsWith('cfg_modal:') || interaction.customId.startsWith('cfg_modal:col_filter:'))){
@@ -746,7 +882,14 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   if(interaction.isButton() && interaction.customId.startsWith('setup:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
+    return handleSetupButton(interaction, setupCtx);
+  }
+  // Setup wizard's own paginated trait-value picker (distinct from /config's
+  // vpick:traitrole: / vpick:filtertrait: above — this one stays inside the
+  // wizard's embeds instead of exiting to /config's UI).
+  if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('vpick:wtraitrole:')){
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isButton() && (interaction.customId.startsWith('cfg:') || interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col_filter:'))){
@@ -764,17 +907,17 @@ client.on('interactionCreate', async (interaction)=>{
   }
   // Channel select menus from setup wizard (still native Discord component)
   if(interaction.isChannelSelectMenu() && interaction.customId.startsWith('setup_chsel:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   // Role select menus from setup wizard — now a manually-paginated StringSelectMenu
   // (see lib/role-picker.js); isRoleSelectMenu() kept as a harmless fallback.
   if((interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) && interaction.customId.startsWith('setup_rolesel:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_traitrole:')){
-    const setupCtx = { pgPool, setConfig };
+    const setupCtx = { pgPool, setConfig, getConfig };
     return handleSetupButton(interaction, setupCtx);
   }
   if(interaction.isStringSelectMenu() && (interaction.customId.startsWith('cfg_role:') || interaction.customId.startsWith('cfg_col:') || interaction.customId.startsWith('cfg_filter:') || interaction.customId.startsWith('cfg_col_filter:') || interaction.customId.startsWith('cfg_col_salesfilter:') || interaction.customId.startsWith('cfg_tzsel:'))){
@@ -812,15 +955,19 @@ client.on('interactionCreate', async (interaction)=>{
     return handleRankFindBrowseInteraction(interaction, rfCtx);
   }
   if((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('ma_browse:')){
-    const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert };
+    const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert, getTokenAlert, setTokenAlert };
     return handleMyAlertInteraction(interaction, maCtx);
+  }
+  if(interaction.isModalSubmit() && interaction.customId.startsWith('ma_modal:')){
+    const maCtx = { getConfig, getRailwayApiUrl, getCachedTraitIndex, getAlert, setAlert, getTokenAlert, setTokenAlert };
+    return handleMyAlertModalSubmit(interaction, maCtx);
   }
   if(interaction.isButton() && interaction.customId.startsWith('mac_browse:')){
     const macCtx = { getAlert, setAlert, deleteAlert };
     return handleMaClearInteraction(interaction, macCtx);
   }
   if((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('me_browse:')){
-    const meCtx = { getAlert, setAlert, deleteAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser };
+    const meCtx = { getAlert, setAlert, deleteAlert, getTokenAlert, setTokenAlert, deleteTokenAlert, getConfig, getRailwayApiUrl, getCachedTraitIndex, pgPool, fetchBotApiJson, getSyncStatus, syncWalletForUser: _syncWalletForUser, osHeaders };
     return handleMeInteraction(interaction, meCtx);
   }
 
@@ -828,6 +975,27 @@ client.on('interactionCreate', async (interaction)=>{
   if(interaction.isModalSubmit() && interaction.customId.startsWith('me_modal:')){
     const parts = interaction.customId.split(':');
     const alertType = parts[1];
+
+    if(alertType === 'download'){
+      // customId is me_modal:download:slug:tokenId — 4 segments, unlike
+      // every other me_modal type below (3 segments: type:slug), so this
+      // is handled before the generic `const slug = parts.slice(2).join(':')`
+      // line further down would otherwise incorrectly merge the tokenId
+      // into the slug for this one case.
+      const dlSlug = parts[2];
+      const dlTokenId = parseInt(parts[3]);
+      const sizeInput = (interaction.fields.getTextInputValue('size')||'').trim();
+      const sizeRaw = sizeInput ? parseInt(sizeInput, 10) : 2048;
+      if(sizeInput && (isNaN(sizeRaw) || sizeRaw < 50 || sizeRaw > 4096)){
+        return interaction.reply({ content: '❌ Invalid size. Must be a number between 50 and 4096.', flags: MessageFlags.Ephemeral });
+      }
+      const dlSize = Math.max(50, Math.min(sizeRaw || 2048, 4096));
+      const transparentInput = (interaction.fields.getTextInputValue('transparent')||'').trim().toLowerCase();
+      const dlTransparent = transparentInput === 'yes' || transparentInput === 'y' || transparentInput === 'true';
+      const meCtx = { pgPool, osHeaders, getConfig };
+      return handleMeTokenDownload(interaction, meCtx, dlSlug, dlTokenId, dlSize, dlTransparent);
+    }
+
     const slug = parts.slice(2).join(':');
 
     if(alertType === 'pricealert'){
@@ -994,23 +1162,40 @@ client.on('interactionCreate', async (interaction)=>{
   }
 
   // ── Start Verification button ─────────────────────────────────────────────
-  if(interaction.isButton() && interaction.customId.startsWith('start_verification:')){
+  if(interaction.isButton() && (interaction.customId.startsWith('start_verification:') || interaction.customId.startsWith('start_verification_additional:'))){
+    const isAdditionalWallet = interaction.customId.startsWith('start_verification_additional:');
     const svGuild = interaction.guildId;
     const svUser  = interaction.user.id;
 
-    // Check if already verified in this server
+    // jv: "the bot should support multiple wallets." This used to fully
+    // block anyone already verified from going any further -- correct
+    // when a wallet could only ever be replaced, but that's exactly the
+    // case where someone wants to link a second one now. addLinkedWallet
+    // (lib/linked-wallets.js) is additive, so the actual verification flow
+    // below already safely supports adding another wallet -- this just
+    // needed to stop dead-ending before it could get there. Shows every
+    // currently-linked wallet (not only the one user_registrations
+    // happens to have) with the option to continue and add another.
     try{
-      const svEx = await pgPool.query(
-        'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND guild_id=$2 AND verified=true',
-        [svUser, svGuild]
-      );
-      if(svEx.rows.length){
-        const w = svEx.rows[0].wallet;
-        return interaction.reply({flags:64, content:'✅ Already verified in this server!\n🔗 Wallet: `'+w.slice(0,6)+'...'+w.slice(-4)+'`'});
+      const existingWallets = isAdditionalWallet ? [] : await getLinkedWalletAddresses(pgPool, svUser, svGuild);
+      if(existingWallets.length){
+        const list = existingWallets.map(w => '`'+w.slice(0,6)+'...'+w.slice(-4)+'`').join(', ');
+        return interaction.reply({
+          flags:64,
+          content: `✅ Already verified in this server with ${existingWallets.length} wallet${existingWallets.length>1?'s':''}: ${list}\n\nWant to link another one?`,
+          components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('start_verification_additional:'+svGuild).setLabel('Add Another Wallet').setStyle(ButtonStyle.Primary).setEmoji('➕'),
+          )],
+        });
       }
     }catch(_){}
 
-    // Check if already verified in ANY server (cross-server shortcut)
+    // Check if already verified in ANY server (cross-server shortcut) --
+    // skipped entirely for isAdditionalWallet: this shortcut exists to
+    // recognise "you're already verified elsewhere with the SAME wallet,
+    // no need to re-verify" -- exactly wrong for someone who explicitly
+    // wants to type in a DIFFERENT, new address instead.
+    if(!isAdditionalWallet)
     try{
       const globalEx = await pgPool.query(
         'SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1',
@@ -1021,6 +1206,8 @@ client.on('interactionCreate', async (interaction)=>{
         const knownWallet = globalEx.rows[0].wallet;
         const gCfg = getConfig(svGuild) || {};
         const slug = gCfg.collectionSlug || gCfg.slug || 'on-chain-all-stars';
+        const slugChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+        const slugChain = slugChainRes.rows[0]?.chain || 'ethereum';
 
         // Full OS profile fetch — get ALL linked wallets
         let allWallets = [knownWallet];
@@ -1038,12 +1225,30 @@ client.on('interactionCreate', async (interaction)=>{
           }
         }catch(_){}
 
+        // jv confirmed live: verifying a second wallet showed "Tokens
+        // found: 0" and no role changes, even though an earlier-linked
+        // wallet genuinely holds tokens. Same root cause as the SVDone
+        // flow above -- allWallets here only ever reflected OpenSea's own
+        // profile-linking for knownWallet specifically, with no way to
+        // know about a wallet linked in an earlier, separate verification
+        // unless OpenSea itself considers them the same linked profile.
+        // Persisting first, then re-fetching the FULL combined set from
+        // linked_wallets (the actual source of truth across every
+        // verification attempt this user has ever completed), and using
+        // that for the token count and role sync below.
+        for(const w of allWallets){
+          await addLinkedWallet(pgPool, svUser, svGuild, w, true).catch(e =>
+            console.warn('[SVInstant] addLinkedWallet failed for', w, ':', e.message)
+          );
+        }
+        allWallets = await getLinkedWalletAddresses(pgPool, svUser, svGuild).catch(() => allWallets);
+
         // Fetch token holdings across all wallets
         let totalTokens = [];
         for(const w of allWallets){
           try{
             const nftRes = await fetch(
-              `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+              `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
               { headers:osHeaders() }
             );
             if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
@@ -1052,13 +1257,6 @@ client.on('interactionCreate', async (interaction)=>{
         const tokenCount = totalTokens.length;
 
         // Save to this guild
-        await pgPool.query(
-          `INSERT INTO user_registrations (discord_id,guild_id,wallet,verified,verified_at,updated_at)
-           VALUES ($1,$2,$3,true,NOW(),NOW())
-           ON CONFLICT (discord_id,guild_id) DO UPDATE SET wallet=$3,verified=true,verified_at=NOW(),updated_at=NOW()`,
-          [svUser, svGuild, knownWallet]
-        ).catch(()=>{});
-
         // Assign roles
         try{
           const panelR = await pgPool.query(
@@ -1081,7 +1279,7 @@ client.on('interactionCreate', async (interaction)=>{
         }catch(e){ console.error('[SVInstant] role assign error:', e.message); }
 
         // Sync trait roles immediately and collect summary
-        const roleSummaryInst = await syncTraitRoles(interaction.guild, svUser, knownWallet).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
+        const roleSummaryInst = await syncTraitRoles(interaction.guild, svUser, allWallets).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
 
         const rolePartsInst = [];
         if(roleSummaryInst.assigned.length)   rolePartsInst.push(`✅ Roles assigned: ${roleSummaryInst.assigned.map(id=>`<@&${id}>`).join(', ')}`);
@@ -1270,20 +1468,45 @@ client.on('interactionCreate', async (interaction)=>{
 
     // Get all linked wallets from profile
     const addresses = profile.addresses || [];
-    const wallets = [wallet, ...addresses
+    const walletsFromThisProfile = [wallet, ...addresses
       .map(a => (a.address||'').toLowerCase())
       .filter(a => /^0x[0-9a-f]{40}$/.test(a) && a !== wallet)
     ];
 
+    // jv confirmed live: verified a second wallet, got "Tokens found: 0"
+    // and no role changes, even though the FIRST wallet (already verified
+    // earlier) genuinely holds tokens. Root cause -- everything below used
+    // to run entirely off walletsFromThisProfile (this one verification
+    // attempt's own wallet plus whatever OpenSea's own profile-linking
+    // reports for it specifically), which has no way to know about a
+    // wallet linked in an earlier, separate verification unless OpenSea
+    // itself considers them the same linked profile. The "Assign roles"
+    // block further down used to run BEFORE this wallet was even
+    // persisted to linked_wallets, compounding the problem. Persisting
+    // first, then re-fetching the FULL combined set from linked_wallets
+    // (the actual source of truth for "every wallet this user has ever
+    // linked, across all verification attempts"), and using that for the
+    // token count, the holder-role check, and syncTraitRoles below --
+    // walletsFromThisProfile is kept only for the display text describing
+    // what THIS attempt specifically discovered.
+    for(const w of walletsFromThisProfile){
+      await addLinkedWallet(pgPool, discordId, svGuild, w, true).catch(e =>
+        console.warn('[SVDone] addLinkedWallet failed for', w, ':', e.message)
+      );
+    }
+    const wallets = await getLinkedWalletAddresses(pgPool, discordId, svGuild).catch(() => walletsFromThisProfile);
+
     const cfg  = getConfig(svGuild) || {};
     const slug = cfg.collectionSlug || cfg.slug || 'on-chain-all-stars';
+    const slugChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const slugChain = slugChainRes.rows[0]?.chain || 'ethereum';
 
     // Fetch token holdings across all wallets
     let totalTokens = [];
     for(const w of wallets){
       try{
         const nftRes = await fetch(
-          `https://api.opensea.io/api/v2/chain/ethereum/account/${w}/nfts?collection=${slug}&limit=200`,
+          `https://api.opensea.io/api/v2/chain/${slugChain}/account/${w}/nfts?collection=${slug}&limit=200`,
           { headers:osHeaders() }
         );
         if(nftRes.ok) totalTokens = totalTokens.concat((await nftRes.json()).nfts||[]);
@@ -1353,7 +1576,7 @@ client.on('interactionCreate', async (interaction)=>{
       : `🔗 **Wallet:** \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``;
 
     // Sync trait roles immediately and collect summary
-    const roleSummary = await syncTraitRoles(interaction.guild, discordId, wallet).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
+    const roleSummary = await syncTraitRoles(interaction.guild, discordId, wallets).catch(()=>({ assigned:[], skipped:[], alreadyHad:[] }));
 
     const roleParts = [];
     if(roleSummary.assigned.length)   roleParts.push(`✅ Roles assigned: ${roleSummary.assigned.map(id=>`<@&${id}>`).join(', ')}`);
@@ -1479,7 +1702,14 @@ client.on('interactionCreate', async (interaction)=>{
             if(buf) ir = { type:'buffer', buffer:buf, filename:embed._imageFilename||'token.png' };
           }catch(_){}
         } else if(src.startsWith('http') && isDiscordOk(src)){
-          ir = { type:'url', url:src };
+          if(await verifyImageIsRaster(src)){
+            ir = { type:'url', url:src };
+          } else {
+            try{
+              const buf = await extractPngFromSvg(src);
+              if(buf) ir = { type:'buffer', buffer:buf, filename:embed._imageFilename||'token.png' };
+            }catch(_){}
+          }
         }
       }
       if(ir?.type === 'buffer'){
@@ -1518,23 +1748,38 @@ client.on('interactionCreate', async (interaction)=>{
     await pgPool.query(`DELETE FROM user_price_alerts WHERE id=$1 AND discord_id=$2`, [id, interaction.user.id]).catch(()=>{});
     return interaction.update({ content: '🗑️ Price alert deleted.', embeds: [], components: [] }).catch(()=>{});
   }
-  if(interaction.isButton() && interaction.customId === 'ta_pause'){
-    setAlert(interaction.user.id, { paused: true });
+  if(interaction.isButton() && interaction.customId.startsWith('ta_pause')){
+    // jv: "I want that too" -- Trait Alert and Token Alert are fully
+    // independent alert records now (see lib/poll.js), so these inline
+    // DM buttons need to know which kind of alert actually triggered
+    // this specific DM (encoded as ta_pause:trait / ta_pause:token by
+    // _sendAlertDM) rather than always acting on the trait alert record
+    // regardless of which one the DM was actually about.
+    const kind = interaction.customId.split(':')[1] || 'trait';
+    if(kind === 'token') setTokenAlert(interaction.user.id, { paused: true });
+    else setAlert(interaction.user.id, { paused: true });
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('ta_resume').setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId('ta_stop').setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`ta_resume:${kind}`).setLabel('▶️ Resume').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`ta_stop:${kind}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
     );
     return interaction.update({ components: [row] }).catch(()=>{});
   }
-  if(interaction.isButton() && interaction.customId === 'ta_resume'){
-    setAlert(interaction.user.id, { paused: false });
+  if(interaction.isButton() && interaction.customId.startsWith('ta_resume')){
+    const kind = interaction.customId.split(':')[1] || 'trait';
+    if(kind === 'token') setTokenAlert(interaction.user.id, { paused: false });
+    else setAlert(interaction.user.id, { paused: false });
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('ta_pause').setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('ta_stop').setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`ta_pause:${kind}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`ta_stop:${kind}`).setLabel('🗑️ Stop').setStyle(ButtonStyle.Danger),
     );
     return interaction.update({ components: [row] }).catch(()=>{});
   }
-  if(interaction.isButton() && interaction.customId === 'ta_stop'){
+  if(interaction.isButton() && interaction.customId.startsWith('ta_stop')){
+    const kind = interaction.customId.split(':')[1] || 'trait';
+    if(kind === 'token'){
+      deleteTokenAlert(interaction.user.id);
+      return interaction.update({ content: '🗑️ Token alert deleted.', embeds: [], components: [] }).catch(()=>{});
+    }
     deleteAlert(interaction.user.id);
     return interaction.update({ content: '🗑️ Trait alert deleted.', embeds: [], components: [] }).catch(()=>{});
   }
@@ -1584,7 +1829,7 @@ client.on('interactionCreate', async (interaction)=>{
     const page = Math.max(0, Math.min(session.page, totalPages - 1));
     session.page = page;
     const slice = listings.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-    const tokenLines = slice.map(formatSweepTokenLine);
+    const tokenLines = slice.map(item => formatSweepTokenLine(item, session));
     const navRow = new ActionRowBuilder();
     if(page > 0)            navRow.addComponents(new ButtonBuilder().setCustomId('sweep:prev:' + sessionId).setLabel('← Prev').setStyle(ButtonStyle.Secondary));
     if(page < totalPages-1) navRow.addComponents(new ButtonBuilder().setCustomId('sweep:next:' + sessionId).setLabel('Next →').setStyle(ButtonStyle.Secondary));
@@ -1602,57 +1847,96 @@ client.on('interactionCreate', async (interaction)=>{
 
   // ── Show Traits button — ephemeral, only visible to clicker ─────────────
   if(interaction.isButton() && interaction.customId.startsWith('ocas_traits:')){
-    const tokenId = parseInt(interaction.customId.split(':')[1]);
+    const parts = interaction.customId.split(':');
+    const tokenId = parseInt(parts[1]);
+    // 3rd segment (collection slug) added so this button works correctly
+    // for non-OCAS collections too — previously this customId only ever
+    // carried a tokenId (copied from the OCAS-only /ocas command's own
+    // identical button), so this handler had no way to know which
+    // collection a token belonged to and silently defaulted to OCAS every
+    // time. Confirmed live: /token showing "Chimps #5000" with the
+    // correct title still showed genuine OCAS traits when Show Traits was
+    // clicked. Empty/missing segment (e.g. from /ocas's own button, or any
+    // stale message from before this fix) still means OCAS, unchanged.
+    const slugFromButton = parts[2] ? decodeURIComponent(parts[2]) : '';
+    const isOcasToken = !slugFromButton || slugFromButton === OCAS_SLUG;
+    console.log(`[ShowTraits] customId="${interaction.customId}" tokenId=${tokenId} slugFromButton="${slugFromButton}" isOcasToken=${isOcasToken}`);
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const RAILWAY_URL = getRailwayApiUrl();
+      console.log(`[ShowTraits] RAILWAY_URL="${RAILWAY_URL}" (empty means this whole API path is skipped)`);
       const API_SECRET  = process.env.API_SECRET;
       let traits = null;
 
-      const cached = ocasTraitsCache.get(tokenId);
-      if(cached && Date.now() < cached.expires){
-        traits = cached.traits;
-      }
-
-      // For OCAS, current contract tokenURI is the true source and preserves
-      // duplicate trait categories through the raw attributes[] array.
-      // Try it before API/DB so stale flattened DB traits do not hide duplicates.
-      if(!traits || realTraitCount(traits) < 10){
-        const contractTraits = await fetchTokenUriFromContract(tokenId).catch(e => {
-          console.warn('[ShowTraits contract]', e.message);
-          return null;
-        });
-        if(contractTraits && realTraitCount(contractTraits)){
-          traits = contractTraits;
-          setCachedTraits(tokenId, traits);
+      if(isOcasToken){
+        const cached = ocasTraitsCache.get(tokenId);
+        if(cached && Date.now() < cached.expires){
+          traits = cached.traits;
         }
-      }
 
-      // API fallback for cases where contract RPC is temporarily unavailable.
-      if((!traits || !realTraitCount(traits)) && RAILWAY_URL){
-        try{
-          const tqs = new URLSearchParams({ key: API_SECRET||'' });
-          const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
-          if(tr.ok){
-            const tj = await tr.json();
-            if(tj.ok && tj.token?.traits) traits = tj.token.traits;
-          }
-          if(traits){
+        // For OCAS, current contract tokenURI is the true source and preserves
+        // duplicate trait categories through the raw attributes[] array.
+        // Try it before API/DB so stale flattened DB traits do not hide duplicates.
+        if(!traits || realTraitCount(traits) < 10){
+          const contractTraits = await fetchTokenUriFromContract(tokenId).catch(e => {
+            console.warn('[ShowTraits contract]', e.message);
+            return null;
+          });
+          if(contractTraits && realTraitCount(contractTraits)){
+            traits = contractTraits;
             setCachedTraits(tokenId, traits);
           }
-        }catch(apiErr){
-          console.warn('[ShowTraits API]', apiErr.message);
         }
-      }
 
-      if(!traits || !realTraitCount(traits)){
-        const local = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
-        traits = local?.traits || null;
+        // API fallback for cases where contract RPC is temporarily unavailable.
+        if((!traits || !realTraitCount(traits)) && RAILWAY_URL){
+          try{
+            const tqs = new URLSearchParams({ key: API_SECRET||'' });
+            const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
+            if(tr.ok){
+              const tj = await tr.json();
+              if(tj.ok && tj.token?.traits) traits = tj.token.traits;
+            }
+            if(traits){
+              setCachedTraits(tokenId, traits);
+            }
+          }catch(apiErr){
+            console.warn('[ShowTraits API]', apiErr.message);
+          }
+        }
+
+        if(!traits || !realTraitCount(traits)){
+          const local = await fetchTokenMetaFromDb(tokenId).catch(()=>null);
+          traits = local?.traits || null;
+        }
+      } else {
+        // Non-OCAS collection — skip the OCAS-only on-chain tokenURI fast
+        // path entirely (that always reads OCAS's own contract regardless
+        // of which token is actually being viewed), and scope the DB
+        // lookup to the real collection instead of silently defaulting to
+        // OCAS.
+        if(RAILWAY_URL){
+          const fetchUrl = `${RAILWAY_URL}/db/token/${tokenId}?${new URLSearchParams({ key: API_SECRET||'', slug: slugFromButton })}`;
+          console.log(`[ShowTraits] fetching non-OCAS traits: ${fetchUrl.replace(API_SECRET || '__none__', '***')}`);
+          try{
+            const tqs = new URLSearchParams({ key: API_SECRET||'', slug: slugFromButton });
+            const tr = await fetch(`${RAILWAY_URL}/db/token/${tokenId}?${tqs}`);
+            console.log(`[ShowTraits] response status=${tr.status} ok=${tr.ok}`);
+            if(tr.ok){
+              const tj = await tr.json();
+              console.log(`[ShowTraits] response body: ok=${tj.ok} hasTraits=${!!tj.token?.traits} traitKeys=${tj.token?.traits ? Object.keys(tj.token.traits).join(',') : 'none'}`);
+              if(tj.ok && tj.token?.traits) traits = tj.token.traits;
+            }
+          }catch(apiErr){
+            console.warn('[ShowTraits API]', apiErr.message);
+          }
+        }
       }
 
       if(!traits || !realTraitCount(traits)){ await interaction.editReply({ content: 'Could not load traits.' }); return; }
       const traitLines = traitDisplayLines(traits, 25).join('\n');
-      await interaction.editReply({ content: `**OCAS #${tokenId} Traits (${realTraitCount(traits)})**\n${traitLines}`.slice(0, 1900) });
+      const titleLabel = isOcasToken ? 'OCAS' : slugFromButton;
+      await interaction.editReply({ content: `**${titleLabel} #${tokenId} Traits (${realTraitCount(traits)})**\n${traitLines}`.slice(0, 1900) });
     } catch(e) {
       console.error('[ShowTraits]', e.message);
       try { await interaction.editReply({ content: 'Error loading traits.' }); } catch(_){}
@@ -1991,8 +2275,19 @@ client.on('interactionCreate', async (interaction)=>{
               }
             }catch(_){}
           } else if(imgSrc.startsWith('http') && isDiscordOk(imgSrc)){
-            slideEmbed._imageResult = { type:'url', url:imgSrc };
-            slideEmbed._imageSource = imgSrc;
+            if(await verifyImageIsRaster(imgSrc)){
+              slideEmbed._imageResult = { type:'url', url:imgSrc };
+              slideEmbed._imageSource = imgSrc;
+            } else {
+              try{
+                const buf = await extractPngFromSvg(imgSrc);
+                if(buf){
+                  slideEmbed._imageResult = { type:'buffer', buffer:buf, filename:`token-${survivorId}-burn${burnNum}.png` };
+                  slideEmbed._imageSource = imgSrc;
+                  slideEmbed._imageFilename = `token-${survivorId}-burn${burnNum}.png`;
+                }
+              }catch(_){}
+            }
           }
         }
         embeds.push(slideEmbed);
@@ -2038,13 +2333,28 @@ client.on('interactionCreate', async (interaction)=>{
 
   if(!interaction.isChatInputCommand()) return;
   const {commandName,guildId}=interaction;
-  const config=getConfig(guildId);
-  const isAdmin=interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
-    || OWNER_DISCORD_IDS.has(String(interaction.user.id));
-
-  // /setup
-
-  const ctx = buildCtx(interaction, guildId, config, isAdmin);
+  // jv confirmed live: /predetermined got stuck on Discord's "thinking..."
+  // state twice in a row with literally nothing in the logs -- not even
+  // an error. This whole pre-routing block (getConfig/buildCtx, which
+  // every single slash command depends on before it can be routed
+  // anywhere) had no error handling at all -- a throw here would vanish
+  // silently with the interaction never even acknowledged, regardless of
+  // which command was being run. Purely defensive: unchanged behavior on
+  // success, but a failure here now actually gets logged and at least
+  // attempts to tell the user something went wrong instead of leaving
+  // them staring at "thinking..." until Discord's own interaction token
+  // quietly expires ~15 minutes later.
+  let config, isAdmin, ctx;
+  try{
+    config=getConfig(guildId);
+    isAdmin=interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
+      || OWNER_DISCORD_IDS.has(String(interaction.user.id));
+    ctx = buildCtx(interaction, guildId, config, isAdmin);
+  }catch(e){
+    console.error(`[Dispatch] getConfig/buildCtx failed for command "${commandName}":`, e.message);
+    try{ await interaction.reply({ content: 'Something went wrong handling this command. Please try again.', flags: MessageFlags.Ephemeral }); }catch(_){}
+    return;
+  }
 
   if(ADMIN_COMMANDS.has(commandName))   return handleAdminCommand(commandName, ctx);
   if(MARKET_COMMANDS.has(commandName))  return handleMarketCommand(commandName, ctx);
@@ -2117,18 +2427,68 @@ client.on('interactionCreate', async (interaction)=>{
     await interaction.deferReply({flags:64});
     if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild))
       return interaction.editReply({content:'❌ You need Manage Server permission.'});
-    await interaction.editReply({content:'⏳ Syncing trait roles for all verified members... This may take a moment.'});
+
+    // This makes one live OpenSea API call per verified member PER
+    // configured collection with trait roles — for a guild with hundreds
+    // of verified members, that's hundreds of calls per invocation, and
+    // there was no cooldown at all. Same policy as /config's re-backfill
+    // button: unlimited for the bot owner, 1 per 24h per guild for
+    // everyone else, since running this repeatedly doesn't get anyone
+    // anything a single run + the normal periodic re-sync wouldn't.
     const guildId = interaction.guildId;
+    const isOwner = OWNER_DISCORD_IDS.has(String(interaction.user.id));
+    if(!isOwner){
+      const cfg = getConfig(guildId) || {};
+      const COOLDOWN_MS = 24 * 60 * 60 * 1000;
+      const lastRun = cfg.lastTraitSyncAt ? new Date(cfg.lastTraitSyncAt).getTime() : 0;
+      const now = Date.now();
+      if(now - lastRun < COOLDOWN_MS){
+        const nextRun = new Date(lastRun + COOLDOWN_MS);
+        const hrs = Math.ceil((nextRun - now) / 3600000);
+        return interaction.editReply({content:`⏳ /synctraits is limited to once per 24h to avoid hammering the API on every server's behalf. Available again in **${hrs}h**.`});
+      }
+      // Store the timestamp before running (same reasoning as re-backfill's
+      // cooldown) — prevents a burst of rapid re-clicks before the first
+      // run finishes from all slipping through the check above.
+      const freshCfg = getConfig(guildId) || {};
+      freshCfg.lastTraitSyncAt = new Date().toISOString();
+      await setConfig(guildId, freshCfg).catch(()=>{});
+    }
+
+    await interaction.editReply({content:'⏳ Syncing trait roles for all verified members... This may take a moment.'});
     try{
+      // jv: combine holdings across every linked wallet for role purposes
+      // -- same linked_wallets source as runDailyTraitSync, grouped so
+      // each user's full set of verified wallets goes to syncTraitRoles
+      // together rather than only their first.
       const regs = await pgPool.query(
-        'SELECT discord_id, wallet FROM user_registrations WHERE guild_id=$1 AND verified=true',
+        `SELECT discord_id, array_agg(wallet) AS wallets
+         FROM linked_wallets WHERE guild_id=$1 AND verified=true
+         GROUP BY discord_id`,
         [guildId]
       );
+      // Failures used to be completely invisible here — syncTraitRoles's
+      // return value was discarded entirely, and the reply always said
+      // "✅ synced" even when individual role assignments failed (e.g.
+      // Discord's "Missing Permissions" when the bot's own role sits below
+      // the trait role in the server's hierarchy). Confirmed live: the only
+      // way to discover this was checking Railway's own server logs
+      // directly, which no other server's admin can do. Now aggregated and
+      // surfaced directly in the reply.
+      let totalFailed = 0;
+      const failureReasons = new Set();
       for(const reg of regs.rows){
-        await syncTraitRoles(interaction.guild, reg.discord_id, reg.wallet);
+        const result = await syncTraitRoles(interaction.guild, reg.discord_id, reg.wallets);
+        if(result?.failed?.length){
+          totalFailed += result.failed.length;
+          for(const f of result.failed) failureReasons.add(f.reason);
+        }
         await new Promise(r=>setTimeout(r,500));
       }
-      return interaction.editReply({content:'✅ Trait roles synced for '+regs.rows.length+' verified member'+(regs.rows.length!==1?'s':'')+'.'});
+      const failureNote = totalFailed
+        ? `\n\n⚠️ **${totalFailed} role assignment${totalFailed===1?'':'s'} failed:** ${[...failureReasons].slice(0,3).join('; ')}\nThis usually means the bot's own role needs to be moved **above** the trait role in Server Settings → Roles.`
+        : '';
+      return interaction.editReply({content:'✅ Trait roles synced for '+regs.rows.length+' verified member'+(regs.rows.length!==1?'s':'')+'.'+failureNote});
     }catch(e){
       console.error('[SyncTraits]', e.message);
       return interaction.editReply({content:'❌ Sync failed: '+e.message});
@@ -2163,12 +2523,11 @@ client.on('guildCreate', async (guild)=>{
         '`/setup` — initial configuration wizard\n' +
         '`/config` — manage channels, roles & listing filters\n' +
         '`/synctraits` — manually sync holder trait roles\n' +
-        '`/lotteries` — manage burn lotteries & giveaways\n' +
+        '`/traitfind` — search tokens, listings, or sales by trait\n' +
         '`/help` — full command list\n\n' +
         '**Recommended channel setup:**\n' +
         '`#sales` — auto-posts every sale\n' +
         '`#listings` — auto-posts new listings\n' +
-        '`#burns` — burn machine alerts\n' +
         '`#owner-verification` — wallet verification panel\n\n' +
         '*This bot will never DM members or ask for seed phrases.*'
       )
@@ -2199,6 +2558,38 @@ client.on('guildCreate', async (guild)=>{
       }
     }
   }catch(e){ console.warn('[Welcome]',guild.name,e.message); }
+});
+
+// ── Wipe server-scoped data on kick ───────────────────────────────────────────
+// Confirmed real gap: nothing cleaned up when the bot was removed from a
+// server, so re-inviting it left the entire prior setup (config, roles,
+// trait rules, verification panel) still fully intact -- a re-invited bot
+// looked "already configured" even though the person expected a clean slate.
+// Every table below was confirmed via lib/db.js to actually have a guild_id
+// column, rather than guessed. user_registrations/verification_codes also
+// have 'global' (cross-server, intentionally not guild-scoped) rows mixed
+// in with per-guild ones -- filtering by the real, specific guild.id here
+// naturally never touches those, since they only ever match the literal
+// string 'global', never an actual snowflake ID.
+client.on('guildDelete', async (guild)=>{
+  const gid = guild.id;
+  await deleteConfig(gid);
+  const tables = [
+    'user_alert_configs', 'verification_panels',
+    'trait_roles', 'traitview_links', 'tv_verify_codes',
+    'burn_lotteries', 'generic_lotteries', 'skipped_listing_batches',
+    'user_registrations', 'verification_codes',
+  ];
+  let cleaned = 0;
+  for(const table of tables){
+    try{
+      const res = await pgPool.query(`DELETE FROM ${table} WHERE guild_id=$1`, [gid]);
+      cleaned += res.rowCount || 0;
+    }catch(e){
+      console.warn(`[GuildDelete] Failed to clean ${table} for ${guild.name} (${gid}):`, e.message);
+    }
+  }
+  console.log(`[GuildDelete] Wiped config + ${cleaned} row(s) across ${tables.length + 1} tables for ${guild.name} (${gid})`);
 });
 
 
@@ -2256,6 +2647,82 @@ client.once('clientReady', async ()=>{
     console.log(`[MemoryDetail] ${JSON.stringify(caches)}`);
   }, 60_000);
 
+  // jv: "there should be an automatic retry, server admins shouldn't have
+  // to manually re run it if it fails." Runs every 15 minutes -- frequent
+  // enough that a 30-minute-backoff retry doesn't sit waiting much longer
+  // than it has to, without being so frequent it'd re-check every failed
+  // collection needlessly often. Only ever touches collections whose own
+  // market_next_retry_at (set by seedMarketHistory's own backoff logic,
+  // sync-listings.js) has actually arrived, so this never re-hammers a
+  // collection that just failed a minute ago.
+  //
+  // jv: "when is the next retry cycle? I was trying to get the collection
+  // on traitview" -- caught a real gap answering that: any collection that
+  // failed BEFORE this feature existed (cryptoadz-by-gremplin included)
+  // has market_next_retry_at sitting at NULL, since the old code path that
+  // failed it never wrote to a column that didn't exist yet. The original
+  // WHERE here required market_next_retry_at IS NOT NULL, which would have
+  // silently excluded every pre-existing failure forever -- treating NULL
+  // as "never scheduled, so eligible right now" instead means this first
+  // cycle after deploy immediately retries every collection already stuck
+  // in 'failed', not just ones that fail from here on.
+  async function retryFailedMarketHistory(){
+    try{
+      const stuckRes = await pgPool.query(
+        `SELECT slug, contract FROM collections
+         WHERE status = 'failed' AND (market_next_retry_at IS NULL OR market_next_retry_at <= NOW())`
+      );
+      for(const row of stuckRes.rows){
+        console.log(`[MarketRetry] Retrying seedMarketHistory for "${row.slug}"`);
+        try{
+          await seedMarketHistory({ slug: row.slug, contract: row.contract });
+          // jv: "I didn't get any alert notification for the re try" -- this
+          // whole function only ever logged to console before, which is
+          // invisible unless someone happens to be watching Railway's own
+          // logs live (which is how jv found this in the first place).
+          // Matching the existing pattern from lib/auto-backfill.js's own
+          // seedMarketHistory calls: an activity webhook on success, an
+          // error webhook on failure, so either outcome actually reaches
+          // Discord instead of only the server console.
+          sendActivityWebhook(`✅ seedMarketHistory retry succeeded: "${row.slug}"`, 'Status should now be \'ready\' -- collection should appear on TraitView.').catch(()=>{});
+        }catch(e){
+          console.warn(`[MarketRetry] [${row.slug}] retry failed (will back off further):`, e.message);
+          sendErrorWebhook(`seedMarketHistory retry failed: "${row.slug}"`, e, 'Will back off further and retry again automatically -- or re-run /config for this collection in any server to try again sooner.').catch(()=>{});
+        }
+      }
+    }catch(e){
+      console.error('[MarketRetry] query failed:', e.message);
+    }
+  }
+  // Run once immediately on startup/deploy (same pattern as pollSales/
+  // pollListings below), not just after the first 15-minute interval --
+  // otherwise a fresh deploy of this exact feature would still make
+  // jv wait 15 minutes for the first check, on top of everything above.
+  retryFailedMarketHistory();
+  setInterval(retryFailedMarketHistory, 15 * 60_000);
+
+  // Trait Pulse -- jv: "What traits are actually moving right now?" Runs
+  // every 20 minutes, once per known collection (from the collections
+  // registry table, the same source of truth used throughout this file for
+  // "which collections exist"). 20 minutes keeps the 1h window meaningfully
+  // fresh without recomputing every trait/value combination across every
+  // collection too often; the underlying data (sales, listings) only
+  // updates as fast as the existing sales/listings pollers anyway.
+  async function runTraitPulseForAllCollections(){
+    try{
+      const slugsRes = await pgPool.query(`SELECT slug FROM collections`);
+      for(const row of slugsRes.rows){
+        await computeTraitPulse(pgPool, row.slug).catch(e => {
+          console.warn(`[TraitPulse] [${row.slug}] failed:`, e.message);
+        });
+      }
+    }catch(e){
+      console.error('[TraitPulse] collection list query failed:', e.message);
+    }
+  }
+  runTraitPulseForAllCollections();
+  setInterval(runTraitPulseForAllCollections, 20 * 60_000);
+
   // Listing poller re-enabled with fix: caps fetch at 50 listings to prevent
   // loading 500-listing bursts into memory on restart (confirmed OOM cause).
   pollSales();
@@ -2266,12 +2733,79 @@ client.once('clientReady', async ()=>{
   setInterval(saveSaleCursors, 60_000);
   setInterval(saveListingCursors, 60_000);
   // Poll burn events every 2 minutes (blocks ~12s apart, no need to rush)
-  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL){
+  // Gated on OCAS_BURN_POLLER_ENABLED, a genuine, deployment-controlled
+  // flag -- OCAS_CONTRACT itself is hardcoded in lib/constants.js, not
+  // read from an env var at all, so checking it directly would always be
+  // true regardless of which deployment is running. Defaults to enabled
+  // (only disabled by explicitly setting the env var to 'false'), so the
+  // existing OCAS deployment needs zero changes to keep working exactly
+  // as before -- only a new deployment not meant to track OCAS needs to
+  // explicitly opt out.
+  const ocasBurnPollerEnabled = process.env.OCAS_BURN_POLLER_ENABLED !== 'false';
+  if(ocasBurnPollerEnabled && (process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL)){
     console.log('[Burn] Starting burn poller');
     pollBurnEvents();
     setInterval(pollBurnEvents, 30_000);
+  } else if(!ocasBurnPollerEnabled){
+    console.log('[Burn] OCAS_BURN_POLLER_ENABLED=false — burn poller disabled (this deployment isn\'t tracking OCAS)');
   } else {
     console.log('[Burn] No ALCHEMY_API_KEY set — burn poller disabled');
+  }
+
+  // EIP-4906 metadata-update poller — generic, not OCAS-specific, so this
+  // runs on any deployment with an Alchemy key configured (unlike the burn
+  // poller above, which is gated on OCAS_BURN_POLLER_ENABLED specifically
+  // for OCAS's own burn-lifecycle tracking). Only actually does anything for
+  // collections with metadata_updates_supported=true in the collections
+  // table (confirmed live so far: argonauts, via a direct
+  // supportsInterface(0x49064906) eth_call) — a no-op query against an empty
+  // result set otherwise, so safe to always start.
+  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_WEBSOCKET_URL){
+    startMetadataUpdatePoller();
+  } else {
+    console.log('[MetadataUpdate] No ALCHEMY_API_KEY set — metadata-update poller disabled');
+  }
+  // jv: "new tokens are still being claimed in Argonauts... is there
+  // something that is capturing those events". The metadata-update
+  // poller right above only ever watches for CHANGES to tokens already
+  // known to exist -- nothing previously checked whether a collection's
+  // on-chain supply had grown and new token IDs now exist that were
+  // never backfilled at all. Runs for every 'ready' collection (not
+  // just argonauts), on the same ALCHEMY_API_KEY requirement as the
+  // poller above since it needs it for the same reasons (an on-chain
+  // totalSupply() read via Alchemy's RPC proxy, and the NFT-API calls to
+  // actually fetch any new tokens found).
+  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
+    startNewTokenPoller();
+    // Collection-wide transfer history for holder insights (hold time,
+    // minters) -- see lib/collection-transfers.js.
+    startCollectionTransferSync();
+  } else {
+    console.log('[NewTokenPoller] No ALCHEMY_API_KEY set — new-token poller disabled');
+  }
+  // jv: "There are actually trades happening on Gondi as well. Is there
+  // anyway to catch those in traitview?" Same ALCHEMY_API_KEY
+  // requirement as the pollers above -- Gondi's own SDK needs an RPC
+  // transport to even instantiate its client (a real wallet object is
+  // required by the SDK regardless of whether anything ever gets
+  // signed; see lib/gondi-sync.js for why).
+  if(process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY){
+    startGondiSync();
+  } else {
+    console.log('[GondiSync] No ALCHEMY_API_KEY set — Gondi sync disabled');
+  }
+  // Gondi sales (non-OpenSea) + P2P trades for every ready collection Gondi
+  // indexes -- plain read-only GraphQL, no key or wallet needed
+  // (lib/gondi-activity-sync.js).
+  startGondiActivitySync();
+  // Generic burned-token detection (lib/burn-detect.js) -- jv: Argonauts has
+  // no protocol-level burn mechanic, a third-party account independently
+  // sent tokens to a dead address on its own. Same ALCHEMY_API_KEY gate as
+  // the metadata poller above (both need Alchemy for their respective bulk
+  // reads); a no-op query against an empty result set for any deployment
+  // with no 'ready' collections, so safe to always start alongside it.
+  if(process.env.ALCHEMY_API_KEY){
+    startBurnDetectionPoller();
   }
   // Process pending burn alerts every 30s — waits for metadata to refresh before posting
   setInterval(processPendingBurnAlerts, 30_000);
@@ -2288,6 +2822,21 @@ client.once('clientReady', async ()=>{
   processDueGenericLotteries();
   setInterval(processDueGenericLotteries, 15_000);
   setTimeout(()=>{ runDailyTraitSync(); setInterval(runDailyTraitSync, 24*60*60*1000); }, 5*60*1000);
+  // jv confirmed live: moved Argonauts out of a wallet, but /me portfolio
+  // and TraitView's Connected Holder both kept showing them as still
+  // held, days later. Root cause -- backfillWallet() (lib/wallet-backfill.js)
+  // only ever runs once per wallet+collection: it checks nft_transfers for
+  // ANY existing row and, if found, skips the entire backfill permanently,
+  // by design (it's meant to be a one-time historical population, not an
+  // ongoing sync). The only things that ever forced a fresh re-check were
+  // the initial verification itself and manually clicking "🔄 Sync" in
+  // /me -- nothing periodic. A user who never happens to click that stays
+  // stale indefinitely, which is exactly what happened here. This adds
+  // the missing periodic path: reuses syncWalletForUser (the same delete-
+  // then-rebackfill logic the manual Sync button already uses correctly)
+  // for every verified registration, daily, so staleness self-corrects
+  // without anyone needing to know to click anything.
+  setTimeout(()=>{ runDailyWalletResync(); setInterval(runDailyWalletResync, 24*60*60*1000); }, 10*60*1000);
 });
 
 client.on('error',e=>{ console.error('[Discord]',e.message); sendErrorWebhook('Discord Client Error', e); });
@@ -2346,6 +2895,63 @@ async function migrateMarketCollectionsToServerConfigs(){
   }catch(e){
     console.error('[Migration] market_collections_v1 failed:', e.message);
   }
+}
+
+// ── Alchemy Address Activity webhook server ─────────────────────────────────
+// jv: real-time transfer detection for every linked wallet (not just
+// marketplace sales, already handled separately in lib/poll.js). This lives
+// in bot.js specifically -- not the separate api.js process -- because it
+// needs direct, in-memory access to the Discord client and syncTraitRoles,
+// neither of which exist in api.js's own process. bot.js has never run an
+// HTTP server before this, so this is a new public endpoint on this
+// service -- see the setup walkthrough for the Railway/Alchemy dashboard
+// steps this requires alongside the code.
+{
+  const webhookApp = express();
+  // jv confirmed live: the bot started spam-posting old sales shortly
+  // after this server was added. Leading, plausible cause -- this express
+  // app previously had no route at all for a bare GET /, and Railway
+  // (or any platform-level health check hitting the root path) getting a
+  // 404 there could read as "unhealthy" and restart the service
+  // repeatedly. A restart mid-poll, before saveSaleCursors()'s fire-and-
+  // forget write (never awaited) actually finishes, would lose that
+  // cursor update -- the next poll after restart re-fetches and re-posts
+  // the same "new" sales again. Adding a real health-check route so
+  // there's something for a check to actually hit successfully.
+  webhookApp.get('/', (req, res) => res.status(200).send('ok'));
+  webhookApp.get('/healthz', (req, res) => res.status(200).send('ok'));
+  // Alchemy's HMAC signature is computed over the exact raw request body --
+  // a re-serialized JSON object will not match it, so this route needs the
+  // raw bytes, not express.json()'s parsed result. express.raw() gives us
+  // that; the route below parses it into JSON itself only after the
+  // signature is confirmed valid.
+  webhookApp.post('/webhooks/alchemy/address-activity', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
+    const signature = req.get('X-Alchemy-Signature');
+    if(!getConfiguredWebhooks().length){
+      console.warn('[AlchemyWebhook] No chain webhooks configured — rejecting');
+      return res.status(500).send('not configured');
+    }
+    // One shared endpoint receives every configured chain's webhook --
+    // tries each chain's own signing key rather than assuming exactly one.
+    if(!verifyAgainstAnyConfiguredChain(req.body, signature)){
+      console.warn('[AlchemyWebhook] Invalid signature — rejecting');
+      return res.status(401).send('invalid signature');
+    }
+    // Acknowledge immediately — Alchemy expects a fast 2xx response and will
+    // retry on timeout. Processing continues after responding rather than
+    // making Alchemy wait on however long the DB writes/role sync take.
+    res.status(200).send('ok');
+    let payload;
+    try{ payload = JSON.parse(req.body.toString('utf8')); }
+    catch(e){ console.warn('[AlchemyWebhook] Failed to parse payload:', e.message); return; }
+    processAddressActivityEvent(payload, {
+      pgPool, client, syncTraitRolesFn: syncTraitRoles, shouldSyncRolesNow,
+    }).catch(e => console.error('[AlchemyWebhook] processAddressActivityEvent error:', e.message));
+  });
+  const webhookPort = process.env.PORT || 8081;
+  webhookApp.listen(webhookPort, () => {
+    console.log(`[AlchemyWebhook] Listening on port ${webhookPort} for /webhooks/alchemy/address-activity`);
+  });
 }
 
 client.login(DISCORD_TOKEN);

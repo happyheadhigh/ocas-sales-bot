@@ -1,6 +1,7 @@
 'use strict';
 
 const { DEFAULT_LOTTERY_TIMEZONE } = require('../lib/constants');
+const fetch = require('node-fetch');
 
 // ── Address helpers ───────────────────────────────────────────────────────────
 function normAddr(addr){
@@ -109,14 +110,58 @@ function isDiscordOk(url){
   return true;
 }
 
+// Confirmed live: the assumption baked into isDiscordOk above -- that
+// nft2-cdn.alchemy.com/nft3-cdn.alchemy.com always serve pre-rendered raster
+// images "even if URL ends in .svg" -- is not reliably true. Alchemy's CDN
+// can and does serve genuine SVG content through a URL with ZERO textual
+// indication of that at all (no .svg extension, no "image/svg" substring,
+// just a hash-like path) -- isDiscordOk's entire approach is pattern-
+// matching the URL string, which can never catch this, since there's
+// nothing in the URL itself to match against. The only reliable way to know
+// what a URL actually serves is to ask the server. isDiscordOk is still
+// useful as a fast, free first-pass filter (rejects non-http, data URIs,
+// raw markup, obviously-bad .svg links) -- this is the authoritative check
+// for anything that passes it and is about to be used directly, without a
+// render step as a fallback.
+//
+// A HEAD request (no body download) is enough. Falls back to treating a
+// URL as fine if the check itself fails for any reason (network hiccup, no
+// HEAD support) -- avoids losing a genuinely good image over an unrelated
+// verification failure.
+async function verifyImageIsRaster(url){
+  try{
+    const r = await fetch(url, { method: 'HEAD', timeout: 5000 });
+    const contentType = (r.headers.get('content-type') || '').toLowerCase();
+    if(!contentType) return true; // no header to go on — don't block over it
+    return contentType.startsWith('image/') && !contentType.includes('svg');
+  }catch(e){
+    return true;
+  }
+}
+
 // ── Trait filter matching ─────────────────────────────────────────────────────
 function matchesFilters(traits, filters){
   if(!filters || Object.keys(filters).length === 0) return true;
+  // jv confirmed live: a trait alert set up through the guided wizard
+  // (ma_browse:confirm: in commands/market.js) never fired. Root cause --
+  // that flow saves the trait key straight from a Discord custom-ID
+  // string, in whatever case the collection's real trait name happens to
+  // use (e.g. "Type", "Background" -- extremely common for NFT trait
+  // names). This function already lowercased the token's own trait-type
+  // keys when building `lookup` below, but never lowercased the filter's
+  // own keys to match -- so a saved key of "Type" could never find
+  // lookup's "type", and the alert silently matched nothing, forever.
+  // The direct /myalert slash command happened to already lowercase its
+  // own input before saving, which is why that specific path worked. Now
+  // both sides are always lowercased here, so this is correct regardless
+  // of which alert-creation path saved the filter, and needs no data
+  // migration for already-saved alerts -- they read correctly the next
+  // time this runs.
   const lookup = {};
   for(const t of (traits || [])) lookup[t.trait_type?.toLowerCase()] = String(t.value).toLowerCase();
   for(const [k, v] of Object.entries(filters)){
     const allowed = Array.isArray(v) ? v : [v];
-    if(allowed.map(a => String(a).toLowerCase()).includes(lookup[k])) return true;
+    if(allowed.map(a => String(a).toLowerCase()).includes(lookup[k.toLowerCase()])) return true;
   }
   return false;
 }
@@ -127,4 +172,5 @@ module.exports = {
   burnLotteryWindowDurationHours, burnLotteryWindowSummary,
   formatBurnLotteryWindow, formatBurnLotteryLocalTime,
   burnLotteryWindowStatusLine, isSvg, isDiscordOk, matchesFilters,
+  verifyImageIsRaster,
 };

@@ -227,8 +227,7 @@ function buildHelpEmbed(){
       {
         name:'Alerts & Admin',
         value:[
-          '`/myalert trait:Type value:Zombie` — Personal DM alert',
-          '`/myalertstatus` / `/myalertclear` — Manage personal alerts',
+          '`/me` → Trait Alert — Personal DM alert (add filters, pause, or remove)',
           '`/setuphere` — Set sales channel here',
           '`/setlistingshere` — Set listings channel here',
           '`/setupburn` — Set burn channel here',
@@ -293,8 +292,7 @@ function buildWelcomeEmbed(){
       {
         name:'Personal DM Alerts & Burn Machine',
         value:[
-          '`/myalert trait:Type value:Zombie` — personal sale/listing DMs',
-          '`/myalertstatus` / `/myalertclear` — manage DM alerts',
+          '`/me` → Trait Alert — personal sale/listing DMs (add filters, pause, or remove)',
           '`/setupburn` — set OCAS burn alert channel',
           '',
           'Use `/help` anytime to see all commands.',

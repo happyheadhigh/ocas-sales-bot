@@ -78,7 +78,26 @@ async function discoverCollections() {
     console.error('[sync] discoverCollections query failed, falling back to OCAS only:', e.message);
   }
 
-  return Array.from(map.values());
+  const collections = Array.from(map.values());
+
+  // Chain isn't in server_configs at all — same gap already fixed in
+  // /download, wallet-backfill, and elsewhere tonight. One batch query
+  // against the collections registry (the actual source of truth) rather
+  // than a lookup per collection.
+  try {
+    const chainRes = await pool.query(
+      `SELECT slug, chain FROM collections WHERE slug = ANY($1)`,
+      [collections.map(c => c.slug)]
+    );
+    const chainMap = {};
+    for (const row of chainRes.rows) chainMap[row.slug] = row.chain;
+    for (const c of collections) c.chain = chainMap[c.slug] || 'ethereum';
+  } catch (e) {
+    console.warn('[sync] discoverCollections chain lookup failed (defaulting to ethereum):', e.message);
+    for (const c of collections) c.chain = c.chain || 'ethereum';
+  }
+
+  return collections;
 }
 
 // ── Ensure floor_history table exists ─────────────────────────────────────────
@@ -109,7 +128,7 @@ async function ensureFloorHistoryTable() {
 ensureFloorHistoryTable();
 
 async function syncListings(collection) {
-  const { slug, contract } = collection;
+  const { slug, contract, chain = 'ethereum' } = collection;
   const startTime = Date.now();
   console.log(`[sync] Starting listings sync for ${slug} at ${new Date().toISOString()}`);
 
@@ -118,27 +137,41 @@ async function syncListings(collection) {
     const listingsMap = {}; // token_id -> {price_eth, url}
     let next = null;
     let pages = 0;
-    // Confirmed live: jv reported OCAS live listings showing fewer than
-    // OpenSea actually has. Traced to this exact function -- a single
-    // transient HTTP error on ANY page immediately broke out of pagination
-    // and used whatever had been collected so far. This endpoint has no
-    // reason to be price-sorted (more likely sorted by listing time), so a
-    // page lost to a rate limit or timeout could easily be exactly the page
-    // holding real, currently-active listings. Worse, the DB write below is
-    // a full DELETE + re-INSERT for this slug, so a partial fetch didn't
-    // just fail to add anything new -- it actively replaced a previously-
-    // complete set with an incomplete one, which would explain this being
-    // intermittent rather than constant (only shows up on syncs that
-    // happen to hit a transient OpenSea error mid-pagination).
+    // Confirmed the actual bug jv reported (TraitView missing real, active
+    // listings that OpenSea itself shows -- not a price-accuracy issue,
+    // confirmed live prices matched for tokens that DID show up). Previously
+    // a single transient HTTP error on ANY page immediately broke out of
+    // pagination and used whatever had been collected so far -- this
+    // endpoint has no reason to be price-sorted (more likely sorted by
+    // listing time), so a page lost to a rate limit or timeout could easily
+    // be exactly the page holding the actual cheapest listings. Worse, the
+    // DB write below is a full DELETE + re-INSERT for this slug, so a
+    // partial fetch didn't just fail to add anything new -- it actively
+    // replaced a previously-complete set with an incomplete one.
     // completedFully only becomes true if the loop's own `next` cursor runs
     // out (a genuine end of the collection's listings) -- the DB write
     // below is skipped entirely otherwise, leaving whatever the last
-    // successful full sync wrote in place until the next cycle (1 minute
-    // later) gets a clean run.
+    // successful full sync wrote in place until the next cycle (60s later)
+    // gets a clean run.
     let completedFully = false;
+    let totalDropped = 0;
+    let totalDuplicateTokenListings = 0;
 
     do {
-      const qs = new URLSearchParams({ chain: 'ethereum', limit: '100' });
+      // jv: "Opensea is showing 29 more listings... traitview isn't
+      // catching those." Confirmed via OpenSea's own documented API
+      // reference for this exact endpoint: it takes an
+      // include_private_listings parameter that DEFAULTS TO FALSE when
+      // omitted -- which this always did. A private/restricted listing
+      // (one visible to a specific buyer, or otherwise not publicly
+      // browsable) never appeared in the response AT ALL, not even as a
+      // page it then failed to parse -- there was nothing to drop or
+      // warn about, since the API itself silently excluded it before
+      // this code ever saw it. OpenSea's own collection-page "Listed"
+      // stat very plausibly counts these regardless of visibility,
+      // which is exactly the kind of persistent, silent gap this
+      // produces with zero trace in the sync's own logs.
+      const qs = new URLSearchParams({ chain, limit: '100', include_private_listings: 'true' });
       if (next) qs.set('next', next);
 
       // Retry transient failures (rate limits, momentary server errors)
@@ -171,6 +204,20 @@ async function syncListings(collection) {
         if (body.listings?.length > 0) {
           const sample = body.listings[0];
           console.log(`[sync] [${slug}] Sample listing keys: ${Object.keys(sample).join(', ')}`);
+          // jv confirmed live on nekoadz: listing prices showing as 0.000 on
+          // TraitView, matching an earlier "8e-12 ETH" floor-price log this
+          // exact bug already produced. getPriceEth() below falls back to
+          // assuming 18 decimals (wei/1e18) whenever OpenSea doesn't hand
+          // it a pre-computed .decimal -- correct for ETH/WETH, but this
+          // chain's own assets have been confirmed elsewhere to NOT
+          // reliably use 18 decimals, resolved via an actual on-chain
+          // decimals() call rather than assumed -- a strong signal this
+          // chain's native/listing currency may not be 18 decimals either.
+          // Logging the full raw price object here (not just its top-level
+          // keys) so the actual field names/values are visible without
+          // needing another log round-trip to guess at OpenSea's response
+          // shape for this specific chain.
+          if(sample.price) console.log(`[sync] [${slug}] Sample listing price object: ${JSON.stringify(sample.price)}`);
         }
       }
 
@@ -184,7 +231,7 @@ async function syncListings(collection) {
           listing?.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria,
         ];
         for (let c of cands) {
-          if (!c) continue;
+          if (c == null || c === '') continue; // (a numeric 0 id is valid)
           c = String(c);
           const parts = c.includes('/') ? c.split('/') : c.split(':');
           const last = parts[parts.length - 1];
@@ -195,9 +242,35 @@ async function syncListings(collection) {
 
       function getPriceEth(listing) {
         const wei = listing?.price?.current?.value || listing?.price?.value || null;
-        const dec = listing?.price?.current?.decimal ?? listing?.price?.decimal
-          ?? (wei ? Number(wei) / 1e18 : null);
-        return dec != null ? parseFloat(dec) : null;
+        if(wei == null) return null;
+        // jv: Nekoadz (Robinhood Chain, USDG) listings showing "Ξ0.0000"
+        // on the grid despite the floor pill (a different data source)
+        // showing the correct "12.000 USDG". This always fell through to
+        // a hardcoded /1e18 (ETH-style) conversion regardless of the
+        // listing's real currency -- .decimal (singular) isn't an actual
+        // OpenSea field at all, so that check never once matched
+        // anything; .decimals (plural, the real decimals COUNT OpenSea
+        // returns -- the same field name already correctly read on the
+        // sales side's own currency-decimals fix, sync-listings.js
+        // above) was never checked. Dividing a 6-decimal USDG raw value
+        // by 1e18 instead of 1e6 produces a number so tiny it rounds to
+        // 0.0000 at display precision -- looks like "no price" rather
+        // than a wrong one, which is why this wasn't obviously broken.
+        const decimals = listing?.price?.current?.decimals ?? listing?.price?.decimals ?? 18;
+        return parseFloat(wei) / Math.pow(10, decimals);
+      }
+
+      // jv: "make the weth and eth wording through the page green for eth
+      // and red for weth" -- traced back to here: listings never tracked
+      // currency at all, only a numeric price_eth value, unlike sales
+      // (which already got this same fix earlier this session). OpenSea's
+      // listing price object carries its own currency symbol alongside
+      // the value/decimal fields getPriceEth above already reads --
+      // extracting it the same way, defaulting to 'ETH' only if truly
+      // absent (matching how every existing listing row -- inserted
+      // before this column existed -- should be read).
+      function getCurrency(listing) {
+        return listing?.price?.current?.currency || listing?.price?.currency || 'ETH';
       }
 
       // Generous, collection-agnostic sanity bound against malformed parses —
@@ -207,16 +280,38 @@ async function syncListings(collection) {
       const MAX_PLAUSIBLE_TOKEN_ID = 10_000_000;
 
       let droppedThisPage = 0;
+      let duplicateTokenListingsThisPage = 0;
       for (const listing of (body.listings || [])) {
         const id = getTokenId(listing);
         const priceEth = getPriceEth(listing);
+        const currency = getCurrency(listing);
 
-        if (!id || isNaN(id) || id < 0 || id > MAX_PLAUSIBLE_TOKEN_ID) { droppedThisPage++; continue; }
+        // (was `!id`, which also rejected a perfectly valid token #0)
+        if (id == null || isNaN(id) || id < 0 || id > MAX_PLAUSIBLE_TOKEN_ID) { droppedThisPage++; continue; }
         if (priceEth == null || isNaN(priceEth) || priceEth <= 0) { droppedThisPage++; continue; }
 
-        const url = `https://opensea.io/assets/ethereum/${contract}/${id}`;
-        if (!listingsMap[id] || priceEth < listingsMap[id].price_eth) {
-          listingsMap[id] = { price_eth: priceEth, url };
+        const url = `https://opensea.io/assets/${chain}/${contract}/${id}`;
+        if (!listingsMap[id]) {
+          listingsMap[id] = { price_eth: priceEth, url, currency };
+        } else {
+          // jv: "why 29 listings are missing from OpenSea's listings"
+          // count. Confirmed this is a real, expected occurrence (see
+          // this loop's own comment further down about "more than one
+          // listing entry per token") -- counting it explicitly now so
+          // a gap between OpenSea's own displayed count and what this
+          // sync keeps is directly explainable from the very next
+          // sync's logs, instead of needing to reason about it after
+          // the fact. Every one of these is a listing for a token this
+          // page already saw once this cycle -- OpenSea's own "listed"
+          // count very plausibly counts each such entry separately
+          // (competing listings, or a re-list OpenSea hasn't retired the
+          // old entry for yet), while this sync deliberately keeps only
+          // the cheapest one per token, since that's the one that
+          // actually matters for floor/mispriced/grid display.
+          duplicateTokenListingsThisPage++;
+          if (priceEth < listingsMap[id].price_eth) {
+            listingsMap[id] = { price_eth: priceEth, url, currency };
+          }
         }
       }
       // Visible in logs if a real fraction of a page is unparseable --
@@ -226,19 +321,27 @@ async function syncListings(collection) {
       if (droppedThisPage > 0){
         console.warn(`[sync] [${slug}] Dropped ${droppedThisPage}/${body.listings?.length ?? 0} listings on page ${pages} (unparseable id or price)`);
       }
+      if (duplicateTokenListingsThisPage > 0){
+        console.log(`[sync] [${slug}] ${duplicateTokenListingsThisPage}/${body.listings?.length ?? 0} listings on page ${pages} were extra listings for a token already seen this cycle (kept the cheapest one per token)`);
+      }
+      totalDropped += droppedThisPage;
+      totalDuplicateTokenListings += duplicateTokenListingsThisPage;
 
       next = body.next || null;
       pages++;
 
       // Raised from 25 -> 150 pages (2,500 -> 15,000 raw listings). 25 was
-      // never validated against actual collection sizes, and this endpoint
-      // can return more than one listing entry per token (competing offers,
-      // re-listings still present in a page before OpenSea's own indexing
-      // catches up), so the raw listing count this loop sees isn't the same
-      // as the unique, currently-listed token count it ends up keeping.
-      // Combined with the completedFully check below, hitting even this
-      // higher cap still means the DB write for this cycle gets skipped
-      // rather than writing a silently-incomplete set.
+      // never validated against actual collection sizes -- Argonauts alone
+      // has ~9,216 total tokens, and this endpoint can return more than one
+      // listing entry per token (competing offers, re-listings still
+      // present in a page before OpenSea's own indexing catches up), so
+      // the raw listing count this loop sees isn't the same as the unique,
+      // currently-listed token count it ends up keeping. Combined with the
+      // completedFully check below, hitting even this higher cap still
+      // means the DB write for this cycle gets skipped rather than writing
+      // a silently-incomplete set -- so this is about giving genuinely
+      // large or heavily-listed collections room to actually finish, not
+      // about removing the safety net itself.
       if (pages >= 150) break;
       if (next) await new Promise(r => setTimeout(r, 80)); // rate limit
 
@@ -247,7 +350,7 @@ async function syncListings(collection) {
     completedFully = (next == null);
 
     const entries = Object.entries(listingsMap);
-    console.log(`[sync] [${slug}] Fetched ${entries.length} listings across ${pages} pages (completedFully=${completedFully})`);
+    console.log(`[sync] [${slug}] Fetched ${entries.length} unique listed token(s) across ${pages} pages (completedFully=${completedFully}, ${totalDropped} unparseable dropped, ${totalDuplicateTokenListings} extra listings for an already-seen token collapsed)`);
 
     if (entries.length === 0) {
       console.warn(`[sync] [${slug}] No listings returned — skipping DB write`);
@@ -258,6 +361,16 @@ async function syncListings(collection) {
       console.warn(`[sync] [${slug}] Sync did not complete fully (stopped early after retries or hit the page cap) -- skipping DB write this cycle to avoid replacing a complete set with a partial one. Will retry next cycle.`);
       return;
     }
+
+    // Push alerts (lib/push.js): snapshot the listings BEFORE replacing them,
+    // so after the write we know which are new (not listed before) or
+    // relisted lower. An empty previous set (e.g. first sync on a fresh DB)
+    // sends nothing -- otherwise every listing would look "new".
+    let _prevListings = null;
+    try{
+      const pr = await pool.query(`SELECT token_id, price_eth FROM listings WHERE collection_slug = $1`, [slug]);
+      _prevListings = new Map(pr.rows.map(r => [parseInt(r.token_id, 10), parseFloat(r.price_eth)]));
+    }catch(_){ _prevListings = null; }
 
     // Upsert into Postgres in batches of 100
     const client = await pool.connect();
@@ -273,15 +386,16 @@ async function syncListings(collection) {
       // Insert fresh listings, scoped by collection_slug
       for (let i = 0; i < entries.length; i += 100) {
         const batch = entries.slice(i, i + 100);
-        const vals  = batch.map((_, j) => `($${j*4+1}, $${j*4+2}, $${j*4+3}, $${j*4+4}, NOW())`).join(', ');
-        const params = batch.flatMap(([id, d]) => [parseInt(id), d.price_eth, d.url, slug]);
+        const vals  = batch.map((_, j) => `($${j*5+1}, $${j*5+2}, $${j*5+3}, $${j*5+4}, $${j*5+5}, NOW())`).join(', ');
+        const params = batch.flatMap(([id, d]) => [parseInt(id), d.price_eth, d.url, slug, d.currency || 'ETH']);
 
         await client.query(`
-          INSERT INTO listings (token_id, price_eth, url, collection_slug, updated_at)
+          INSERT INTO listings (token_id, price_eth, url, collection_slug, currency, updated_at)
           VALUES ${vals}
           ON CONFLICT (token_id, collection_slug) DO UPDATE
             SET price_eth = EXCLUDED.price_eth,
                 url       = EXCLUDED.url,
+                currency  = EXCLUDED.currency,
                 updated_at = NOW()
         `, params);
       }
@@ -289,6 +403,19 @@ async function syncListings(collection) {
       await client.query('COMMIT');
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       console.log(`[sync] [${slug}] ✓ Upserted ${entries.length} listings in ${elapsed}s`);
+
+      if(_prevListings && _prevListings.size){
+        const fresh = [];
+        for(const [id, d] of entries){
+          const tokenId = parseInt(id, 10), price = parseFloat(d.price_eth);
+          if(!Number.isFinite(price)) continue;
+          const before = _prevListings.get(tokenId);
+          if(before == null || price < before - 1e-9) fresh.push({ tokenId, priceEth: price });
+        }
+        if(fresh.length){
+          try{ require('./lib/push').notifyNewListings(slug, fresh); }catch(e){ console.warn('[sync] push hook:', e.message); }
+        }
+      }
 
       // ── Write floor_history entry if floor has changed ─────────────────────
       // Only writes when MIN(price_eth) changes vs last recorded value.
@@ -322,6 +449,10 @@ async function syncListings(collection) {
               [newFloor, tokenId, slug]
             );
             console.log(`[sync] [${slug}] Floor history: ${lastFloor ?? 'none'} → ${newFloor} ETH (token #${tokenId})`);
+            // Floor alerts (lib/push.js): needs a previous floor to detect a crossing.
+            if(lastFloor !== null){
+              try{ require('./lib/push').notifyFloor(slug, lastFloor, newFloor, parseInt(tokenId, 10)); }catch(e){ console.warn('[sync] floor push hook:', e.message); }
+            }
           }
         }
       } catch(e) { console.error(`[sync] [${slug}] floor_history write error:`, e.message); }
@@ -338,16 +469,43 @@ async function syncListings(collection) {
   }
 }
 
+// jv: "The listing totals are off" (794 shown vs. OpenSea's own live 816
+// for Argonauts). Investigated the sync itself thoroughly -- pagination
+// retries, per-listing parsing, the completedFully guard against writing
+// a partial set -- all already correct and already fixed for a prior,
+// similar report. What was NOT guarded: setInterval here has no
+// reentrancy protection at all. If one full pass (sequentially syncing
+// every configured collection, each its own multi-page OpenSea fetch)
+// ever takes longer than SYNC_INTERVAL -- plausible with retries, or a
+// collection with enough listings to need many pages -- the next tick
+// fires a second, fully concurrent syncAllListings() run before the
+// first has finished. Two overlapping syncListings() calls for the same
+// collection racing their own DELETE+INSERT against each other is
+// exactly the kind of gap that could produce a wrong count without ever
+// showing up as an error anywhere, since neither run would fail --
+// they'd just interleave.
+let _syncAllListingsRunning = false;
 async function syncAllListings() {
-  const collections = await discoverCollections();
-  console.log(`[sync] Syncing listings for ${collections.length} collection(s): ${collections.map(c => c.slug).join(', ')}`);
-  for (const collection of collections) {
-    await syncListings(collection);
-    if (collections.length > 1) await new Promise(r => setTimeout(r, COLLECTION_DELAY));
+  if(_syncAllListingsRunning){
+    console.warn('[sync] syncAllListings still running from a previous tick -- skipping this one rather than overlapping');
+    return;
+  }
+  _syncAllListingsRunning = true;
+  try{
+    const collections = await discoverCollections();
+    console.log(`[sync] Syncing listings for ${collections.length} collection(s): ${collections.map(c => c.slug).join(', ')}`);
+    for (const collection of collections) {
+      await syncListings(collection);
+      if (collections.length > 1) await new Promise(r => setTimeout(r, COLLECTION_DELAY));
+    }
+  } finally {
+    _syncAllListingsRunning = false;
   }
 }
 
-// Run immediately on startup, then every 3 minutes
+// Run immediately on startup, then every 60 seconds (SYNC_INTERVAL) -- a
+// tick that finds the previous pass still in flight skips itself instead
+// of overlapping it (see the reentrancy guard above).
 syncAllListings();
 setInterval(syncAllListings, SYNC_INTERVAL);
 
@@ -393,9 +551,29 @@ async function syncSales(collection) {
 
         const priceWei = ev?.payment?.quantity || ev?.total_price;
         if (!priceWei) continue;
-        const price_eth = parseFloat(priceWei) / 1e18;
+        // jv confirmed live on nekoadz (Robinhood Chain): a sale showing
+        // "8 ETH" that was actually 8 of the chain's real native/listing
+        // currency. This hardcoded 18 decimals unconditionally regardless
+        // of ev.payment.decimals -- same bug class already fixed for
+        // listing prices (getPriceEth's 8e-12 ETH incident). Reading the
+        // real decimals when OpenSea provides them, same as the already-
+        // correct pattern used for sale embeds elsewhere in this codebase
+        // (lib/embeds.js: `const dec = event.payment?.decimals ?? 18;`).
+        const decimals = ev?.payment?.decimals ?? 18;
+        const price_eth = parseFloat(priceWei) / Math.pow(10, decimals);
         if (isNaN(price_eth) || price_eth <= 0 || price_eth > MAX_PLAUSIBLE_PRICE_ETH) continue;
 
+        // jv: "Nekoadz is showing a sale for 8 eth but it's actually 8
+        // USDG." This already correctly reads ev.payment.symbol rather
+        // than assuming ETH -- if it's still showing "ETH" after this
+        // deploys, that means OpenSea's own event payload isn't actually
+        // populating .symbol for this chain's sales, not a bug in this
+        // read. Logging the full raw payment object once per sync run so
+        // the real field structure is visible without guessing further.
+        if (!global.__loggedSamplePayment) {
+          global.__loggedSamplePayment = true;
+          console.log(`[sync-sales] [${slug}] Sample sale payment object: ${JSON.stringify(ev?.payment)}`);
+        }
         const currency = ev?.payment?.symbol || 'ETH';
         const buyer  = ev?.buyer  || ev?.winner_account?.address || null;
         const seller = ev?.seller || ev?.from_account?.address   || null;
@@ -419,6 +597,7 @@ async function syncSales(collection) {
     }
 
     const client = await pool.connect();
+    const _insertedSales = [];   // sale alerts: only rows actually inserted
     try {
       await client.query('BEGIN');
       for (let i = 0; i < allSales.length; i += 100) {
@@ -432,11 +611,28 @@ async function syncSales(collection) {
         await client.query(`
           INSERT INTO sales (token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash, collection_slug)
           VALUES ${vals}
-          ON CONFLICT (token_id, sale_ts, collection_slug) DO NOTHING
-        `, params);
+          -- jv reported (via cryptoadz-by-gremplin's retry logs): "duplicate
+          -- key value violates unique constraint 'sales_tx_hash...'" here,
+          -- even though this INSERT already targets ON CONFLICT (token_id,
+          -- sale_ts, collection_slug). Root cause: the sales table carries
+          -- TWO separate unique constraints -- the original UNIQUE(tx_hash,
+          -- token_id) from this table's very first CREATE TABLE, and a
+          -- later sales_token_ts_slug_unique index added for this exact
+          -- ON CONFLICT clause (see diag-check-conflict-constraints.js,
+          -- written for a similar earlier gap). A targeted ON CONFLICT only
+          -- suppresses a violation of the ONE constraint it names -- a
+          -- conflict on the older, still-active tx_hash+token_id constraint
+          -- was never covered by this clause at all. Targetless DO NOTHING
+          -- suppresses a violation of ANY unique/exclusion constraint on the
+          -- table, so this is safe regardless of which of the two is hit
+          -- (or if a third is ever added later).
+          ON CONFLICT DO NOTHING
+          RETURNING token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash
+        `, params).then(r => { _insertedSales.push(...r.rows); return r; });
       }
       await client.query('COMMIT');
       console.log(`[sync-sales] [${slug}] ✓ Upserted ${allSales.length} sales`);
+      try{ const push = require('./lib/push'); const fresh = push.freshSales(_insertedSales); if(fresh.length) push.notifySales(slug, fresh); }catch(e){ console.warn('[sync-sales] push hook:', e.message); }
     } catch (e) {
       await client.query('ROLLBACK');
       console.error(`[sync-sales] [${slug}] DB write failed:`, e.message);
@@ -448,12 +644,25 @@ async function syncSales(collection) {
   }
 }
 
+// Same reentrancy guard as syncAllListings above -- less likely to matter
+// at a 15-minute interval, but the same class of risk exists in principle
+// if a pass ever runs long, so guarded the same way for consistency.
+let _syncAllSalesRunning = false;
 async function syncAllSales() {
-  const collections = await discoverCollections();
-  console.log(`[sync-sales] Syncing sales for ${collections.length} collection(s): ${collections.map(c => c.slug).join(', ')}`);
-  for (const collection of collections) {
-    await syncSales(collection);
-    if (collections.length > 1) await new Promise(r => setTimeout(r, COLLECTION_DELAY));
+  if(_syncAllSalesRunning){
+    console.warn('[sync-sales] syncAllSales still running from a previous tick -- skipping this one rather than overlapping');
+    return;
+  }
+  _syncAllSalesRunning = true;
+  try{
+    const collections = await discoverCollections();
+    console.log(`[sync-sales] Syncing sales for ${collections.length} collection(s): ${collections.map(c => c.slug).join(', ')}`);
+    for (const collection of collections) {
+      await syncSales(collection);
+      if (collections.length > 1) await new Promise(r => setTimeout(r, COLLECTION_DELAY));
+    }
+  } finally {
+    _syncAllSalesRunning = false;
   }
 }
 
@@ -461,6 +670,225 @@ async function syncAllSales() {
 syncAllSales();
 setInterval(syncAllSales, 15 * 60 * 1000);
 
+// ── One-time full sales history seed for a newly onboarded collection ───────
+// Distinct from syncSales above: that one is deliberately capped at ~1000
+// recent events for the ongoing rolling sync (every 15 min), which is the
+// right bound for "stay current" but wrong for "give a brand-new collection
+// its actual trading history" — a collection could easily have many
+// thousands of historical sales going back to mint. This walks the full
+// event history with a much higher safety cap (50,000 sales) rather than no
+// cap at all, so a pathological collection can't run forever unnoticed —
+// hitting the cap logs clearly rather than failing silently.
+async function seedFullSalesHistory(collection) {
+  const { slug } = collection;
+
+  // jv: two consecutive retry-failure webhooks an hour apart, both dying at
+  // the exact same "page 180" -- confirmed this always restarted from page 1
+  // with no delay between requests at all, which is both why it keeps
+  // tripping the same rate limit and why every retry wastes the same ~180
+  // requests before dying at the same wall again. Resuming from wherever
+  // the last attempt actually got to, instead of starting over from zero.
+  const priorRes = await pool.query(
+    `SELECT sales_seed_cursor, sales_seed_written, sales_seed_pages FROM collections WHERE slug=$1`, [slug]
+  ).catch(() => null);
+  let cursor = priorRes?.rows[0]?.sales_seed_cursor || null;
+  let totalWritten = priorRes?.rows[0]?.sales_seed_written || 0;
+  let pages = priorRes?.rows[0]?.sales_seed_pages || 0;
+  if(cursor){
+    console.log(`[seed] [${slug}] Resuming FULL sales history pull from saved cursor (page ${pages}, ${totalWritten} sales already written) at ${new Date().toISOString()}`);
+  } else {
+    console.log(`[seed] Starting FULL sales history pull for ${slug} at ${new Date().toISOString()}`);
+  }
+
+  const MAX_PLAUSIBLE_TOKEN_ID = 10_000_000;
+  const MAX_PLAUSIBLE_PRICE_ETH = 100_000;
+  const MAX_PAGES = 2000; // 2000 * 100 = 200,000 sales safety cap — raised from 50,000, which would have quietly truncated a ~44k-token collection trading at anywhere near OnChainHoodies' ~1.2 sales/token ratio
+
+  try {
+    do {
+      const qs = new URLSearchParams({ event_type: 'sale', limit: '100' });
+      if (cursor) qs.set('next', cursor);
+
+      const resp = await fetch(
+        `https://api.opensea.io/api/v2/events/collection/${slug}?${qs}`,
+        { headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' } }
+      );
+
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        throw new Error(`OpenSea HTTP ${resp.status} on page ${pages}: ${errText.slice(0, 200)}`);
+      }
+
+      const body = await resp.json();
+      const events = body.asset_events || [];
+      const pageSales = [];
+
+      for (const ev of events) {
+        const rawId = ev?.nft?.identifier || ev?.asset?.token_id;
+        if (!rawId) continue;
+        const token_id = parseInt(rawId, 10);
+        if (isNaN(token_id) || token_id < 0 || token_id > MAX_PLAUSIBLE_TOKEN_ID) continue;
+
+        const priceWei = ev?.payment?.quantity || ev?.total_price;
+        if (!priceWei) continue;
+        // jv confirmed live on nekoadz (Robinhood Chain): a sale showing
+        // "8 ETH" that was actually 8 of the chain's real native/listing
+        // currency. This hardcoded 18 decimals unconditionally regardless
+        // of ev.payment.decimals -- same bug class already fixed for
+        // listing prices (getPriceEth's 8e-12 ETH incident). Reading the
+        // real decimals when OpenSea provides them, same as the already-
+        // correct pattern used for sale embeds elsewhere in this codebase
+        // (lib/embeds.js: `const dec = event.payment?.decimals ?? 18;`).
+        const decimals = ev?.payment?.decimals ?? 18;
+        const price_eth = parseFloat(priceWei) / Math.pow(10, decimals);
+        if (isNaN(price_eth) || price_eth <= 0 || price_eth > MAX_PLAUSIBLE_PRICE_ETH) continue;
+
+        // jv: "Nekoadz is showing a sale for 8 eth but it's actually 8
+        // USDG." This already correctly reads ev.payment.symbol rather
+        // than assuming ETH -- if it's still showing "ETH" after this
+        // deploys, that means OpenSea's own event payload isn't actually
+        // populating .symbol for this chain's sales, not a bug in this
+        // read. Logging the full raw payment object once per sync run so
+        // the real field structure is visible without guessing further.
+        if (!global.__loggedSamplePayment) {
+          global.__loggedSamplePayment = true;
+          console.log(`[sync-sales] [${slug}] Sample sale payment object: ${JSON.stringify(ev?.payment)}`);
+        }
+        const currency = ev?.payment?.symbol || 'ETH';
+        const buyer  = ev?.buyer  || ev?.winner_account?.address || null;
+        const seller = ev?.seller || ev?.from_account?.address   || null;
+        const sale_ts = ev?.closing_date
+          ? new Date(ev.closing_date * 1000).toISOString()
+          : ev?.event_timestamp || new Date().toISOString();
+        const tx_hash = ev?.transaction || null;
+
+        pageSales.push({ token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash });
+      }
+
+      if (pageSales.length) {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          for (let i = 0; i < pageSales.length; i += 100) {
+            const batch = pageSales.slice(i, i + 100);
+            const vals = batch.map((_, j) =>
+              `($${j*8+1},$${j*8+2},$${j*8+3},$${j*8+4},$${j*8+5},$${j*8+6},$${j*8+7},$${j*8+8})`
+            ).join(', ');
+            const params = batch.flatMap(s => [
+              s.token_id, s.price_eth, s.currency, s.buyer, s.seller, s.sale_ts, s.tx_hash, slug
+            ]);
+            await client.query(`
+              INSERT INTO sales (token_id, price_eth, currency, buyer, seller, sale_ts, tx_hash, collection_slug)
+              VALUES ${vals}
+              ON CONFLICT DO NOTHING
+            `, params);
+          }
+          await client.query('COMMIT');
+          totalWritten += pageSales.length;
+        } catch (e) {
+          await client.query('ROLLBACK');
+          throw e;
+        } finally {
+          client.release();
+        }
+      }
+
+      cursor = body.next || null;
+      pages++;
+      // jv: two consecutive retries both died at the exact same "page 180"
+      // rate limit. There was already an 80ms delay here, which clearly
+      // wasn't enough spacing to avoid tripping OpenSea's limit across ~180
+      // consecutive requests -- raised to 300ms, matching the spacing
+      // already used for OpenSea pagination elsewhere in this codebase
+      // (lib/poll.js), and persisting progress every page (below) so if it
+      // DOES still get rate-limited somewhere, the next attempt resumes
+      // from here instead of restarting from page 1 and hitting the exact
+      // same wall again.
+      await pool.query(
+        `UPDATE collections SET sales_seed_cursor = $2, sales_seed_written = $3, sales_seed_pages = $4, updated_at = NOW() WHERE slug = $1`,
+        [slug, cursor, totalWritten, pages]
+      ).catch(e => console.warn(`[seed] [${slug}] Failed to persist sales-seed cursor (non-fatal, next retry will just restart from page 1):`, e.message));
+      if (pages % 20 === 0) console.log(`[seed] [${slug}] ...${pages} pages, ${totalWritten} sales written so far`);
+      if (pages >= MAX_PAGES) {
+        console.warn(`[seed] [${slug}] Hit the ${MAX_PAGES}-page safety cap (${MAX_PAGES * 100} events) — history pull stopped early, not necessarily complete`);
+        break;
+      }
+      if (cursor) await new Promise(r => setTimeout(r, 300));
+    } while (cursor);
+
+    // Pull complete -- clear the saved cursor so a future re-onboard of this
+    // same slug (unlikely, but possible) starts fresh rather than "resuming"
+    // from a pull that already finished.
+    await pool.query(
+      `UPDATE collections SET sales_seed_cursor = NULL, sales_seed_written = 0, sales_seed_pages = 0, updated_at = NOW() WHERE slug = $1`,
+      [slug]
+    ).catch(() => {});
+    console.log(`[seed] [${slug}] ✓ Full sales history pull complete: ${totalWritten} sales across ${pages} pages`);
+    return { ok: true, salesWritten: totalWritten, pages };
+  } catch (e) {
+    console.error(`[seed] [${slug}] Sales history pull failed after ${pages} pages, ${totalWritten} sales written:`, e.message);
+    throw e;
+  }
+}
+
+// Orchestrates the full one-time onboarding seed for a newly added
+// collection: full sales history (above) + current listings snapshot
+// (syncListings, unchanged — its existing cap is already right for "current
+// active listings"), with the collections registry status updated
+// throughout so the frontend/onboarding trigger can poll progress.
+async function seedMarketHistory(collection) {
+  const { slug } = collection;
+  try {
+    await pool.query(
+      `UPDATE collections SET status = 'backfilling_market', updated_at = NOW() WHERE slug = $1`,
+      [slug]
+    );
+
+    await seedFullSalesHistory(collection);
+    await syncListings(collection);
+
+    // jv: "there should be an automatic retry, server admins shouldn't have
+    // to manually re run it if it fails." Reset retry state on success --
+    // this can be reached either as a first-try success or as the eventual
+    // successful attempt after one or more scheduled retries
+    // (retryFailedMarketHistory, bot.js), so both paths need it cleared.
+    await pool.query(
+      `UPDATE collections SET status = 'ready', market_synced_at = NOW(), market_retry_count = 0, market_next_retry_at = NULL, updated_at = NOW() WHERE slug = $1`,
+      [slug]
+    );
+    console.log(`[seed] [${slug}] Market history seed complete — status set to ready`);
+  } catch (e) {
+    // Exponential backoff: 30min, 1hr, 2hr, 4hr, 8hr, capping at 24hr so a
+    // persistent failure still gets checked roughly once a day rather than
+    // retrying forever at the same short interval and re-hammering
+    // whatever's rate-limiting it. market_retry_count is read-then-written
+    // here (not an atomic increment) because this whole function only ever
+    // runs for one slug at a time, never concurrently with itself.
+    const priorRes = await pool.query(`SELECT market_retry_count FROM collections WHERE slug=$1`, [slug]).catch(() => null);
+    const priorCount = priorRes?.rows[0]?.market_retry_count || 0;
+    const newCount = priorCount + 1;
+    // Give up on scheduled retries after 10 attempts (roughly a week at the
+    // capped 24hr interval) rather than retrying an actually-broken
+    // collection forever -- market_next_retry_at stays NULL from here on,
+    // which retryFailedMarketHistory's own query (bot.js) already filters
+    // on, so this alone stops it from being picked up again. A manual
+    // /config re-run still resets market_retry_count to 0 on its next
+    // success, same as any other retry.
+    const giveUp = newCount >= 10;
+    const backoffMinutes = Math.min(30 * Math.pow(2, priorCount), 24 * 60);
+    await pool.query(
+      `UPDATE collections SET status = 'failed', error_message = $2, market_retry_count = $3, market_next_retry_at = $4, updated_at = NOW() WHERE slug = $1`,
+      [slug, e.message, newCount, giveUp ? null : new Date(Date.now() + backoffMinutes * 60_000)]
+    ).catch(dbErr => console.error(`[seed] [${slug}] Also failed to record error status:`, dbErr.message));
+    if(giveUp){
+      console.error(`[seed] [${slug}] Market history seed failed ${newCount} times -- giving up on automatic retries, needs manual attention:`, e.message);
+    } else {
+      console.error(`[seed] [${slug}] Market history seed failed (attempt ${newCount}, next retry in ${backoffMinutes}min):`, e.message);
+    }
+    throw e;
+  }
+}
+
 // Export for use in api.js trigger endpoint
-module.exports = { syncListings, syncSales, syncAllListings, syncAllSales, discoverCollections };
+module.exports = { syncListings, syncSales, syncAllListings, syncAllSales, discoverCollections, seedFullSalesHistory, seedMarketHistory };
 })(); // end guard IIFE

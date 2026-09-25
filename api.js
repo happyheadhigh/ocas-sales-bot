@@ -10,9 +10,12 @@
  */
 
 const express = require('express');
+const compression = require('compression');
 const { Pool } = require('pg');
 const { OCAS_SLUG, BURN_CONTRACT } = require('./lib/constants');
-const { runMigrations } = require('./lib/db');
+const { runMigrations, fetchAndStoreCollectionTraits } = require('./lib/db');
+const { burnRpc, burnRpcUrl } = require('./lib/rpc');
+const saleStream = require('./lib/sale-stream');
 
 // Loaded at module level (not lazily inside a route handler) specifically
 // so its setInterval-driven sync loops actually start the moment this
@@ -23,8 +26,31 @@ const { runMigrations } = require('./lib/db');
 // [sync] log lines were ever appearing, on this version or the version
 // before today's rewrite.
 const syncListingsModule = require('./sync-listings');
+const { onboardCollection, backfillCollectionLinks } = require('./lib/collection-onboard');
+const { computeObsRanks } = require('./lib/rank-compute');
+const { refreshBurnedStatus } = require('./lib/burn-detect');
+const { fixCollectionImages, fetchRawTokenUri, diagnoseIpfsGateways } = require('./lib/collection-backfill');
 
 const app = express();
+// jv: argonauts' collection page took ~20s to load on mobile. Root cause:
+// /db/all-traits embeds every survivor's actual image inline per token --
+// a URL for OCAS/most collections, but full raw SVG markup for Argonauts
+// specifically (token_svg_cache, SVG-based on-chain art) since it has no
+// externally-hosted image at all. ~8,600 tokens' worth of pixel-art SVG
+// (lots of repeated, near-identical <rect> tags) in one uncompressed JSON
+// response is a genuinely huge, highly compressible payload -- this was
+// never gzipped at all. Mounted before every route (and before the CORS/
+// body-parser middleware below) so it applies uniformly to every
+// response this server sends, not just this one endpoint.
+app.use(compression({
+  // /db/sales-stream is a long-lived Server-Sent-Events connection
+  // (lib/sale-stream.js) -- small, frequent chunks (keep-alive pings,
+  // individual sale events) that need to reach the client immediately.
+  // Compression buffers/chunks output, which works against exactly that;
+  // excluding this one route rather than trusting the default filter to
+  // get it right on its own.
+  filter: (req, res) => req.path !== '/db/sales-stream' && compression.filter(req, res),
+}));
 const PORT = process.env.PORT || 3001;
 const DEFAULT_OCAS_CONTRACT = '0x078be86f3104a32313a47815792230a3808642cc';
 
@@ -81,6 +107,10 @@ pool.on('error', (err) => console.error('DB pool error:', err.message));
 // All requests must include ?key=YOUR_API_SECRET or x-api-key header
 const API_SECRET = process.env.API_SECRET;
 const REQUIRE_API_AUTH = process.env.NODE_ENV === 'production';
+// jv: used by /tv/identity for the OpenSea account-profile lookup (linked
+// X account) -- same env var lib/collection-onboard.js already reads,
+// just not previously needed at this file's own top level.
+const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY || process.env.OPENSEA_KEY;
 // Railway sits behind a reverse proxy -- without this, req.ip always reflects
 // the proxy's IP for every request, which would make per-IP rate limiting
 // completely ineffective (every request looks like it's from the same "IP").
@@ -125,7 +155,18 @@ setInterval(() => {
   }
 }, 15 * 60 * 1000);
 
-app.use(express.json());
+// 5mb limit (default is 100kb) -- needed for POST /render/svg-token, which
+// accepts a base64 on-chain SVG data URI in the request body. Confirmed
+// live: a large embedded-PNG on-chain SVG failed with HTTP 431 when sent as
+// a GET query-string parameter (a request line has much tighter length
+// limits than a POST body almost everywhere) -- moving it to a POST body
+// fixes that, but only if the body-size limit is actually large enough to
+// hold it. Raised globally rather than as a second, route-specific
+// express.json() call: Express only reads the request body stream once, so
+// stacking a second json() middleware on top of this global one for a
+// single route risks silently no-op'ing or erroring on an already-consumed
+// stream, not actually widening anything.
+app.use(express.json({ limit: '5mb' }));
 
 // ── CORS — allow the production site, Cloudflare Pages previews, and local/
 // LAN dev testing; reject arbitrary third-party origins from embedding
@@ -174,25 +215,34 @@ app.get('/db/tokens', auth, async (req, res) => {
     const rankMax   = req.query.rank_max ? parseInt(req.query.rank_max) : null;
     const listedOnly = req.query.listed === '1';
     const limit     = Math.min(parseInt(req.query.limit || '10000'), 10000);
+    // jv: same cross-collection bug class found and fixed across several
+    // other endpoints tonight (/db/token-sales, /db/floor-trend,
+    // /db/trait-sales, /db/rank-sales) -- this entire query joined
+    // tokens/token_traits/listings purely on token_id, with no
+    // collection_slug filter anywhere at all. Every collection's tokens
+    // were being mixed together in whatever generic token search/filter
+    // this backs. slug defaults to OCAS_SLUG, matching this file's
+    // existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
 
     const traitEntries = Object.entries(traitFilters).filter(([, vals]) => vals?.length > 0);
     const traitCountFilter = req.query.trait_count ? parseInt(req.query.trait_count) : null;
 
     let query = `SELECT t.id, t.obs_rank FROM tokens t`;
-    const params = [];
-    let p = 1;
+    const params = [slug];
+    let p = 2;
 
     // One JOIN per trait name — AND logic across names, OR within values
     traitEntries.forEach(([name, vals], i) => {
-      query += ` JOIN token_traits tt${i} ON tt${i}.token_id = t.id`
+      query += ` JOIN token_traits tt${i} ON tt${i}.token_id = t.id AND tt${i}.collection_slug = t.collection_slug`
              + ` AND tt${i}.trait_name = $${p++}`
              + ` AND tt${i}.trait_value = ANY($${p++}::text[])`;
       params.push(name, Array.isArray(vals) ? vals : [vals]);
     });
 
-    if (listedOnly) query += ` JOIN listings l ON l.token_id = t.id`;
+    if (listedOnly) query += ` JOIN listings l ON l.token_id = t.id AND l.collection_slug = t.collection_slug`;
 
-    const conditions = [ACTIVE_TOKEN_CONDITION];
+    const conditions = [ACTIVE_TOKEN_CONDITION, `t.collection_slug = $1`];
     if (rankMin !== null) { conditions.push(`t.obs_rank >= $${p++}`); params.push(rankMin); }
     if (rankMax !== null) { conditions.push(`t.obs_rank <= $${p++}`); params.push(rankMax); }
     if (traitCountFilter !== null) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCountFilter); }
@@ -219,7 +269,7 @@ app.get('/db/tokens', auth, async (req, res) => {
 app.get('/db/token/:id', auth, async (req, res) => {
   try {
     const tokenId = parseInt(req.params.id);
-    if (!tokenId || tokenId < 1 || tokenId > 10000) {
+    if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) { // generous, collection-agnostic bound — was hardcoded to OCAS's ~10k supply and also rejected token id 0 (breaks 0-indexed collections like CryptoPunks)
       return res.status(400).json({ ok: false, error: 'invalid token id' });
     }
     // Defaults to OCAS when no slug is provided so any caller not yet updated
@@ -230,9 +280,10 @@ app.get('/db/token/:id', auth, async (req, res) => {
     // /traitfind garbled-trait bug.
     const slug = (req.query.slug || OCAS_SLUG).toString();
 
-    const [tokenRes, traitsRes] = await Promise.all([
-      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count FROM tokens WHERE id = $1 AND collection_slug = $2`, [tokenId, slug]),
-      pool.query(`SELECT trait_name, trait_value, COALESCE(trait_index,0) AS trait_index FROM token_traits WHERE token_id = $1 AND collection_slug = $2 ORDER BY COALESCE(trait_index,0), trait_name`, [tokenId, slug])
+    const [tokenRes, traitsRes, collRes] = await Promise.all([
+      pool.query(`SELECT id, obs_rank, os_rank, os_score, rarity_score, trait_count, image_url, is_burned, animation_url FROM tokens WHERE id = $1 AND collection_slug = $2`, [tokenId, slug]),
+      pool.query(`SELECT trait_name, trait_value, COALESCE(trait_index,0) AS trait_index FROM token_traits WHERE token_id = $1 AND collection_slug = $2 ORDER BY COALESCE(trait_index,0), trait_name`, [tokenId, slug]),
+      pool.query(`SELECT contract, chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }))
     ]);
 
     if (!tokenRes.rows.length) return res.status(404).json({ ok: false, error: 'not found' });
@@ -240,6 +291,7 @@ app.get('/db/token/:id', auth, async (req, res) => {
     const t = tokenRes.rows[0];
     const traits = traitsFromRows(traitsRes.rows);
     const actualTraitCount = traits.__attributes?.length || parseInt(t.trait_count || 0);
+    const collInfo = collRes.rows[0] || null;
 
     res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
     res.json({
@@ -251,6 +303,11 @@ app.get('/db/token/:id', auth, async (req, res) => {
         os_score: t.os_score ? parseFloat(t.os_score) : null,
         rarity_score: t.rarity_score != null ? parseFloat(t.rarity_score) : null,
         trait_count: actualTraitCount,
+        image_url: t.image_url || null,
+        burned: !!t.is_burned,
+        animation_url: t.animation_url || null,
+        chain: collInfo?.chain || null,
+        contract: collInfo?.contract || null,
         traits
       }
     });
@@ -270,22 +327,34 @@ app.get('/db/trait-floor', auth, async (req, res) => {
     if (!trait_name || !trait_value) {
       return res.status(400).json({ ok: false, error: 'missing trait_name or trait_value' });
     }
-
-    const result = await pool.query(`
-      SELECT t.id, t.obs_rank, l.price_eth, l.url
-      FROM tokens t
-      JOIN token_traits tt ON tt.token_id = t.id
-      JOIN listings l ON l.token_id = t.id
-      WHERE tt.trait_name = $1 AND tt.trait_value = $2
-        AND NOT EXISTS (
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- no collection_slug filter anywhere in this query at all.
+    // Also: the burn exclusion subquery ran unconditionally for every
+    // collection against OCAS-specific burn_event_inputs data -- a
+    // non-OCAS collection's token could be incorrectly excluded here if
+    // its numeric id happened to match an OCAS burned token's id (the same
+    // cross-collection numeric-id-collision class of bug, just via burn
+    // data specifically). Gated to isOcas only, same pattern already used
+    // in lib/rank-compute.js for this exact same subquery shape.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
+    const isOcas = slug === OCAS_SLUG;
+    const burnExclusion = isOcas ? `AND NOT EXISTS (
           SELECT 1 FROM burn_event_inputs active_burned
           JOIN burn_events active_be ON active_be.id = active_burned.burn_event_id
           WHERE active_burned.burned_token_id = t.id
             AND active_burned.burned_token_id != active_be.survivor_token_id
-        )
+        )` : '';
+
+    const result = await pool.query(`
+      SELECT t.id, t.obs_rank, l.price_eth, l.url
+      FROM tokens t
+      JOIN token_traits tt ON tt.token_id = t.id AND tt.collection_slug = t.collection_slug
+      JOIN listings l ON l.token_id = t.id AND l.collection_slug = t.collection_slug
+      WHERE t.collection_slug = $3 AND tt.trait_name = $1 AND tt.trait_value = $2
+        ${burnExclusion}
       ORDER BY l.price_eth ASC
       LIMIT 1
-    `, [trait_name, trait_value]);
+    `, [trait_name, trait_value, slug]);
 
     res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
     res.json({
@@ -350,13 +419,170 @@ app.get('/db/listings/sync', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/collections/onboard — full onboarding for a brand-new collection ──
+// Resolves the slug via OpenSea, validates it (rejects disabled/NSFW/non-
+// Ethereum/non-erc721 collections), creates the registry row, then runs
+// trait/image backfill followed by the market history seed in sequence.
+// Runs in background; poll /db/collections to watch status move through
+// pending -> backfilling_traits -> backfilling_market -> ready/failed.
+//
+// Admin-only, gated by a SEPARATE secret from the regular API key — that
+// key is already embedded in TraitView's public frontend JS (visible via
+// devtools), so it can't provide real gating for something that kicks off
+// OpenSea/Alchemy-heavy work. ADMIN_ONBOARD_SECRET must be set on Railway
+// and never given to the frontend; trigger manually (browser URL bar or
+// curl) until there's a considered decision to open this up more broadly.
+const ADMIN_ONBOARD_SECRET = process.env.ADMIN_ONBOARD_SECRET;
+app.get('/db/collections/onboard', async (req, res) => {
+  try {
+    if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+      return res.status(403).json({ ok: false, error: 'forbidden' });
+    }
+    const slug = String(req.query.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    res.json({ ok: true, message: `Onboarding started for "${slug}" — running in background, poll /db/collections to watch status` });
+    onboardCollection(pool, slug).catch(e => {
+      console.error(`[/db/collections/onboard] ${slug} failed:`, e.message);
+    });
+  } catch(e) {
+    console.error('/db/collections/onboard error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/:slug/sync-trait-index — populate collection_traits only ──
+// For collections onboarded before onboardCollection started calling this
+// automatically. Pulls trait-frequency stats directly from OpenSea's own
+// /v2/traits/{slug} endpoint (a separate data source from token_traits/
+// Alchemy) — this is specifically what /traitfind's dropdown depends on for
+// non-OCAS collections. Cheap and fast compared to a full re-backfill.
+app.get('/db/collections/:slug/sync-trait-index', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+    // This used to always report ok:true regardless of whether the OpenSea
+    // fetch actually succeeded, since fetchAndStoreCollectionTraits swallowed
+    // every error internally and returned nothing — making this endpoint
+    // useless as an actual diagnostic. It now returns what really happened.
+    const result = await fetchAndStoreCollectionTraits(slug, pool);
+    const countRes = await pool.query(`SELECT COUNT(*)::int AS n FROM collection_traits WHERE slug=$1`, [slug]).catch(()=>({rows:[{n:0}]}));
+    res.json({
+      ok: !!result.ok,
+      slug,
+      reason: result.reason || null,
+      opensea_status: result.status || null,
+      rows_in_collection_traits: countRes.rows[0]?.n || 0,
+      message: result.ok
+        ? `Trait index sync succeeded for "${slug}" — check /db/trait-index?slug=${slug} to confirm`
+        : `Trait index sync did NOT populate data for "${slug}": ${result.reason || 'unknown reason'}`,
+    });
+  } catch(e) {
+    console.error(`/db/collections/${req.params.slug}/sync-trait-index error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/:slug/fix-images — re-verify images for a non-Ethereum
+// collection backfilled before writePage started always checking non-Ethereum
+// images against the real on-chain source. One-time correction pass; skips
+// traits entirely (those are already correct). Runs in the background —
+// iterates every token individually, so this takes a while for a large
+// collection. Check server logs for progress.
+app.get('/db/collections/:slug/fix-images', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    const collRes = await pool.query(`SELECT slug, contract, chain FROM collections WHERE slug = $1`, [slug]);
+    if (!collRes.rows.length) {
+      return res.status(404).json({ ok: false, error: `No collections row for slug "${slug}"` });
+    }
+
+    res.json({ ok: true, message: `Image fix started for "${slug}" — running in background, check server logs for progress` });
+    fixCollectionImages(pool, collRes.rows[0]).catch(e => {
+      console.error(`[/db/collections/${slug}/fix-images] background fix failed:`, e.message);
+    });
+  } catch(e) {
+    console.error(`/db/collections/${req.params.slug}/fix-images error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/:slug/repair-status — check progress of the
+// background metadata repair queue (Tier 4 of the tiered backfill) without
+// needing to tail server logs. Reports pending/done/permanently_failed
+// counts, plus a small sample of currently-pending token IDs so it's
+// obvious at a glance whether the drain is actually making progress.
+app.get('/db/collections/:slug/repair-status', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    const countsRes = await pool.query(
+      `SELECT status, COUNT(*)::int AS n FROM metadata_repair_jobs WHERE collection_slug=$1 GROUP BY status`,
+      [slug]
+    );
+    const counts = { pending: 0, done: 0, permanently_failed: 0 };
+    for (const row of countsRes.rows) counts[row.status] = row.n;
+
+    const sampleRes = await pool.query(
+      `SELECT token_id, attempts, last_error, last_attempt_at FROM metadata_repair_jobs
+       WHERE collection_slug=$1 AND status='pending' ORDER BY token_id ASC LIMIT 10`,
+      [slug]
+    );
+
+    const total = counts.pending + counts.done + counts.permanently_failed;
+    res.json({
+      ok: true,
+      slug,
+      total,
+      pending: counts.pending,
+      done: counts.done,
+      permanently_failed: counts.permanently_failed,
+      percentComplete: total ? Math.round(((counts.done + counts.permanently_failed) / total) * 100) : 100,
+      stillDraining: counts.pending > 0,
+      samplePendingTokens: sampleRes.rows,
+    });
+  } catch(e) {
+    console.error(`/db/collections/${req.params.slug}/repair-status error:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/:slug/seed-market — one-time full sales history +
+// current listings pull for a newly onboarded collection. Runs in the
+// background; poll /db/collections (added in phase 1) to watch status go
+// pending -> backfilling_market -> ready/failed. Expects the collection row
+// to already exist (created by the trait/image backfill step) — this only
+// covers the market side.
+app.get('/db/collections/:slug/seed-market', auth, async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').toLowerCase().trim();
+    if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+
+    const existing = await pool.query(`SELECT slug, contract FROM collections WHERE slug = $1`, [slug]);
+    if (!existing.rows.length) {
+      return res.status(404).json({ ok: false, error: `No collections row for slug "${slug}" — run the trait/image backfill first` });
+    }
+
+    res.json({ ok: true, message: `Market history seed started for ${slug} — running in background, poll /db/collections to watch status` });
+    syncListingsModule.seedMarketHistory(existing.rows[0]).catch(e => {
+      console.error(`[/db/collections/${slug}/seed-market] background seed failed:`, e.message);
+    });
+  } catch(e) {
+    console.error('/db/collections/:slug/seed-market error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/listings — all current listings from DB ───────────────────────────
 app.get('/db/listings', auth, async (req, res) => {
   try {
     // Default to OCAS slug for TraitView; pass ?slug= to override
     const slug = req.query.slug || 'on-chain-all-stars';
     const result = await pool.query(
-      `SELECT token_id, price_eth, url FROM listings WHERE collection_slug = $1 ORDER BY price_eth ASC`,
+      `SELECT token_id, price_eth, url, currency FROM listings WHERE collection_slug = $1 ORDER BY price_eth ASC`,
       [slug]
     );
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
@@ -365,7 +591,8 @@ app.get('/db/listings', auth, async (req, res) => {
       listings: result.rows.map(r => ({
         token_id: parseInt(r.token_id),
         price_eth: parseFloat(r.price_eth),
-        url: r.url
+        url: r.url,
+        currency: r.currency || 'ETH'
       })),
       count: result.rows.length
     });
@@ -375,16 +602,378 @@ app.get('/db/listings', auth, async (req, res) => {
   }
 });
 
+// ── GET /db/gondi-listings — active Gondi marketplace listings ──────────────
+// jv: "There are actually trades happening on Gondi as well. Is there
+// anyway to catch those in traitview?" Separate from OpenSea's own
+// listings table entirely -- see lib/gondi-sync.js for the full
+// integration and its own caveats (price_wei/currency_address may be
+// null; the SDK's documented listings() response doesn't show a price
+// field at all).
+app.get('/db/gondi-listings', auth, async (req, res) => {
+  try {
+    const slug = (req.query.slug || 'argonauts').toLowerCase();
+    const result = await pool.query(
+      `SELECT token_id, marketplace_name, seller_wallet, price_wei, currency_address, gondi_created_at
+       FROM gondi_listings WHERE collection_slug = $1 ORDER BY token_id ASC`,
+      [slug]
+    );
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      slug,
+      listings: result.rows.map(r => ({
+        token_id: parseInt(r.token_id),
+        marketplace: r.marketplace_name,
+        seller: r.seller_wallet,
+        price_wei: r.price_wei,
+        currency_address: r.currency_address,
+        created_at: r.gondi_created_at,
+      })),
+      count: result.rows.length
+    });
+  } catch(e) {
+    console.error('/db/gondi-listings error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Push notifications (TraitView installed app) ─────────────────────────────
+// jv: "push notifications should work just like the discord bot" -- see
+// lib/push.js. A device is identified by its push subscription endpoint;
+// every rule read/write is scoped to that endpoint.
+const push = require('./lib/push');
+const PUSH_KINDS = new Set(['listing', 'mint', 'burn', 'floor', 'sale', 'wallet']);
+const PUSH_SCOPES = new Set(['any', 'trait', 'traitcount', 'token']);
+const MAX_RULES_PER_DEVICE = 50;
+async function _pushSubId(endpoint){
+  if(typeof endpoint !== 'string' || !endpoint.startsWith('https://')) return null;
+  const r = await pool.query(`SELECT id FROM push_subscriptions WHERE endpoint = $1`, [endpoint]);
+  return r.rows[0]?.id || null;
+}
+app.get('/push/public-key', auth, async (req, res) => {
+  try{ res.json({ ok: true, key: await push.ensurePush() }); }
+  catch(e){ res.status(500).json({ ok: false, error: e.message }); }
+});
+app.post('/push/subscribe', auth, rateLimit({ max: 20, windowMs: 60_000, keyFn: r => 'pushsub:' + r.ip }), async (req, res) => {
+  try{
+    await push.ensurePush();
+    const sub = req.body?.subscription;
+    const endpoint = sub?.endpoint, p256dh = sub?.keys?.p256dh, authKey = sub?.keys?.auth;
+    if(typeof endpoint !== 'string' || !endpoint.startsWith('https://') || !p256dh || !authKey) return res.status(400).json({ ok: false, error: 'bad subscription' });
+    const r = await pool.query(
+      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_agent) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (endpoint) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, user_agent = EXCLUDED.user_agent
+       RETURNING id`, [endpoint, p256dh, authKey, String(req.body?.userAgent || '').slice(0, 300)]);
+    res.json({ ok: true, id: r.rows[0].id });
+  }catch(e){ res.status(500).json({ ok: false, error: e.message }); }
+});
+app.get('/push/rules', auth, async (req, res) => {
+  try{
+    await push.ensurePush();
+    const subId = await _pushSubId(req.query.endpoint);
+    if(!subId) return res.json({ ok: true, rules: [] });
+    const r = await pool.query(`SELECT id, collection_slug, collection_name, kind, scope, trait_name, trait_value, trait_count, max_price_eth, direction, threshold_eth, token_id, wallet_address, created_at, last_sent_at
+                                FROM push_rules WHERE subscription_id = $1 ORDER BY created_at DESC`, [subId]);
+    res.json({ ok: true, rules: r.rows });
+  }catch(e){ res.status(500).json({ ok: false, error: e.message }); }
+});
+app.post('/push/rules', auth, rateLimit({ max: 30, windowMs: 60_000, keyFn: r => 'pushrule:' + r.ip }), async (req, res) => {
+  try{
+    await push.ensurePush();
+    const b = req.body || {};
+    const subId = await _pushSubId(b.endpoint);
+    if(!subId) return res.status(400).json({ ok: false, error: 'subscribe first' });
+    const slug = String(b.slug || '').toLowerCase().slice(0, 100);
+    const kind = String(b.kind || ''), scope = String(b.scope || 'any');
+    if(!slug || !PUSH_KINDS.has(kind) || !PUSH_SCOPES.has(scope)) return res.status(400).json({ ok: false, error: 'bad rule' });
+    const scoped = kind === 'listing' || kind === 'sale';   // these take any / trait / trait count / token #
+    if(scoped && scope === 'trait' && (!b.traitName || b.traitValue == null)) return res.status(400).json({ ok: false, error: 'trait required' });
+    if(scoped && scope === 'traitcount' && !Number.isFinite(Number(b.traitCount))) return res.status(400).json({ ok: false, error: 'trait count required' });
+    const tokenId = parseInt(b.tokenId, 10);
+    if(scoped && scope === 'token' && !(tokenId >= 0)) return res.status(400).json({ ok: false, error: 'token # required' });
+    const max = b.maxPriceEth === '' || b.maxPriceEth == null ? null : Number(b.maxPriceEth);
+    if(max != null && !(max > 0)) return res.status(400).json({ ok: false, error: 'bad price' });
+    const direction = b.direction === 'above' ? 'above' : 'below';
+    const threshold = Number(b.thresholdEth);
+    if(kind === 'floor' && !(threshold > 0)) return res.status(400).json({ ok: false, error: 'floor threshold required' });
+    const wallet = String(b.wallet || '').toLowerCase().trim();
+    if(kind === 'wallet' && !/^0x[0-9a-f]{40}$/.test(wallet)) return res.status(400).json({ ok: false, error: 'wallet address required' });
+    if(kind === 'wallet'){
+      const dup = await pool.query(`SELECT id FROM push_rules WHERE subscription_id=$1 AND kind='wallet' AND collection_slug=$2 AND wallet_address=$3`, [subId, slug, wallet]);
+      if(dup.rows[0]) return res.json({ ok: true, id: dup.rows[0].id, existing: true });
+    }
+    const n = await pool.query(`SELECT COUNT(*)::int AS n FROM push_rules WHERE subscription_id = $1`, [subId]);
+    if(n.rows[0].n >= MAX_RULES_PER_DEVICE) return res.status(400).json({ ok: false, error: `limit ${MAX_RULES_PER_DEVICE} alerts per device` });
+    const r = await pool.query(
+      `INSERT INTO push_rules (subscription_id, collection_slug, collection_name, kind, scope, trait_name, trait_value, trait_count, excluded_categories, max_price_eth, direction, threshold_eth, token_id, wallet_address)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+      [subId, slug, String(b.collectionName || '').slice(0, 100) || null, kind, scoped ? scope : 'any',
+       scope === 'trait' ? String(b.traitName).slice(0, 100) : null, scope === 'trait' ? String(b.traitValue).slice(0, 200) : null,
+       scope === 'traitcount' ? parseInt(b.traitCount, 10) : null,
+       JSON.stringify(Array.isArray(b.excludedCategories) ? b.excludedCategories.slice(0, 50).map(String) : []),
+       kind === 'listing' ? max : null,
+       kind === 'floor' ? direction : null, kind === 'floor' ? threshold : null,
+       scoped && scope === 'token' ? tokenId : null, kind === 'wallet' ? wallet : null]);
+    res.json({ ok: true, id: r.rows[0].id });
+  }catch(e){ res.status(500).json({ ok: false, error: e.message }); }
+});
+app.delete('/push/rules/:id', auth, async (req, res) => {
+  try{
+    await push.ensurePush();
+    const subId = await _pushSubId(req.query.endpoint);
+    if(!subId) return res.status(400).json({ ok: false, error: 'unknown device' });
+    const r = await pool.query(`DELETE FROM push_rules WHERE id = $1 AND subscription_id = $2`, [parseInt(req.params.id, 10), subId]);
+    res.json({ ok: true, deleted: r.rowCount });
+  }catch(e){ res.status(500).json({ ok: false, error: e.message }); }
+});
+// Activity inbox (jv): the bell's feed of everything this device was sent.
+app.get('/push/inbox', auth, async (req, res) => {
+  try{
+    await push.ensurePush();
+    const subId = await _pushSubId(req.query.endpoint);
+    if(!subId) return res.json({ ok: true, items: [], unread: 0 });
+    const [items, seen] = await Promise.all([
+      pool.query(`SELECT id, collection_slug, kind, title, body, url, EXTRACT(EPOCH FROM created_at)::bigint AS ts
+                  FROM push_inbox WHERE subscription_id = $1 ORDER BY id DESC LIMIT 100`, [subId]),
+      pool.query(`SELECT inbox_seen_at FROM push_subscriptions WHERE id = $1`, [subId]),
+    ]);
+    const seenTs = seen.rows[0]?.inbox_seen_at ? new Date(seen.rows[0].inbox_seen_at).getTime() / 1000 : 0;
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, items: items.rows, unread: items.rows.filter(i => Number(i.ts) > seenTs).length, seenTs });
+  }catch(e){ res.status(500).json({ ok: false, error: e.message }); }
+});
+app.post('/push/inbox/seen', auth, async (req, res) => {
+  try{
+    await push.ensurePush();
+    const subId = await _pushSubId(req.body?.endpoint);
+    if(!subId) return res.json({ ok: true });
+    await pool.query(`UPDATE push_subscriptions SET inbox_seen_at = NOW() WHERE id = $1`, [subId]);
+    res.json({ ok: true });
+  }catch(e){ res.status(500).json({ ok: false, error: e.message }); }
+});
+app.delete('/push/inbox', auth, async (req, res) => {
+  try{
+    await push.ensurePush();
+    const subId = await _pushSubId(req.query.endpoint);
+    if(!subId) return res.json({ ok: true });
+    await pool.query(`DELETE FROM push_inbox WHERE subscription_id = $1`, [subId]);
+    res.json({ ok: true });
+  }catch(e){ res.status(500).json({ ok: false, error: e.message }); }
+});
+app.post('/push/test', auth, rateLimit({ max: 5, windowMs: 60_000, keyFn: r => 'pushtest:' + r.ip }), async (req, res) => {
+  try{
+    await push.ensurePush();
+    const r = await pool.query(`SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE endpoint = $1`, [req.body?.endpoint]);
+    if(!r.rows[0]) return res.status(400).json({ ok: false, error: 'unknown device' });
+    const ok = await push.sendToSubscription(r.rows[0], { title: 'TraitView alerts are on 🔔', body: "You'll get a notification like this when your alerts trigger.", url: '/', tag: 'test' });
+    res.json({ ok });
+  }catch(e){ res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── GET /db/gondi-trades — executed Gondi P2P trades for a collection ────────
+// jv: "what about trades that happen on gondi? and past trades and sales".
+// Every executed deal, both sides in full (see lib/gondi-activity-sync.js).
+// Swaps with NFTs on both sides have no single price, so TraitView shows
+// them in token history / the wallet panel rather than on the price chart.
+app.get('/db/gondi-trades', auth, async (req, res) => {
+  try{
+    const slug = (req.query.slug || 'argonauts').toLowerCase();
+    const r = await pool.query(
+      `SELECT deal_id, maker, taker, tx_hash, executed_at, maker_nfts, taker_nfts,
+              maker_erc20s, maker_erc20_amounts, taker_erc20s, taker_erc20_amounts, is_sale
+       FROM gondi_trades WHERE collection_slug = $1 ORDER BY executed_at DESC NULLS LAST LIMIT 2000`, [slug]);
+    res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
+    res.json({ ok: true, slug, trades: r.rows, count: r.rows.length });
+  }catch(e){
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/holder-stats — per-wallet insights for the Holders tab ───────────
+// jv: "Wallet hold time, top minter, top p&l, which wallet bought the most,
+// which sold, which wallets sold for a total losses". Built from the
+// collection-wide transfer history (lib/collection-transfers.js, synced by
+// the bot) plus the sales table. Compact rows: see `fields`.
+// P&L = realized flips only: a wallet bought a token in a sale and later
+// sold that same token (sale price minus buy price, before fees/royalties).
+// Tokens a wallet minted or received by transfer have no known cost, so
+// they don't count toward P&L.
+const _holderStatsCache = new Map(); // slug -> {at, body}
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+const DEAD_ADDR = '0x000000000000000000000000000000000000dead';
+app.get('/db/holder-stats', auth, async (req, res) => {
+  try{
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
+    const hit = _holderStatsCache.get(slug);
+    if(hit && Date.now() - hit.at < 10 * 60_000 && !req.query.fresh){
+      res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+      return res.json(hit.body);
+    }
+    const [tr, sa, st] = await Promise.all([
+      pool.query(`SELECT token_id, from_address AS f, to_address AS t, EXTRACT(EPOCH FROM ts)::bigint AS ts
+                  FROM collection_transfers WHERE collection_slug=$1 ORDER BY block_number, unique_id`, [slug])
+        .catch(() => ({ rows: [] })),
+      pool.query(`SELECT token_id, price_eth::float8 AS p, UPPER(COALESCE(currency,'ETH')) AS c,
+                         LOWER(buyer) AS b, LOWER(seller) AS s
+                  FROM sales WHERE collection_slug=$1 AND price_eth IS NOT NULL AND price_eth > 0
+                  ORDER BY sale_ts, id`, [slug]),
+      pool.query(`SELECT value FROM bot_state WHERE key=$1`, [`ctx_complete:${slug}`]).catch(() => ({ rows: [] })),
+    ]);
+    const W = new Map();
+    const get = (w) => {
+      let o = W.get(w);
+      if(!o){ o = { minted:0, bought:0, boughtEth:0, sold:0, soldEth:0, pnl:0, flips:0, lossFlips:0, since:[] }; W.set(w, o); }
+      return o;
+    };
+    // Replay transfers: minters + when each current owner got each token.
+    const owner = new Map(); // token -> {w, ts}
+    for(const r of tr.rows){
+      const id = Number(r.token_id), ts = Number(r.ts) || null;
+      if(r.f === ZERO_ADDR && r.t && r.t !== ZERO_ADDR) get(r.t).minted++;
+      if(!r.t || r.t === ZERO_ADDR || r.t === DEAD_ADDR) owner.delete(id);
+      else owner.set(id, { w: r.t, ts });
+    }
+    const now = Date.now() / 1000;
+    for(const { w, ts } of owner.values()){ if(ts) get(w).since.push(ts); }
+    // Sales in the collection's main currency (ETH and WETH count as one).
+    const norm = (c) => (c === 'WETH' ? 'ETH' : c);
+    const cc = new Map();
+    for(const r of sa.rows){ const c = norm(r.c); cc.set(c, (cc.get(c) || 0) + 1); }
+    const currency = [...cc.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'ETH';
+    const lastBuy = new Map(); // token -> {b, p}
+    for(const r of sa.rows){
+      if(norm(r.c) !== currency) continue;
+      const id = Number(r.token_id), p = Number(r.p);
+      if(r.b){ const o = get(r.b); o.bought++; o.boughtEth += p; }
+      if(r.s){
+        const o = get(r.s); o.sold++; o.soldEth += p;
+        const lb = lastBuy.get(id);
+        if(lb && lb.b === r.s){
+          const d = p - lb.p;
+          o.pnl += d; o.flips++; if(d < 0) o.lossFlips++;
+        }
+      }
+      if(r.b) lastBuy.set(id, { b: r.b, p });
+    }
+    const r4 = (n) => Math.round(n * 10000) / 10000;
+    const fields = ['wallet','held','minted','avgHoldDays','longestHoldDays','bought','boughtVol','sold','soldVol','pnl','flips','lossFlips'];
+    const rows = [];
+    let inProfit = 0, inLoss = 0;
+    for(const [w, o] of W){
+      const held = o.since.length;
+      if(!held && !o.minted && !o.bought && !o.sold) continue;
+      const days = o.since.map(t => (now - t) / 86400);
+      const avg = held ? days.reduce((a, b) => a + b, 0) / held : 0;
+      const longest = held ? Math.max(...days) : 0;
+      if(o.flips){ if(o.pnl > 0) inProfit++; else if(o.pnl < 0) inLoss++; }
+      rows.push([w, held, o.minted, Math.round(avg * 10) / 10, Math.round(longest * 10) / 10,
+        o.bought, r4(o.boughtEth), o.sold, r4(o.soldEth), r4(o.pnl), o.flips, o.lossFlips]);
+    }
+    const body = {
+      ok: true, slug, currency,
+      transfersComplete: st.rows[0]?.value === '1',
+      transferCount: tr.rows.length, saleCount: sa.rows.length,
+      walletsInProfit: inProfit, walletsInLoss: inLoss,
+      updated: new Date().toISOString(), fields, rows,
+    };
+    _holderStatsCache.set(slug, { at: Date.now(), body });
+    res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json(body);
+  }catch(e){
+    console.error('/db/holder-stats error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/wallet-activity — every move of a wallet's tokens ────────────────
+// jv: "change that to 'wallet history' and add sells and transfers to that
+// chart ... There's a lot of wallets I'm seeing that held or minted and no
+// longer hold but don't have any sale history". Every transfer in or out
+// of the wallet (collection_transfers), each classified:
+//   mint  (from 0x0)            burn (to 0x0 / 0x...dead)
+//   sale  (same tx + token is in the sales table -- chart already has these)
+//   swap  (tx is a Gondi P2P trade)
+//   in / out (plain transfer, no sale recorded -- gift, own-wallet move, or
+//            a sale on a marketplace we don't track)
+app.get('/db/wallet-activity', auth, async (req, res) => {
+  try{
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
+    const wallet = String(req.query.wallet || '').toLowerCase().trim();
+    if(!/^0x[0-9a-f]{40}$/.test(wallet)) return res.status(400).json({ ok:false, error:'bad wallet' });
+    const tr = await pool.query(
+      `SELECT token_id, from_address AS f, to_address AS t, EXTRACT(EPOCH FROM ts)::bigint AS ts, LOWER(tx_hash) AS tx
+       FROM collection_transfers WHERE collection_slug=$1 AND (from_address=$2 OR to_address=$2)
+       ORDER BY block_number, unique_id LIMIT 20000`, [slug, wallet]).catch(() => ({ rows: [] }));
+    const txs = [...new Set(tr.rows.map(r => r.tx).filter(Boolean))];
+    const saleKeys = new Set(), swapTx = new Set();
+    if(txs.length){
+      const sr = await pool.query(`SELECT LOWER(tx_hash) AS tx, token_id FROM sales WHERE collection_slug=$1 AND LOWER(tx_hash) = ANY($2::text[])`, [slug, txs]).catch(() => ({ rows: [] }));
+      for(const r of sr.rows) saleKeys.add(r.tx + ':' + Number(r.token_id));
+      const gr = await pool.query(`SELECT LOWER(tx_hash) AS tx FROM gondi_trades WHERE collection_slug=$1 AND LOWER(tx_hash) = ANY($2::text[])`, [slug, txs]).catch(() => ({ rows: [] }));
+      for(const r of gr.rows) swapTx.add(r.tx);
+    }
+    const ZERO = '0x0000000000000000000000000000000000000000', DEAD = '0x000000000000000000000000000000000000dead';
+    const events = tr.rows.map(r => {
+      const id = Number(r.token_id), out = r.f === wallet;
+      let type;
+      if(r.f === ZERO) type = 'mint';
+      else if(out && (r.t === ZERO || r.t === DEAD)) type = 'burn';
+      else if(saleKeys.has(r.tx + ':' + id)) type = out ? 'sell' : 'buy';
+      else if(swapTx.has(r.tx)) type = out ? 'swap-out' : 'swap-in';
+      else type = out ? 'out' : 'in';
+      return { id, ts: Number(r.ts) || null, type, other: out ? r.t : r.f, tx: r.tx };
+    });
+    const st = await pool.query(`SELECT value FROM bot_state WHERE key=$1`, [`ctx_complete:${slug}`]).catch(() => ({ rows: [] }));
+    res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
+    res.json({ ok: true, slug, wallet, transfersComplete: st.rows[0]?.value === '1', events });
+  }catch(e){
+    console.error('/db/wallet-activity error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /db/floor-trend — aggregated sales for chart ─────────────────────────
 app.get('/db/floor-trend', auth, async (req, res) => {
   try {
-    const days = Math.min(parseInt(req.query.days || '90'), 365);
+    // jv: "all sales in the history should always be loaded for both
+    // floor trend and sales chart." Was capped at 365 days regardless
+    // of what the caller actually asked for -- fine while every
+    // collection here happens to be under a year old, but wrong once
+    // any of them isn't, and silently wrong in a way that wouldn't be
+    // obvious from the chart alone (it would just quietly stop at a
+    // year back instead of showing an error). Raised to effectively
+    // uncapped (100 years) -- the LIMIT 20000 on the query itself,
+    // unrelated to this cap, is still what actually bounds the result
+    // size.
+    const days = Math.min(parseInt(req.query.days || '90'), 36500);
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
+    // jv: "when it does load it's all stacked in 1 spot" -- the daily
+    // floor line (from floor_history, a periodic snapshot with no row cap
+    // at all) correctly spanned the full 30 days, but the individual sale
+    // dots all crowded into the last few days only. Root cause: LIMIT 2000
+    // ordered by sale_ts DESC returns the MOST RECENT 2000 sales, not an
+    // even sample across whatever range was actually requested. This
+    // collection does roughly 100+ sales/day -- at that rate 2000 rows are
+    // consumed in well under 3 weeks, so a 30-day (or longer) request was
+    // silently getting truncated down to just its most recent few days,
+    // no matter which range the user had actually selected. Raised well
+    // past this collection's own current all-time sale count (order of
+    // 15k) so a genuinely full range comes back uncapped in practice
+    // rather than needing a cap increase again the next time volume grows.
+    // jv (TraitView Sale Chart): wallet-grouping ("2+ buys" connecting
+    // lines, wallet search/highlight) depends entirely on buyer/seller,
+    // but this endpoint never selected them at all -- every sale coming
+    // through this (fast, primary) path had buyer/seller silently
+    // undefined, so wallet-grouping could only ever have worked on the
+    // rare occasion this endpoint failed and the client fell back to
+    // raw OpenSea event fetches instead (those do carry buyer/seller
+    // directly). Added here so the normal, fast path carries them too.
     const result = await pool.query(
-      `SELECT s.token_id, s.price_eth, s.currency, s.sale_ts, t.obs_rank
-       FROM sales s JOIN tokens t ON t.id = s.token_id
-       WHERE s.sale_ts > NOW() - ($1 || ' days')::INTERVAL
-       ORDER BY s.sale_ts DESC LIMIT 2000`,
-      [days]
+      `SELECT s.token_id, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller, s.marketplace, t.obs_rank
+       FROM sales s JOIN tokens t ON t.id = s.token_id AND t.collection_slug = s.collection_slug
+       WHERE s.collection_slug = $2 AND s.sale_ts > NOW() - ($1 || ' days')::INTERVAL
+       ORDER BY s.sale_ts DESC LIMIT 20000`,
+      [days, slug]
     );
     res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
     res.json({
@@ -394,6 +983,10 @@ app.get('/db/floor-trend', auth, async (req, res) => {
         price_eth: parseFloat(r.price_eth),
         currency: r.currency,
         sale_ts: r.sale_ts,
+        buyer: r.buyer || null,
+        seller: r.seller || null,
+        // null = OpenSea; 'gondi' / 'gondi-trade' from lib/gondi-activity-sync.js
+        marketplace: r.marketplace || null,
         obs_rank: r.obs_rank ? parseInt(r.obs_rank) : null
       })),
       count: result.rows.length
@@ -413,18 +1006,32 @@ app.get('/db/floor-trend', auth, async (req, res) => {
 app.get('/db/token-sales', auth, async (req, res) => {
   try {
     const tokenId = parseInt(req.query.token_id);
-    if (!tokenId || tokenId < 1 || tokenId > 10000) {
+    if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) { // generous, collection-agnostic bound — was hardcoded to OCAS's ~10k supply and also rejected token id 0 (breaks 0-indexed collections like CryptoPunks)
       return res.status(400).json({ ok: false, error: 'invalid token_id' });
     }
     const limit = Math.min(parseInt(req.query.limit || '200'), 500);
+    // jv: "for some argonauts tokens it's showing sales for OCAS." This
+    // query had no collection_slug filter at all -- WHERE token_id = $1
+    // alone, on a table that spans every collection. dbFetch() on the
+    // frontend already auto-injects slug on every single call (confirmed
+    // directly in js/api.js), so the caller was always sending it
+    // correctly; this endpoint simply never read it. Since OCAS and
+    // Argonauts both have roughly 10,000 tokens, most numeric IDs exist in
+    // both -- any token id present in both collections would return sales
+    // mixed together from whichever rows matched, regardless of which
+    // collection's modal was actually asking. slug defaults to OCAS_SLUG,
+    // matching every other endpoint in this file's own existing
+    // req.query.slug || OCAS_SLUG convention, so this doesn't change
+    // behavior for any caller that predates this fix and never sent one.
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
 
     const result = await pool.query(
       `SELECT token_id, price_eth, currency, buyer, seller, tx_hash, sale_ts
        FROM sales
-       WHERE token_id = $1
+       WHERE token_id = $1 AND collection_slug = $2
        ORDER BY sale_ts ASC
-       LIMIT $2`,
-      [tokenId, limit]
+       LIMIT $3`,
+      [tokenId, slug, limit]
     );
 
     res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
@@ -449,7 +1056,167 @@ app.get('/db/token-sales', auth, async (req, res) => {
 
 
 
-// ── GET /db/trait-sales ───────────────────────────────────────────────────────
+// ── GET /db/sales-search ──────────────────────────────────────────────────────
+// Full, non-paginated sales history matching a free-text trait search
+// and/or an exact trait count -- backs the Sales tab's trait search box and
+// trait-count filter, reading directly from this collection's own sales
+// history rather than being limited to whatever's currently loaded from
+// OpenSea's own paginated feed.
+// Query params:
+//   q           — free-text substring, matched against trait NAME or VALUE
+//                 (e.g. "gold" matches a "Crown: Gold Chain" trait) — optional
+//   trait_count — exact trait count match — optional
+//   limit       — default 100, max 500
+//   sort        — "desc" (newest first, default) or "asc"
+// At least one of q/trait_count is required.
+// Returns: { ok, sales: [{token_id, price_eth, currency, sale_ts, buyer, seller}], count }
+app.get('/db/sales-search', auth, async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    const traitCount = req.query.trait_count ? parseInt(req.query.trait_count) : null;
+    // jv: sales tab shows "OpenSea API failed: 401 — Invalid API key" for
+    // the unfiltered/live view, while applying a trait-count filter (which
+    // already routes through this exact endpoint instead) works fine --
+    // confirmed this endpoint queries this repo's own already-synced sales
+    // table, with no dependency on the Cloudflare Worker or its separate,
+    // broken OPENSEA_API_KEY secret at all. Relaxing the previous
+    // q-or-trait_count requirement so the frontend can fall back to this
+    // same, healthy endpoint for the unfiltered case too (most recent
+    // sales for the slug, no filter applied) rather than being stuck with
+    // no working data source at all whenever that worker's key is down.
+    const limit = Math.min(parseInt(req.query.limit || '100'), 500);
+    const sort  = req.query.sort === 'asc' ? 'ASC' : 'DESC';
+    const slug  = (req.query.slug || OCAS_SLUG).toLowerCase();
+
+    const conditions = ['s.collection_slug = $1'];
+    const params = [slug];
+    let p = 2;
+    if (q) {
+      // jv: tapping one of the search box's own datalist suggestions
+      // (built as "Category: value" strings, e.g. "Artifact: Vape
+      // (Dragon's Breath)" -- see the datalist-building comment in
+      // app.js) filled the box with that whole string, but this only
+      // ever tried matching it as ONE substring against trait_name OR
+      // trait_value separately -- the combined "Category: value" text
+      // can't appear whole in either column alone, so it silently
+      // matched nothing. A colon in the query is a strong, deliberate
+      // signal it's one of these suggestions rather than free-typed
+      // text (nobody types a literal colon searching for a trait by
+      // hand) -- split on the first one and require the category part
+      // AND the value part to both match, on the same trait row. Plain
+      // free-text search (no colon) is unchanged.
+      const colonIdx = q.indexOf(':');
+      if (colonIdx > 0) {
+        const cat = q.slice(0, colonIdx).trim();
+        const val = q.slice(colonIdx + 1).trim();
+        conditions.push(`EXISTS (
+          SELECT 1 FROM token_traits tt
+          WHERE tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
+          AND tt.trait_name ILIKE $${p} AND tt.trait_value ILIKE $${p + 1}
+        )`);
+        params.push(`%${cat}%`, `%${val}%`);
+        p += 2;
+      } else {
+        conditions.push(`EXISTS (
+          SELECT 1 FROM token_traits tt
+          WHERE tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
+          AND (tt.trait_name ILIKE $${p} OR tt.trait_value ILIKE $${p})
+        )`);
+        params.push(`%${q}%`);
+        p++;
+      }
+    }
+    if (traitCount != null) {
+      conditions.push(`EXISTS (
+        SELECT 1 FROM tokens t
+        WHERE t.id = s.token_id AND t.collection_slug = s.collection_slug AND t.trait_count = $${p}
+      )`);
+      params.push(traitCount);
+      p++;
+    }
+    params.push(limit);
+
+    const result = await pool.query(
+      `SELECT DISTINCT s.token_id, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller
+       FROM sales s
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY s.sale_ts ${sort}
+       LIMIT $${p}`,
+      params
+    );
+
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
+    res.json({
+      ok: true,
+      q: q || null,
+      trait_count: traitCount,
+      sales: result.rows.map(r => ({
+        token_id:  parseInt(r.token_id),
+        price_eth: parseFloat(r.price_eth),
+        currency:  r.currency || 'ETH',
+        sale_ts:   r.sale_ts,
+        buyer:     r.buyer  || null,
+        seller:    r.seller || null,
+      })),
+      count: result.rows.length
+    });
+  } catch (e) {
+    console.error('/db/sales-search error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// jv: "Trait Pulse" -- serves the pre-computed rankings from
+// trait_pulse_cache (lib/trait-pulse.js does the actual computation, on a
+// schedule; this endpoint only ever reads the cache, never computes live).
+// ?window=1h|6h|24h|7d (default 1h), ?limit= (default 20, max 100).
+app.get('/db/trait-pulse', auth, async (req, res) => {
+  try {
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
+    const windowKey = ['1h','6h','24h','7d'].includes(req.query.window) ? req.query.window : '1h';
+    const limit = Math.min(parseInt(req.query.limit || '20'), 100);
+
+    const result = await pool.query(
+      `SELECT trait_name, trait_value, supply, sales_count, velocity_multiplier,
+              listed_count, listed_count_prior, listing_pressure_pct,
+              trait_floor_eth, trait_floor_eth_prior, floor_change_pct,
+              heat_score, computed_at
+       FROM trait_pulse_cache
+       WHERE collection_slug = $1 AND window_key = $2
+       ORDER BY heat_score DESC
+       LIMIT $3`,
+      [slug, windowKey, limit]
+    );
+
+    res.set('Cache-Control', 'public, max-age=120, s-maxage=120');
+    res.json({
+      ok: true,
+      slug,
+      window: windowKey,
+      computed_at: result.rows[0]?.computed_at || null,
+      traits: result.rows.map(r => ({
+        trait_name:  r.trait_name,
+        trait_value: r.trait_value,
+        supply:      parseInt(r.supply),
+        sales_count: parseInt(r.sales_count),
+        velocity_multiplier: parseFloat(r.velocity_multiplier),
+        listed_count: r.listed_count != null ? parseInt(r.listed_count) : null,
+        listed_count_prior: r.listed_count_prior != null ? parseInt(r.listed_count_prior) : null,
+        listing_pressure_pct: r.listing_pressure_pct != null ? parseFloat(r.listing_pressure_pct) : null,
+        trait_floor_eth: r.trait_floor_eth != null ? parseFloat(r.trait_floor_eth) : null,
+        trait_floor_eth_prior: r.trait_floor_eth_prior != null ? parseFloat(r.trait_floor_eth_prior) : null,
+        floor_change_pct: r.floor_change_pct != null ? parseFloat(r.floor_change_pct) : null,
+        heat_score: parseFloat(r.heat_score),
+      })),
+      count: result.rows.length
+    });
+  } catch (e) {
+    console.error('/db/trait-pulse error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 // Sales history filtered by a trait value — full collection history, no pagination cap.
 // Query params:
 //   trait   — trait name  e.g. "Type"
@@ -466,17 +1233,26 @@ app.get('/db/trait-sales', auth, async (req, res) => {
     }
     const limit = Math.min(parseInt(req.query.limit || '50'), 200);
     const sort  = req.query.sort === 'asc' ? 'ASC' : 'DESC';
+    // jv: same cross-collection bug class as /db/token-sales and
+    // /db/floor-trend above -- token_traits AND sales both span every
+    // collection, and this join matched purely on token_id with no
+    // collection_slug anywhere. Two collections sharing the same trait
+    // name/value (e.g. a common "Background: Blue") would have their sales
+    // mixed together here. slug defaults to OCAS_SLUG, matching this
+    // file's existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
 
     // Join sales with token_traits — case-insensitive match on both trait and value
     const result = await pool.query(
       `SELECT s.token_id, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller
        FROM sales s
-       JOIN token_traits tt ON tt.token_id = s.token_id
-       WHERE LOWER(tt.trait_name)  = LOWER($1)
+       JOIN token_traits tt ON tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
+       WHERE s.collection_slug = $4
+         AND LOWER(tt.trait_name)  = LOWER($1)
          AND LOWER(tt.trait_value) = LOWER($2)
        ORDER BY s.sale_ts ${sort}
        LIMIT $3`,
-      [trait, value, limit]
+      [trait, value, limit, slug]
     );
 
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
@@ -507,7 +1283,13 @@ app.get('/db/trait-sales', auth, async (req, res) => {
 // Returns: { ok, history: [{floor_eth, token_id, recorded_at}], current, ref_24h }
 app.get('/db/floor-history', auth, async (req, res) => {
   try {
-    const hours = Math.min(parseInt(req.query.hours || '48'), 9600);
+    // jv: "all sales in the history should always be loaded for both
+    // floor trend and sales chart." Same reasoning as /db/floor-trend's
+    // own days cap right above -- 9600 hours (400 days) was already
+    // wrong for any collection older than that, just not yet visibly
+    // so for anything currently onboarded here. Raised to effectively
+    // uncapped (100 years).
+    const hours = Math.min(parseInt(req.query.hours || '48'), 876000);
     const result = await pool.query(
       `SELECT floor_eth, token_id, recorded_at
        FROM floor_history
@@ -558,20 +1340,29 @@ app.get('/db/floor-before-sweep', auth, async (req, res) => {
     if (!sweptIds.length) {
       return res.status(400).json({ ok: false, error: 'no valid token IDs' });
     }
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- neither query here had a collection_slug filter at all,
+    // meaning floor_before/floor_after were computed across EVERY
+    // collection's listings combined, not just the requesting one. A much
+    // lower floor anywhere else on this service would silently corrupt
+    // this collection's own sweep-impact numbers. slug defaults to
+    // OCAS_SLUG, matching this file's existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
 
-    // Floor before = current minimum across ALL active listings
+    // Floor before = current minimum across ALL active listings for this collection
     const beforeResult = await pool.query(
-      `SELECT MIN(price_eth) AS floor_eth FROM listings`
+      `SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug = $1`,
+      [slug]
     );
     const floor_before = beforeResult.rows[0]?.floor_eth
       ? parseFloat(beforeResult.rows[0].floor_eth)
       : null;
 
-    // Floor after = minimum excluding swept token IDs
+    // Floor after = minimum excluding swept token IDs, still this collection only
     const afterResult = await pool.query(
       `SELECT MIN(price_eth) AS floor_eth FROM listings
-       WHERE token_id != ALL($1::int[])`,
-      [sweptIds]
+       WHERE collection_slug = $1 AND token_id != ALL($2::int[])`,
+      [slug, sweptIds]
     );
     const floor_after = afterResult.rows[0]?.floor_eth
       ? parseFloat(afterResult.rows[0].floor_eth)
@@ -862,6 +1653,11 @@ app.get('/db/multi-trait-floor', auth, async (req, res) => {
     const rankMax = req.query.rank_max ? parseInt(req.query.rank_max) : null;
     const rankType = req.query.rank_type === 'obs' ? 'obs' : 'os';
     const rankCol = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- no collection_slug filter anywhere in this query, and the
+    // per-group token_traits EXISTS subquery matched purely on token_id
+    // too. slug defaults to OCAS_SLUG, matching this file's convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
 
     if (!matches.length && !traitCount && rankMin === null && rankMax === null) {
       return res.status(400).json({ ok: false, error: 'provide matches, trait_count, or rank filter' });
@@ -870,18 +1666,18 @@ app.get('/db/multi-trait-floor', auth, async (req, res) => {
     let query = `SELECT l.token_id, l.price_eth, l.url,
                         t.trait_count, t.os_rank, t.obs_rank, t.os_score, t.rarity_score
                  FROM listings l
-                 JOIN tokens t ON t.id = l.token_id`;
-    const params = [];
-    let p = 1;
+                 JOIN tokens t ON t.id = l.token_id AND t.collection_slug = l.collection_slug`;
+    const params = [slug];
+    let p = 2;
 
-    const conditions = [ACTIVE_TOKEN_CONDITION];
+    const conditions = [ACTIVE_TOKEN_CONDITION, `t.collection_slug = $1`];
     groups.forEach((group, i) => {
       const ors = [];
       group.forEach(m => {
         ors.push(`(LOWER(g${i}.trait_name) = LOWER($${p++}) AND LOWER(g${i}.trait_value) = LOWER($${p++}))`);
         params.push(m.trait_name, m.trait_value);
       });
-      conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND (${ors.join(' OR ')}))`);
+      conditions.push(`EXISTS (SELECT 1 FROM token_traits g${i} WHERE g${i}.token_id = t.id AND g${i}.collection_slug = t.collection_slug AND (${ors.join(' OR ')}))`);
     });
     if (traitCount !== null && !isNaN(traitCount)) { conditions.push(`t.trait_count = $${p++}`); params.push(traitCount); }
     if (rankMin !== null && !isNaN(rankMin)) { conditions.push(`${rankCol} >= $${p++}`); params.push(rankMin); }
@@ -928,6 +1724,14 @@ app.get('/db/rank-sales', auth, async (req, res) => {
     const rankMax = req.query.rank_max ? parseInt(req.query.rank_max) : 100;
     const limit   = Math.min(parseInt(req.query.limit || '25'), 100);
     const sort    = req.query.sort === 'asc' ? 'ASC' : 'DESC';
+    // jv: same cross-collection bug class as the three fixes above --
+    // sales/tokens/token_traits all span every collection, and every join
+    // here matched purely on token_id. Every collection's own rank range
+    // starts back at 1, so this would mix sales from an unrelated
+    // collection whenever its os_rank happened to fall in the requested
+    // range too. slug defaults to OCAS_SLUG, matching this file's existing
+    // convention.
+    const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
 
     const result = await pool.query(
       `SELECT s.token_id, t.os_rank, t.obs_rank, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller,
@@ -942,13 +1746,13 @@ app.get('/db/rank-sales', auth, async (req, res) => {
                 )
               ) AS traits
        FROM sales s
-       JOIN tokens t ON t.id = s.token_id
-       LEFT JOIN token_traits tt ON tt.token_id = s.token_id
-       WHERE t.os_rank >= $1 AND t.os_rank <= $2
+       JOIN tokens t ON t.id = s.token_id AND t.collection_slug = s.collection_slug
+       LEFT JOIN token_traits tt ON tt.token_id = s.token_id AND tt.collection_slug = s.collection_slug
+       WHERE s.collection_slug = $4 AND t.os_rank >= $1 AND t.os_rank <= $2
        GROUP BY s.token_id, t.os_rank, t.obs_rank, s.price_eth, s.currency, s.sale_ts, s.buyer, s.seller
        ORDER BY s.sale_ts ${sort}
        LIMIT $3`,
-      [rankMin, rankMax, limit]
+      [rankMin, rankMax, limit, slug]
     );
 
     res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
@@ -990,6 +1794,10 @@ app.get('/db/rank-listings', auth, async (req, res) => {
     const rankType = req.query.rank_type === 'obs' ? 'obs' : 'os';
     const limit    = Math.min(parseInt(req.query.limit || '25'), 100);
     const rankCol  = rankType === 'obs' ? 't.obs_rank' : 't.os_rank';
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- no collection_slug filter anywhere in this query at all.
+    // slug defaults to OCAS_SLUG, matching this file's existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
 
     // Include traits so the Discord bot doesn't need extra /db/token calls per result
     const result = await pool.query(
@@ -1006,14 +1814,14 @@ app.get('/db/rank-listings', auth, async (req, res) => {
                 )
               ) AS traits
        FROM tokens t
-       JOIN listings l ON l.token_id = t.id
-       LEFT JOIN token_traits tt ON tt.token_id = t.id
-       WHERE ${rankCol} >= $1 AND ${rankCol} <= $2
+       JOIN listings l ON l.token_id = t.id AND l.collection_slug = t.collection_slug
+       LEFT JOIN token_traits tt ON tt.token_id = t.id AND tt.collection_slug = t.collection_slug
+       WHERE t.collection_slug = $4 AND ${rankCol} >= $1 AND ${rankCol} <= $2
          AND ${ACTIVE_TOKEN_CONDITION}
        GROUP BY t.id, t.obs_rank, t.os_rank, t.os_score, t.trait_count, l.price_eth, l.url
        ORDER BY l.price_eth ASC
        LIMIT $3`,
-      [rankMin, rankMax, limit]
+      [rankMin, rankMax, limit, slug]
     );
 
     res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
@@ -1045,10 +1853,21 @@ app.get('/db/rank-listings', auth, async (req, res) => {
 // Lightweight endpoint — returns os_rank for all tokens.
 // Used by TraitView to populate OS_RANK_MAP on init.
 // Returns: { ok, ranks: [[id, os_rank], ...] }  (compact array format)
+// Confirmed live: this query had ZERO collection scoping at all -- always
+// returned every token across every collection with an os_rank value
+// (in practice, only ever OCAS's, since no other collection has ever had
+// this populated), regardless of which collection was actually requesting.
+// TraitView's mobile fast-path trusts OS_RANK_MAP once it's non-empty,
+// so viewing Argonauts (or any other collection) silently pulled in
+// OCAS's own token IDs and ranks instead -- those then failed to match
+// the actual collection's live listings, producing "No matches" until
+// the user's next action happened to bypass this fast path entirely.
 app.get('/db/os-ranks', auth, async (req, res) => {
   try {
+    const slug = (req.query.slug || OCAS_SLUG).toString();
     const result = await pool.query(
-      `SELECT id, os_rank FROM tokens WHERE os_rank IS NOT NULL ORDER BY os_rank ASC`
+      `SELECT id, os_rank FROM tokens WHERE os_rank IS NOT NULL AND collection_slug = $1 ORDER BY os_rank ASC`,
+      [slug]
     );
     res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
     res.json({
@@ -1074,15 +1893,19 @@ app.get('/db/trait-count-floor', auth, async (req, res) => {
     if (!traitCount || isNaN(traitCount)) {
       return res.status(400).json({ ok: false, error: 'trait_count is required' });
     }
+    // jv: same cross-collection bug class as several other endpoints fixed
+    // tonight -- no collection_slug filter anywhere in this query. slug
+    // defaults to OCAS_SLUG, matching this file's existing convention.
+    const slug = (req.query.slug || OCAS_SLUG).toString();
     const result = await pool.query(`
       SELECT l.token_id, l.price_eth, l.url,
              t.trait_count, t.os_rank, t.obs_rank
       FROM listings l
-      JOIN tokens t ON t.id = l.token_id
-      WHERE t.trait_count = $1
+      JOIN tokens t ON t.id = l.token_id AND t.collection_slug = l.collection_slug
+      WHERE l.collection_slug = $2 AND t.trait_count = $1
       ORDER BY l.price_eth ASC
       LIMIT 1
-    `, [traitCount]);
+    `, [traitCount, slug]);
 
     res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
     res.json({
@@ -1108,6 +1931,21 @@ function isEthAddress(addr) {
 }
 function cleanAddress(addr) {
   return normalizeEthAddress(addr);
+}
+// jv: "figure that out" -- re: combining Wallet Analytics (P&L, cost
+// basis, top tokens) across every Discord-linked wallet, not just the
+// one connected in the browser. Every /db/wallet/:address/* endpoint
+// below took exactly one address in the path; this lets the frontend
+// pass a comma-separated list instead (:address stays one URL segment
+// either way, just potentially multi-valued), parsed into a clean,
+// deduplicated array here once rather than reimplementing this same
+// split/clean/validate logic in each of the 5 endpoints. Returns null
+// if ANY segment is invalid, so a typo'd address fails the whole
+// request loudly instead of silently querying a partial, wrong set.
+function parseWalletAddresses(param) {
+  const parts = String(param || '').split(',').map(s => cleanAddress(s.trim())).filter(Boolean);
+  if (!parts.length || !parts.every(isEthAddress)) return null;
+  return [...new Set(parts)];
 }
 function intParam(value, fallback, max) {
   const n = parseInt(value || fallback, 10);
@@ -1333,6 +2171,22 @@ app.get('/db/token/:id/burn-history', auth, async (req, res) => {
       } : null,
     });
   } catch (e) {
+    // Argonauts (and any other collection onboarded without OCAS's burn/
+    // rebirth game) gets its burn_events table from this same schema-init
+    // function, which only ever defines the small columns actually used
+    // there (id, tx_hash, block_number, burned_token_id, survivor_token_id,
+    // burn_type, created_at) -- OCAS's real production table has many more
+    // (burner_wallet, burned_at, points_used, etc.) added out-of-band over
+    // time and never backported here. Querying burned_at against one of
+    // those other, burn-game-less collections throws "column does not
+    // exist" (42703) -- correctly meaning "this collection has no burn
+    // game, so this token was never part of one," same as a real 0-row
+    // result would for OCAS itself. Treat it as exactly that instead of a
+    // 500, so the modal's pre-burn toggle stays silent rather than erroring
+    // on every open for every non-OCAS collection.
+    if (e?.code === '42703') {
+      return res.json({ ok: true, token_id: tokenId, timeline: [], survivor_count: 0, destroyed_in: null });
+    }
     console.error('/db/token/:id/burn-history error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -1442,38 +2296,49 @@ app.put('/db/wallet/:address/favorites', auth,
 
 // Current derived wallet summary. Returns empty data if wallet sync has not run.
 app.get('/db/wallet/:address/summary', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0]; // kept for the response's own `address` field and error paths below
+  // Confirmed live: jv reported never getting any wallet holdings for
+  // Argonauts. Traced to this route specifically -- the note below (from
+  // 2026-07-02) already flagged this exact hardcoding as a known gap, but
+  // it was never actually applied here despite the fix landing on other
+  // endpoints (/db/traits-fast, /db/all-traits) the same day. The frontend's
+  // dbFetch() helper already sends the active collection's own slug on
+  // every request (confirmed in traitview/js/api.js) -- this route just
+  // never read it, so every wallet summary was silently computed against
+  // OCAS's own token/listing/interval rows regardless of which collection's
+  // site the request actually came from. Same (req.query.slug || OCAS_SLUG)
+  // convention already used elsewhere in this file (e.g. /db/traits-fast).
+  const slug = (req.query.slug || OCAS_SLUG).toString();
   try {
-    const cache = await pool.query(
-      `SELECT summary_json, updated_at FROM wallet_analytics_cache WHERE wallet_address = $1`,
-      [address]
-    );
-    if (cache.rows.length) {
-      res.set('Cache-Control', 'public, max-age=60, s-maxage=60');
-      return res.json({ ok: true, address, synced: true, cached: true, updated_at: cache.rows[0].updated_at, summary: cache.rows[0].summary_json });
-    }
-
-    // NOTE (2026-07-02): hardcoded to OCAS_SLUG for now, same reasoning as
-    // /db/traits-fast and /db/all-traits earlier today — this wasn't scoped
-    // at all before, so a wallet's holdings/traits/floor across EVERY
-    // configured collection were all merged together. The listings JOIN
-    // and the floor query were both unscoped too (token_id collisions +
-    // absolute cheapest listing across all collections, not just OCAS).
+    // Removed the wallet_analytics_cache short-circuit that used to sit
+    // here. That table has no collection_slug column at all, keyed only by
+    // wallet_address -- so any wallet with a pre-existing cached row from
+    // earlier OCAS-only testing would keep getting that stale, OCAS-scoped
+    // row served back regardless of the slug fix below, since this check
+    // ran and returned before the fixed query ever executed. A previous
+    // session's own diagnostic script (diag-check-wallet-cache.js) was
+    // built to detect exactly this failure mode for a different symptom,
+    // which is exactly what jv just hit here: traits worked (no such cache
+    // check exists on that route) while summary silently kept serving an
+    // old cached response. Safe to drop entirely -- nothing in this
+    // codebase currently writes to this table, so removing the read here
+    // doesn't lose any live functionality, only a footgun.
     const current = await pool.query(`
       SELECT w.token_id, t.os_rank, t.obs_rank, l.price_eth, w.cost_eth
       FROM wallet_token_intervals w
       LEFT JOIN tokens t ON t.id = w.token_id AND t.collection_slug = w.collection_slug
       LEFT JOIN listings l ON l.token_id = w.token_id AND l.collection_slug = w.collection_slug
-      WHERE w.wallet_address = $1 AND w.collection_slug = $2 AND w.disposed_at IS NULL
+      WHERE w.wallet_address = ANY($1::text[]) AND w.collection_slug = $2 AND w.disposed_at IS NULL
       ORDER BY COALESCE(t.os_rank, t.obs_rank, 999999) ASC
       LIMIT 10000
-    `, [address, OCAS_SLUG]);
+    `, [addresses, slug]);
 
     const owned = current.rows;
     const ranks = owned.map(r => parseInt(r.os_rank || r.obs_rank)).filter(Number.isFinite);
     const listed = owned.filter(r => r.price_eth != null);
-    const floor = await pool.query('SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug = $1', [OCAS_SLUG]);
+    const floor = await pool.query('SELECT MIN(price_eth) AS floor_eth FROM listings WHERE collection_slug = $1', [slug]);
     const floorEth = floor.rows[0]?.floor_eth ? parseFloat(floor.rows[0].floor_eth) : null;
     const estimated = floorEth == null ? null : owned.length * floorEth;
 
@@ -1483,9 +2348,9 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
     const realizedRes = await pool.query(`
       SELECT COALESCE(SUM(sale_eth - cost_eth), 0) AS realized_pnl, COUNT(*)::int AS sold_count
       FROM wallet_token_intervals
-      WHERE wallet_address = $1 AND collection_slug = $2
+      WHERE wallet_address = ANY($1::text[]) AND collection_slug = $2
         AND disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0
-    `, [address, OCAS_SLUG]);
+    `, [addresses, slug]);
     const realizedPnl = parseFloat(realizedRes.rows[0]?.realized_pnl || 0);
     const soldCount = parseInt(realizedRes.rows[0]?.sold_count || 0);
     const totalCostBasis = owned.reduce((s, r) => s + (parseFloat(r.cost_eth) || 0), 0);
@@ -1547,21 +2412,28 @@ app.get('/db/wallet/:address/summary', auth, async (req, res) => {
 
 // ── GET /db/wallet/:address/transfers ────────────────────────────────────────
 app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0];
   const limit = intParam(req.query.limit, 100, 1000);
   const offset = intParam(req.query.offset, 0, 10000);
+  // Same hardcoded-to-OCAS bug as /db/wallet/:address/summary above, same
+  // fix pattern -- resolve the actual requested collection's own contract
+  // rather than assuming OCAS_CONTRACT/OCAS_SLUG.
+  const slug = (req.query.slug || OCAS_SLUG).toString();
   try {
+    const collRes = await pool.query('SELECT contract FROM collections WHERE slug = $1', [slug]);
+    const contract = collRes.rows[0]?.contract || OCAS_CONTRACT;
     const result = await pool.query(`
       SELECT nt.contract, nt.token_id, nt.from_address, nt.to_address, nt.tx_hash, nt.log_index,
              nt.block_number, COALESCE(nt.block_ts, nt.transferred_at) AS block_ts, nt.event_type,
              s.price_eth AS sale_price, s.buyer, s.seller
       FROM nft_transfers nt
       LEFT JOIN sales s ON s.tx_hash = nt.tx_hash AND s.token_id = nt.token_id
-      WHERE nt.contract = $1 AND nt.collection_slug = $2 AND (nt.from_address = $3 OR nt.to_address = $3)
+      WHERE nt.contract = $1 AND nt.collection_slug = $2 AND (nt.from_address = ANY($3::text[]) OR nt.to_address = ANY($3::text[]))
       ORDER BY nt.block_number DESC, nt.log_index DESC
       LIMIT $4 OFFSET $5
-    `, [OCAS_CONTRACT, OCAS_SLUG, address, limit, offset]);
+    `, [contract, slug, addresses, limit, offset]);
 
     // Burns live in their own purpose-built tables (burn_events/burn_event_inputs),
     // separate from nft_transfers entirely -- pull them directly rather than
@@ -1569,13 +2441,13 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
     // every wallet's historical rows.
     const burnRes = await pool.query(`
       SELECT be.id AS burn_event_id, be.tx_hash, be.block_number, be.log_index, be.burned_at, be.survivor_token_id,
-             be.points_used, bei.burned_token_id
+             be.points_used, be.burner_wallet, bei.burned_token_id
       FROM burn_events be
       JOIN burn_event_inputs bei ON bei.burn_event_id = be.id
-      WHERE LOWER(be.burner_wallet) = LOWER($1)
+      WHERE LOWER(be.burner_wallet) = ANY($1::text[])
       ORDER BY be.block_number DESC
       LIMIT $2
-    `, [address, limit]).catch(() => ({ rows: [] })); // tolerate if burn tables aren't present in some env
+    `, [addresses, limit]).catch(() => ({ rows: [] })); // tolerate if burn tables aren't present in some env
 
     // Same reasoning as everywhere else burn rows get displayed: a destroyed
     // input token no longer represents its original self, so a "current"
@@ -1606,7 +2478,7 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
     const burnRows = burnRes.rows.map(r => ({
       contract: OCAS_CONTRACT,
       token_id: parseInt(r.burned_token_id),
-      from_address: address,
+      from_address: r.burner_wallet || address,
       to_address: null,
       tx_hash: r.tx_hash,
       log_index: r.log_index != null ? parseInt(r.log_index) : 0,
@@ -1647,16 +2519,17 @@ app.get('/db/wallet/:address/transfers', auth, async (req, res) => {
 // / burn_event_inputs tables (confirmed live schema, not the CREATE TABLE
 // statement in lib/db.js which is missing several real columns).
 app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0];
   try {
     const eventsRes = await pool.query(`
       SELECT id, tx_hash, block_number, burned_at, survivor_token_id, points_used,
              result_is_angel, boost_chance, result_body_type, burn_type
       FROM burn_events
-      WHERE LOWER(burner_wallet) = LOWER($1)
+      WHERE LOWER(burner_wallet) = ANY($1::text[])
       ORDER BY block_number DESC
-    `, [address]);
+    `, [addresses]);
     const events = eventsRes.rows;
     if (!events.length) {
       return res.json({
@@ -1770,17 +2643,30 @@ app.get('/db/wallet/:address/burn-stats', auth, async (req, res) => {
 
 // ── GET /db/wallet/:address/history ──────────────────────────────────────────
 app.get('/db/wallet/:address/history', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0];
   const days = intParam(req.query.days, 90, 365);
   try {
+    // wallet_daily_snapshots is one row per wallet per day -- a plain
+    // `wallet_address = ANY($1)` swap here would return N rows per date
+    // (one per linked wallet) instead of one combined row for the
+    // frontend's chart, which expects exactly one point per date. GROUP BY
+    // date and SUM the per-wallet counts/values (best_rank uses MIN, since
+    // a lower rank number is better -- this wallet SET's best rank is
+    // whichever single wallet's best rank was lowest that day, not a sum).
     const result = await pool.query(`
-      SELECT snapshot_date, owned_count, best_rank, listed_count, estimated_floor_value
+      SELECT snapshot_date,
+             SUM(owned_count)::int AS owned_count,
+             MIN(best_rank) AS best_rank,
+             SUM(listed_count)::int AS listed_count,
+             SUM(estimated_floor_value) AS estimated_floor_value
       FROM wallet_daily_snapshots
-      WHERE wallet_address = $1
+      WHERE wallet_address = ANY($1::text[])
         AND snapshot_date >= CURRENT_DATE - ($2 || ' days')::INTERVAL
+      GROUP BY snapshot_date
       ORDER BY snapshot_date ASC
-    `, [address, days]);
+    `, [addresses, days]);
     res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.json({
       ok: true,
@@ -1805,9 +2691,12 @@ app.get('/db/wallet/:address/history', auth, async (req, res) => {
 
 // ── GET /db/wallet/:address/traits ───────────────────────────────────────────
 app.get('/db/wallet/:address/traits', auth, async (req, res) => {
-  const address = cleanAddress(req.params.address);
-  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const addresses = parseWalletAddresses(req.params.address);
+  if (!addresses) return res.status(400).json({ ok: false, error: 'invalid wallet address' });
+  const address = addresses[0];
   const limit = intParam(req.query.limit, 100, 500);
+  // Same hardcoded-to-OCAS bug as /db/wallet/:address/summary, same fix.
+  const slug = (req.query.slug || OCAS_SLUG).toString();
   try {
     const result = await pool.query(`
       SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS count,
@@ -1815,11 +2704,11 @@ app.get('/db/wallet/:address/traits', auth, async (req, res) => {
       FROM wallet_token_intervals w
       JOIN token_traits tt ON tt.token_id = w.token_id AND tt.collection_slug = w.collection_slug
       LEFT JOIN tokens t ON t.id = w.token_id AND t.collection_slug = w.collection_slug
-      WHERE w.wallet_address = $1 AND w.collection_slug = $3 AND w.disposed_at IS NULL
+      WHERE w.wallet_address = ANY($1::text[]) AND w.collection_slug = $3 AND w.disposed_at IS NULL
       GROUP BY tt.trait_name, tt.trait_value
       ORDER BY count DESC, tt.trait_name ASC, tt.trait_value ASC
       LIMIT $2
-    `, [address, limit, OCAS_SLUG]);
+    `, [addresses, limit, slug]);
     res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.json({
       ok: true,
@@ -1843,21 +2732,28 @@ app.get('/db/wallet/:address/traits', auth, async (req, res) => {
 // ── GET /db/token/:id/history ────────────────────────────────────────────────
 app.get('/db/token/:id/history', auth, async (req, res) => {
   const tokenId = parseInt(req.params.id, 10);
-  if (!tokenId || tokenId < 1 || tokenId > 10000) return res.status(400).json({ ok: false, error: 'invalid token id' });
+  if (isNaN(tokenId) || tokenId < 0 || tokenId > 10_000_000) return res.status(400).json({ ok: false, error: 'invalid token id' }); // generous, collection-agnostic bound — see /db/token/:id above for why
   const limit = intParam(req.query.limit, 100, 200);
+  // Same hardcoded-to-OCAS bug as /db/wallet/:address/transfers had, same fix:
+  // resolve the actual requested collection's own contract via the collections
+  // registry rather than assuming OCAS_CONTRACT/OCAS_SLUG regardless of slug.
+  const slug = (req.query.slug || OCAS_SLUG).toString();
   try {
+    const collRes = await pool.query('SELECT contract FROM collections WHERE slug = $1', [slug]);
+    const contract = collRes.rows[0]?.contract || OCAS_CONTRACT;
     const result = await pool.query(`
-      SELECT contract, token_id, from_address, to_address, tx_hash, log_index, block_number, block_ts, event_type
+      SELECT contract, token_id, from_address, to_address, tx_hash, log_index, block_number,
+             COALESCE(block_ts, transferred_at) AS block_ts, event_type
       FROM nft_transfers
-      WHERE contract = $1 AND token_id = $2
+      WHERE contract = $1 AND collection_slug = $2 AND token_id = $3
       ORDER BY block_number ASC, log_index ASC
-      LIMIT $3
-    `, [OCAS_CONTRACT, tokenId, limit]);
+      LIMIT $4
+    `, [contract, slug, tokenId, limit]);
     res.set('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.json({
       ok: true,
       token_id: tokenId,
-      contract: OCAS_CONTRACT,
+      contract,
       synced: true,
       history: result.rows.map(r => ({
         contract: r.contract,
@@ -1873,7 +2769,7 @@ app.get('/db/token/:id/history', auth, async (req, res) => {
       count: result.rows.length,
     });
   } catch (e) {
-    if (isMissingWalletAnalyticsTable(e)) return res.json({ ok: true, token_id: tokenId, synced: false, history: [], count: 0 });
+    if (isMissingWalletAnalyticsTable(e) || e?.code === '42703') return res.json({ ok: true, token_id: tokenId, synced: false, history: [], count: 0 });
     console.error('/db/token/:id/history error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -2322,60 +3218,338 @@ app.get('/tv/link-status-by-wallet', auth,
        ORDER BY linked_at DESC LIMIT 1`,
       [wallet]
     );
-    if (!row.rows.length) return res.json({ linked: false });
-    res.json({ linked: true, discord_id: row.rows[0].discord_id, guild_id: row.rows[0].guild_id, linked_at: row.rows[0].linked_at });
+
+    let discordId, guildId = null, linkedAt = null;
+
+    if (row.rows.length) {
+      discordId = row.rows[0].discord_id;
+      guildId = row.rows[0].guild_id;
+      linkedAt = row.rows[0].linked_at;
+    } else {
+      // jv confirmed live: "on desktop, it's not picking up that I have 2
+      // wallets verified through the bot... I did the verification through
+      // mobile." Root cause -- traitview_links (this website's own separate
+      // verification record, populated only by claiming a code through
+      // /tv/claim-code) upserts on (discord_id, guild_id) alone, so it can
+      // only ever store ONE wallet per user at a time -- whichever wallet
+      // happened to be attached to the most recently claimed code. If the
+      // wallet connected on a different device/browser is a DIFFERENT one
+      // of the user's genuinely bot-linked wallets (linked_wallets, the
+      // bot's real multi-wallet source of truth, has no such single-wallet
+      // limit), the lookup above finds nothing and returns linked:false --
+      // even though this wallet is, in fact, one of theirs. Falling back to
+      // resolving discord_id directly from linked_wallets by wallet address
+      // when traitview_links has no row for this specific one, rather than
+      // requiring every one of a user's wallets to also happen to be the
+      // one traitview_links most recently recorded.
+      const fallback = await pool.query(
+        `SELECT discord_id FROM linked_wallets WHERE LOWER(wallet)=LOWER($1) ORDER BY linked_at DESC LIMIT 1`,
+        [wallet]
+      ).catch(() => ({ rows: [] }));
+      if (!fallback.rows.length) return res.json({ linked: false });
+      discordId = fallback.rows[0].discord_id;
+    }
+
+    // linked_wallets (the bot's actual multi-wallet source of truth) is
+    // keyed by discord_id -- once known (either path above), every wallet
+    // ever linked to this same Discord account, across every guild
+    // they've verified in, is a second, cheap lookup away. Deduplicated
+    // since the same wallet can appear under multiple guild_ids if
+    // verification cascaded across servers.
+    const linkedRows = await pool.query(
+      `SELECT DISTINCT wallet FROM linked_wallets WHERE discord_id=$1`,
+      [discordId]
+    ).catch(() => ({ rows: [] }));
+    const linkedWallets = linkedRows.rows.map(r => r.wallet);
+
+    res.json({
+      linked: true,
+      discord_id: discordId,
+      guild_id: guildId,
+      linked_at: linkedAt,
+      linkedWallets: linkedWallets.length ? linkedWallets : [wallet.toLowerCase()],
+    });
   } catch (e) {
     res.status(500).json({ error: 'server_error' });
   }
 });
 
 
+// jv: "Is it better to store an .eth addresses in a db and then run
+// that db for the holdings of that address? ... let's also think this
+// through for the best way to optimize these api calls." ENS names and
+// linked X accounts almost never change (unlike holdings, which can
+// change any time a token trades hands), so this checks wallet_identity
+// first and only calls out to ENS/OpenSea when there's no row yet or
+// the row is stale (7 days) -- most lookups for a wallet already seen
+// once become a single, cheap DB read instead of two external API
+// calls every time.
+const IDENTITY_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+app.get('/tv/identity', auth,
+  rateLimit({ max: 30, windowMs: 60 * 1000, keyFn: req => 'identity:' + req.ip }),
+  async (req, res) => {
+  const address = cleanAddress(req.query.address || '');
+  if (!isEthAddress(address)) return res.status(400).json({ ok: false, error: 'valid address required' });
+  const lower = address.toLowerCase();
+
+  try {
+    const cached = await pool.query(
+      `SELECT ens_name, twitter_username, checked_at FROM wallet_identity WHERE address=$1`,
+      [lower]
+    );
+    const row = cached.rows[0];
+    const isFresh = row && (Date.now() - new Date(row.checked_at).getTime()) < IDENTITY_STALE_MS;
+    if (isFresh) {
+      return res.json({ ok: true, address: lower, name: row.ens_name, twitter: row.twitter_username, source: 'cache' });
+    }
+
+    // Stale or missing -- refresh from source. Two independent lookups;
+    // neither failing should sink the other, so each gets its own catch
+    // rather than one wrapping both.
+    const ensPromise = fetch(`https://api.ensideas.com/ens/resolve/${lower}`)
+      .then(r => r.ok ? r.json() : null).catch(() => null);
+    const acctPromise = OPENSEA_API_KEY
+      ? fetch(`https://api.opensea.io/api/v2/accounts/${lower}`, { headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' } })
+          .then(r => r.ok ? r.json() : null).catch(() => null)
+      : Promise.resolve(null);
+    const [ensBody, acctBody] = await Promise.all([ensPromise, acctPromise]);
+
+    const ensName = ensBody?.name || null;
+    // Defensive: OpenSea's exact field name for a linked X account hasn't
+    // been confirmed live yet -- checking a few plausible shapes rather
+    // than assuming one.
+    const twitter = acctBody?.socials?.twitter || acctBody?.social_media_accounts?.twitter
+      || acctBody?.twitter_username || acctBody?.twitter || null;
+
+    await pool.query(
+      `INSERT INTO wallet_identity (address, ens_name, twitter_username, checked_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (address) DO UPDATE SET ens_name=EXCLUDED.ens_name, twitter_username=EXCLUDED.twitter_username, checked_at=NOW()`,
+      [lower, ensName, twitter]
+    ).catch(e => console.warn(`[identity] upsert failed for ${lower}:`, e.message));
+
+    res.json({ ok: true, address: lower, name: ensName, twitter, source: 'live' });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// ── GET /tv/ens-resolve?name=foo.eth ─────────────────────────────────────────
+// jv: "Searching a .eth address in the address search bar in the sales
+// chart doesn't work. It should bring up the wallet activity history just
+// for that wallet." Forward lookup (name -> address), the reverse of
+// /tv/identity above, via the same ENSIdeas source. Not written into
+// wallet_identity: that table holds each address's PRIMARY (reverse)
+// name, and a name that resolves to an address isn't necessarily that
+// address's primary name.
+app.get('/tv/ens-resolve', auth,
+  rateLimit({ max: 30, windowMs: 60 * 1000, keyFn: req => 'ensresolve:' + req.ip }),
+  async (req, res) => {
+  const name = String(req.query.name || '').trim().toLowerCase();
+  if (!name || name.length > 255 || !name.endsWith('.eth') || /[\s/?#]/.test(name)) {
+    return res.status(400).json({ ok: false, error: 'valid .eth name required' });
+  }
+  try {
+    const r = await fetch(`https://api.ensideas.com/ens/resolve/${encodeURIComponent(name)}`);
+    const body = r.ok ? await r.json().catch(() => null) : null;
+    const address = (body?.address || '').toLowerCase();
+    if (!isEthAddress(address)) return res.json({ ok: true, name, address: null });
+    res.json({ ok: true, name, address });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: 'lookup_failed' });
+  }
+});
+
+
+// per person if doable" -- then "yes i want multiple picks per person
+// just not the same one twice". So per person: any number of DISTINCT
+// emojis (🚀 AND ❤️ can both be active at once), enforced by
+// collection_reactions' UNIQUE(slug, client_id, emoji) constraint (see
+// lib/db.js's migration comment) -- never two rows for the same emoji,
+// nothing stopping several different ones. A fixed, curated emoji set
+// rather than free-text input -- simpler UI (a plain button row) and no
+// need to validate arbitrary Unicode input against anything.
+const REACTION_EMOJI = ['🚀', '❤️', '👀', '🚩'];
+
+// ── GET /db/collections/:slug/reactions ──────────────────────────────────────
+// Returns current counts for each allowed emoji, plus this client's own
+// current picks (an array now, not a single value -- see above) so the
+// frontend can highlight all of them.
+app.get('/db/collections/:slug/reactions', auth, async (req, res) => {
+  try {
+    const slug = (req.params.slug || '').toLowerCase();
+    const clientId = (req.query.client_id || '').toString().slice(0, 100);
+    if (!slug) return res.status(400).json({ ok: false, error: 'missing slug' });
+    const counts = await pool.query(
+      `SELECT emoji, COUNT(*)::int AS count FROM collection_reactions WHERE slug = $1 GROUP BY emoji`,
+      [slug]
+    );
+    const countsByEmoji = {};
+    for (const e of REACTION_EMOJI) countsByEmoji[e] = 0;
+    for (const row of counts.rows) if (row.emoji in countsByEmoji) countsByEmoji[row.emoji] = row.count;
+
+    let mine = [];
+    if (clientId) {
+      const mineRes = await pool.query(
+        `SELECT emoji FROM collection_reactions WHERE slug = $1 AND client_id = $2`,
+        [slug, clientId]
+      );
+      mine = mineRes.rows.map(r => r.emoji);
+    }
+    res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+    res.json({ ok: true, slug, counts: countsByEmoji, mine });
+  } catch (e) {
+    console.error('/db/collections/:slug/reactions error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── POST /db/collections/:slug/react ─────────────────────────────────────────
+// Tapping an emoji you already picked removes just that one (a
+// per-emoji toggle); tapping one you haven't picked yet adds it
+// alongside whatever else you've already picked for this collection --
+// never replacing a different emoji's pick the way the earlier
+// one-per-person version did.
+app.post('/db/collections/:slug/react', auth, async (req, res) => {
+  try {
+    const slug = (req.params.slug || '').toLowerCase();
+    const clientId = (req.body?.client_id || '').toString().slice(0, 100);
+    const emoji = (req.body?.emoji || '').toString();
+    if (!slug || !clientId) return res.status(400).json({ ok: false, error: 'missing slug or client_id' });
+    if (!REACTION_EMOJI.includes(emoji)) return res.status(400).json({ ok: false, error: 'invalid emoji' });
+
+    const existing = await pool.query(
+      `SELECT 1 FROM collection_reactions WHERE slug = $1 AND client_id = $2 AND emoji = $3`,
+      [slug, clientId, emoji]
+    );
+    if (existing.rows.length) {
+      await pool.query(`DELETE FROM collection_reactions WHERE slug = $1 AND client_id = $2 AND emoji = $3`, [slug, clientId, emoji]);
+    } else {
+      await pool.query(
+        `INSERT INTO collection_reactions (slug, client_id, emoji, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (slug, client_id, emoji) DO NOTHING`,
+        [slug, clientId, emoji]
+      );
+    }
+
+    const [counts, mineRes] = await Promise.all([
+      pool.query(`SELECT emoji, COUNT(*)::int AS count FROM collection_reactions WHERE slug = $1 GROUP BY emoji`, [slug]),
+      pool.query(`SELECT emoji FROM collection_reactions WHERE slug = $1 AND client_id = $2`, [slug, clientId]),
+    ]);
+    const countsByEmoji = {};
+    for (const e of REACTION_EMOJI) countsByEmoji[e] = 0;
+    for (const row of counts.rows) if (row.emoji in countsByEmoji) countsByEmoji[row.emoji] = row.count;
+    res.json({ ok: true, slug, counts: countsByEmoji, mine: mineRes.rows.map(r => r.emoji) });
+  } catch (e) {
+    console.error('/db/collections/:slug/react error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections ───────────────────────────────────────────────────────
+// Lists the collections registry. Read-only for now — the onboarding
+// trigger that inserts new rows (search an unknown slug -> kick off backfill)
+// is a later phase; this just exposes what's already in the table.
+app.get('/db/collections', auth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT slug, contract, chain, name, status, token_standard, total_supply,
+             is_animated, has_svg_images, error_message,
+             traits_synced_at, market_synced_at, created_at, updated_at,
+             opensea_url, website_url, twitter_url, avatar_image_url, banner_image_url,
+             non_worn_trait_categories
+      FROM collections
+      ORDER BY (slug = $1) DESC, created_at ASC
+    `, [OCAS_SLUG]);
+    res.json({ ok: true, collections: result.rows });
+  } catch (e) {
+    console.error('[/db/collections]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 // ── GET /db/traits-fast ───────────────────────────────────────────────────────
 // Serves traits_fast.json structure computed live from DB, excluding burned tokens.
-// Cached in memory for 5 minutes.
+// Cached in memory for 5 minutes, per collection_slug.
 // Returns: { ok, rank: [[id, score], ...], domain: {trait: [values]},
 //            buckets: {count: [ids]}, freq: {trait: {value: count}}, survivorCount }
-let _traitsFastCache = null;
-let _traitsFastCacheTs = 0;
+const _traitsFastCache = new Map(); // slug -> { data, ts }
 const TRAITS_FAST_TTL = 5 * 60 * 1000;
 
 app.get('/db/traits-fast', auth, async (req, res) => {
   try {
+    const slug = (req.query.slug || OCAS_SLUG).toString().toLowerCase();
+    const isOcas = slug === OCAS_SLUG;
     const now = Date.now();
-    if (_traitsFastCache && (now - _traitsFastCacheTs) < TRAITS_FAST_TTL) {
-      return res.json(_traitsFastCache);
+    const cached = _traitsFastCache.get(slug);
+    if (cached && (now - cached.ts) < TRAITS_FAST_TTL) {
+      return res.json(cached.data);
     }
 
-    const BURNED_EXCL = `NOT EXISTS (
+    // Burn mechanic only exists for OCAS — burn_event_inputs/burn_events have
+    // no collection_slug column, so this must never run for other slugs, or a
+    // numerically-colliding token_id in another collection (e.g. Fluxeto #81)
+    // could get wrongly excluded as "burned". See the cross-collection image
+    // collision bug fixed 2026-06-28 for the same underlying class of issue.
+    //
+    // jv: "Burned tokens are getting ranked and they should not be ranked
+    // ... once a token is burned, it's gone forever out of the collection
+    // and should not count towards the collection or ranking." This
+    // endpoint's own rank array and freq/domain counts were the actual
+    // on-screen source of that bug (Argonaut #3339, Rank 30, owned by
+    // 0x0000...dead) -- lib/rank-compute.js already excludes burned
+    // tokens when it WRITES obs_rank, but this endpoint was still reading
+    // every token's obs_rank back out with no exclusion of its own for
+    // any non-OCAS slug (BURNED_EXCL was unconditionally 'TRUE' here).
+    // Two exclusions added, universally (not gated on isOcas), alongside
+    // the OCAS-only mechanic above rather than instead of it:
+    //  - is_burned (lib/burn-detect.js's periodic on-chain ownership
+    //    poll) -- same signal rank-compute.js already trusts.
+    //  - a live "Fate: Burned" trait pair -- Argonauts' own on-chain
+    //    renderer stamps this onto a dead token's metadata directly, so
+    //    it's ground truth sourced every backfill, independent of
+    //    is_burned's separate poll cadence (which hadn't yet caught
+    //    #3339's transfer). Safe for every collection: no other slug
+    //    uses a "Fate" category valued "Burned".
+    const NOT_MARKED_BURNED_T = `NOT EXISTS (
+      SELECT 1 FROM tokens tb WHERE tb.id = t.id AND tb.collection_slug = t.collection_slug AND tb.is_burned = TRUE
+    )`;
+    const NOT_FATE_BURNED_T = `NOT EXISTS (
+      SELECT 1 FROM token_traits ttb WHERE ttb.token_id = t.id AND ttb.collection_slug = t.collection_slug
+      AND LOWER(ttb.trait_name) = 'fate' AND LOWER(ttb.trait_value) = 'burned'
+    )`;
+    const BURNED_EXCL = `${isOcas ? `NOT EXISTS (
       SELECT 1 FROM burn_event_inputs bei
       JOIN burn_events be ON be.id = bei.burn_event_id
       WHERE bei.burned_token_id = t.id
       AND bei.burned_token_id != be.survivor_token_id
-    )`;
+    )` : 'TRUE'} AND ${NOT_MARKED_BURNED_T} AND ${NOT_FATE_BURNED_T}`;
 
-    const BURNED_EXCL_TT = `NOT EXISTS (
+    const NOT_MARKED_BURNED_TT = `NOT EXISTS (
+      SELECT 1 FROM tokens tb WHERE tb.id = tt.token_id AND tb.collection_slug = tt.collection_slug AND tb.is_burned = TRUE
+    )`;
+    const NOT_FATE_BURNED_TT = `NOT EXISTS (
+      SELECT 1 FROM token_traits ttb WHERE ttb.token_id = tt.token_id AND ttb.collection_slug = tt.collection_slug
+      AND LOWER(ttb.trait_name) = 'fate' AND LOWER(ttb.trait_value) = 'burned'
+    )`;
+    const BURNED_EXCL_TT = `${isOcas ? `NOT EXISTS (
       SELECT 1 FROM burn_event_inputs bei
       JOIN burn_events be ON be.id = bei.burn_event_id
       WHERE bei.burned_token_id = tt.token_id
       AND bei.burned_token_id != be.survivor_token_id
-    )`;
+    )` : 'TRUE'} AND ${NOT_MARKED_BURNED_TT} AND ${NOT_FATE_BURNED_TT}`;
 
     // 1. Surviving tokens sorted by obs_rank ASC (pre-computed rank in DB)
     // Falls back to id order if obs_rank not available
-    // NOTE: hardcoded to OCAS_SLUG for now — TraitView itself isn't
-    // multi-collection aware yet (no slug param sent), so without this
-    // filter, other configured collections' tokens/traits merge in here
-    // too (confirmed: Fluxeto traits appearing in TraitView's OCAS filter
-    // panel, same root cause as the /traitfind cross-collection bug fixed
-    // 2026-07-01 — the JOIN below also previously matched on token_id
-    // alone with no collection_slug check on either side).
     const [rankRes, traitRes] = await Promise.all([
       pool.query(`
         SELECT t.id, t.obs_rank, t.trait_count
         FROM tokens t
         WHERE t.collection_slug = $1 AND ${BURNED_EXCL}
         ORDER BY t.obs_rank ASC NULLS LAST, t.id ASC
-      `, [OCAS_SLUG]),
+      `, [slug]),
       // 2. Trait frequencies for surviving tokens
       pool.query(`
         SELECT tt.trait_name, tt.trait_value, COUNT(*)::int AS freq
@@ -2384,7 +3558,7 @@ app.get('/db/traits-fast', auth, async (req, res) => {
         WHERE tt.collection_slug = $1 AND ${BURNED_EXCL_TT}
         GROUP BY tt.trait_name, tt.trait_value
         ORDER BY tt.trait_name, tt.trait_value
-      `, [OCAS_SLUG])
+      `, [slug])
     ]);
 
     // rank array: [[id, obsRank], ...] sorted by obs_rank ASC
@@ -2416,9 +3590,9 @@ app.get('/db/traits-fast', auth, async (req, res) => {
       buckets[key].push(parseInt(id));
     }
 
-    _traitsFastCache = { ok: true, rank, domain, freq, buckets, survivorCount: rankRes.rows.length };
-    _traitsFastCacheTs = now;
-    res.json(_traitsFastCache);
+    const data = { ok: true, rank, domain, freq, buckets, survivorCount: rankRes.rows.length };
+    _traitsFastCache.set(slug, { data, ts: now });
+    res.json(data);
   } catch (e) {
     console.error('[/db/traits-fast]', e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -2429,10 +3603,9 @@ app.get('/db/traits-fast', auth, async (req, res) => {
 // ── GET /db/all-traits ────────────────────────────────────────────────────────
 // Returns all surviving tokens' traits in chunk-compatible format.
 // Used by TraitView to replace static chunk files with live DB data.
-// Server-side cache: 5 minutes. One DB query per 5 min regardless of visitors.
+// Server-side cache: 5 minutes per collection_slug.
 // Returns: { ok, tokens: { "1": { traits: {...} }, ... }, survivorCount }
-let _allTraitsCache = null;
-let _allTraitsCacheTs = 0;
+const _allTraitsCache = new Map(); // slug -> { data, ts }
 const ALL_TRAITS_TTL = 5 * 60 * 1000;
 
 // ── Lazy token images ─────────────────────────────────────────────────────────
@@ -2454,14 +3627,6 @@ function _isInlineImage(v){
 }
 function _inlineImageIsSvg(v){
   return v.startsWith('<svg') || v.startsWith('<?xml') || v.startsWith('data:image/svg');
-}
-// main keeps a single OCAS-only all-traits cache (not a per-slug Map like
-// public-bot). Wrap it in the entry shape _allTraitsLazy expects; the
-// wrapper (and its memoized lazy token list) lives as long as that cache.
-let _ocasLazyEntryObj = null;
-function _ocasLazyEntry(){
-  if(!_ocasLazyEntryObj || _ocasLazyEntryObj.data !== _allTraitsCache) _ocasLazyEntryObj = { data: _allTraitsCache };
-  return _ocasLazyEntryObj;
 }
 function _allTraitsLazy(req, slug, entry){
   if(!entry.lazyTokens){
@@ -2503,7 +3668,7 @@ app.get('/db/token-image', auth, async (req, res) => {
     const slug = (req.query.slug || OCAS_SLUG).toString().toLowerCase();
     const id = parseInt(req.query.id, 10);
     if(!Number.isFinite(id) || id < 0) return res.status(400).json({ ok: false, error: 'bad id' });
-    let img = (slug === OCAS_SLUG ? _allTraitsCache?.tokens?.[String(id)]?.image : null) || null;   // main: single OCAS cache
+    let img = _allTraitsCache.get(slug)?.data?.tokens?.[String(id)]?.image || null;
     if(!img){
       const r1 = await pool.query(`SELECT image_url FROM tokens WHERE id = $1 AND collection_slug = $2`, [id, slug]).catch(() => ({ rows: [] }));
       img = r1.rows[0]?.image_url || null;
@@ -2557,37 +3722,83 @@ app.get('/db/token-image', auth, async (req, res) => {
 
 app.get('/db/all-traits', auth, async (req, res) => {
   try {
+    const slug = (req.query.slug || OCAS_SLUG).toString().toLowerCase();
+    const isOcas = slug === OCAS_SLUG;
     const now = Date.now();
-    if (_allTraitsCache && (now - _allTraitsCacheTs) < ALL_TRAITS_TTL) {
-      return res.json(req.query.lazyImages === '1' ? _allTraitsLazy(req, OCAS_SLUG, _ocasLazyEntry()) : _allTraitsCache);
+    const cached = _allTraitsCache.get(slug);
+    if (cached && (now - cached.ts) < ALL_TRAITS_TTL) {
+      return res.json(req.query.lazyImages === '1' ? _allTraitsLazy(req, slug, cached) : cached.data);
     }
 
-    // Get all surviving token IDs
-    // NOTE: hardcoded to OCAS_SLUG for now — same reasoning as /db/traits-fast above.
-    const survivorsRes = await pool.query(`
-      SELECT t.id, t.image_url
-      FROM tokens t
-      WHERE t.collection_slug = $1 AND NOT EXISTS (
-        SELECT 1 FROM burn_event_inputs bei
-        JOIN burn_events be ON be.id = bei.burn_event_id
-        WHERE bei.burned_token_id = t.id
-        AND bei.burned_token_id != be.survivor_token_id
-      )
-      ORDER BY t.id
-    `, [OCAS_SLUG]);
+    // Burn mechanic only exists for OCAS — see note in /db/traits-fast above.
+    // Gate explicitly on isOcas rather than relying on absence of burn rows,
+    // since a numerically colliding token_id in another collection must
+    // never be excluded.
+    const survivorsRes = isOcas
+      ? await pool.query(`
+          SELECT t.id, t.image_url, t.is_burned, t.animation_url
+          FROM tokens t
+          WHERE t.collection_slug = $1 AND NOT EXISTS (
+            SELECT 1 FROM burn_event_inputs bei
+            JOIN burn_events be ON be.id = bei.burn_event_id
+            WHERE bei.burned_token_id = t.id
+            AND bei.burned_token_id != be.survivor_token_id
+          )
+          ORDER BY t.id
+        `, [slug])
+      : await pool.query(`
+          SELECT t.id, t.image_url, t.is_burned, t.animation_url
+          FROM tokens t
+          WHERE t.collection_slug = $1
+          ORDER BY t.id
+        `, [slug]);
 
     const survivorIds = new Set(survivorsRes.rows.map(r => parseInt(r.id)));
     const imageUrlById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), r.image_url || null]));
-    // tokens.image_url is written live by burn-poller.js at burn-finalization
-    // time but has confirmed historical gaps (NULL/stale for some survivors —
-    // see check-live-metadata-gaps.js). burn_state_snapshots is the same
-    // ground-truth source /db/token/:id/burn-history already uses
-    // successfully, so prefer it here and only fall back to image_url where
-    // a snapshot doesn't exist yet.
-    const survivorSnapshotImages = await getSurvivorImageMap([...survivorIds]).catch(e => {
-      console.warn('[/db/all-traits] survivor snapshot image lookup failed (non-fatal):', e.message);
-      return {};
-    });
+    // is_burned (lib/burn-detect.js) — generic, contract-agnostic "sent to a
+    // known dead address" flag, refreshed every 6h for every ready collection.
+    // Separate concept from OCAS's own burn_events survivor mechanic (already
+    // excluded from this response entirely, above) -- this just tags tokens
+    // still present in the response so the frontend can badge/filter them.
+    const isBurnedById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), !!r.is_burned]));
+    // jv: "the burns... are actually animated. Anyway to get that
+    // animation to display on the site??" -- captured by
+    // lib/metadata-update-poller.js alongside the static image.
+    const animationUrlById = new Map(survivorsRes.rows.map(r => [parseInt(r.id), r.animation_url || null]));
+
+    // Confirmed live: this endpoint's own comment below already documented
+    // this exact gap ("token_svg_cache, read separately by the frontend")
+    // but no such separate mechanism actually existed anywhere -- the
+    // frontend's multi-collection support work surfaced this directly:
+    // Argonauts tokens whose image is SVG-based (tokens.image_url
+    // deliberately set to NULL for those -- see refreshSingleTokenMetadata
+    // in lib/metadata-update-poller.js, which clears it precisely so
+    // token_svg_cache is what display code reaches for) never had an image
+    // at all in this response, only tokens with a raster URL did. Fixed by
+    // querying token_svg_cache directly here instead of relying on a
+    // frontend mechanism that was never built.
+    const svgCacheRes = isOcas
+      ? { rows: [] } // OCAS doesn't use token_svg_cache at all -- no-op query avoided entirely
+      : await pool.query(
+          `SELECT token_id, image_data FROM token_svg_cache WHERE collection_slug = $1 AND token_id = ANY($2::int[])`,
+          [slug, [...survivorIds]]
+        ).catch(e => {
+          console.warn('[/db/all-traits] token_svg_cache lookup failed (non-fatal):', e.message);
+          return { rows: [] };
+        });
+    const svgCacheById = new Map(svgCacheRes.rows.map(r => [parseInt(r.token_id), r.image_data || null]));
+
+    // burn_state_snapshots is OCAS-only ground truth for post-burn survivor
+    // images — skip entirely for other collections; tokens.image_url (or
+    // token_svg_cache, queried directly above -- was "read separately by
+    // the frontend" until that mechanism was confirmed to never actually
+    // exist) is the only source.
+    const survivorSnapshotImages = isOcas
+      ? await getSurvivorImageMap([...survivorIds]).catch(e => {
+          console.warn('[/db/all-traits] survivor snapshot image lookup failed (non-fatal):', e.message);
+          return {};
+        })
+      : {};
 
     // Get all traits for surviving tokens in one query
     const traitsRes = await pool.query(`
@@ -2595,17 +3806,16 @@ app.get('/db/all-traits', auth, async (req, res) => {
       FROM token_traits tt
       WHERE tt.collection_slug = $2 AND tt.token_id = ANY($1::int[])
       ORDER BY tt.token_id, COALESCE(tt.trait_index, 0), tt.trait_name
-    `, [[...survivorIds], OCAS_SLUG]);
+    `, [[...survivorIds], slug]);
 
     // Build tokens object: { "1": { traits: { "Type": "Human 6", ... }, image: "..." }, ... }
     const tokens = {};
 
     // Initialize all survivors with empty traits + current image (snapshot
-    // preferred, tokens.image_url as fallback — most non-survivor tokens
-    // will have image:null here, which is fine, TraitView already falls
-    // back to its own static image source for those)
+    // preferred for OCAS; tokens.image_url preferred otherwise, falling back
+    // to token_svg_cache for tokens whose image is SVG-based)
     for (const id of survivorIds) {
-      tokens[String(id)] = { traits: {}, image: survivorSnapshotImages[id] || imageUrlById.get(id) || null };
+      tokens[String(id)] = { traits: {}, image: survivorSnapshotImages[id] || imageUrlById.get(id) || svgCacheById.get(id) || null, burned: isBurnedById.get(id) || false, animation: animationUrlById.get(id) || null };
     }
 
     // Populate traits
@@ -2616,10 +3826,11 @@ app.get('/db/all-traits', auth, async (req, res) => {
       }
     }
 
-    _allTraitsCache = { ok: true, tokens, survivorCount: survivorIds.size };
-    _allTraitsCacheTs = now;
+    const data = { ok: true, tokens, survivorCount: survivorIds.size, _debugVersion: 'svgcache-fix-610b9c5', _debugSvgCacheRows: svgCacheRes.rows.length, _debugSvgCacheHits: [...svgCacheById.values()].filter(v => v != null).length };
+    const entry = { data, ts: now };
+    _allTraitsCache.set(slug, entry);
 
-    res.json(req.query.lazyImages === '1' ? _allTraitsLazy(req, OCAS_SLUG, _ocasLazyEntry()) : _allTraitsCache);
+    res.json(req.query.lazyImages === '1' ? _allTraitsLazy(req, slug, entry) : data);
   } catch (e) {
     console.error('[/db/all-traits]', e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -2635,14 +3846,22 @@ app.get('/db/all-traits', auth, async (req, res) => {
 // hours. This service is stateless and can be restarted independently.
 // Query params: svgUrl (or svgData for data: URIs)
 // Returns: image/png binary
-const sharp = require('sharp');
-sharp.cache(false);
-sharp.concurrency(2);
+// renderSvgTextToPng (and its sharp global config) moved to lib/svg-render.js
+// so it's reachable in-process by lib/images.js's extractPngFromSvg when
+// that code runs within this same service — not just via this route's own
+// HTTP interface.
+const { renderSvgTextToPng } = require('./lib/svg-render');
 
 app.get('/render/svg-token', auth, async (req, res) => {
   try {
     const svgSource = req.query.svgUrl || req.query.svgData;
     if (!svgSource) return res.status(400).json({ ok: false, error: 'missing svgUrl or svgData' });
+
+    // Clamped to a sane range -- prevents an absurd request (e.g. size=100000)
+    // from exhausting memory/CPU on this shared service. Defaults to 500,
+    // matching the previous hardcoded behavior for any caller not specifying one.
+    let size = parseInt(req.query.size) || 500;
+    size = Math.max(50, Math.min(3000, size));
 
     let svgText;
     if (svgSource.startsWith('data:image/svg')) {
@@ -2655,28 +3874,11 @@ app.get('/render/svg-token', auth, async (req, res) => {
       svgText = await r.text();
     }
 
-    const SIZE = 500;
-    let bgBuf;
+    let finalBuf;
     try {
-      bgBuf = await sharp(Buffer.from(svgText))
-        .resize(SIZE, SIZE, { kernel: 'nearest', fit: 'fill' })
-        .png()
-        .toBuffer();
+      finalBuf = await renderSvgTextToPng(svgText, size);
     } catch (e) {
       return res.status(500).json({ ok: false, error: 'SVG render failed: ' + e.message });
-    }
-
-    // Extract embedded character PNG and composite, same as original extractPngFromSvg
-    const pngMatch = svgText.match(/src=["']data:image\/png;base64,([A-Za-z0-9+/=\s]+)["']/);
-    let finalBuf = bgBuf;
-    if (pngMatch) {
-      try {
-        const rawPng = Buffer.from(pngMatch[1].replace(/\s/g, ''), 'base64');
-        const charBuf = await sharp(rawPng).resize(SIZE, SIZE, { kernel: 'nearest' }).png().toBuffer();
-        finalBuf = await sharp(bgBuf).composite([{ input: charBuf, blend: 'over' }]).png().toBuffer();
-      } catch (e) {
-        console.warn('[/render/svg-token] char composite failed, using full SVG render:', e.message);
-      }
     }
 
     res.set('Content-Type', 'image/png');
@@ -2688,74 +3890,742 @@ app.get('/render/svg-token', auth, async (req, res) => {
   }
 });
 
+// ── POST /render/svg-token — same rendering, but for svgData (base64 data
+// URIs) specifically instead of the GET route's query-string parameter.
+// Confirmed live: a large on-chain-generated SVG (e.g. one with an embedded
+// base64 PNG, same pattern this endpoint already handles via pngMatch above)
+// pushed the GET request's query string past whatever length limit sits in
+// front of this service, failing with HTTP 431 (Request Header Fields Too
+// Large) — a GET request's entire URL, including its query string, is part
+// of the request line, which has much tighter length limits than a POST
+// body does almost everywhere. svgUrl stays on the GET route unchanged,
+// since a URL itself is always short regardless of how large the SVG behind
+// it is — only svgData (which embeds the actual content) needed to move.
+// Route-specific body-size limit isn't needed here — the global
+// express.json() limit above was raised to 5mb specifically to cover this
+// route, avoiding a second, redundant json() call on the same request (see
+// that comment for why stacking two would be unsafe).
+app.post('/render/svg-token', auth, async (req, res) => {
+  try {
+    const svgData = req.body?.svgData;
+    if (!svgData) return res.status(400).json({ ok: false, error: 'missing svgData in request body' });
+    if (!svgData.startsWith('data:image/svg')) return res.status(400).json({ ok: false, error: 'svgData must be a data:image/svg URI' });
+
+    let size = parseInt(req.body?.size) || 500;
+    size = Math.max(50, Math.min(3000, size));
+
+    const b64 = svgData.split(',')[1];
+    if (!b64) return res.status(400).json({ ok: false, error: 'empty svg data' });
+    const svgText = Buffer.from(b64, 'base64').toString('utf-8');
+
+    let finalBuf;
+    try {
+      finalBuf = await renderSvgTextToPng(svgText, size);
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'SVG render failed: ' + e.message });
+    }
+
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(finalBuf);
+  } catch (e) {
+    console.error('[POST /render/svg-token]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/sales-stream ─────────────────────────────────────────────────────
+// Server-Sent Events endpoint TraitView connects to for live sale feedback.
+// See lib/sale-stream.js for the full architecture explanation -- this
+// route itself is deliberately thin, just handing off to that module.
+// Not wired through the auth() middleware used elsewhere in this file: SSE
+// requests come from an EventSource in the browser, which can't set custom
+// headers, so this relies on the same ?key= query-param path auth() itself
+// already supports for exactly this reason -- but delegates the actual
+// check to auth() rather than duplicating that logic here.
+app.get('/db/sales-stream', auth, saleStream.handleSseRequest);
+
 // Runs the same idempotent CREATE TABLE/INDEX IF NOT EXISTS migrations used
 // elsewhere -- ensures a brand-new database gets its full schema automatically
 // on first deploy, and self-heals if any table/index was ever missing,
 // instead of relying on a separate manual step that's easy to forget.
-// ── TEMP DIAGNOSTIC — checking whether this branch (main) is what OCAS's
-// production service actually deploys from, since a route pushed to
-// public-bot returned 404 on the same URL jv tested. No auth, read-only --
-// meant to be opened directly in a mobile browser. Remove once this is
-// settled.
-app.get('/diag/listings-compare', async (req, res) => {
-  const slug = (req.query.slug || 'on-chain-all-stars').toString();
-  const OPENSEA_API_KEY = process.env.OPENSEA_KEY || process.env.OPENSEA_API_KEY;
-  try {
-    const dbResult = await pool.query(
-      `SELECT COUNT(*)::int AS count, MIN(updated_at) AS oldest_updated, MAX(updated_at) AS newest_updated
-       FROM listings WHERE collection_slug = $1`,
-      [slug]
-    );
-    const dbRow = dbResult.rows[0];
 
-    if (!OPENSEA_API_KEY) {
-      return res.json({ ok: true, deployedBranchGuess: 'main', slug, db: dbRow, opensea_live: { error: 'OPENSEA_KEY not configured on this service' } });
+// ── TEMP DIAGNOSTIC — jv reported OCAS live listings showing fewer than
+// OpenSea actually has. Compares the DB's current listing count/freshness
+// against a live, direct call to OpenSea's own listings endpoint (same one
+// sync-listings.js uses) to see whether the gap is a stale/incomplete sync,
+// or something else (e.g. this endpoint itself not returning everything
+// OpenSea's own website shows). No auth, read-only -- meant to be opened
+// directly in a mobile browser. Remove once this is settled.
+// ── GET /diag/gondi-probe — live check of Gondi's sale-listings + sales API ──
+// jv: Gondi trades on Argonauts should reach TraitView. Verifies, live from
+// Railway, that the plain GraphQL reads in lib/gondi-api.js work (no SDK /
+// sign-in) and shows the real data shape before anything is built on it.
+//   /diag/gondi-probe?contract=0x...   (defaults to Argonauts)
+app.get('/diag/gondi-probe', async (req, res) => {
+  const { gondiCollectionIds, gondiListingsForSalePage, gondiSalesPage } = require('./lib/gondi-api');
+  const contract = (req.query.contract || '0x387C41B0B2F1128dE44dB1Bcf8baad085f26392C').toString();
+  const out = { ok: true, contract };
+  const eth = (wei, dec) => { try{ return Number(BigInt(wei)) / Math.pow(10, dec ?? 18); }catch(_){ return null; } };
+  const onContract = n => (n?.nft?.collection?.contractData?.contractAddress || '').toLowerCase() === contract.toLowerCase();
+  try{
+    out.collections = await gondiCollectionIds(contract);
+  }catch(e){ out.collectionsError = e.message; return res.json(out); }
+  const col = out.collections[0];
+  if(!col){ out.note = 'Gondi has no collection for this contract'; return res.json(out); }
+  const { gondiAsksPage } = require('./lib/gondi-api');
+  const summarizeAsks = nodes => ({
+    onThisPage: nodes.length, onContract: nodes.filter(onContract).length,
+    byMarketPlace: nodes.reduce((m, n) => (m[n.marketPlace] = (m[n.marketPlace] || 0) + 1, m), {}),
+    sample: nodes.slice(0, 4).map(n => ({ tokenId: n.nft?.tokenId, priceEth: eth(n.price, n.currency?.decimals), symbol: n.currency?.symbol,
+      isAsk: n.isAsk, hidden: n.hidden, isPrivate: n.isPrivate, status: n.status, maker: n.maker, expiration: n.expiration,
+      marketPlace: n.marketPlace, contract: n.nft?.collection?.contractData?.contractAddress })),
+  });
+  // Split into two quick pages so no single load can hang:
+  //   /diag/gondi-probe              -> listings + trades/loan events
+  //   /diag/gondi-probe?part=sales   -> sales scan (20s per load, resumable)
+  const base = `${req.protocol}://${req.get('host')}${req.path}`;
+  if(req.query.part !== 'sales'){
+    try{
+      const page = await gondiAsksPage(col.id, null, ['NATIVE']);
+      out.gondiListings = { totalCount: page?.totalCount, ...summarizeAsks((page?.edges || []).map(e => e.node)) };
+    }catch(e){ out.gondiListingsError = e.message; }
+    try{
+      const page = await gondiAsksPage(col.id, null, null);
+      out.allMarketplaceListings = { totalCount: page?.totalCount, ...summarizeAsks((page?.edges || []).map(e => e.node)) };
+    }catch(e){ out.allMarketplaceListingsError = e.message; }
+    try{
+      const { gondiEventsPage } = require('./lib/gondi-api');
+      out.events = {};
+      for(const t of ['TRADE_EXECUTED', 'LOAN_FORECLOSED', 'LOAN_AUCTIONED']){
+        try{
+          const page = await gondiEventsPage(col.id, [t], null, 3);
+          out.events[t] = { totalCount: page?.totalCount, sample: (page?.edges || []).map(e => e.node).slice(0, 2) };
+        }catch(e){ out.events[t] = { error: e.message }; }
+      }
+    }catch(e){ out.eventsError = e.message; }
+    out.next = `${base}?part=sales`;
+    return res.json(out);
+  }
+  // Sales scan: 20s per load, newest first; resumes from ?after= with running
+  // totals carried in ?counts= so each load stays short.
+  try{
+    const started = Date.now(); let after = req.query.after || null, pages = 0, scanned = 0, hasNext = true, total = null;
+    let byMarket = {}; try{ if(req.query.counts) byMarket = JSON.parse(req.query.counts); }catch(_){}
+    let prevScanned = parseInt(req.query.scanned || '0', 10) || 0;
+    const nonOpenSea = [];
+    while(hasNext && Date.now() - started < 20_000){
+      const page = await gondiSalesPage(col.id, null, after, 100);
+      total = page?.totalCount; pages++;
+      for(const e of (page?.edges || [])){
+        const n = e.node; scanned++;
+        byMarket[n.marketPlace] = (byMarket[n.marketPlace] || 0) + 1;
+        if(n.marketPlace !== 'MarketPlace.OpenSea' && nonOpenSea.length < 8){
+          nonOpenSea.push({ tokenId: n.nft?.tokenId, priceWei: n.price, currencyAddress: n.currencyAddress, marketPlace: n.marketPlace,
+            marketPlaceAddress: n.marketPlaceAddress, seller: n.sender, buyer: n.receiver, timestamp: n.timestamp, txHash: n.txHash });
+        }
+      }
+      hasNext = !!page?.pageInfo?.hasNextPage; after = page?.pageInfo?.endCursor;
     }
+    const totalScanned = prevScanned + scanned;
+    out.sales = { totalCount: total, scannedSoFar: totalScanned, complete: !hasNext, byMarketPlace: byMarket, nonOpenSeaSamplesThisLoad: nonOpenSea };
+    if(hasNext) out.continue = `${base}?part=sales&after=${encodeURIComponent(after)}&scanned=${totalScanned}&counts=${encodeURIComponent(JSON.stringify(byMarket))}`;
+  }catch(e){ out.salesError = e.message; }
+  res.json(out);
+});
 
-    let next = null, pages = 0, totalRaw = 0;
-    const uniqueTokenIds = new Set();
+app.get('/diag/listings-compare', async (req, res) => {
+  // jv: "traitview is always behind OS listings, behind like 20+ or so
+  // listings" (Argonauts: OpenSea's page says 872 listed, TraitView 854).
+  // v1 of this only compared the DB against OpenSea's /all endpoint -- but
+  // the sync IS /all, so those two always agree and the check always
+  // "looked good". v2 looks past /all: compares it against OpenSea's /best
+  // endpoint (best listing per NFT), breaks down what /all contains, and
+  // lists the exact token IDs that differ, so a few can be looked up on
+  // OpenSea directly to see what kind of listing TraitView is missing.
+  //   /diag/listings-compare?slug=<opensea-slug>&chain=ethereum
+  const slug  = (req.query.slug || 'on-chain-all-stars').toString();
+  const chain = (req.query.chain || 'ethereum').toString();
+  const key = process.env.OPENSEA_API_KEY || process.env.OPENSEA_KEY;
+  const tokenIdOf = (listing) => {
+    const cands = [
+      listing?.criteria?.nft?.identifier, listing?.nft?.identifier, listing?.asset?.token_id,
+      listing?.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria,
+      listing?.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria,
+    ];
+    for (let c of cands) {
+      if (c == null || c === '') continue;
+      c = String(c);
+      const parts = c.includes('/') ? c.split('/') : c.split(':');
+      const last = parts[parts.length - 1];
+      if (last && /^\d+$/.test(last)) return parseInt(last, 10);
+    }
+    return null;
+  };
+  const priceOf = (l) => {
+    const v = l?.price?.current?.value ?? l?.price?.value;
+    const d = l?.price?.current?.decimals ?? l?.price?.decimals ?? 18;
+    return v == null ? null : parseFloat(v) / Math.pow(10, d);
+  };
+  const bump = (obj, k) => { k = String(k ?? '(none)'); obj[k] = (obj[k] || 0) + 1; };
+
+  async function pull(endpoint) {
+    let next = null, pages = 0, raw = 0, err = null;
+    const ids = new Set();
+    const byCurrency = {}, byType = {}, byProtocol = {};
+    let noId = 0, badPrice = 0, sample = null;
     do {
-      const qs = new URLSearchParams({ chain: 'ethereum', limit: '100' });
+      const qs = new URLSearchParams({ limit: '100' });
+      if (endpoint === 'all') { qs.set('chain', chain); qs.set('include_private_listings', 'true'); }
       if (next) qs.set('next', next);
-      const r = await fetch(`https://api.opensea.io/api/v2/listings/collection/${slug}/all?${qs}`, {
-        headers: { 'x-api-key': OPENSEA_API_KEY, 'Accept': 'application/json' }
+      const r = await fetch(`https://api.opensea.io/api/v2/listings/collection/${encodeURIComponent(slug)}/${endpoint}?${qs}`, {
+        headers: { 'x-api-key': key, 'Accept': 'application/json' }
       });
-      if (!r.ok) { return res.json({ ok: true, deployedBranchGuess: 'main', slug, db: dbRow, opensea_live: { error: `HTTP ${r.status} on page ${pages}`, pagesCompleted: pages } }); }
+      if (!r.ok) { err = `HTTP ${r.status} on page ${pages}: ${(await r.text().catch(()=>'')).slice(0,160)}`; break; }
       const body = await r.json();
       const listings = body.listings || [];
-      totalRaw += listings.length;
-      for (const listing of listings) {
-        const cands = [
-          listing?.criteria?.nft?.identifier, listing?.nft?.identifier, listing?.asset?.token_id,
-          listing?.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria,
-          listing?.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria,
-        ];
-        for (let c of cands) {
-          if (!c) continue;
-          c = String(c);
-          const parts = c.includes('/') ? c.split('/') : c.split(':');
-          const last = parts[parts.length - 1];
-          if (last && /^\d+$/.test(last)) { uniqueTokenIds.add(parseInt(last, 10)); break; }
-        }
+      raw += listings.length;
+      for (const l of listings) {
+        if (!sample) sample = { keys: Object.keys(l), type: l.type, protocol_address: l.protocol_address, price: l.price };
+        const id = tokenIdOf(l);
+        const p = priceOf(l);
+        bump(byCurrency, l?.price?.current?.currency || l?.price?.currency);
+        bump(byType, l?.type);
+        bump(byProtocol, l?.protocol_address);
+        if (id == null) { noId++; continue; }
+        if (p == null || !(p > 0)) badPrice++;
+        ids.add(id);
       }
       next = body.next || null;
       pages++;
       if (pages >= 150) break;
-      if (next) await new Promise(r2 => setTimeout(r2, 80));
+      if (next) await new Promise(r2 => setTimeout(r2, 100));
     } while (next);
+    return { ids, summary: { pages, completedFully: !err && next === null, error: err, totalRawListings: raw,
+      uniqueTokens: ids.size, listingsWithNoTokenId: noId, listingsWithNoUsablePrice: badPrice,
+      byCurrency, byType, byProtocolAddress: byProtocol, sampleListing: sample } };
+  }
+
+  try {
+    const dbRows = await pool.query(`SELECT token_id, updated_at FROM listings WHERE collection_slug = $1`, [slug]);
+    const dbIds = new Set(dbRows.rows.map(r => parseInt(r.token_id, 10)));
+    const newest = dbRows.rows.reduce((m, r) => (!m || r.updated_at > m ? r.updated_at : m), null);
+    if (!key) return res.json({ ok: true, slug, db: { uniqueTokens: dbIds.size, newestUpdate: newest }, error: 'no OpenSea key configured on this service' });
+
+    const all  = await pull('all');
+    const best = await pull('best');
+    const only = (a, b) => [...a].filter(x => !b.has(x)).sort((x, y) => x - y);
+    const lim = arr => ({ count: arr.length, tokenIds: arr.slice(0, 60) });
+
+    let stats = null;
+    try {
+      const r = await fetch(`https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}/stats`, { headers: { 'x-api-key': key, 'Accept': 'application/json' } });
+      if (r.ok) stats = (await r.json())?.total || null;
+    } catch {}
 
     res.json({
-      ok: true,
-      deployedBranchGuess: 'main',
-      slug,
-      db: dbRow,
-      opensea_live: {
-        pagesCompleted: pages,
-        totalRawListingsSeen: totalRaw,
-        uniqueTokenIdsSeen: uniqueTokenIds.size,
-        completedFully: next === null,
+      ok: true, slug, chain,
+      howToRead: 'If best.uniqueTokens > all.uniqueTokens, OpenSea counts listings that /all (what TraitView syncs) omits -- look up a few tokenIds from inBestNotInAll on OpenSea to see what kind of listing they are. If db != all, the sync itself is dropping or lagging.',
+      db: { uniqueTokens: dbIds.size, newestUpdate: newest },
+      all: all.summary,
+      best: best.summary,
+      diff: {
+        inBestNotInAll: lim(only(best.ids, all.ids)),
+        inAllNotInBest: lim(only(all.ids, best.ids)),
+        inAllNotInDb:   lim(only(all.ids, dbIds)),
+        inDbNotInAll:   lim(only(dbIds, all.ids)),
       },
+      openseaCollectionStats: stats,
     });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── TEMP DIAGNOSTIC — checking whether Argonauts (or any non-OCAS
+// collection) actually has obs_rank populated in the DB, or whether it's
+// NULL for every row (meaning /db/traits-fast's ORDER BY obs_rank falls
+// back entirely to id order -- TV Rank effectively becoming "rank = token
+// ID", not a real rarity computation at all). Remove once this is settled.
+app.get('/diag/obs-rank-check', async (req, res) => {
+  const slug = (req.query.slug || 'argonauts').toString();
+  try {
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS total, COUNT(obs_rank)::int AS with_obs_rank,
+              MIN(obs_rank)::int AS min_rank, MAX(obs_rank)::int AS max_rank
+       FROM tokens WHERE collection_slug = $1`,
+      [slug]
+    );
+    res.json({ ok: true, slug, ...r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/recompute-ranks — (re)run TV Rank for an already-
+// onboarded collection ────────────────────────────────────────────────────
+// Same admin gating as /db/collections/onboard, same reasoning (this key is
+// already visible in TraitView's public frontend JS via devtools, so it
+// can't gate anything on its own). Exists specifically because Argonauts
+// (and potentially other collections onboarded before computeObsRanks()
+// existed) already went through onboarding with obs_rank left entirely
+// NULL -- this lets that be fixed without a full re-onboard. Safe to call
+// repeatedly; always a full recompute from current token_traits.
+app.get('/db/collections/recompute-ranks', async (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  const slug = String(req.query.slug || '').toLowerCase().trim();
+  if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+  const isOcas = slug === OCAS_SLUG;
+  try {
+    const result = await computeObsRanks(pool, slug, { isOcas });
+    res.json({ ok: true, slug, ...result });
+  } catch (e) {
+    console.error(`[/db/collections/recompute-ranks] ${slug} failed:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/refresh-burned-status — bulk on-chain ownership
+// check for tokens sent to a known dead address ─────────────────────────────
+// jv: Argonauts has no protocol-level burn mechanic -- a third-party account
+// independently sent ~15 tokens (and possibly more over time) to a dead
+// address on their own. See lib/burn-detect.js for why this needs its own,
+// separate mechanism from OCAS's burn_events tracking. Same admin gating as
+// the endpoints above. Chains straight into a rank recompute afterward,
+// since a token's burned status changing is exactly the kind of thing that
+// should shift every other token's rank too, same as any other trait-data
+// change -- running this without following it with a recompute would just
+// leave ranks stale relative to whatever this just found.
+app.get('/db/collections/refresh-burned-status', async (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  const slug = String(req.query.slug || '').toLowerCase().trim();
+  if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+  try {
+    const colRes = await pool.query(`SELECT contract, chain FROM collections WHERE slug = $1`, [slug]);
+    if (!colRes.rows[0]) return res.status(404).json({ ok: false, error: `no collection on file for slug "${slug}"` });
+    const { contract, chain } = colRes.rows[0];
+    const burnResult = await refreshBurnedStatus(pool, { slug, contract, chain: chain || 'ethereum' });
+    const rankResult = await computeObsRanks(pool, slug, { isOcas: slug === OCAS_SLUG });
+    res.json({ ok: true, slug, ...burnResult, ranked: rankResult.tokenCount });
+  } catch (e) {
+    console.error(`[/db/collections/refresh-burned-status] ${slug} failed:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /db/collections/backfill-links — fetch/update OpenSea/Website/
+// Twitter for an already-onboarded collection ───────────────────────────────
+// jv: hamburger menu links were hardcoded to OCAS for every collection.
+// New onboardings pick these up automatically (see lib/collection-onboard.js),
+// but Argonauts itself onboarded before these three columns existed at all --
+// this is specifically for backfilling it (and anything else onboarded
+// before now) without a full re-onboard. Same admin gating as the endpoints
+// above; safe to call repeatedly.
+app.get('/db/collections/backfill-links', async (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  const slug = String(req.query.slug || '').toLowerCase().trim();
+  if (!slug) return res.status(400).json({ ok: false, error: 'slug required' });
+  try {
+    const result = await backfillCollectionLinks(pool, slug);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error(`[/db/collections/backfill-links] ${slug} failed:`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── TEMP DIAGNOSTIC — recompute-ranks reported 9167 for Argonauts against a
+// total of 9168 tokens on file. computeObsRanks() only ranks tokens that
+// have at least one token_traits row, so this finds whichever token has
+// none at all (a metadata fetch failure, most likely) to confirm that's
+// really the gap rather than something else. Remove once this is settled.
+app.get('/diag/tokens-missing-traits', async (req, res) => {
+  const slug = (req.query.slug || 'argonauts').toString();
+  try {
+    const r = await pool.query(
+      `SELECT t.id FROM tokens t
+       WHERE t.collection_slug = $1
+       AND NOT EXISTS (SELECT 1 FROM token_traits tt WHERE tt.token_id = t.id AND tt.collection_slug = t.collection_slug)
+       ORDER BY t.id`,
+      [slug]
+    );
+    const missingIds = r.rows.map(row => row.id);
+
+    // For each missing token: pull its own tokens-table row (does it even
+    // exist as real data, or is it a bare placeholder row with nothing but
+    // an id?) and try a direct OpenSea lookup (does this token ID actually
+    // exist as a real, minted NFT at all, independent of anything in this
+    // DB) -- settles whether this is a real gap or just an artifact of how
+    // the range-based backfill iterates (e.g. starting from 0 even though
+    // minting actually starts at 1).
+    const details = [];
+    for (const id of missingIds) {
+      const rowRes = await pool.query(`SELECT * FROM tokens WHERE id=$1 AND collection_slug=$2`, [id, slug]);
+      const colRes = await pool.query(`SELECT contract, chain FROM collections WHERE slug=$1`, [slug]);
+      let openSeaExists = null;
+      if (colRes.rows[0] && process.env.OPENSEA_API_KEY) {
+        try {
+          const osRes = await fetch(
+            `https://api.opensea.io/api/v2/chain/${colRes.rows[0].chain || 'ethereum'}/contract/${colRes.rows[0].contract}/nfts/${id}`,
+            { headers: { 'X-API-KEY': process.env.OPENSEA_API_KEY } }
+          );
+          openSeaExists = osRes.ok;
+        } catch (e) {
+          openSeaExists = `fetch error: ${e.message}`;
+        }
+      }
+      details.push({ id, dbRow: rowRes.rows[0] || null, existsOnOpenSea: openSeaExists });
+    }
+
+    res.json({ ok: true, slug, missingCount: missingIds.length, details });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── TEMP DIAGNOSTIC — jv: "the sales history is WRONG. token #1477 is MY
+// token. it does not have 610 sales. I MINTED token #1477 and eventually
+// transferred it to another wallet. that is it." Confirmed genuinely
+// wrong data (the on-chain transfer log shows only a mint + one transfer,
+// ever) -- not legitimate wash trading, and not the cross-collection-
+// slug bug already fixed in /db/token-sales et al. (the obs_rank this
+// token's own sales correctly join against matches its real rank, which
+// only happens if collection_slug on these rows is genuinely 'argonauts'
+// already -- a different collection's data bleeding through would fail
+// that join or return a mismatched rank). Surfaces every token_id in a
+// collection with a suspiciously high sale count, so the real scope of
+// the problem (one token? many? all clustered in one time window?) is
+// visible before deciding on a fix. Remove once this is settled.
+app.get('/diag/sales-per-token', async (req, res) => {
+  const slug = (req.query.slug || 'argonauts').toString().toLowerCase();
+  const minCount = Math.max(2, parseInt(req.query.min_count || '10', 10));
+  try {
+    const r = await pool.query(
+      `SELECT token_id, COUNT(*) AS sale_count,
+              COUNT(DISTINCT buyer) AS distinct_buyers,
+              COUNT(DISTINCT seller) AS distinct_sellers,
+              MIN(sale_ts) AS first_sale, MAX(sale_ts) AS last_sale
+       FROM sales
+       WHERE collection_slug = $1
+       GROUP BY token_id
+       HAVING COUNT(*) >= $2
+       ORDER BY sale_count DESC
+       LIMIT 50`,
+      [slug, minCount]
+    );
+    const totalRes = await pool.query(`SELECT COUNT(*) AS total FROM sales WHERE collection_slug = $1`, [slug]);
+    res.json({ ok: true, slug, minCount, affectedTokenCount: r.rows.length, totalSalesInCollection: parseInt(totalRes.rows[0].total, 10), tokens: r.rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── TEMP DIAGNOSTIC/REPAIR — browser-URL versions of diag-verify-sales-
+// onchain.js / repair-wrong-sales-rows.js. jv: "im honest im so confused.
+// im a beginner need to explain better for me" -- those two scripts work,
+// but need a terminal, Railway CLI, and environment variables set up
+// correctly, none of which jv has done before. This does the exact same
+// verification (real on-chain transaction logs, not inference) and the
+// exact same repair (delete only rows confirmed wrong that way), but
+// through plain URLs opened in a browser tab -- the same thing jv already
+// did successfully for /diag/sales-per-token above. The verify step can
+// take a few minutes (one RPC call per flagged transaction) and browsers/
+// proxies often time out a request that takes that long, so it runs in
+// the background: /verify-sales-onchain/start kicks it off and returns
+// immediately, /verify-sales-onchain/status is opened again a bit later to
+// check progress or see the finished result. Job state lives in memory
+// only (this is a one-off tool, not something needing to survive a
+// restart) -- one job at a time, most recent slug/result only.
+// Remove this whole block once the current data is cleaned up.
+let _salesVerifyJob = null; // { slug, minTokenCount, status, startedAt, progress, result, error }
+
+async function _runSalesVerifyJob(slug, minTokenCount){
+  const TRANSFER_TOPIC0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  function realTokenIdsFromReceipt(receipt, contract){
+    const ids = new Set();
+    for (const log of (receipt.logs || [])) {
+      if (String(log.address || '').toLowerCase() !== contract.toLowerCase()) continue;
+      if (!log.topics || log.topics[0] !== TRANSFER_TOPIC0) continue;
+      if (log.topics.length !== 4) continue;
+      ids.add(parseInt(log.topics[3], 16));
+    }
+    return ids;
+  }
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  let contract;
+  if (slug === OCAS_SLUG) {
+    contract = OCAS_CONTRACT;
+  } else {
+    const colRes = await pool.query(`SELECT contract FROM collections WHERE slug=$1`, [slug]);
+    if (!colRes.rows[0] || !colRes.rows[0].contract) throw new Error(`No contract on file for slug "${slug}"`);
+    contract = colRes.rows[0].contract;
+  }
+
+  const rpcUrl = burnRpcUrl();
+  const flaggedRes = await pool.query(
+    `SELECT tx_hash FROM sales WHERE tx_hash IS NOT NULL AND collection_slug = $2
+     GROUP BY tx_hash HAVING COUNT(DISTINCT token_id) >= $1`,
+    [minTokenCount, slug]
+  );
+  const txHashes = flaggedRes.rows.map(r => r.tx_hash);
+  _salesVerifyJob.progress = { checked: 0, total: txHashes.length };
+
+  const wrongRows = [];
+  let confirmedCorrect = 0, confirmedWrong = 0, lookupFailures = 0;
+
+  for (let i = 0; i < txHashes.length; i++) {
+    const txHash = txHashes[i];
+    _salesVerifyJob.progress.checked = i;
+
+    let receipt;
+    try {
+      receipt = await burnRpc(rpcUrl, 'eth_getTransactionReceipt', [txHash]);
+      if (!receipt) throw new Error('null receipt');
+    } catch (e) {
+      lookupFailures++;
+      await sleep(150);
+      continue;
+    }
+
+    const realTokenIds = realTokenIdsFromReceipt(receipt, contract);
+    const rowsRes = await pool.query(`SELECT id, token_id FROM sales WHERE tx_hash=$1 AND collection_slug=$2`, [txHash, slug]);
+    for (const row of rowsRes.rows) {
+      if (realTokenIds.has(parseInt(row.token_id))) {
+        confirmedCorrect++;
+      } else {
+        confirmedWrong++;
+        wrongRows.push({ id: row.id, token_id: parseInt(row.token_id), tx_hash: txHash });
+      }
+    }
+    await sleep(150);
+  }
+
+  _salesVerifyJob.progress.checked = txHashes.length;
+  _salesVerifyJob.status = 'done';
+  _salesVerifyJob.finishedAt = new Date().toISOString();
+  _salesVerifyJob.result = {
+    transactionsChecked: txHashes.length,
+    lookupFailures,
+    confirmedCorrect,
+    confirmedWrong,
+    wrongRowCount: wrongRows.length,
+    wrongRows, // full list kept for the repair step below; sample only is returned in the status response
+  };
+}
+
+app.get('/diag/verify-sales-onchain/start', (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
+  const minTokenCount = Math.max(2, parseInt(req.query.min_count || '5', 10));
+
+  if (_salesVerifyJob && _salesVerifyJob.status === 'running') {
+    return res.json({ ok: true, alreadyRunning: true, slug: _salesVerifyJob.slug, progress: _salesVerifyJob.progress });
+  }
+
+  _salesVerifyJob = { slug, minTokenCount, status: 'running', startedAt: new Date().toISOString(), progress: { checked: 0, total: 0 }, result: null, error: null };
+  _runSalesVerifyJob(slug, minTokenCount).catch(e => {
+    _salesVerifyJob.status = 'error';
+    _salesVerifyJob.error = e.message;
+  });
+
+  res.json({ ok: true, started: true, slug, message: 'Started. Open /diag/verify-sales-onchain/status?admin_key=...&slug=' + slug + ' in a minute or two to check progress.' });
+});
+
+app.get('/diag/verify-sales-onchain/status', (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  if (!_salesVerifyJob) return res.json({ ok: true, status: 'not_started' });
+  const { slug, minTokenCount, status, startedAt, finishedAt, progress, error, result } = _salesVerifyJob;
+  const response = { ok: true, slug, minTokenCount, status, startedAt, finishedAt, progress, error };
+  if (result) {
+    response.result = {
+      transactionsChecked: result.transactionsChecked,
+      lookupFailures: result.lookupFailures,
+      confirmedCorrect: result.confirmedCorrect,
+      confirmedWrong: result.confirmedWrong,
+      wrongRowCount: result.wrongRowCount,
+      sampleWrongRows: result.wrongRows.slice(0, 10),
+    };
+  }
+  res.json(response);
+});
+
+app.get('/diag/verify-sales-onchain/repair', async (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  if (!_salesVerifyJob || _salesVerifyJob.status !== 'done' || !_salesVerifyJob.result) {
+    return res.status(400).json({ ok: false, error: 'No completed diagnostic to repair from -- open /diag/verify-sales-onchain/start first and wait for it to finish.' });
+  }
+  const write = req.query.write === 'true';
+  const slug = _salesVerifyJob.slug;
+  const ids = _salesVerifyJob.result.wrongRows.map(r => r.id);
+  if (!ids.length) return res.json({ ok: true, message: 'Nothing to delete -- the diagnostic found no confirmed-wrong rows.' });
+
+  try {
+    const checkRes = await pool.query(`SELECT id, token_id, tx_hash FROM sales WHERE id = ANY($1::bigint[]) AND collection_slug = $2`, [ids, slug]);
+    if (!write) {
+      return res.json({ ok: true, dryRun: true, slug, wouldDelete: checkRes.rows.length, expected: ids.length, sample: checkRes.rows.slice(0, 10) });
+    }
+    const delRes = await pool.query(`DELETE FROM sales WHERE id = ANY($1::bigint[]) AND collection_slug = $2`, [ids, slug]);
+    res.json({ ok: true, deleted: delRes.rowCount, expected: ids.length, slug });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── TEMP DIAGNOSTIC/REPAIR (per-token) — jv: "still not correct" (#1477
+// still showing 40 sales after the collection-wide repair above, against a
+// real transfer log of a mint + one transfer -- zero genuine sales). The
+// collection-wide check above only ever looked at tx_hash values shared
+// across 5+ DISTINCT token_ids (the bulk, page-size-50 duplication
+// pattern) -- it never touched rows with their own individual, not-shared
+// tx_hash, which is apparently a separate, second way wrong rows got in.
+// This checks every sales row for ONE specific token_id directly against
+// real on-chain logs, regardless of whether its tx_hash is shared with
+// anything else -- small enough in scope (one token's own rows) to run
+// synchronously, no background job needed. Same real-on-chain-truth
+// verification as above, just scoped differently.
+// ── TEMP DIAGNOSTIC — jv: "so this needs a same per token check still?
+// i have no idea how many tokens are affected." The real bug (fixed
+// above, lib/wallet-backfill.js) fires specifically when enrichCostBasis()
+// runs for a token whose held/holding wallet still needs its cost basis
+// resolved (wallet_token_intervals.cost_eth IS NULL OR 0) -- that's a much
+// smaller, more specific candidate set than "every token in the
+// collection", and it's a plain DB query, no blockchain calls needed, so
+// it's fast enough to just answer directly rather than guessing at scale.
+// Being a candidate here doesn't guarantee that token actually has wrong
+// rows (this function may never have run for it, or may have succeeded
+// via the FIRST, already-correct account-level lookup before ever
+// reaching the buggy per-token one) -- it's an upper bound on which
+// tokens are worth actually running /diag/verify-token-sales against,
+// not a confirmed-wrong list itself.
+app.get('/diag/cost-basis-candidates', async (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
+  try {
+    const r = await pool.query(
+      `SELECT DISTINCT token_id FROM wallet_token_intervals
+       WHERE collection_slug = $1 AND (cost_eth IS NULL OR cost_eth = 0)
+       ORDER BY token_id`,
+      [slug]
+    );
+    const tokenIds = r.rows.map(row => row.token_id);
+    res.json({ ok: true, slug, candidateCount: tokenIds.length, tokenIds });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// jv: "so this needs a same per token check still? i have no idea how
+// many tokens are affected." /diag/cost-basis-candidates turned out to
+// list exactly 8 tokens. Originally converted this to a start/status/
+// repair background job out of concern that checking all 8 together
+// could risk a timeout on a plain request -- but the actual run took
+// about 7 seconds (most of these tokens' wrong rows share the same
+// handful of underlying transactions, so the receipt cache made real
+// RPC calls far fewer than the row count suggested). That background-
+// job design then broke in a more serious way: results kept
+// disappearing between the start/status/repair calls, most likely
+// because this API runs on more than one server instance and each has
+// its own separate memory -- a job started on one instance is
+// invisible to a later request handled by a different one. Collapsed
+// back into one single, synchronous request that verifies and (with
+// write=true) deletes in the same call -- nothing stored in memory
+// between requests, so there's nothing for a second instance to miss.
+app.get('/diag/verify-token-sales', async (req, res) => {
+  if (!ADMIN_ONBOARD_SECRET || req.query.admin_key !== ADMIN_ONBOARD_SECRET) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  const slug = (req.query.slug || OCAS_SLUG).toLowerCase();
+  const rawIds = (req.query.token_ids || req.query.token_id || '').toString();
+  const tokenIds = rawIds.split(',').map(s => parseInt(s.trim(), 10)).filter(Number.isFinite);
+  if (!tokenIds.length) return res.status(400).json({ ok: false, error: 'token_id or token_ids required' });
+  const write = req.query.write === 'true';
+
+  const TRANSFER_TOPIC0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  function realTokenIdsFromReceipt(receipt, contract){
+    const ids = new Set();
+    for (const log of (receipt.logs || [])) {
+      if (String(log.address || '').toLowerCase() !== contract.toLowerCase()) continue;
+      if (!log.topics || log.topics[0] !== TRANSFER_TOPIC0) continue;
+      if (log.topics.length !== 4) continue;
+      ids.add(parseInt(log.topics[3], 16));
+    }
+    return ids;
+  }
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  try {
+    let contract;
+    if (slug === OCAS_SLUG) {
+      contract = OCAS_CONTRACT;
+    } else {
+      const colRes = await pool.query(`SELECT contract FROM collections WHERE slug=$1`, [slug]);
+      if (!colRes.rows[0] || !colRes.rows[0].contract) return res.status(400).json({ ok: false, error: `No contract on file for slug "${slug}"` });
+      contract = colRes.rows[0].contract;
+    }
+
+    const rpcUrl = burnRpcUrl();
+    const receiptCache = new Map();
+    const perToken = {};
+    let totalConfirmedCorrect = 0, totalConfirmedWrong = 0, totalLookupFailures = 0;
+    const allWrongIds = [];
+
+    for (const tokenId of tokenIds) {
+      const rowsRes = await pool.query(`SELECT id, tx_hash, price_eth, currency, buyer, seller, sale_ts FROM sales WHERE token_id=$1 AND collection_slug=$2 ORDER BY sale_ts ASC`, [tokenId, slug]);
+      const wrongRows = [];
+      let confirmedCorrect = 0, lookupFailures = 0;
+
+      for (const row of rowsRes.rows) {
+        if (!row.tx_hash) { wrongRows.push({ id: row.id, tx_hash: null, reason: 'no tx_hash on file' }); continue; }
+        let realTokenIds = receiptCache.get(row.tx_hash);
+        if (!realTokenIds) {
+          try {
+            const receipt = await burnRpc(rpcUrl, 'eth_getTransactionReceipt', [row.tx_hash]);
+            if (!receipt) throw new Error('null receipt');
+            realTokenIds = realTokenIdsFromReceipt(receipt, contract);
+            receiptCache.set(row.tx_hash, realTokenIds);
+          } catch (e) {
+            lookupFailures++;
+            await sleep(150);
+            continue;
+          }
+          await sleep(150);
+        }
+        if (realTokenIds.has(tokenId)) {
+          confirmedCorrect++;
+        } else {
+          wrongRows.push({ id: row.id, tx_hash: row.tx_hash, price_eth: row.price_eth, sale_ts: row.sale_ts, actualTokenIdsInTx: Array.from(realTokenIds) });
+        }
+      }
+
+      perToken[tokenId] = { totalRows: rowsRes.rows.length, confirmedCorrect, confirmedWrong: wrongRows.length, lookupFailures, sampleWrongRows: wrongRows.slice(0, 5) };
+      totalConfirmedCorrect += confirmedCorrect;
+      totalConfirmedWrong += wrongRows.length;
+      totalLookupFailures += lookupFailures;
+      allWrongIds.push(...wrongRows.map(r => r.id));
+    }
+
+    if (!write) {
+      return res.json({ ok: true, dryRun: true, slug, tokenIds, totalConfirmedCorrect, totalConfirmedWrong, totalLookupFailures, wouldDelete: allWrongIds.length, perToken });
+    }
+
+    if (!allWrongIds.length) return res.json({ ok: true, slug, tokenIds, deleted: 0, message: 'Nothing confirmed wrong across these tokens -- no rows deleted.' });
+    const delRes = await pool.query(`DELETE FROM sales WHERE id = ANY($1::bigint[]) AND collection_slug = $2`, [allWrongIds, slug]);
+    res.json({ ok: true, slug, tokenIds, deleted: delRes.rowCount, expected: allWrongIds.length, totalConfirmedCorrect, totalLookupFailures });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -2766,6 +4636,11 @@ runMigrations().then(() => {
     console.log(`TraitView API running on port ${PORT}`);
     console.log(`Auth: ${API_SECRET ? 'enabled' : (REQUIRE_API_AUTH ? 'REQUIRED BUT MISSING' : 'DISABLED (dev only; set API_SECRET to enable)')}`);
   });
+  // Live sale feed: subscribe to every fully-onboarded collection's
+  // item_sold events right away, so the stream is already running before
+  // any TraitView client connects -- not lazily on first request, which
+  // would miss whatever sold in the gap before the first viewer showed up.
+  saleStream.subscribeToAllReadyCollections();
 }).catch(e => {
   console.error('[Migrations] Failed to run on startup:', e.message);
   // Still start the server even if migrations failed -- an existing,
@@ -2773,5 +4648,6 @@ runMigrations().then(() => {
   app.listen(PORT, () => {
     console.log(`TraitView API running on port ${PORT} (migrations may be incomplete, check logs above)`);
   });
+  saleStream.subscribeToAllReadyCollections();
 });
 

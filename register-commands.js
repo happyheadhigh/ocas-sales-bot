@@ -26,13 +26,12 @@ const commands = [
 
   new SlashCommandBuilder().setName('status').setDescription('Show current bot configuration'),
 
-
   new SlashCommandBuilder().setName('download')
   .setDescription('Download a high-res PNG for OCAS or another configured collection — leave blank for a guided menu')
   .addStringOption(o=>o.setName('search').setDescription('Example: ocas #337 2048 no bg').setRequired(false))
   .addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(false).setMinValue(1))
   .addStringOption(o=>o.setName('collection').setDescription('Collection slug or alias. Defaults to OCAS').setRequired(false).setAutocomplete(true))
-  .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(512).setMaxValue(4096))
+  .addIntegerOption(o=>o.setName('size').setDescription('PNG size in pixels, default 2048').setRequired(false).setMinValue(50).setMaxValue(4096))
   .addBooleanOption(o=>o.setName('transparent').setDescription('Export with transparent/no background').setRequired(false)),
 
   new SlashCommandBuilder().setName('lastsale').setDescription('Show the most recent sale').addStringOption(o=>o.setName('collection').setDescription('Collection slug (uses server default if not set)').setRequired(false).setAutocomplete(true)),
@@ -47,17 +46,17 @@ const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 
   new SlashCommandBuilder().setName('rankfind').setDescription('Find listings or sales by OS rank range — leave blank for a guided menu').addIntegerOption(o=>o.setName('min_rank').setDescription('Minimum OS rank (default 1)').setRequired(false).setMinValue(1).setMaxValue(10000)).addIntegerOption(o=>o.setName('max_rank').setDescription('Maximum OS rank (default 100)').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('mode').setDescription('What to search (default: listings)').setRequired(false).addChoices({name:'Listings',value:'listings'},{name:'Sales',value:'sales'})).addStringOption(o=>o.setName('sort').setDescription('Sort order for listings (default: cheapest first)').setRequired(false).addChoices({name:'Cheapest first',value:'price'},{name:'Best rank first',value:'rank'})).addStringOption(o=>o.setName('collection').setDescription('Collection slug').setRequired(false).setAutocomplete(true)),
-  new SlashCommandBuilder().setName('ocas').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false)),
+  new SlashCommandBuilder().setName('arbitrage').setDescription('Check current listings for a gross spread below the best WETH offer').addStringOption(o=>o.setName('collection').setDescription('Collection slug (defaults to primary)').setRequired(false).setAutocomplete(true)),
   new SlashCommandBuilder().setName('token').setDescription('Show a random OCAS — search by trait, count, rank, or token ID').addIntegerOption(o=>o.setName('token').setDescription('Specific token ID').setRequired(false).setMinValue(1).setMaxValue(10000)).addStringOption(o=>o.setName('search').setDescription('Search: zombie, 15 traits, rank 1-100, or token number').setRequired(false))
     .addStringOption(o=>o.setName('collection').setDescription('Collection to search (defaults to primary)').setRequired(false).setAutocomplete(true)),
-  new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep cheapest listed OCAS').addStringOption(o=>o.setName('search').setDescription('e.g. 10, 2eth, 0.05 floor, 10 zombie').setRequired(false)),
+  // /sweep re-added: its handler is fully generic/multi-collection-aware
+  // (resolveCollectionFromServerCfg + per-guild paid-tier gate) — it only
+  // got caught in the original OCAS-specific command removal because its
+  // description said "OCAS." burnstats/burnlatest/burn/burnwallet/
+  // burnleaderboard/burnrefresh stay removed — those genuinely only work
+  // with OCAS's burn-tracking data, which this deployment doesn't have.
+  new SlashCommandBuilder().setName('sweep').setDescription('Calculate ETH cost to sweep the cheapest listed tokens in your collection').addStringOption(o=>o.setName('search').setDescription('e.g. 10, 2eth, 0.05 floor, 10 zombie').setRequired(false)).addStringOption(o=>o.setName('collection').setDescription('Collection to sweep (defaults to primary)').setRequired(false).setAutocomplete(true)),
 
-  new SlashCommandBuilder().setName('burnstats').setDescription('Show OCAS Burn Machine stats — total burned, created, estimated supply'),
-  new SlashCommandBuilder().setName('burnlatest').setDescription('Show recent finalized OCAS burn events').addIntegerOption(o=>o.setName('count').setDescription('Number of burns to show (max 10, default 1)').setRequired(false).setMinValue(1).setMaxValue(10)),
-  new SlashCommandBuilder().setName('burn').setDescription('Show burn status and lineage for a token').addIntegerOption(o=>o.setName('token').setDescription('Token ID').setRequired(true).setMinValue(1).setMaxValue(10000)),
-  new SlashCommandBuilder().setName('burnwallet').setDescription('Show burn history for a wallet address').addStringOption(o=>o.setName('wallet').setDescription('Wallet address (0x...)').setRequired(true)),
-  new SlashCommandBuilder().setName('burnleaderboard').setDescription('Top OCAS burners ranked by tokens burned'),
-  new SlashCommandBuilder().setName('burnrefresh').setDescription('Refresh metadata and re-post burn alert for a created token (5 min cooldown)').addIntegerOption(o=>o.setName('token').setDescription('Survivor/created token ID').setRequired(true).setMinValue(1).setMaxValue(10000)),
 
   new SlashCommandBuilder().setName('synctraits').setDescription('Refresh token traits from contract — fixes missing/stale traits in DB (admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('mode').setDescription('survivors = refresh all burn survivors; token = single token (default)').setRequired(false).addChoices({name:'Single token',value:'token'},{name:'All burn survivors',value:'survivors'}))
@@ -71,9 +70,37 @@ const commands = [
 
   new SlashCommandBuilder().setName('setup').setDescription('Setup wizard — configure your bot step by step (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('config').setDescription('Configure your bot — collections, channels, roles (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-  new SlashCommandBuilder().setName('lotteries').setDescription('View live and completed lotteries and giveaways'),
-  new SlashCommandBuilder().setName('giveaway').setDescription('Start a burn lottery, giveaway, guess game, or instant draw (Admin only)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('globalstats').setDescription('Owner only').setDefaultMemberPermissions('0'),
+  // jv: Argonauts (and any future collection with the same architecture --
+  // traits predetermined on-chain, independent of minting, via a separate
+  // renderer contract's own tokenURI(id, traits, printed)) needs a one-time
+  // setup + backfill trigger, distinct from the normal per-server /config
+  // dashboard since this is a bot-wide data-source decision, not a server
+  // preference. Owner-gated the same way globalstats is -- default_member_permissions
+  // '0' hides it from every server's command picker; the real gate is the
+  // OWNER_DISCORD_IDS check in the handler, same as every other owner-only
+  // command here.
+  new SlashCommandBuilder().setName('predetermined').setDescription('Owner only — set up or run the predetermined on-chain trait source for a collection').setDefaultMemberPermissions('0')
+    .addStringOption(o=>o.setName('slug').setDescription('Collection slug (must already be onboarded)').setRequired(true))
+    .addStringOption(o=>o.setName('renderer_contract').setDescription('The renderer contract address (0x...) — only needed the first time for a collection').setRequired(false))
+    .addIntegerOption(o=>o.setName('max_id').setDescription('Override the highest token ID (default: tries on-chain MAX_ID, then stored supply)').setRequired(false).setMinValue(1)),
+
+  // jv: "this was fixed with the bot a while ago" -- this contract's own
+  // MetadataUpdate/BatchMetadataUpdate signal was confirmed unreliable at
+  // scale (missed hundreds to thousands of tokens whose traits changed
+  // before the event poller existed, or that it simply never announced).
+  // fullCollectionVerification() (lib/metadata-update-poller.js) already
+  // existed as the real fix -- a full direct on-chain re-check of every
+  // token, bypassing events entirely -- but was only ever reachable via a
+  // raw HTTP endpoint (/db/metadata-verify-all/:slug), never through
+  // Discord. That's exactly why this resurfaced with no way for jv to
+  // re-trigger it himself: staleness naturally re-accumulates over time
+  // since the underlying event signal never became reliable, and the fix
+  // was never wired up as something repeatable. Same owner-gating pattern
+  // as /predetermined and /globalstats.
+  new SlashCommandBuilder().setName('verifymetadata').setDescription('Owner only — re-check every token on-chain, bypassing the unreliable event signal').setDefaultMemberPermissions('0')
+    .addStringOption(o=>o.setName('slug').setDescription('Collection slug (must already be onboarded)').setRequired(true))
+    .addIntegerOption(o=>o.setName('concurrency').setDescription('Parallel on-chain reads (default: 4 — raise cautiously, this hits the RPC provider directly)').setRequired(false).setMinValue(1).setMaxValue(20)),
 
   new SlashCommandBuilder().setName('resetverify')
     .setDescription('Clear a member\'s verification so they can verify again (Admin only)')

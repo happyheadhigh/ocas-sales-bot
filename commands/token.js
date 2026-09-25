@@ -14,7 +14,7 @@ async function handleTokenCommand(commandName, ctx){
     COLORS, OCAS_CONTRACT, sweepSessions, API_SECRET,
     getTraitIndex, chooseTraitGroupsFromQuery, getRankTierColor, traitGroupsLabel,
     fetchTokenMetaFromDb, buildEmbedPayload, traitObjectToArray,
-    timeSince, shortAddr, formatEth, isDiscordOk,
+    timeSince, shortAddr, formatEth, isDiscordOk, verifyImageIsRaster, extractPngFromSvg,
   } = ctx;
 
   if(commandName==='token'){
@@ -23,6 +23,14 @@ async function handleTokenCommand(commandName, ctx){
     const colInput = interaction.options.getString('collection') || null;
     const resolved = resolveCollectionFromServerCfg(config, colInput);
     const activeCol = resolved ? {...config, ...resolved} : config;
+    // Generic label for the actually-resolved collection — this used to be a
+    // hardcoded "OCAS" throughout this command's user-facing text (title,
+    // error messages), so explicitly selecting a different collection (e.g.
+    // robinhood-chimps) still showed "OCAS #5000" in the embed even when the
+    // underlying data (image, traits, contract) was already correctly
+    // resolved to the right collection the whole time — the label was just
+    // lying about it.
+    const colLabel = activeCol.name || activeCol.contractName || activeCol.slug || activeCol.collectionSlug || 'Token';
     const tokenInput = interaction.options.getInteger('token');
     const rawSearch  = (interaction.options.getString('search') || '').trim();
     const contract   = activeCol.contract || config.contract || '';
@@ -88,7 +96,7 @@ async function handleTokenCommand(commandName, ctx){
         matchedGroups = resolved.groups;
 
         if(!matchedGroups.length){
-          await interaction.editReply(`I couldn't match **"${searchForTraits}"** to any known OCAS trait value. Try a more exact trait value like **Zombie**, **Gold Chain**, or **Diamond Choker**.`);
+          await interaction.editReply(`I couldn't match **"${searchForTraits}"** to any known ${colLabel} trait value. Try a more exact trait value like **Zombie**, **Gold Chain**, or **Diamond Choker**.`);
           return;
         }
         if(resolved.unmatched.length){
@@ -111,7 +119,7 @@ async function handleTokenCommand(commandName, ctx){
           if(!j.ok) throw new Error(j.error || 'multi-trait-floor API error');
           if(!j.floor){
             const label = matchedGroups.length ? traitGroupsLabel(matchedGroups) : `${traitCount} traits`;
-            await interaction.editReply(`No listed OCAS found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
+            await interaction.editReply(`No listed ${colLabel} found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
             return;
           }
           tokenId = j.floor.token_id;
@@ -125,7 +133,7 @@ async function handleTokenCommand(commandName, ctx){
           const tokens = j.tokens || [];
           if(!tokens.length){
             const label = matchedGroups.length ? traitGroupsLabel(matchedGroups) : `${traitCount} traits`;
-            await interaction.editReply(`No OCAS tokens found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
+            await interaction.editReply(`No ${colLabel} tokens found for **${label}**${traitCount !== null && matchedGroups.length ? ` + **${traitCount} traits**` : ''}${rankMin&&rankMax ? ` + **OS rank #${rankMin}–#${rankMax}**` : ''}.`);
             return;
           }
           const picked = tokens[Math.floor(Math.random() * tokens.length)];
@@ -136,13 +144,59 @@ async function handleTokenCommand(commandName, ctx){
       // ── Random fallback ───────────────────────────────────────────────────
       if(!tokenId) tokenId = Math.floor(Math.random()*10000)+1;
 
+      // Fetch OS rank + chain for title badge, rank-tier sidebar color, and
+      // correct-chain image/URL below — one fetch, used for both. Falls
+      // back to activeCol.collectionSlug too, matching the same pattern
+      // used for the Show Traits button's customId — activeCol.slug alone
+      // was inconsistent with how other parts of this same command resolve
+      // the collection, and fetchTokenMetaFromDb's own default param
+      // (OCAS_SLUG) means an undefined slug here silently fetches OCAS's
+      // data instead of failing loudly.
+      const resolvedSlugForMeta = activeCol.slug || activeCol.collectionSlug;
+      const dbMeta  = await fetchTokenMetaFromDb(tokenId, resolvedSlugForMeta).catch(()=>null);
+      console.log(`[token] dbMeta fetch: slug="${resolvedSlugForMeta}" (activeCol.slug="${activeCol.slug}" activeCol.collectionSlug="${activeCol.collectionSlug}") -> image_url=${dbMeta?.image_url ? 'present' : 'null'} chain=${dbMeta?.chain}`);
+      const tokenChain = dbMeta?.chain || 'ethereum';
+
       // ── Fetch + post image ────────────────────────────────────────────────
-      let imgResult = getCachedImage(`${contract}:${tokenId}`);
-      if(!imgResult){
-        imgResult = await resolveImage({identifier:String(tokenId)}, contract, 'ethereum');
-        if(imgResult) setCachedImage(`${contract}:${tokenId}`, imgResult);
+      // For collections whose metadata can actually change after mint
+      // (metadata_updates_supported=true, tracked via the EIP-4906 poller),
+      // this in-memory cache can silently outlive a real, correct DB refresh
+      // -- confirmed live: an image cached here from an earlier /token call
+      // persisted for up to its own 1-hour TTL even after the token's actual
+      // artwork changed and the DB was already correctly updated, because
+      // this cache has no way to know the DB changed underneath it. Static
+      // collections (the overwhelming majority) keep the full caching
+      // benefit unchanged -- this only bypasses the cache for the specific
+      // collections where staleness is actually possible.
+      const dynamicColRes = await pgPool.query(
+        `SELECT metadata_updates_supported FROM collections WHERE slug=$1`,
+        [resolvedSlugForMeta]
+      ).catch(() => ({ rows: [] }));
+      const isDynamicCollection = dynamicColRes.rows[0]?.metadata_updates_supported === true;
+
+      let imgResult = isDynamicCollection ? null : getCachedImage(`${contract}:${tokenId}`);
+      if(!imgResult && dbMeta?.image_url && isDiscordOk(dbMeta.image_url)){
+        // Prefer whatever the backfill already fetched and stored in
+        // tokens.image_url over a live OpenSea call — see the comment in
+        // fetchTokenMetaFromDb for why this matters for non-Ethereum chains.
+        // isDiscordOk alone isn't reliable, though — confirmed live that
+        // Alchemy's own CDN can serve genuine SVG content through a URL
+        // with zero textual indication of that (no .svg extension, no
+        // "image/svg" substring). Verify the real content-type before
+        // trusting the URL directly.
+        const isRaster = await verifyImageIsRaster(dbMeta.image_url);
+        if(isRaster){
+          imgResult = { type:'url', url: dbMeta.image_url };
+        } else {
+          const buf = await extractPngFromSvg(dbMeta.image_url).catch(() => null);
+          if(buf) imgResult = { type:'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+        }
       }
-      const osUrl = `https://opensea.io/assets/ethereum/${contract}/${tokenId}`;
+      if(!imgResult){
+        imgResult = await resolveImage({identifier:String(tokenId)}, contract, tokenChain);
+      }
+      if(imgResult && !isDynamicCollection) setCachedImage(`${contract}:${tokenId}`, imgResult);
+      const osUrl = `https://opensea.io/assets/${tokenChain}/${contract}/${tokenId}`;
       const tvUrl = `https://traitview.com/?token=${tokenId}`;
 
       // Description: trait values + count + rank only, no category labels
@@ -157,21 +211,29 @@ async function handleTokenCommand(commandName, ctx){
       const priceLine   = (wantFloor && floorPrice != null) ? `**Floor:** Ξ ${floorPrice >= 1 ? floorPrice.toFixed(3) : floorPrice.toFixed(4)}\n` : '';
       const contextLine = descParts.length ? `${descParts.join(' · ')}\n` : '';
 
-      // Fetch OS rank for title badge + rank-tier sidebar color
-      const dbMeta  = await fetchTokenMetaFromDb(tokenId, activeCol.slug).catch(()=>null);
       const osRank  = dbMeta?.os_rank ? Number(dbMeta.os_rank) : null;
       const rankBadge = osRank ? ` ⬥${osRank.toLocaleString()}` : '';
       const ocasColor = getRankTierColor(osRank) ?? COLORS.OCAS_BG;
 
       const traitsRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-          .setCustomId(`ocas_traits:${tokenId}`)
+          // Collection slug appended as a 3rd segment — previously this was
+          // just `ocas_traits:${tokenId}` (borrowed from the OCAS-only
+          // command's own button), so the handler had no way to know which
+          // collection a token belonged to and silently defaulted to OCAS
+          // every time. Confirmed live: /token showing "Chimps #5000" with
+          // the correct title still showed genuine OCAS traits (Type,
+          // Clothes, Hat Hair...) when Show Traits was clicked.
+          .setCustomId(`ocas_traits:${tokenId}:${encodeURIComponent(resolvedSlugForMeta || '')}`)
           .setLabel('Show Traits')
           .setStyle(ButtonStyle.Secondary)
       );
+      console.log(`[token] Show Traits button built with slug="${resolvedSlugForMeta || ''}" -> customId="ocas_traits:${tokenId}:${encodeURIComponent(resolvedSlugForMeta || '')}"`);
 
+      // Generic label for the actually-resolved collection — computed near
+      // the top of this function, see there for why.
       const embed = new EmbedBuilder()
-        .setTitle(`OCAS #${tokenId}${rankBadge}`)
+        .setTitle(`${colLabel} #${tokenId}${rankBadge}`)
         .setColor(ocasColor)
         .setDescription(`${priceLine}${contextLine}[OpenSea](${osUrl}) · [TraitView](${tvUrl})`);
 

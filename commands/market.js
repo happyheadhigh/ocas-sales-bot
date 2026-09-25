@@ -4,8 +4,9 @@ const { EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, Button
 const fetch = require('node-fetch');
 const { OWNER_DISCORD_IDS, OCAS_SLUG } = require('../lib/constants');
 const { extractPngFromSvg, resolveImage } = require('../lib/images');
-const { isDiscordOk } = require('../utils/format');
+const { isDiscordOk, verifyImageIsRaster } = require('../utils/format');
 const { initSession: initValuePicker, getSession: getValuePickerSession, clearSession: clearValuePicker, buildStackedValuePickerRows, recordMenuSelection, parseValuePickerCustomId } = require('../lib/value-picker');
+const { getLinkedWalletAddresses } = require('../lib/linked-wallets');
 
 /**
  * Handle market/NFT lookup commands.
@@ -75,20 +76,17 @@ function resolveCollectionFromServerCfg(serverCfg, collectionInput){
   const all = [primary, ...extras].filter(c => c.slug);
 
   if(!collectionInput) {
-    // No explicit collection was given -- and there's currently no slash
-    // command option to provide one anyway. Previously this just returned
-    // whatever "primary" happened to be configured as, with no regard for
-    // whether OCAS was even the primary slot. That's exactly how a server
-    // with OCAS registered as a secondary/"extra" collection (and
-    // something else as primary) silently swept the wrong collection with
-    // no way to override it. Prefer OCAS specifically wherever it's
-    // configured for this server; only fall back to "primary" as a last
-    // resort when OCAS genuinely isn't configured here and there's more
-    // than one other collection to choose between (fully ambiguous case).
-    const ocasMatch = all.find(c => (c.slug||'').toLowerCase() === OCAS_SLUG);
-    if(ocasMatch) return ocasMatch;
-    if(all.length === 1) return all[0];
-    return primary.slug ? primary : null;
+    // Blank /token (and other collection-aware commands) should show the
+    // guild's actual PRIMARY collection — whatever that's configured as —
+    // not a hardcoded preference for one specific collection. This used to
+    // explicitly search for and prefer OCAS wherever it was configured for
+    // a server (even as a secondary/"extra" collection), from back when
+    // /sweep and friends had no collection option at all and this was the
+    // only way to avoid silently sweeping the wrong collection. Every
+    // collection-aware command now has a real `collection` option with
+    // autocomplete, so that workaround is no longer needed and was actively
+    // wrong for any server where OCAS isn't the intended primary.
+    return primary.slug ? primary : (all[0] || null);
   }
 
   const input = collectionInput.toLowerCase();
@@ -148,7 +146,7 @@ async function handleMarketCommand(commandName, ctx){
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const sales=(await r.json()).asset_events||[];
       if(!sales.length){await interaction.editReply('No sales found.');return;}
-      const embed=await buildSaleEmbed(sales[0],activeConfig);
+      const embed=await buildSaleEmbed(sales[0],activeConfig, 'commands');
       const ir=embed._imageResult;delete embed._imageResult;
       if(ir?.type==='buffer'){const att=new AttachmentBuilder(ir.buffer,{name:ir.filename});embed.setThumbnail(`attachment://${ir.filename}`);await interaction.editReply({embeds:[embed],files:[att]});}
       else{if(ir?.type==='url')embed.setThumbnail(ir.url);await interaction.editReply({embeds:[embed]});}
@@ -171,7 +169,7 @@ async function handleMarketCommand(commandName, ctx){
       if(!sales.length){await interaction.editReply('No sales found.');return;}
       const cfg={...config,slug};
       const embeds=[];
-      for(const s of sales.reverse()){ const e=await buildSaleEmbed(s,cfg).catch(()=>null); if(e) embeds.push(e); }
+      for(const s of sales.reverse()){ const e=await buildSaleEmbed(s,cfg, 'commands').catch(()=>null); if(e) embeds.push(e); }
       await postEmbeds(interaction, embeds, `Last ${sales.length} sales for **${slug}**:`);
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
@@ -191,7 +189,7 @@ async function handleMarketCommand(commandName, ctx){
       if(!r.ok){await interaction.editReply('OpenSea error: '+r.status);return;}
       const sales=(await r.json()).asset_events||[];
       if(!sales.length){await interaction.editReply(`No sales found for #${tokenId}.`);return;}
-      const embed=await buildSaleEmbed(sales[0],config);
+      const embed=await buildSaleEmbed(sales[0],config, 'commands');
       const ir=embed._imageResult;delete embed._imageResult;
       if(ir?.type==='buffer'){const att=new AttachmentBuilder(ir.buffer,{name:ir.filename});embed.setThumbnail(`attachment://${ir.filename}`);await interaction.editReply({embeds:[embed],files:[att]});}
       else{if(ir?.type==='url')embed.setThumbnail(ir.url);await interaction.editReply({embeds:[embed]});}
@@ -267,7 +265,7 @@ async function handleMarketCommand(commandName, ctx){
             payment: { symbol: (sale.currency||'ETH'), token_address: (sale.currency||'ETH').toUpperCase()==='WETH'?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
             event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
           };
-          return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+          return buildSaleEmbed(syntheticSale, cfg, 'commands').catch(()=>null);
         }));
         const totalNote = j.count > want ? ` (showing ${want} of ${j.count} total)` : '';
         await postEmbeds(interaction, saleEmbeds.filter(Boolean),
@@ -302,7 +300,7 @@ async function handleMarketCommand(commandName, ctx){
             os_rank: t.os_rank || null,
             _dbToken: scopedDbToken,
           };
-          return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
+          return buildListingEmbed(fakeListingObj, cfg, 'commands').catch(()=>null);
         }
         const dbMeta = await fetchTokenMetaFromDb(tokenId, slug).catch(()=>null);
         return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
@@ -337,7 +335,7 @@ async function handleMarketCommand(commandName, ctx){
       const listings=(await r.json()).asset_events||[];
       if(!listings.length){await interaction.editReply('No listings found.');return;}
       const cfg={...config,slug:colSlug};
-      const embeds=await Promise.all(listings.reverse().map(l=>buildListingEmbed(l,cfg).catch(()=>null)));
+      const embeds=await Promise.all(listings.reverse().map(l=>buildListingEmbed(l,cfg, 'commands').catch(()=>null)));
       await postEmbeds(interaction, embeds.filter(Boolean), `${listings.length} recent listings for **${colSlug}**:`);
     }catch(e){await interaction.editReply('Error: '+e.message);}
     return;
@@ -426,8 +424,7 @@ async function handleMarketCommand(commandName, ctx){
       `Listing DMs: ${alertListings?'on':'off'}`,
       '',
       'You will receive DMs when matching events happen.',
-      'Use `/myalert` again to add more trait filters.',
-      'Use `/myalertclear` to remove your alert.'
+      'Run `/me` → **Trait Alert** to add more filters, pause, or remove your alert.'
     ].join('\n');
 
     await interaction.reply({content:lines, flags: MessageFlags.Ephemeral});
@@ -462,7 +459,7 @@ async function handleMarketCommand(commandName, ctx){
   // /myalertstatus
   if(commandName==='myalertstatus'){
     const alert=getAlert(interaction.user.id);
-    if(!alert){await interaction.reply({content:'You have no personal alert set. Use `/myalert` to create one.', flags: MessageFlags.Ephemeral});return;}
+    if(!alert){await interaction.reply({content:'You have no personal alert set. Run `/me` → **Trait Alert** to create one.', flags: MessageFlags.Ephemeral});return;}
     const filterStr=alert.traitFilters&&Object.keys(alert.traitFilters).length>0?Object.entries(alert.traitFilters).map(([k,v])=>`**${k}** = ${Array.isArray(v)?v.join(' OR '):v}`).join('\n'):'none (all events)';
     const lines=[
       `Collection: **${alert.slug||'any'}**`,
@@ -472,6 +469,84 @@ async function handleMarketCommand(commandName, ctx){
     ].join('\n');
     await interaction.reply({content:lines, flags: MessageFlags.Ephemeral});
     return;
+  }
+
+  // /arbitrage — checks current listings against the best applicable WETH
+  // offer for each token, surfacing any where the offer exceeds the listing
+  // price (a real, well-known "buy the listing, flip into the offer"
+  // strategy). Shows the GROSS spread only — see lib/arbitrage.js's own
+  // top comment for why fee/gas math isn't included.
+  if(commandName==='arbitrage'){
+    await interaction.deferReply({ ephemeral: true }).catch(()=>{});
+    const colInput = interaction.options.getString('collection') || null;
+    const resolved = resolveCollectionFromServerCfg(config, colInput);
+    const slug = resolved?.slug || config.slug;
+    const contract = resolved?.contract || config.contract;
+    if(!slug) return interaction.editReply({ content: 'Run `/setup` first or provide a collection.' });
+
+    const colChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const chain = colChainRes.rows[0]?.chain || 'ethereum';
+
+    const { checkArbitrageOpportunity, extractListingPriceEth, extractListingTokenId } = require('../lib/arbitrage');
+
+    try{
+      const qs = new URLSearchParams({ limit: '30', include_private_listings: 'true' });
+      const r = await fetch(`https://api.opensea.io/api/v2/listings/collection/${encodeURIComponent(slug)}/all?${qs}`, { headers: osHeaders() });
+      if(!r.ok) return interaction.editReply({ content: `Couldn't fetch current listings for **${slug}** (HTTP ${r.status}).` });
+      const j = await r.json();
+      const listings = j.listings || [];
+      if(!listings.length) return interaction.editReply({ content: `No active listings found for **${slug}**.` });
+      // Unconditional, once per command run — confirmed live that
+      // formatListingEth (designed for a different OpenSea endpoint's
+      // event-shaped payload, not this one's actual Seaport orders) was
+      // silently returning null for every single listing, skipping the
+      // arbitrage check entirely for all 30 results with zero indication
+      // anything had gone wrong. Logs the very first listing's raw shape so
+      // that specific class of bug is checkable directly against real data,
+      // not just inferred after the fact.
+      console.log(`[arbitrage] /arbitrage command: raw first listing for ${slug}: ${JSON.stringify(listings[0]).slice(0, 500)}`);
+
+      const results = [];
+      let checkedCount = 0;
+      for(const l of listings){
+        const tokenId = extractListingTokenId(l);
+        const listingPriceEth = extractListingPriceEth(l);
+        if(!tokenId || !listingPriceEth){
+          console.log(`[arbitrage] /arbitrage command: skipping a listing for ${slug} — tokenId=${JSON.stringify(tokenId)} listingPriceEth=${JSON.stringify(listingPriceEth)}`);
+          continue;
+        }
+        checkedCount++;
+        const result = await checkArbitrageOpportunity(slug, tokenId, listingPriceEth).catch(() => null);
+        if(result) results.push(result);
+        // Small spacing between sequential OpenSea calls — up to 30 of these
+        // back-to-back with zero delay risked hitting a 429 partway through,
+        // especially alongside whatever sales/listings polling is already
+        // hitting OpenSea concurrently at the same time.
+        await new Promise(res => setTimeout(res, 150));
+      }
+
+      if(!checkedCount){
+        return interaction.editReply({ content: `Found ${listings.length} listing(s) for **${slug}**, but couldn't extract a token ID/price from any of them — see bot logs for the raw shape, this likely needs a parsing fix.` });
+      }
+      if(!results.length){
+        return interaction.editReply({ content: `Checked ${listings.length} listing(s) for **${slug}** — no offer currently exceeds its listing price.` });
+      }
+
+      results.sort((a, b) => parseFloat(b.spreadEth) - parseFloat(a.spreadEth));
+      const lines = results.slice(0, 15).map(r =>
+        contract
+          ? `**[#${r.tokenId}](https://opensea.io/assets/${chain}/${contract}/${r.tokenId})** — listed Ξ${r.listingPriceEth}, offer Ξ${r.offerPriceEth} → **gross spread Ξ${r.spreadEth}**`
+          : `**#${r.tokenId}** — listed Ξ${r.listingPriceEth}, offer Ξ${r.offerPriceEth} → **gross spread Ξ${r.spreadEth}**`
+      );
+      const embed = new EmbedBuilder()
+        .setColor(COLORS.RANK_TOP_100)
+        .setTitle(`🔀 ${slug} — ${results.length} arbitrage opportunit${results.length === 1 ? 'y' : 'ies'} found`)
+        .setDescription(lines.join('\n') + `\n\n⚠️ Gross spread only — does not account for marketplace fees, creator royalties, or gas. Verify actual numbers on OpenSea before acting. Checked ${listings.length} of the collection's active listings.`);
+      return interaction.editReply({ embeds: [embed] });
+    }catch(e){
+      console.error('[arbitrage command]', e.message);
+      return interaction.editReply({ content: `Something went wrong checking arbitrage for **${slug}**: ${e.message}` });
+    }
   }
 
   // /rankfind
@@ -616,7 +691,7 @@ async function handleMarketCommand(commandName, ctx){
 
       const labelParts = matchedGroups.map(g => [...new Set(g.map(x => x.trait_value))][0]);
       if(traitCount !== null) labelParts.push(traitCount + ' traits');
-      const traitLabel = labelParts.length ? labelParts.join(' · ') : 'OCAS';
+      const traitLabel = labelParts.length ? labelParts.join(' · ') : (sweepConfig.name || sweepConfig.contractName || sweepSlug);
 
       let modeTitle;
       if(sweepMode === 'budget') modeTitle = `Budget Sweep Ξ${budget} · ${traitLabel}`;
@@ -743,7 +818,17 @@ async function handleMarketCommand(commandName, ctx){
         const oldest = sweepSessions.keys().next().value;
         sweepSessions.delete(oldest);
       }
-      sweepSessions.set(sessionId, { listings: cleanSweepListings, page: 0 });
+      sweepSessions.set(sessionId, {
+        listings: cleanSweepListings, page: 0,
+        // jv: "make sure ... all links lead to correct links via it be
+        // OpenSea or traitview." sweepTokenUrl() (lib/burn-config.js) had
+        // OCAS's own contract address hardcoded directly -- harmless for
+        // OCAS itself, but /sweep is explicitly available for non-OCAS
+        // collections on a paid tier (see isPaidFeature check above), so
+        // any Argonauts (or other) sweep silently built an OpenSea link
+        // pointing at the wrong contract entirely.
+        contract: sweepConfig.contract || '', chain: sweepConfig.chain || 'ethereum', slug: sweepConfig.slug || sweepConfig.collectionSlug || '',
+      });
       setTimeout(() => sweepSessions.delete(sessionId), 30 * 60 * 1000);
       components.push(new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('sweep:showall:' + sessionId).setLabel('Show All Tokens').setStyle(ButtonStyle.Secondary)
@@ -770,7 +855,7 @@ async function handleMarketCommand(commandName, ctx){
 
 const MARKET_COMMANDS = new Set([
   'lastsale','recentsales','sale','traitfind','listings','debuglisting',
-  'myalert','myalertclear','myalertstatus','rankfind','sweep','me',
+  'myalert','myalertclear','myalertstatus','rankfind','sweep','me','arbitrage',
 ]);
 
 // ── /traitfind guided flow helpers ───────────────────────────────────────────
@@ -870,7 +955,7 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
           payment: { symbol: (sale.currency||'ETH'), token_address: isWethSale?'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
           event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
         };
-        return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+        return buildSaleEmbed(syntheticSale, cfg, 'commands').catch(()=>null);
       }));
       await postEmbeds(interaction, saleEmbeds.filter(Boolean),
         `📊 **OS Rank ⬥ #${rankMin}–#${rankMax}** — ${sales.length} recent sale${sales.length===1?'':'s'}:`);
@@ -894,7 +979,9 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
       const tokenChain = dbMeta?.chain || 'ethereum';
       const tokenContract = dbMeta?.contract || contract;
       const listingUrl = l.url || `https://opensea.io/assets/${tokenChain}/${tokenContract}/${tokenId}`;
-      const tvUrl = `https://traitview.com/?jump=${tokenId}`;
+      // Same fix as embeds.js/poll.js's identical tvUrl -- needs &collection=
+      // or it silently lands on the default (OCAS) collection instead.
+      const tvUrl = `https://traitview.com/?jump=${tokenId}&collection=${rfSlug}`;
       const rankColor = getRankTierColor(l.os_rank) ?? COLORS.OPENSEA_BLUE;
       const embed = new EmbedBuilder()
         .setColor(rankColor)
@@ -903,13 +990,40 @@ async function runRankFindSearch(interaction, ctx, config, { rankMin, rankMax, m
         .setFooter({ text: `${rfSlug} · OS Rank #${rankMin}–#${rankMax} · ${sortBy==='rank'?'best rank first':'cheapest first'}` })
         .setTimestamp();
       const tvLink = `[OpenSea](${l.url}) · [TraitView](${tvUrl})`;
-      if(tokenTraits.length){
+      // Same per-server toggle as everywhere else — /rankfind is a command
+      // result, so it always checks the "commands" context.
+      const showTraits = config.embedShowTraits?.commands !== false;
+      if(showTraits && tokenTraits.length){
         embed.setDescription(traitDisplayLines(tokenTraits, 8).join('\n') + '\n\n**Links**\n' + tvLink);
       } else { embed.setDescription('**Links**\n' + tvLink); }
       try{
-        const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
-        embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+        // Prefer the backfill's own cached image over a live gateway race —
+        // this branch is a separate, hand-rolled embed builder (doesn't
+        // reuse buildListingEmbed at all) that was missed when this exact
+        // fix was applied everywhere else earlier tonight.
+        let dbUrlIsRaster = false;
+        if(dbMeta?.image_url && isDiscordOk(dbMeta.image_url)){
+          dbUrlIsRaster = await verifyImageIsRaster(dbMeta.image_url);
+        }
+        if(dbUrlIsRaster){
+          embed._imageResult = { type:'url', url: dbMeta.image_url };
+        } else if(dbMeta?.image_url){
+          // Confirmed URL is genuine SVG content despite passing isDiscordOk
+          // — render it directly rather than falling through to a live
+          // race that would just find the same non-raster URL again.
+          const buf = await extractPngFromSvg(dbMeta.image_url).catch(() => null);
+          if(buf){
+            embed._imageResult = { type:'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+          } else {
+            const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
+            embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+          }
+        } else {
+          const onChainImage = dbMeta?.chain ? await resolveOnChainImage(tokenContract, String(tokenId), dbMeta.chain).catch(() => null) : null;
+          embed._imageResult = onChainImage || await resolveImage({ identifier: String(tokenId) }, tokenContract, tokenChain);
+        }
       }catch(e){}
+      embed._imageLarge = !showTraits;
       return embed;
     }));
     const sortLabel = sortBy==='rank' ? 'best rank first' : 'cheapest first';
@@ -981,7 +1095,8 @@ async function showTfValuePicker(interaction, ctx, slug, traitName){
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){ console.warn('[traitfind] getCachedTraitIndex failed:', e.message); }
-  const matchingRows = traitIndex.filter(t => t.trait_name === traitName);
+  const matchingRows = traitIndex.filter(t => t.trait_name === traitName)
+    .sort((a, b) => (a.token_count||0) - (b.token_count||0));
   if(!matchingRows.length){
     return interaction.update({ content: `No values found for **${traitName}**.`, components: [] });
   }
@@ -1188,7 +1303,7 @@ async function handleTraitBrowseInteraction(interaction, ctx){
             payment: { symbol: 'ETH', token_address: '', quantity: sale.price_eth!=null?String(BigInt(Math.round(sale.price_eth*1e18))):'0', decimals:18 },
             event_timestamp: sale.sale_ts ? Math.floor(new Date(sale.sale_ts).getTime()/1000) : null,
           };
-          return buildSaleEmbed(syntheticSale, cfg).catch(()=>null);
+          return buildSaleEmbed(syntheticSale, cfg, 'commands').catch(()=>null);
         }));
         await postEmbeds(interaction, saleEmbeds.filter(Boolean), `Found **${j.count}** sale${j.count===1?'':'s'} with **${matchLabel}**:`);
         return;
@@ -1212,7 +1327,7 @@ async function handleTraitBrowseInteraction(interaction, ctx){
             maker: t.seller||'', url: t.url||null, os_rank: t.os_rank||null,
             _dbToken: { traits: t.traits||{}, obs_rank: t.obs_rank||null, os_rank: t.os_rank||null, chain: chainInfo?.chain||null, contract: chainInfo?.contract||null },
           };
-          return buildListingEmbed(fakeListingObj, cfg).catch(()=>null);
+          return buildListingEmbed(fakeListingObj, cfg, 'commands').catch(()=>null);
         }
         const dbMeta = await fetchTokenMetaFromDb(tokenId, slug).catch(()=>null);
         return buildTokenSearchEmbed({...t, _dbToken: dbMeta}, cfg, `Trait Search - ${matchLabel}`).catch(()=>null);
@@ -1286,11 +1401,45 @@ async function showMaTraitPicker(interaction, ctx, slug, page = 0){
   const replyFn = interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : (interaction.replied || interaction.deferred ? 'editReply' : 'reply');
   const replyOpts = {
     content: `**🔔 My Alert — ${slug}**\n\nPick a trait to filter by${pageNote}:`,
-    components: [new ActionRowBuilder().addComponents(menu)],
+    components: [
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        // jv: "is there any way to set personal alerts for trait counts".
+        // Same independent-condition pattern as the token-# watch that
+        // used to live here (see /me → Token Alert now, a separate
+        // top-level section since jv found a non-trait alert type
+        // confusing to locate inside "Trait Alert") -- stored as
+        // alert.traitCountFilters (an array of exact counts to watch
+        // for) and checked the same way in sendPersonalAlerts.
+        new ButtonBuilder().setCustomId(`ma_browse:traitcountmodal:${slug}`).setLabel('🔢 Watch a Trait Count').setStyle(ButtonStyle.Secondary)
+      ),
+    ],
     embeds: [],
   };
   if(replyFn !== 'update') replyOpts.flags = MessageFlags.Ephemeral;
   return interaction[replyFn](replyOpts);
+}
+
+// Extracted from the button handler that used to trigger this from
+// inside the trait wizard (ma_browse:tokenidmodal:, now gone) so the new
+// standalone Token Alert entry point (/me → Token Alert →
+// ma_browse:tokencol's collection pick) can show the exact same modal.
+async function showMtaTokenIdModal(interaction, ctx, slug){
+  const { getTokenAlert } = ctx;
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+  const existing = getTokenAlert(interaction.user.id) || {};
+  const modal = new ModalBuilder()
+    .setCustomId(`ma_modal:tokenid:${slug}`)
+    .setTitle('Watch Specific Token #(s)');
+  modal.addComponents(new AR().addComponents(
+    new TextInputBuilder().setCustomId('ma_tokenids')
+      .setLabel('Token ID(s), comma-separated')
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder('e.g. 1234 or 1234,5678')
+      .setValue((existing.slug === slug && Array.isArray(existing.tokenIds)) ? existing.tokenIds.join(',') : '')
+      .setRequired(true)
+  ));
+  return interaction.showModal(modal);
 }
 
 async function showMaValuePicker(interaction, ctx, slug, traitName){
@@ -1299,7 +1448,14 @@ async function showMaValuePicker(interaction, ctx, slug, traitName){
   const API_SECRET = process.env.API_SECRET;
   let traitIndex = [];
   try { traitIndex = await getCachedTraitIndex(RAILWAY_URL, API_SECRET, slug); } catch(e){ console.warn('[traitfind] getCachedTraitIndex failed:', e.message); }
-  const valueRows = traitIndex.filter(t => t.trait_name === traitName).slice(0, 25);
+  // jv: "Noticed the traits are out of order. Traits should display as
+  // rarest at the top." traitIndex had no sort applied at all here --
+  // whatever order the underlying cached index happened to return was
+  // whatever displayed. Rarest first = ascending token_count (fewer
+  // tokens sharing a value = rarer).
+  const valueRows = traitIndex.filter(t => t.trait_name === traitName)
+    .sort((a, b) => (a.token_count||0) - (b.token_count||0))
+    .slice(0, 25);
   if(!valueRows.length){
     return interaction.update({ content: `No values found for **${traitName}**.`, components: [] });
   }
@@ -1380,7 +1536,7 @@ async function showMaConfirm(interaction, ctx, slug, traitName, traitValues, ale
 
 // ── /myalert wizard — select menu + button follow-ups ────────────────────────
 async function handleMyAlertInteraction(interaction, ctx){
-  const { getAlert, setAlert } = ctx;
+  const { getAlert, setAlert, getTokenAlert, setTokenAlert } = ctx;
   const customId = interaction.customId;
 
   if(customId.startsWith('ma_browse:col')){
@@ -1399,6 +1555,32 @@ async function handleMyAlertInteraction(interaction, ctx){
   if(customId.startsWith('ma_browse:skiptr:')){
     const slug = customId.slice('ma_browse:skiptr:'.length);
     return showMaTypePicker(interaction, slug, null, null);
+  }
+  if(customId.startsWith('ma_browse:tokencol')){
+    // jv: token-# watching's collection picker, now its own top-level
+    // entry point (/me → Token Alert) rather than a button inside the
+    // trait wizard -- goes straight to the modal below on collection
+    // pick, skipping trait selection entirely since it's not relevant
+    // here.
+    const slug = interaction.values[0];
+    return showMtaTokenIdModal(interaction, ctx, slug);
+  }
+  if(customId.startsWith('ma_browse:traitcountmodal:')){
+    const slug = customId.slice('ma_browse:traitcountmodal:'.length);
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+    const existing = getAlert(interaction.user.id) || {};
+    const modal = new ModalBuilder()
+      .setCustomId(`ma_modal:traitcount:${slug}`)
+      .setTitle('Watch Exact Trait Count(s)');
+    modal.addComponents(new AR().addComponents(
+      new TextInputBuilder().setCustomId('ma_traitcounts')
+        .setLabel('Trait count(s), comma-separated')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('e.g. 3 or 3,4')
+        .setValue((existing.slug === slug && Array.isArray(existing.traitCountFilters)) ? existing.traitCountFilters.join(',') : '')
+        .setRequired(true)
+    ));
+    return interaction.showModal(modal);
   }
   if(customId.startsWith('ma_browse:val:')){
     const parts = customId.slice('ma_browse:val:'.length).split(':');
@@ -1447,8 +1629,7 @@ async function handleMyAlertInteraction(interaction, ctx){
         `**Filters:**`,
         fmtF(filters),
         '',
-        'Use `/myalert` again to add more filters.',
-        'Use `/myalertclear` to remove your alert.',
+        'Run `/me` → **Trait Alert** to add more filters, pause, or remove your alert.',
       ].join('\n'));
     const backRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
@@ -1460,6 +1641,89 @@ async function handleMyAlertInteraction(interaction, ctx){
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
     );
     return interaction.update({ content: 'Alert wizard cancelled.', embeds: [], components: [backRow] });
+  }
+}
+
+// ── /me → Trait Alert — "Watch a Specific Token #" modal submit ─────────────
+// jv: "Does the bot support personal alerts for specific token #'s? Or just
+// traits?" Sibling to handleMyAlertInteraction above (same ma_ prefix
+// family, same getAlert/setAlert dependency) but routed separately since
+// modal submissions are dispatched from bot.js by their own isModalSubmit()
+// check, distinct from the isButton()/isStringSelectMenu() check that
+// routes every ma_browse: interaction to that function.
+async function handleMyAlertModalSubmit(interaction, ctx){
+  const { getAlert, setAlert, getTokenAlert, setTokenAlert } = ctx;
+  const customId = interaction.customId;
+  if(customId.startsWith('ma_modal:tokenid:')){
+    const slug = customId.slice('ma_modal:tokenid:'.length);
+    const raw = interaction.fields.getTextInputValue('ma_tokenids').trim();
+    const tokenIds = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if(!tokenIds.length || tokenIds.some(s => !/^\d+$/.test(s))){
+      return interaction.reply({ content: '❌ Enter one or more numeric token IDs, comma-separated (e.g. 1234 or 1234,5678).', flags: MessageFlags.Ephemeral });
+    }
+    const idsInt = tokenIds.map(s => parseInt(s));
+    // jv: "I want that too" -- Token Alert is a fully independent alert
+    // record now (getTokenAlert/setTokenAlert, its own collection scope
+    // and Sales/Listing DM toggle), not a field tacked onto the trait
+    // alert record. Preserves an existing token alert's own sales/
+    // listings toggle if one's already configured for this same
+    // collection; defaults both DM types on for a brand new one, since
+    // watching one specific token is a strong enough signal of interest
+    // that off-by-default would likely surprise someone expecting to
+    // hear about it either way.
+    const existing = getTokenAlert(interaction.user.id) || {};
+    const alertSales = existing.slug === slug ? (existing.alertSales ?? true) : true;
+    const alertListings = existing.slug === slug ? (existing.alertListings ?? true) : true;
+    setTokenAlert(interaction.user.id, { slug, alertSales, alertListings, tokenIds: idsInt });
+    const embed = new EmbedBuilder()
+      .setTitle('✅ Alert Set!')
+      .setColor(0x57F287)
+      .setDescription([
+        `**Collection:** ${slug}`,
+        `**Sales DMs:** ${alertSales ? '✅ on' : '❌ off'}`,
+        `**Listing DMs:** ${alertListings ? '✅ on' : '❌ off'}`,
+        `**Watching token${idsInt.length > 1 ? 's' : ''}:** ${idsInt.map(id => `#${id}`).join(', ')}`,
+        '',
+        'Run `/me` → **Token Alert** to pause or stop watching. This is fully independent from your Trait Alert now, if you have one.',
+      ].join('\n'));
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.reply({ embeds: [embed], components: [backRow], flags: MessageFlags.Ephemeral });
+  }
+  if(customId.startsWith('ma_modal:traitcount:')){
+    const slug = customId.slice('ma_modal:traitcount:'.length);
+    const raw = interaction.fields.getTextInputValue('ma_traitcounts').trim();
+    const counts = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if(!counts.length || counts.some(s => !/^\d+$/.test(s))){
+      return interaction.reply({ content: '❌ Enter one or more whole numbers, comma-separated (e.g. 3 or 3,4).', flags: MessageFlags.Ephemeral });
+    }
+    const countsInt = [...new Set(counts.map(s => parseInt(s)))];
+    const existing = getAlert(interaction.user.id) || {};
+    // jv: "is there any way to set personal alerts for trait counts" --
+    // same independent-condition pattern as the token-ID modal above
+    // (preserve whatever else is already configured for this same
+    // collection rather than clobbering it, default both DM types on for
+    // a brand new alert).
+    const alertSales = existing.slug === slug ? (existing.alertSales ?? true) : true;
+    const alertListings = existing.slug === slug ? (existing.alertListings ?? true) : true;
+    const traitFilters = existing.slug === slug ? (existing.traitFilters || {}) : {};
+    setAlert(interaction.user.id, { slug, traitFilters, alertSales, alertListings, traitCountFilters: countsInt });
+    const embed = new EmbedBuilder()
+      .setTitle('✅ Alert Set!')
+      .setColor(0x57F287)
+      .setDescription([
+        `**Collection:** ${slug}`,
+        `**Sales DMs:** ${alertSales ? '✅ on' : '❌ off'}`,
+        `**Listing DMs:** ${alertListings ? '✅ on' : '❌ off'}`,
+        `**Watching trait count${countsInt.length > 1 ? 's' : ''}:** ${countsInt.join(', ')}`,
+        '',
+        'Run `/me` → **Trait Alert** to add more filters, pause, or remove your alert.',
+      ].join('\n'));
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back to My Settings').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.reply({ embeds: [embed], components: [backRow], flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -1658,7 +1922,7 @@ function formatCooldown(minutes){
 
 // ── /me hub — main entry ──────────────────────────────────────────────────────
 async function showMeHub(interaction, ctx){
-  const { getAlert, pgPool } = ctx;
+  const { getAlert, getTokenAlert, pgPool } = ctx;
   const userId = interaction.user.id;
   const fmtF = f => !f || Object.keys(f).length===0 ? 'none' :
     Object.entries(f).map(([k,v]) => `${k}: ${Array.isArray(v)?v.join(', '):v}`).join(' · ');
@@ -1672,8 +1936,24 @@ async function showMeHub(interaction, ctx){
     const pausedTag = alert.paused ? ' ⏸️ paused' : '';
     summaryLines.push(`📣 **Trait Alert** — ${alert.slug||'any'} · Sales: ${alert.alertSales?'✅':'❌'} · Listings: ${alert.alertListings?'✅':'❌'}${pausedTag}`);
     summaryLines.push(`  Filters: ${fmtF(alert.traitFilters)}`);
+    if(Array.isArray(alert.traitCountFilters) && alert.traitCountFilters.length){
+      summaryLines.push(`  Trait count(s): ${alert.traitCountFilters.join(', ')}`);
+    }
   } else {
     summaryLines.push('📣 **Trait Alert** — not set');
+  }
+
+  // jv: "it lives inside trait alerts and it should be its own separate
+  // alert" -> "I want that too" (fully independent record, not just
+  // independent pause) -- Token Alert is its own alert type now
+  // (getTokenAlert/setTokenAlert/deleteTokenAlert), with its own
+  // collection scope, Sales/Listing DM toggle, and pause flag, entirely
+  // separate from Trait Alert's own record.
+  const tokenAlert = getTokenAlert(userId);
+  if(tokenAlert && Array.isArray(tokenAlert.tokenIds) && tokenAlert.tokenIds.length){
+    summaryLines.push(`🔢 **Token Alert** — ${tokenAlert.slug||'any'} · watching ${tokenAlert.tokenIds.map(id=>`#${id}`).join(', ')}${tokenAlert.paused ? ' ⏸️ paused' : ''}`);
+  } else {
+    summaryLines.push('🔢 **Token Alert** — not set');
   }
 
   // Price alerts
@@ -1723,6 +2003,7 @@ async function showMeHub(interaction, ctx){
     .setPlaceholder('Select a section to manage...')
     .addOptions([
       new StringSelectMenuOptionBuilder().setLabel('📣 Trait Alert').setDescription('Sales & listing DMs by trait').setValue('trait_alert'),
+      new StringSelectMenuOptionBuilder().setLabel('🔢 Token Alert').setDescription('DM me when a specific token # sells or lists').setValue('token_alert'),
       new StringSelectMenuOptionBuilder().setLabel('🏷️ Price Alerts').setDescription('DM when a token drops below a price').setValue('price_alerts'),
       new StringSelectMenuOptionBuilder().setLabel('📉 Floor Alerts').setDescription('DM when a collection floor drops').setValue('floor_alerts'),
       new StringSelectMenuOptionBuilder().setLabel('💼 Wallet').setDescription('Verification & wallet analytics').setValue('wallet'),
@@ -1753,6 +2034,7 @@ async function showMeTraitAlert(interaction, ctx){
     `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
     `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
     alert.paused ? '**Status:** ⏸️ paused' : '',
+    Array.isArray(alert.traitCountFilters) && alert.traitCountFilters.length ? `**Watching trait count(s):** ${alert.traitCountFilters.join(', ')}` : '',
     `**Filters:**`,
     fmtF(alert.traitFilters),
   ].filter(Boolean).join('\n') : 'No trait alert set.';
@@ -1773,6 +2055,47 @@ async function showMeTraitAlert(interaction, ctx){
     }
     row.addComponents(
       new ButtonBuilder().setCustomId('me_browse:alert:clear').setLabel('Manage / Clear').setStyle(ButtonStyle.Danger),
+    );
+  }
+  row.addComponents(
+    new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+  );
+
+  const updateFn = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  return interaction[updateFn]({ embeds: [embed], components: [row] });
+}
+
+async function showMeTokenAlert(interaction, ctx){
+  const { getTokenAlert } = ctx;
+  const alert = getTokenAlert(interaction.user.id);
+
+  // jv: "I want that too" -- Token Alert is a fully independent alert
+  // record now, with its own collection scope and Sales/Listing DM
+  // toggle, not shared with Trait Alert at all anymore.
+  const desc = alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length ? [
+    `**Collection:** ${alert.slug||'any'}`,
+    `**Watching:** ${alert.tokenIds.map(id=>`#${id}`).join(', ')}`,
+    `**Sales DMs:** ${alert.alertSales ? '✅ on' : '❌ off'}`,
+    `**Listing DMs:** ${alert.alertListings ? '✅ on' : '❌ off'}`,
+    alert.paused ? '**Status:** ⏸️ paused' : '',
+  ].filter(Boolean).join('\n') : 'No token alert set.';
+
+  const embed = new EmbedBuilder()
+    .setTitle('🔢 Token Alert')
+    .setColor(0x5865F2)
+    .setDescription(desc);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('me_browse:tokenalert:set').setLabel('Set / Change Token Alert').setStyle(ButtonStyle.Success),
+  );
+  if(alert && Array.isArray(alert.tokenIds) && alert.tokenIds.length){
+    if(alert.paused){
+      row.addComponents(new ButtonBuilder().setCustomId('me_browse:tokenalert:resume').setLabel('▶️ Resume').setStyle(ButtonStyle.Success));
+    } else {
+      row.addComponents(new ButtonBuilder().setCustomId('me_browse:tokenalert:pause').setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary));
+    }
+    row.addComponents(
+      new ButtonBuilder().setCustomId('me_browse:tokenalert:clear').setLabel('✕ Stop Watching').setStyle(ButtonStyle.Danger),
     );
   }
   row.addComponents(
@@ -2100,6 +2423,17 @@ async function showMeWallet(interaction, ctx){
     ? 'editReply'
     : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
 
+  // jv confirmed live: the Sync fix worked (both wallets' data is now
+  // correctly backfilled), but the portfolio DISPLAY here still only
+  // ever queried this one wallet from user_registrations -- so a
+  // collection held only in a DIFFERENT linked wallet never showed up
+  // at all, even though the underlying data was correct. allLinked
+  // (fetched below) is the real combined wallet set; walletsForQuery
+  // falls back to just [wallet] if linked_wallets somehow has nothing
+  // for this user, so this never queries an empty array.
+  const allLinked = pgPool ? await getLinkedWalletAddresses(pgPool, userId, guildId).catch(() => []) : [];
+  const walletsForQuery = allLinked.length ? allLinked : (wallet ? [wallet] : []);
+
   // ── Unverified ──────────────────────────────────────────────────────────────
   if(!wallet){
     const embed = new EmbedBuilder()
@@ -2143,17 +2477,32 @@ async function showMeWallet(interaction, ctx){
             COALESCE(SUM(sale_eth)  FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS total_earned,
             COALESCE(SUM(sale_eth - cost_eth) FILTER (WHERE disposed_at IS NOT NULL AND sale_eth IS NOT NULL AND sale_eth > 0), 0) AS realized_pnl
            FROM wallet_token_intervals
-           WHERE LOWER(wallet_address)=$1 AND collection_slug=$2`,
-          [wallet, col.slug]
+           WHERE wallet_address = ANY($1::text[]) AND collection_slug=$2`,
+          [walletsForQuery, col.slug]
         );
 
         // Count distinct burn events for this wallet+collection
         const burnEvents = await pgPool.query(
           `SELECT COUNT(DISTINCT be.id) AS event_count
            FROM burn_events be
-           WHERE LOWER(be.burner_wallet) = $1`,
-          [wallet]
+           WHERE LOWER(be.burner_wallet) = ANY($1::text[])`,
+          [walletsForQuery]
         ).catch(() => ({ rows: [{ event_count: 0 }] }));
+
+        // jv: "it would be good to have the wallet address next to the
+        // collections that the wallets holds." Only meaningful (and only
+        // queried) when there's more than one linked wallet to
+        // disambiguate between -- a single-wallet user gains nothing from
+        // seeing their own one address repeated on every collection.
+        let holderWallets = [];
+        if(allLinked.length > 1){
+          const holderRes = await pgPool.query(
+            `SELECT DISTINCT wallet_address FROM wallet_token_intervals
+             WHERE wallet_address = ANY($1::text[]) AND collection_slug=$2 AND disposed_at IS NULL`,
+            [walletsForQuery, col.slug]
+          ).catch(() => ({ rows: [] }));
+          holderWallets = holderRes.rows.map(r => r.wallet_address);
+        }
 
         const burnEventCount = parseInt(burnEvents.rows[0]?.event_count || 0);
         const held   = parseInt(stats.rows[0]?.held   || 0);
@@ -2208,7 +2557,7 @@ async function showMeWallet(interaction, ctx){
             const traitSweepRes = await pgPool.query(
               `WITH held_tokens AS (
                  SELECT token_id FROM wallet_token_intervals
-                 WHERE LOWER(wallet_address)=$1 AND collection_slug=$2 AND disposed_at IS NULL
+                 WHERE wallet_address = ANY($1::text[]) AND collection_slug=$2 AND disposed_at IS NULL
                ),
                token_rarest_trait AS (
                  -- For each held token pick its rarest trait (fewest tokens share it)
@@ -2262,7 +2611,7 @@ async function showMeWallet(interaction, ctx){
                  SUM(held_count) AS tokens_covered,
                  SUM(CASE WHEN listings_available >= held_count THEN held_count ELSE listings_available END) AS fully_covered
                FROM trait_sweep`,
-              [wallet, col.slug]
+              [walletsForQuery, col.slug]
             ).catch(() => ({ rows: [] }));
 
             const traitSweepVal = traitSweepRes.rows[0]?.total_trait_sweep
@@ -2339,11 +2688,11 @@ async function showMeWallet(interaction, ctx){
              SELECT DISTINCT nt.token_id
              FROM nft_transfers nt
              WHERE nt.from_address = '0x0000000000000000000000000000000000000000'
-               AND LOWER(nt.to_address) = $1
+               AND LOWER(nt.to_address) = ANY($1::text[])
            ) is_first_recipient ON is_first_recipient.token_id = wti.token_id
-           WHERE LOWER(wti.wallet_address) = $1
+           WHERE wti.wallet_address = ANY($1::text[])
              AND wti.collection_slug = $2`,
-          [wallet, col.slug]
+          [walletsForQuery, col.slug]
         ).catch(() => ({ rows: [{ minted: 0, bought_intervals: 0, total_buy_eth: 0 }] }));
 
         const minted       = parseInt(acquisitionRes.rows[0]?.minted          || 0);
@@ -2352,7 +2701,7 @@ async function showMeWallet(interaction, ctx){
 
         cols.push({ name: col.name, slug: col.slug, held, sold, burned, burnEventCount,
                     floor, collFloorEst, estValue, bestEst, estMethod, avgCost,
-                    unrealizedPnl, realizedPnl, totalEarned, minted, boughtCount, totalBuyEth });
+                    unrealizedPnl, realizedPnl, totalEarned, minted, boughtCount, totalBuyEth, holderWallets });
       } catch(e){ console.warn('[WalletTab]', col.slug, e.message); }
     }
   }
@@ -2401,7 +2750,7 @@ async function showMeWallet(interaction, ctx){
       ? ` (${c.unrealizedPnl >= 0 ? '+' : ''}${((c.unrealizedPnl / (c.avgCost * c.held)) * 100).toFixed(0)}%)`
       : '';
 
-    lines.push(`**${c.name}**`);
+    lines.push(`**${c.name}**${c.holderWallets && c.holderWallets.length ? ` (${c.holderWallets.map(w=>'`'+w.slice(0,6)+'...'+w.slice(-4)+'`').join(', ')})` : ''}`);
 
     // Holdings + est value
     lines.push(`Holdings: **${c.held}** token${c.held === 1 ? '' : 's'}`);
@@ -2460,6 +2809,16 @@ async function showMeWallet(interaction, ctx){
   // of an actual wallet page.
   lines.push(`[📊 Full analytics on TraitView](https://traitview.com/?wallet=${wallet})`);
 
+  // jv: make multi-wallet linking directly visible here, not just
+  // discoverable indirectly. The P&L figures above still only reflect
+  // this one wallet's own activity -- fully combining that across every
+  // linked wallet is a separate, larger piece of work than this
+  // visibility fix.
+  if(allLinked.length > 1){
+    lines.push('');
+    lines.push(`🔗 **${allLinked.length} wallets linked:** ${allLinked.map(w => '`'+w.slice(0,6)+'...'+w.slice(-4)+'`').join(', ')}`);
+  }
+
   const embed = new EmbedBuilder()
     .setTitle('💼 Portfolio')
     .setColor(cols.some(c => c.unrealizedPnl > 0) ? 0x57F287 : 0x5865F2)
@@ -2477,6 +2836,7 @@ async function showMeWallet(interaction, ctx){
     new ActionRowBuilder().addComponents(...tokenBtns),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:wallet:sync').setLabel('🔄 Sync').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('start_verification_additional:'+guildId).setLabel('➕ Add Wallet').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('me_browse:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
     ),
   ];
@@ -2488,6 +2848,7 @@ async function showMeWallet(interaction, ctx){
 async function showMeTokens(interaction, ctx, slug, page = 0){
   const { pgPool } = ctx;
   const userId = interaction.user.id;
+  const guildId = interaction.guildId;
   const updateFn = interaction.deferred || interaction.replied ? 'editReply'
     : (interaction.isButton?.() || interaction.isStringSelectMenu?.() ? 'update' : 'editReply');
 
@@ -2498,6 +2859,13 @@ async function showMeTokens(interaction, ctx, slug, page = 0){
   ).catch(()=>null);
   const wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
   if(!wallet) return interaction[updateFn]({ content: '❌ No wallet linked.', components: [] });
+
+  // jv confirmed live: the "Args tokens" button showed nothing for a
+  // collection held only in a different linked wallet -- same root
+  // cause as showMeWallet's own combined-holdings fix, applied the same
+  // way here (fall back to just [wallet] if linked_wallets has nothing).
+  const allLinked = await getLinkedWalletAddresses(pgPool, userId, guildId).catch(() => []);
+  const walletsForQuery = allLinked.length ? allLinked : [wallet];
 
   // Get collection name
   const cfgRow = await pgPool.query(
@@ -2513,11 +2881,11 @@ async function showMeTokens(interaction, ctx, slug, page = 0){
      LEFT JOIN token_traits tt ON tt.token_id = wti.token_id
        AND (tt.collection_slug = $2 OR tt.collection_slug IS NULL)
        AND LOWER(tt.trait_name) = 'type'
-     WHERE LOWER(wti.wallet_address) = $1
+     WHERE wti.wallet_address = ANY($1::text[])
        AND (wti.collection_slug = $2 OR wti.collection_slug IS NULL)
        AND wti.disposed_at IS NULL
      ORDER BY wti.token_id ASC`,
-    [wallet, slug]
+    [walletsForQuery, slug]
   ).catch(()=>({ rows: [] }));
 
   if(!tokensRes.rows.length){
@@ -2589,7 +2957,7 @@ async function showMeTokens(interaction, ctx, slug, page = 0){
 
 // ── showMeTokenDetail — full detail for a single held token ───────────────────
 async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
-  const { pgPool, getRailwayApiUrl } = ctx;
+  const { pgPool, getRailwayApiUrl, osHeaders } = ctx;
   const userId = interaction.user.id;
 
   // Defer immediately — SVG→PNG rendering can exceed Discord's 3s window
@@ -2605,6 +2973,11 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const wallet = reg?.rows[0]?.wallet?.toLowerCase() || null;
   if(!wallet) return interaction[updateFn]({ content: '❌ No wallet linked.', components: [] });
 
+  // jv confirmed live: same combined-holdings fix as showMeWallet/
+  // showMeTokens, applied here too for consistency across the whole flow.
+  const allLinked = await getLinkedWalletAddresses(pgPool, userId, interaction.guildId).catch(() => []);
+  const walletsForQuery = allLinked.length ? allLinked : [wallet];
+
   // Get interval data for this token — use OR for collection_slug to handle NULL rows
   const wtiRes = await pgPool.query(
     `SELECT wti.token_id, wti.cost_eth, wti.acquired_at,
@@ -2613,11 +2986,11 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
      LEFT JOIN token_traits tt ON tt.token_id = wti.token_id
        AND (tt.collection_slug = $3 OR tt.collection_slug IS NULL)
        AND LOWER(tt.trait_name) = 'type'
-     WHERE LOWER(wti.wallet_address) = $1
+     WHERE wti.wallet_address = ANY($1::text[])
        AND (wti.collection_slug = $3 OR wti.collection_slug IS NULL)
        AND wti.token_id = $2
        AND wti.disposed_at IS NULL`,
-    [wallet, tokenId, slug]
+    [walletsForQuery, tokenId, slug]
   ).catch(()=>({ rows: [] }));
 
   if(!wtiRes.rows.length){
@@ -2648,8 +3021,12 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   const colCfg = allCols.find(c => c.slug === slug);
   const colContract = colCfg?.contract || null;
   const isAnimated = colCfg?.animated === true;
+  const colChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+  const colChain = colChainRes.rows[0]?.chain || 'ethereum';
 
   let imageResult = null;
+  let tokenImgUrl = null;
+  let tokenImgIsRaster = false;
 
   // Animated collection — call OpenSea for display_image_url (cached 2 min)
   if(isAnimated && colContract){
@@ -2662,10 +3039,23 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     const tokenImgRes = await pgPool.query(
       `SELECT image_url FROM tokens WHERE id=$1 AND collection_slug=$2`,
       [tokenId, slug]
-    ).catch(()=>({ rows: [] }));
-    const tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
+    ).catch((e) => { console.error(`[me] tokens query threw for ${slug}#${tokenId}:`, e.message); return { rows: [] }; });
+    tokenImgUrl = tokenImgRes.rows[0]?.image_url || null;
+    // Unconditional — logs every time regardless of outcome, so there's no
+    // ambiguity about what THIS process's own database connection actually
+    // returned, as opposed to whatever a separate diagnostic elsewhere may
+    // have shown (confirmed live: the bot service and API service turned
+    // out to have different DATABASE_URL values entirely, so anything
+    // checked through the API told us nothing about what the bot itself sees).
+    console.log(`[me] ${slug}#${tokenId} tokens query returned ${tokenImgRes.rows.length} row(s), image_url=${JSON.stringify(tokenImgUrl)}`);
     if(tokenImgUrl && isDiscordOk(tokenImgUrl)){
+      tokenImgIsRaster = await verifyImageIsRaster(tokenImgUrl);
+      if(!tokenImgIsRaster) console.log(`[me] ${slug}#${tokenId} image_url passed isDiscordOk but is actually SVG content (verified via HEAD): ${tokenImgUrl}`);
+    }
+    if(tokenImgIsRaster){
       imageResult = { type: 'url', url: tokenImgUrl };
+    } else if(tokenImgUrl && !isDiscordOk(tokenImgUrl)){
+      console.log(`[me] ${slug}#${tokenId} has image_url but isDiscordOk rejected it: ${tokenImgUrl}`);
     }
   }
 
@@ -2674,11 +3064,33 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     const svgRes = await pgPool.query(
       `SELECT image_data FROM token_svg_cache WHERE token_id=$1 AND collection_slug=$2 LIMIT 1`,
       [tokenId, slug]
-    ).catch(()=>({ rows: [] }));
+    ).catch((e) => { console.error(`[me] token_svg_cache query threw for ${slug}#${tokenId}:`, e.message); return { rows: [] }; });
     const svgData = svgRes.rows[0]?.image_data || null;
+    console.log(`[me] ${slug}#${tokenId} token_svg_cache query returned ${svgRes.rows.length} row(s), data length=${svgData ? svgData.length : 'null'}`);
     if(svgData){
-      const buf = await extractPngFromSvg(svgData).catch(()=>null);
+      // Previously silently swallowed any render failure with no logging at
+      // all — if extractPngFromSvg fails for a reason OTHER than the 431
+      // bug fixed earlier, there'd be zero visibility into why the
+      // thumbnail is missing.
+      const buf = await extractPngFromSvg(svgData).catch(e => {
+        console.warn(`[me] token_svg_cache render failed for ${slug}#${tokenId}:`, e.message);
+        return null;
+      });
       if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+    } else if(tokenImgUrl && !tokenImgIsRaster){
+      // token_svg_cache has no pre-rendered version either — confirmed the
+      // stored image_url is real SVG content (not just missing/rejected),
+      // so render it directly rather than leaving the card with no image.
+      const buf = await extractPngFromSvg(tokenImgUrl).catch(e => {
+        console.warn(`[me] direct SVG render of image_url failed for ${slug}#${tokenId}:`, e.message);
+        return null;
+      });
+      if(buf){
+        imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+        console.log(`[me] ${slug}#${tokenId} rendered image_url directly as SVG`);
+      }
+    } else {
+      console.log(`[me] no token_svg_cache row found for ${slug}#${tokenId} — falling through with no image`);
     }
   }
 
@@ -2694,7 +3106,13 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     const imgData = imgRes.rows[0]?.image_data || null;
     if(imgData){
       if(imgData.startsWith('http') && isDiscordOk(imgData)){
-        imageResult = { type: 'url', url: imgData };
+        const isRaster = await verifyImageIsRaster(imgData);
+        if(isRaster){
+          imageResult = { type: 'url', url: imgData };
+        } else {
+          const buf = await extractPngFromSvg(imgData).catch(()=>null);
+          if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
+        }
       } else if(imgData.startsWith('<svg') || imgData.startsWith('data:image/svg') || imgData.toLowerCase().includes('image/svg')){
         const buf = await extractPngFromSvg(imgData).catch(()=>null);
         if(buf) imageResult = { type: 'buffer', buffer: buf, filename: `token-${tokenId}.png` };
@@ -2804,12 +3222,32 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
   if(nextToken !== null) navBtns.push(
     new ButtonBuilder().setCustomId(`me_browse:wallet:token_detail:${slug}:${nextToken}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary)
   );
+  // High-res download — separate from the small thumbnail shown on this
+  // card (fixed at 500px, sized for a compact preview, not for saving).
+  // Posts as its own new message rather than replacing this card, so
+  // browsing/nav state isn't disturbed by requesting a download.
+  navBtns.push(
+    new ButtonBuilder().setCustomId(`me_browse:wallet:token_download:${slug}:${tokenId}`).setLabel('⬇️ Download').setStyle(ButtonStyle.Secondary)
+  );
 
   const typeLabel = t.type_trait ? `${t.type_trait} · ` : '';
   const unrealizedDisplay = displayEst && cost > 0 ? displayEst - cost : null;
   const pctDisplay = (unrealizedDisplay !== null && cost > 0)
     ? ` (${unrealizedDisplay >= 0 ? '+' : ''}${((unrealizedDisplay / cost) * 100).toFixed(0)}%)`
     : '';
+
+  // Token image / links — moved before descLines so the links line below can
+  // use both.
+  const tvUrl = `https://traitview.com/token/${slug}/${tokenId}`;
+  // Confirmed live: colContract || slug put the collection SLUG (e.g.
+  // "argonauts") in the URL position OpenSea's asset URL format expects a
+  // contract address, producing a broken link whenever colContract was
+  // ever unavailable -- same bug class found and fixed in
+  // buildArbitrageEmbed earlier. Falls back to a collection-level link
+  // instead, same pattern used there.
+  const osUrl = colContract
+    ? `https://opensea.io/assets/${colChain}/${colContract}/${tokenId}`
+    : `https://opensea.io/collection/${slug}`;
 
   const descLines = [
     `**#${tokenId}** · ${typeLabel}${slug}`,
@@ -2819,18 +3257,19 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     topTrait ? `Top trait: **${topTrait.trait_value}** · Ξ ${parseFloat(topTrait.trait_floor).toFixed(4)} floor` : '',
     unrealizedDisplay !== null ? `Unrealized: **${unrealizedDisplay >= 0 ? '+' : ''}Ξ ${Math.abs(unrealizedDisplay).toFixed(4)}${pctDisplay}**` : '',
     '',
+    `[OpenSea](${osUrl}) · [TraitView](${tvUrl})`,
     isMinted ? '✨ Minted' : '🛒 Bought',
     burnLine,
   ].filter(Boolean).join('\n');
 
-  // Token image
-  const tvUrl = `https://traitview.com/token/${slug}/${tokenId}`;
-  const osUrl = `https://opensea.io/assets/ethereum/${slug}/${tokenId}`;
+  // jv: clicking the thumbnail/title should go to OpenSea, not TraitView --
+  // TraitView is still one click away via the explicit link in descLines
+  // above.
   const embed = new EmbedBuilder()
     .setTitle(`🔍 Token #${tokenId}`)
     .setColor(unrealizedDisplay !== null && unrealizedDisplay >= 0 ? 0x57F287 : 0xED4245)
     .setDescription(descLines)
-    .setURL(tvUrl)
+    .setURL(osUrl)
     .setFooter({ text: `${currentIdx + 1} of ${sortedTokens.length} held tokens` });
 
   const components = [
@@ -2838,25 +3277,102 @@ async function showMeTokenDetail(interaction, ctx, slug, tokenId, page = 0){
     new ActionRowBuilder().addComponents(...navBtns),
   ];
 
+  console.log(`[me] ${slug}#${tokenId} final imageResult: ${imageResult ? `type=${imageResult.type}` + (imageResult.type === 'url' ? ` url=${imageResult.url}` : '') : 'null (no thumbnail will be set)'}`);
+
   if(imageResult?.type === 'buffer'){
     const att = new AttachmentBuilder(imageResult.buffer, { name: imageResult.filename });
     embed.setThumbnail(`attachment://${imageResult.filename}`);
     return interaction[updateFn]({ embeds: [embed], components, files: [att] });
-  } else {
-    if(imageResult?.type === 'url') embed.setThumbnail(imageResult.url);
+  } else if(imageResult?.type === 'url'){
+    // Confirmed via extensive testing that passing a raw URL straight to
+    // .setThumbnail(url) doesn't reliably render, despite the URL/code/data
+    // being independently confirmed correct at every layer. This tries a
+    // genuinely different mechanism instead of giving up the small-
+    // thumbnail layout: fetch the URL ourselves into a buffer, attach it as
+    // a file, and reference it via attachment://filename — the exact same
+    // pattern the buffer case above already uses. Untested until now
+    // whether attachment-referenced thumbnails are more reliable than raw-
+    // URL ones specifically for this flow; falls back to no image (not a
+    // large standalone one) if the fetch itself fails, preserving the
+    // compact card layout either way.
+    try{
+      const r = await fetch(imageResult.url, { timeout: 10000 });
+      if(r.ok){
+        const buf = Buffer.from(await r.arrayBuffer());
+        const filename = `token-${tokenId}.png`;
+        const att = new AttachmentBuilder(buf, { name: filename });
+        embed.setThumbnail(`attachment://${filename}`);
+        return interaction[updateFn]({ embeds: [embed], components, files: [att] });
+      }
+      console.warn(`[me] fetch of imageResult.url returned ${r.status} for ${slug}#${tokenId}, showing card with no image`);
+    }catch(e){
+      console.warn(`[me] failed to fetch imageResult.url for ${slug}#${tokenId}:`, e.message);
+    }
     return interaction[updateFn]({ embeds: [embed], components, files: [] });
+  } else {
+    return interaction[updateFn]({ embeds: [embed], components, files: [] });
+  }
+}
+
+// ── High-res download from the wallet token detail card ─────────────────────
+// Separate from that card's own thumbnail (fixed at 500px, sized for a
+// compact preview, not for saving) — reuses download.js's renderTokenPng at
+// a meaningfully larger size, matching the exact rendering pipeline /download
+// already uses and just fixed for large on-chain SVGs (see lib/images.js/
+// api.js's POST /render/svg-token). Posts as a brand-new message (via a
+// fresh deferReply, not deferUpdate) so the browsing card/nav state is left
+// untouched — clicking Download doesn't interrupt cycling through tokens.
+async function handleMeTokenDownload(interaction, ctx, slug, tokenId, size = 2048, transparent = false){
+  await interaction.deferReply({ ephemeral: true }).catch(()=>{});
+  try{
+    const { pgPool, osHeaders } = ctx;
+    const serverCfg = ctx.getConfig ? ctx.getConfig(interaction.guildId) : null;
+    const allCols = serverCfg ? [
+      ...(serverCfg.contract ? [{ slug: serverCfg.collectionSlug || serverCfg.slug, contract: serverCfg.contract }] : []),
+      ...(serverCfg.collections || [])
+    ] : [];
+    const colCfg = allCols.find(c => c.slug === slug);
+    const contract = colCfg?.contract || null;
+    if(!contract) return interaction.editReply({ content: '❌ Could not resolve this collection\'s contract.' });
+
+    const colChainRes = await pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug]).catch(() => ({ rows: [] }));
+    const chain = colChainRes.rows[0]?.chain || 'ethereum';
+
+    const { renderTokenPng } = require('./download');
+    // size/transparent now caller-supplied — matches the standalone
+    // /download command's own defaults (2048px, opaque) when the caller
+    // (the button handler below) doesn't show its own options modal first.
+    const SIZE = size;
+    const rendered = await renderTokenPng({ contract, tokenId, chain, size: SIZE, transparent, osHeaders, slug });
+    const ext = rendered.ext || 'png';
+    const filename = `${slug}-${tokenId}${ext === 'png' ? `-${SIZE}` : ''}.${ext}`.replace(/[^a-z0-9_.-]+/gi, '-');
+    const att = new AttachmentBuilder(rendered.buffer, { name: filename });
+
+    let content;
+    if(ext !== 'png'){
+      let rawUrl = rendered.animUrl || null;
+      if(rawUrl) rawUrl = rawUrl.replace('i2c.seadn.io', 'raw2.seadn.io').replace('i.seadn.io', 'raw2.seadn.io');
+      content = `${ext.toUpperCase()} download for **${slug} #${tokenId}**`;
+      if(rawUrl) content += `\n📥 *To save the full quality file: [tap here](${rawUrl})*`;
+    } else {
+      content = `PNG download for **${slug} #${tokenId}** · ${SIZE}px`;
+    }
+    return interaction.editReply({ content, files: [att] });
+  }catch(e){
+    return interaction.editReply({ content: 'Download failed: ' + e.message }).catch(()=>{});
   }
 }
 
 // ── /me interaction handler ───────────────────────────────────────────────────
 async function handleMeInteraction(interaction, ctx){
-  const { getAlert, setAlert, deleteAlert, getConfig, pgPool, getSyncStatus, syncWalletForUser } = ctx;
+  const { getAlert, setAlert, deleteAlert, getTokenAlert, setTokenAlert, deleteTokenAlert, getConfig, pgPool, getSyncStatus, syncWalletForUser } = ctx;
   const customId = interaction.customId;
 
   // Nav dropdown
   if(customId === 'me_browse:nav'){
     const section = interaction.values[0];
     if(section === 'trait_alert') return showMeTraitAlert(interaction, ctx);
+    if(section === 'token_alert') return showMeTokenAlert(interaction, ctx);
     if(section === 'price_alerts') return showMePriceAlerts(interaction, ctx);
     if(section === 'floor_alerts') return showMeFloorAlerts(interaction, ctx);
     if(section === 'wallet') return showMeWallet(interaction, ctx);
@@ -2884,6 +3400,37 @@ async function handleMeInteraction(interaction, ctx){
 
   if(customId === 'me_browse:alert:clear'){
     return showMaClearWizard(interaction, { getAlert, deleteAlert, setAlert });
+  }
+
+  // ── Token alert ──────────────────────────────────────────────────────────────
+  if(customId === 'me_browse:tokenalert:set'){
+    const guildId = interaction.guildId;
+    const config = getConfig(guildId) || {};
+    const allCols = [];
+    const primarySlug = config.collectionSlug || config.slug;
+    if(primarySlug) allCols.push({ slug: primarySlug, name: config.contractName || primarySlug });
+    for(const c of config.collections || []) { if(c.slug) allCols.push({ slug: c.slug, name: c.name || c.slug }); }
+    if(!allCols.length) return interaction.update({ content: 'No collections configured on this server.', embeds:[], components:[] });
+    if(allCols.length === 1) return showMtaTokenIdModal(interaction, ctx, allCols[0].slug);
+    return interaction.update({ content: '**🔢 Token Alert** — Pick a collection:', embeds:[], components: buildCollectionPickerRows(allCols, 'ma_browse:tokencol') });
+  }
+
+  if(customId === 'me_browse:tokenalert:pause'){
+    setTokenAlert(interaction.user.id, { paused: true });
+    return showMeTokenAlert(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:tokenalert:resume'){
+    setTokenAlert(interaction.user.id, { paused: false });
+    return showMeTokenAlert(interaction, ctx);
+  }
+
+  if(customId === 'me_browse:tokenalert:clear'){
+    // jv: "I want that too" -- Token Alert is a fully independent alert
+    // record now, so this deletes that record outright rather than
+    // clearing one field on a record shared with Trait Alert.
+    deleteTokenAlert(interaction.user.id);
+    return showMeTokenAlert(interaction, ctx);
   }
 
   if(customId === 'me_browse:alert:pause'){
@@ -3043,12 +3590,13 @@ async function handleMeInteraction(interaction, ctx){
     if(!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(()=>{});
     const editWalletSync = payload => interaction.editReply(payload).catch(()=>{});
 
-    // Check if verified first
-    const reg = await pgPool.query(
-      `SELECT wallet FROM user_registrations WHERE discord_id=$1 AND verified=true ORDER BY verified_at DESC LIMIT 1`,
-      [userId]
-    ).catch(()=>null);
-    const wallet = reg?.rows[0]?.wallet;
+    // jv confirmed live: this only ever showed/synced "the latest one I
+    // had synced" -- one wallet, not all linked ones. Same root cause as
+    // syncWalletForUser itself (lib/wallet-backfill.js) -- reading only
+    // from user_registrations, which stays single-wallet-per-guild by
+    // design. linked_wallets is the actual multi-wallet source of truth.
+    const allWallets = await getLinkedWalletAddresses(pgPool, userId, guildId).catch(() => []);
+    const wallet = allWallets[0];
 
     if(!wallet){
       return editWalletSync({
@@ -3070,6 +3618,9 @@ async function handleMeInteraction(interaction, ctx){
     }
 
     // Show initial progress screen
+    const walletLine = allWallets.length > 1
+      ? `🔄 Syncing ${allWallets.length} wallets: ${allWallets.map(w=>'`'+w.slice(0,6)+'...'+w.slice(-4)+'`').join(', ')}`
+      : `🔄 Syncing wallet \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``;
     const progressLines = syncCols.map(n => `⏳ ${n}`);
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('me_browse:wallet:progress').setLabel('🔃 Check Progress').setStyle(ButtonStyle.Primary),
@@ -3080,7 +3631,7 @@ async function handleMeInteraction(interaction, ctx){
         .setTitle('💼 Wallet — Syncing')
         .setColor(0x5865F2)
         .setDescription([
-          `🔄 Syncing wallet \`${wallet.slice(0,6)}...${wallet.slice(-4)}\``,
+          walletLine,
           '',
           ...progressLines,
           '',
@@ -3199,6 +3750,27 @@ async function handleMeInteraction(interaction, ctx){
     const tokenId = parseInt(parts[4]);
     return showMeTokenDetail(interaction, ctx, slug, tokenId);
   }
+
+  // High-res download button on the wallet token detail card — renders
+  // separately from (and larger than) the card's own 500px thumbnail,
+  // posted as a new message so it doesn't disturb the browsing card/nav.
+  // Shows a quick options modal (size + transparent background) first,
+  // matching the standalone /download command's own modal, instead of
+  // always using its fixed 2048px/opaque defaults silently.
+  if(customId.startsWith('me_browse:wallet:token_download:')){
+    const parts = customId.split(':');
+    const slug = parts[3];
+    const tokenId = parseInt(parts[4]);
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: AR } = require('discord.js');
+    const modal = new ModalBuilder()
+      .setCustomId(`me_modal:download:${slug}:${tokenId}`)
+      .setTitle('Download Options');
+    modal.addComponents(
+      new AR().addComponents(new TextInputBuilder().setCustomId('size').setLabel('Size in pixels (50-4096)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('2048')),
+      new AR().addComponents(new TextInputBuilder().setCustomId('transparent').setLabel('Transparent background? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('no')),
+    );
+    return interaction.showModal(modal);
+  }
 }
 
 // ── Modal launchers ───────────────────────────────────────────────────────────
@@ -3224,4 +3796,4 @@ async function showFloorAlertModal(interaction, slug){
   return interaction.showModal(modal);
 }
 
-module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick };
+module.exports = { handleMarketCommand, MARKET_COMMANDS, resolveCollectionFromServerCfg, isPaidFeature, handleTraitBrowseInteraction, handleMyAlertInteraction, handleMyAlertModalSubmit, showMaTraitPicker, handleMaClearInteraction, handleMeInteraction, handleRankFindModalSubmit, handleRankFindBrowseInteraction, handleRfColPick, handleMeTokenDownload };

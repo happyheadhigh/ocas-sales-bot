@@ -68,7 +68,7 @@ function buildDashboardEmbed(cfg, traitRoles){
     .setFooter({ text: 'Only visible to you' });
 }
 
-function dashboardRow(){
+function dashboardRow(cfg={}){
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('cfg:cat:collection').setLabel('📦 Collections').setStyle(ButtonStyle.Secondary),
@@ -80,6 +80,7 @@ function dashboardRow(){
       new ButtonBuilder().setCustomId('cfg:cat:access').setLabel('🛡️ Access').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:lotteries').setLabel('🎰 Lotteries').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('cfg:cat:nickname').setLabel('🏷️ Bot Nickname').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:cat:embedstyle').setLabel('🖼️ Embed Style').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -253,6 +254,9 @@ function collectionEditRow(colId, isPrimary, isOcas=false){
   if(!isPrimary) row2Btns.push(
     new ButtonBuilder().setCustomId(`cfg:col:remove:${colId}`).setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)
   );
+  if(isPrimary) row2Btns.push(
+    new ButtonBuilder().setCustomId('cfg:col:removeprimary').setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger)
+  );
 
   return [
     new ActionRowBuilder().addComponents(menu),
@@ -270,8 +274,10 @@ function buildChannelsEmbed(cfg){
       SEP + '\n\n' +
       `🟢 **Sales:** ${ch(cfg.salesChannel||cfg.channelId)} ${ok(cfg.salesChannel||cfg.channelId)}\n` +
       `📋 **Listings:** ${ch(cfg.listingsChannel||cfg.listingsChannelId)} ${ok(cfg.listingsChannel||cfg.listingsChannelId)}\n` +
+      `🔀 **Arbitrage:** ${ch(cfg.arbitrageChannelId)} ${ok(cfg.arbitrageChannelId)}\n` +
       (isOcas ? `🔥 **Burn Alerts:** ${ch(cfg.burnChannel)} ${ok(cfg.burnChannel)}\n` : '') +
-      '\n*Click a button to change that channel.\nLeave a channel unset to disable those alerts.*'
+      '\n*Click a button to change that channel.\nLeave a channel unset to disable those alerts.*\n' +
+      '*Arbitrage alerts (a listing priced below the best current offer) work independently of the Listings channel above — set this one on its own if you want arbitrage alerts without the full listings feed.*'
     )
     .setFooter({ text: 'Only visible to you' });
 }
@@ -280,6 +286,7 @@ function channelsRow(isOcas){
   const btns = [
     new ButtonBuilder().setCustomId('cfg:ch:sales').setLabel('🟢 Sales').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('cfg:ch:listings').setLabel('📋 Listings').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('cfg:ch:arbitrage').setLabel('🔀 Arbitrage').setStyle(ButtonStyle.Secondary),
   ];
   if(isOcas) btns.push(new ButtonBuilder().setCustomId('cfg:ch:burn').setLabel('🔥 Burn Alerts').setStyle(ButtonStyle.Secondary));
   btns.push(new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary));
@@ -289,6 +296,7 @@ function channelsRow(isOcas){
 // ── Verification screen ───────────────────────────────────────────────────────
 function buildVerificationEmbed(cfg){
   const deployed = !!cfg.verifyMessageId;
+  const hasAnyRole = !!(cfg.verifyRole || cfg.holderRole);
   return new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle('🔐 Wallet Verification')
@@ -300,7 +308,10 @@ function buildVerificationEmbed(cfg){
       `🚦 **Panel status:** ${deployed ? '✅ Deployed' : '❌ Not deployed'}\n\n` +
       (cfg.verifyChannel && cfg.verifyRole
         ? '*Any member who verifies gets the Verified role.\nMembers holding ≥1 token also get the Holder role.*'
-        : '*Don\'t need verification? That\'s fine — leave this unconfigured. Your alerts (sales, listings, burns) don\'t depend on it.*')
+        : '*Don\'t need verification? That\'s fine — leave this unconfigured. Your alerts (sales, listings, burns) don\'t depend on it.*') +
+      (hasAnyRole
+        ? '\n\n⚠️ **Important:** in Server Settings → Roles, drag this bot\'s own role **above** the role(s) set here. Discord only lets a bot assign roles ranked below its own — if it isn\'t, assignment silently fails with no error shown anywhere.'
+        : '')
     )
     .setFooter({ text: 'Only visible to you' });
 }
@@ -357,6 +368,10 @@ function traitRuleLabel(r){
   if(r.trait_type === '_count') return `Own ${r.minimum_count}+ tokens`;
   if(r.trait_type === '_totalburns') return `${r.minimum_count}+ burn transactions, ever`;
   if(r.trait_type === '_maxburn') return `${r.minimum_count}+ tokens in a single burn`;
+  if(r.trait_type === '_tokenid'){
+    const ids = String(r.trait_value || '').split(',').filter(Boolean);
+    return ids.length > 1 ? `Owns token #${ids[0]} (or ${ids.length - 1} other${ids.length > 2 ? 's' : ''})` : `Owns token #${ids[0] || '?'}`;
+  }
   return `${r.trait_type}: ${r.trait_value || 'any'}${r.minimum_count > 1 ? ` ×${r.minimum_count}` : ''}`;
 }
 
@@ -373,7 +388,10 @@ function buildRolesEmbed(traitRoles, collectionLabel){
     .setDescription(
       SEP + '\n\n' +
       list + '\n\n' +
-      '*Roles are assigned automatically when a member verifies\nand re-synced every 24 hours.*'
+      '*Roles are assigned automatically when a member verifies\nand re-synced every 24 hours.*' +
+      (traitRoles.length
+        ? '\n\n⚠️ **Important:** in Server Settings → Roles, drag this bot\'s own role **above** every role listed above. Discord only lets a bot assign roles ranked below its own — if it isn\'t, assignment silently fails with no error shown anywhere.'
+        : '')
     )
     .setFooter({ text: 'Only visible to you' });
 }
@@ -403,6 +421,42 @@ function rolesRow(traitRoles, colId){
     ));
   }
   return rows;
+}
+
+// ── Embed Style screen — independent per-context toggles ──────────────────────
+// Sales/listings/commands can each independently show traits+thumbnail
+// (default) or large artwork with no traits — e.g. a server might want
+// artwork-focused sales/command results but keep the full trait list on
+// listings. All default to true (traits shown) so no server's display
+// changes without opting in.
+function buildEmbedStyleEmbed(cfg){
+  const modeLabel = (key) => (cfg.embedShowTraits?.[key] === false) ? '🖼️ Large artwork (no traits)' : '📋 Traits + thumbnail (default)';
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('🖼️ Embed Style')
+    .setDescription(
+      SEP + '\n\n' +
+      'Controls how sale alerts, listing alerts, and command results ' +
+      '(/traitfind, /rankfind) display each token — the full trait list ' +
+      'with a small thumbnail, or a large, artwork-focused image with no ' +
+      'trait list. Each can be set independently.\n\n' +
+      `🟢 **Sales Alerts:** ${modeLabel('sales')}\n` +
+      `📋 **Listing Alerts:** ${modeLabel('listings')}\n` +
+      `⌨️ **Commands** (/traitfind, /rankfind, etc.): ${modeLabel('commands')}\n`
+    )
+    .setFooter({ text: 'Only visible to you' });
+}
+function embedStyleRow(){
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:toggle:embedstyle:sales').setLabel('Toggle Sales').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:toggle:embedstyle:listings').setLabel('Toggle Listings').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('cfg:toggle:embedstyle:commands').setLabel('Toggle Commands').setStyle(ButtonStyle.Secondary),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('cfg:back').setLabel('← Back').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
@@ -584,7 +638,7 @@ async function handleConfigCommand(interaction, ctx){
   ).catch(()=>({ rows:[] }));
   return interaction.editReply({
     embeds: [buildDashboardEmbed(cfg, trRes.rows)],
-    components: dashboardRow(),
+    components: dashboardRow(cfg),
   });
 }
 
@@ -729,13 +783,39 @@ async function handleConfigButton(interaction, ctx){
     colSlug ? [guildId, colSlug] : [guildId]
   ).catch(()=>({ rows:[] }));
 
+  // ── Embed style category + toggles ─────────────────────────────────────────
+  if(customId === 'cfg:cat:embedstyle'){
+    return interaction.editReply({
+      content: '',
+      embeds: [buildEmbedStyleEmbed(cfg)],
+      components: embedStyleRow(),
+    });
+  }
+  if(customId.startsWith('cfg:toggle:embedstyle:')){
+    const key = customId.split(':')[3]; // 'sales' | 'listings' | 'commands'
+    cfg.embedShowTraits = cfg.embedShowTraits || {};
+    cfg.embedShowTraits[key] = cfg.embedShowTraits[key] === false ? true : false;
+    await setConfig(guildId, cfg);
+    const newState = cfg.embedShowTraits[key] === false ? 'Large artwork (no traits)' : 'Traits + thumbnail';
+    const keyLabel = key.charAt(0).toUpperCase() + key.slice(1);
+    return interaction.editReply({
+      // Explicit, unmissable confirmation — previously the only signal a
+      // toggle click actually landed was the embed's own text quietly
+      // reflecting the new state, easy to miss without directly comparing
+      // against the state before clicking.
+      content: `✅ **${keyLabel}** set to **${newState}**`,
+      embeds: [buildEmbedStyleEmbed(cfg)],
+      components: embedStyleRow(),
+    });
+  }
+
   // ── Back to dashboard ──────────────────────────────────────────────────────
   if(customId === 'cfg:back'){
     const trRes = await traitRolesQ();
     return interaction.editReply({
       content: '',
       embeds: [buildDashboardEmbed(cfg, trRes.rows)],
-      components: dashboardRow(),
+      components: dashboardRow(cfg),
     });
   }
 
@@ -848,10 +928,19 @@ async function handleConfigButton(interaction, ctx){
     const field  = parts[3]; // 'sales' or 'listings'
     const colId  = parts[4];
     const isPrimary = colId === 'primary';
+    // Using `= null` here, not `delete` — setConfig() re-fetches the DB row
+    // and merges it under the incoming cfg (`{...dbCfg, ...cfg}`) to avoid
+    // clobbering fields the caller doesn't know about. That merge can only
+    // override a key that's actually PRESENT on the incoming object; a
+    // `delete`d key is simply absent, so the merge let the old DB value flow
+    // straight back through and the "disabled" channel came right back the
+    // next time any /config action re-saved the config. Every downstream
+    // reader already treats null exactly like unset (e.g. lib/poll.js's
+    // `if(!ctx.listingsChannelId) continue`), so this is a safe, real fix.
     if(isPrimary){
-      if(field === 'sales')    { delete cfg.channelId; delete cfg.salesChannel; }
-      if(field === 'listings') { delete cfg.listingsChannelId; delete cfg.listingsChannel; }
-      if(field === 'burn')     { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      if(field === 'sales')    { cfg.channelId = null; cfg.salesChannel = null; }
+      if(field === 'listings') { cfg.listingsChannelId = null; cfg.listingsChannel = null; }
+      if(field === 'burn')     { cfg.burnChannel = null; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
     } else {
       const idx = parseInt(colId);
       if(cfg.collections?.[idx]){
@@ -859,7 +948,7 @@ async function handleConfigButton(interaction, ctx){
         if(field === 'listings') cfg.collections[idx].listingsChannel = null;
       }
       // burn channel is always top-level in cfg
-      if(field === 'burn') { delete cfg.burnChannel; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
+      if(field === 'burn') { cfg.burnChannel = null; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
     }
     await setConfig(guildId, cfg);
     const col = isPrimary
@@ -1438,12 +1527,76 @@ async function handleConfigButton(interaction, ctx){
     }
     await setConfig(guildId, cfg);
 
+    // Run backfill directly — bypasses the "already backfilled" guard in
+    // maybeStartBackfill (intentional: this button should be able to force
+    // a re-run even after a prior completion), but now goes through the
+    // SAME lock (tryClaimBackfillLock) that the auto-trigger path checks —
+    // confirmed live that skipping this entirely let a manual re-backfill
+    // click collide with an auto-triggered run already in progress for the
+    // same slug, running two full concurrent backfills that each burned
+    // real Alchemy/OpenSea request volume for no benefit (ON CONFLICT
+    // protections meant no data got corrupted, just wasted duplicate work).
+    const { backfillCollectionTraits, fetchOnChainTotalSupply } = require('../lib/collection-backfill');
+    const { tryClaimBackfillLock, releaseBackfillLock } = require('../lib/auto-backfill');
+    const { computeObsRanks } = require('../lib/rank-compute');
+    // chain/totalSupply were never passed here, so backfillCollectionTraits()
+    // silently fell back to its own default of chain='ethereum' every time —
+    // for a non-Ethereum collection (e.g. Robinhood Chain), that means Alchemy
+    // gets asked about the contract on the WRONG chain, finds nothing, and the
+    // whole run finishes instantly with 0 tokens written and no error at all.
+    // The other two call sites (auto-backfill.js, collection-onboard.js)
+    // already resolve chain correctly — this one just never did. Reading
+    // chain straight from the collections table (already confirmed correct)
+    // avoids re-hitting OpenSea's API a second time.
+    //
+    // totalSupply is a different story: jv confirmed live on Argonauts that
+    // the stored value here (sourced from OpenSea's cached collection
+    // metadata, set once at initial onboarding) had drifted stale — 8626
+    // stored against a real, current on-chain count that's actually higher.
+    // A re-backfill is exactly the moment to correct that, so this now reads
+    // totalSupply() directly from the contract itself (one fast eth_call,
+    // same RPC path already used for tokenURI() reads) rather than trusting
+    // that cached number — falling back to it only if the on-chain read
+    // fails (not every ERC-721 implements totalSupply()). The corrected
+    // number is also written back to collections.total_supply so it stays
+    // right for anything else that reads it, not just this run.
+    const collRow = await pgPool.query(
+      `SELECT chain, contract, total_supply FROM collections WHERE slug=$1`, [col.slug]
+    ).catch(()=>({ rows:[] }));
+    const chain          = collRow.rows[0]?.chain || 'ethereum';
+    const cachedSupply   = collRow.rows[0]?.total_supply || null;
+    const onChainSupply  = await fetchOnChainTotalSupply(collRow.rows[0]?.contract || col.contract, chain, process.env.ALCHEMY_API_KEY || process.env.ALCHEMY_KEY);
+    const totalSupply    = onChainSupply || cachedSupply;
+    if(onChainSupply && onChainSupply !== cachedSupply){
+      console.log(`[config] ${col.slug} totalSupply corrected from cached ${cachedSupply} to on-chain ${onChainSupply}`);
+      await pgPool.query(`UPDATE collections SET total_supply=$1, updated_at=NOW() WHERE slug=$2`, [onChainSupply, col.slug]).catch(()=>{});
+    }
+
+    const claim = await tryClaimBackfillLock(pgPool, col.slug, col.contract).catch(() => ({ claimed: true })); // fail open — a lock-check error shouldn't block a manual retry
+    if(!claim.claimed){
+      const secondsAgo = Math.round((claim.startedMsAgo || 0) / 1000);
+      return interaction.editReply({
+        content: `⏳ A backfill is already running for **${col.name||col.slug}** (started ~${secondsAgo}s ago). Please wait for it to finish before starting another — running two at once just wastes API calls without going any faster.`,
+        embeds: [], components: [],
+      });
+    }
+
     await interaction.editReply({ content:`🔄 Re-backfilling **${col.name||col.slug}**... This may take a minute.`, embeds:[], components:[] });
 
-    // Run backfill directly — bypasses the "already backfilled" guard in maybeStartBackfill
-    const { backfillCollectionTraits } = require('../lib/collection-backfill');
-    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug })
+    backfillCollectionTraits(pgPool, { contract: col.contract, slug: col.slug, chain, totalSupply, guildId, guildName: interaction.guild?.name, forceRefresh: true })
       .then(async stats => {
+        await releaseBackfillLock(pgPool, col.slug, { success: true, tokensWritten: stats?.written || 0 });
+        // A re-backfill implies trait data may genuinely have changed
+        // (metadata reveal, corrections) -- re-running rank computation here
+        // too, not just at first onboarding, so ranks don't go stale relative
+        // to whatever changed. col.slug could be OCAS here (this command
+        // handles any collection a server has configured), so gate the
+        // burn-exclusion join the same way every other rank-aware endpoint
+        // does -- never assume non-OCAS just because most callers of this
+        // command are.
+        await computeObsRanks(pgPool, col.slug, { isOcas: col.slug === OCAS_SLUG }).catch(e => {
+          console.warn(`[config] [${col.slug}] TV Rank recompute failed after re-backfill (non-fatal):`, e.message);
+        });
         // Store animated detection result in collection config
         if(typeof stats?.animated === 'boolean'){
           const freshCfg = getConfig(guildId) || {};
@@ -1458,9 +1611,13 @@ async function handleConfigButton(interaction, ctx){
           await setConfig(guildId, freshCfg).catch(()=>{});
         }
         const animatedNote = stats?.animated ? ' · 🎞️ Animated detected' : '';
-        interaction.followUp({ content:`✅ Re-backfill complete for **${col.name||col.slug}** — ${stats?.written||0} tokens updated${animatedNote}.`, ephemeral: true }).catch(()=>{});
+        const repairNote = stats?.queuedForRepair
+          ? ` (${stats.queuedForRepair} more resolving in the background — check back shortly)`
+          : '';
+        interaction.followUp({ content:`✅ Re-backfill complete for **${col.name||col.slug}** — ${stats?.written||0} tokens updated${repairNote}${animatedNote}.`, ephemeral: true }).catch(()=>{});
       })
       .catch(e => {
+        releaseBackfillLock(pgPool, col.slug, { success: false, error: e.message }).catch(()=>{});
         console.error('[Config rebackfill]', e.message);
         interaction.followUp({ content:`❌ Re-backfill failed: ${e.message}`, ephemeral: true }).catch(()=>{});
       });
@@ -1476,6 +1633,29 @@ async function handleConfigButton(interaction, ctx){
       await setConfig(guildId, cfg);
     }
     return interaction.editReply({ content:'✅ Collection removed.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
+  }
+  if(customId === 'cfg:col:removeprimary'){
+    // setConfig merges {...dbCfg, ...cfg} -- a JS delete removes the key
+    // entirely, which the merge then reads as "not in cfg" and silently
+    // restores from the database. Explicit null keeps the key present so
+    // the merge actually overwrites it.
+    cfg.contract = null;
+    cfg.contractName = null;
+    cfg.collectionSlug = null;
+    cfg.slug = null;
+    cfg.salesChannel = null;
+    cfg.channelId = null;
+    cfg.listingsChannel = null;
+    cfg.listingsChannelId = null;
+    cfg.burnChannel = null;
+    cfg.isPaidTier = null;
+    cfg.animated = null;
+    cfg.listingFilters = null;
+    cfg.salesFilters = null;
+    cfg.rankAlert = null;
+    cfg.paused = null;
+    await setConfig(guildId, cfg);
+    return interaction.editReply({ content:'✅ Primary collection removed. Click **➕ Add Collection** to set up a new one.', embeds:[buildCollectionsEmbed(cfg)], components:collectionsRow(cfg) });
   }
   if(customId === 'cfg:cat:channels'){
     const isOcas = cfg.contract?.toLowerCase() === OCAS_CONTRACT;
@@ -1781,7 +1961,7 @@ async function handleConfigButton(interaction, ctx){
   // ── Channel edits (show channel select menu) ───────────────────────────────
   if(customId.startsWith('cfg:ch:')){
     const type  = customId.split(':')[2];
-    const label = type === 'sales' ? '🟢 Sales' : type === 'listings' ? '📋 Listings' : '🔥 Burn Alerts';
+    const label = type === 'sales' ? '🟢 Sales' : type === 'listings' ? '📋 Listings' : type === 'arbitrage' ? '🔀 Arbitrage' : '🔥 Burn Alerts';
     const menu  = new ChannelSelectMenuBuilder()
       .setCustomId('cfg_chsel:'+type)
       .setPlaceholder('Pick the '+label+' channel')
@@ -1913,6 +2093,7 @@ async function handleConfigButton(interaction, ctx){
       _count:      'Minimum tokens owned (default: 1)',
       _totalburns: 'Minimum burn transactions (default: 1)',
       _maxburn:    'Minimum tokens in one burn (default: 1)',
+      _tokenid:    'Token ID(s), comma-separated',
     };
     const modal = new ModalBuilder()
       .setCustomId(`cfg_modal:trquick:${roleId}:${qColId}:${category}`)
@@ -1922,7 +2103,7 @@ async function handleConfigButton(interaction, ctx){
         new TextInputBuilder().setCustomId('tr_quick_count')
           .setLabel((fieldLabels[category] || 'Minimum count').slice(0, 45))
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('e.g. 1, 5, 10')
+          .setPlaceholder(category === '_tokenid' ? 'e.g. 1234 or 1234,5678' : 'e.g. 1, 5, 10')
           .setRequired(false)
       ),
     );
@@ -1977,7 +2158,7 @@ async function handleConfigButton(interaction, ctx){
     // burn tracking never applied to any other collection), so those two
     // options only show up when configuring the OCAS collection specifically.
     const isOcasSlug = slug === OCAS_SLUG;
-    const specialCount = isOcasSlug ? 3 : 1;
+    const specialCount = isOcasSlug ? 4 : 2;
     const CAT_CHUNK = 25;
     const catMenuCount = Math.min(4, Math.ceil((categories.length + specialCount) / CAT_CHUNK));
     const catRows = [];
@@ -1992,6 +2173,11 @@ async function handleConfigButton(interaction, ctx){
           .setLabel('🪙 Token Count')
           .setValue('_count')
           .setDescription('Assign role based on how many tokens the user holds')
+        );
+        opts.unshift(new StringSelectMenuOptionBuilder()
+          .setLabel('🔢 Specific Token #')
+          .setValue('_tokenid')
+          .setDescription('Assign role for owning one particular token ID')
         );
         if(isOcasSlug){
           opts.unshift(new StringSelectMenuOptionBuilder()
@@ -2039,11 +2225,12 @@ Step 2 of 3 — Pick the trait category:`,
     const suffix = catColId ? `:${catColId}` : '';
 
     // Token count / burn-based shortcuts — already deferred, so show a button that opens the modal next click
-    if(category === '_count' || category === '_totalburns' || category === '_maxburn'){
+    if(category === '_count' || category === '_totalburns' || category === '_maxburn' || category === '_tokenid'){
       const labels = {
         _count: ['Token Count Rule', 'Set Token Count', 'the minimum token count'],
         _totalburns: ['Total Burns Rule', 'Set Total Burns', 'the minimum number of burn transactions this wallet has ever done'],
         _maxburn: ['Biggest Single Burn Rule', 'Set Burn Size', 'the minimum tokens in any ONE burn transaction'],
+        _tokenid: ['Specific Token # Rule', 'Set Token ID', 'the token ID (or comma-separated list) that grants this role'],
       }[category];
       return interaction.editReply({
         content: `**${labels[0]}**\n\nClick below to set ${labels[2]} for this role.`,
@@ -2179,6 +2366,20 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
         if(field==='burnchan') { cfg.burnChannel = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
       }
       await setConfig(guildId, cfg);
+      // Cursor persists independently of channel configuration — confirmed
+      // live that (re-)setting a channel for a collection that had one
+      // configured at some earlier point resumes from a stale cursor
+      // position instead of "now", dumping every sale/listing that happened
+      // in the gap as if it were brand new. Always reset on (re-)configure
+      // so the next poll cycle starts clean.
+      {
+        const { resetSaleCursor, resetListingCursor } = require('../lib/poll');
+        const targetSlug = isPrimary ? (cfg.collectionSlug || cfg.slug) : cfg.collections[parseInt(colId)]?.slug;
+        if(targetSlug){
+          if(field==='saleschan') resetSaleCursor(guildId, targetSlug);
+          if(field==='listchan')  resetListingCursor(guildId, targetSlug);
+        }
+      }
       const col = isPrimary
         ? { contract:cfg.contract, slug:cfg.collectionSlug||cfg.slug, name:cfg.contractName, salesChannel:cfg.channelId, listingsChannel:cfg.listingsChannelId }
         : cfg.collections[parseInt(colId)];
@@ -2189,6 +2390,7 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
     const type = parts[1];
     if(type === 'sales')    { cfg.salesChannel = chId; cfg.channelId = chId; }
     if(type === 'listings') { cfg.listingsChannel = chId; cfg.listingsChannelId = chId; }
+    if(type === 'arbitrage') { cfg.arbitrageChannelId = chId; }
     if(type === 'burn'){     cfg.burnChannel    = chId; if(syncBurnConfig) syncBurnConfig().catch(()=>{}); }
     if(type === 'verify')   cfg.verifyChannel  = chId;
     if(type === 'rankalert'){
@@ -2208,6 +2410,15 @@ ${selectedValues.map(v=>`• ${category}: ${v}`).join('\n')}`,
       }
     }
     await setConfig(guildId, cfg);
+    // Same reset as the collection-scoped select above — see there for reasoning.
+    if(type === 'sales' || type === 'listings'){
+      const { resetSaleCursor, resetListingCursor } = require('../lib/poll');
+      const targetSlug = cfg.collectionSlug || cfg.slug;
+      if(targetSlug){
+        if(type === 'sales')    resetSaleCursor(guildId, targetSlug);
+        if(type === 'listings') resetListingCursor(guildId, targetSlug);
+      }
+    }
     if(type === 'rankalert'){
       const raColId = parts[2];
       const raIsPrimary = raColId === 'primary';
@@ -2508,7 +2719,9 @@ async function handleConfigModal(interaction, ctx){
     // Backfill all verified wallets in this server for the new collection
     if(slug && contract){
       const { backfillServerWallets } = require('../lib/wallet-backfill');
-      backfillServerWallets(guildId, contract, slug, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+      pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [slug])
+        .then(r => backfillServerWallets(guildId, contract, slug, pgPool, process.env.ALCHEMY_API_KEY, r.rows[0]?.chain || 'ethereum'))
+        .catch(()=>{});
     }
 
     // Every server gets an automatic trait backfill for any new non-OCAS
@@ -2528,8 +2741,16 @@ async function handleConfigModal(interaction, ctx){
     if(slug && contract){
       try{
         const { maybeStartBackfill } = require('../lib/auto-backfill');
-        const result = await maybeStartBackfill(pgPool, { contract, slug });
+        const result = await maybeStartBackfill(pgPool, { contract, slug, guildId, guildName: interaction.guild?.name });
         if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
+        // jv: re-submitted the same slug specifically to retry a stuck
+        // seedMarketHistory, then said "it didn't trigger it" -- this
+        // branch used to say nothing either way (result.needed is always
+        // false once trait data already exists), so there was no way to
+        // tell a silent no-op apart from a silent success or failure.
+        else if(result.seedAttempted) waitMsg = result.seedOk
+          ? '\n\n✅ Sales/listings history for this collection was not fully synced yet — refreshed it just now.'
+          : '\n\n⚠️ Tried to refresh sales/listings history for this collection just now, but it failed again (see #bot-errors for details). Will keep retrying automatically.';
       }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
     }
 
@@ -2564,8 +2785,16 @@ async function handleConfigModal(interaction, ctx){
         if(cfg.collectionSlug && cfg.contract){
           try{
             const { maybeStartBackfill } = require('../lib/auto-backfill');
-            const result = await maybeStartBackfill(pgPool, { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug });
+            const result = await maybeStartBackfill(pgPool, { contract: cfg.contract, slug: cfg.collectionSlug || cfg.slug, guildId, guildName: interaction.guild?.name });
             if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
+        // jv: re-submitted the same slug specifically to retry a stuck
+        // seedMarketHistory, then said "it didn't trigger it" -- this
+        // branch used to say nothing either way (result.needed is always
+        // false once trait data already exists), so there was no way to
+        // tell a silent no-op apart from a silent success or failure.
+        else if(result.seedAttempted) waitMsg = result.seedOk
+          ? '\n\n✅ Sales/listings history for this collection was not fully synced yet — refreshed it just now.'
+          : '\n\n⚠️ Tried to refresh sales/listings history for this collection just now, but it failed again (see #bot-errors for details). Will keep retrying automatically.';
           }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
         }
       }
@@ -2583,7 +2812,32 @@ async function handleConfigModal(interaction, ctx){
         // Trigger wallet backfill if both contract and slug are now set
         if(cfg.collections[idx].contract && cfg.collections[idx].slug){
           const { backfillServerWallets } = require('../lib/wallet-backfill');
-          backfillServerWallets(guildId, cfg.collections[idx].contract, cfg.collections[idx].slug, pgPool, process.env.ALCHEMY_API_KEY).catch(()=>{});
+          const colContract = cfg.collections[idx].contract, colSlug = cfg.collections[idx].slug;
+          pgPool.query(`SELECT chain FROM collections WHERE slug = $1`, [colSlug])
+            .then(r => backfillServerWallets(guildId, colContract, colSlug, pgPool, process.env.ALCHEMY_API_KEY, r.rows[0]?.chain || 'ethereum'))
+            .catch(()=>{});
+        }
+        // jv: re-submitted the same slug specifically to retry a stuck
+        // seedMarketHistory, then said "nothing is happening" -- traced
+        // to a real gap, not just missing UI feedback this time: THIS
+        // branch (an additional, non-primary collection -- cfg.collections
+        // rather than the server's primary cfg.contract/collectionSlug)
+        // never called maybeStartBackfill at all, unlike the isPrimary
+        // branch right above it. Wallet backfill and trait-data sync ran,
+        // but nothing ever retried the actual sales/listings history seed
+        // for a collection added this way -- so if cryptoadz-by-gremplin
+        // is configured here rather than as this server's primary
+        // collection, re-submitting the slug genuinely did nothing for
+        // that specific problem, no matter how many times it was tried.
+        if(cfg.collections[idx].contract && cfg.collections[idx].slug){
+          try{
+            const { maybeStartBackfill } = require('../lib/auto-backfill');
+            const result = await maybeStartBackfill(pgPool, { contract: cfg.collections[idx].contract, slug: cfg.collections[idx].slug, guildId, guildName: interaction.guild?.name });
+            if(result.needed) waitMsg = '\n\n⏳ Please wait 1-2 minutes while trait search data is being loaded for this collection. Listings and sales are already live.';
+            else if(result.seedAttempted) waitMsg = result.seedOk
+              ? '\n\n✅ Sales/listings history for this collection was not fully synced yet — refreshed it just now.'
+              : '\n\n⚠️ Tried to refresh sales/listings history for this collection just now, but it failed again (see #bot-errors for details). Will keep retrying automatically.';
+          }catch(e){ console.warn('[Config] auto-backfill trigger failed:', e.message); }
         }
       }
     }
@@ -2646,7 +2900,7 @@ async function handleConfigModal(interaction, ctx){
     const roleId   = qParts[2];
     const qColId   = qParts[3];
     const category = qParts[4];
-    const minCount = parseInt(interaction.fields.getTextInputValue('tr_quick_count').trim()) || 1;
+    const rawInput = interaction.fields.getTextInputValue('tr_quick_count').trim();
 
     const role = await interaction.guild.roles.fetch(roleId).catch(()=>null);
     if(!role)
@@ -2661,12 +2915,31 @@ async function handleConfigModal(interaction, ctx){
       modColLabel = col?.name || col?.slug;
     }
 
-    await pgPool.query(
-      `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
-       VALUES ($1,$2,$3,'',$4,$5)
-       ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
-      [guildId, roleId, category, minCount, modCollectionSlug]
-    ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+    // jv: "the role manager/assignee should support specific token #'s as
+    // well as long as trait roles." Same as setup.js's identical quick-
+    // modal flow -- this category's own input IS the meaningful value
+    // (which token ID(s) grant the role), not a minimum count, so it's
+    // stored as trait_value with minimum_count fixed at 1.
+    if(category === '_tokenid'){
+      const tokenIds = rawInput.split(',').map(s => s.trim()).filter(Boolean);
+      if(!tokenIds.length || tokenIds.some(s => !/^\d+$/.test(s))){
+        return interaction.editReply({ content: '❌ Enter one or more numeric token IDs, comma-separated (e.g. 1234 or 1234,5678).' });
+      }
+      await pgPool.query(
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,'_tokenid',$3,1,$4)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$4`,
+        [guildId, roleId, tokenIds.join(','), modCollectionSlug]
+      ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+    } else {
+      const minCount = parseInt(rawInput) || 1;
+      await pgPool.query(
+        `INSERT INTO trait_roles (guild_id, role_id, trait_type, trait_value, minimum_count, collection_slug)
+         VALUES ($1,$2,$3,'',$4,$5)
+         ON CONFLICT (guild_id, trait_type, COALESCE(trait_value,''), role_id, minimum_count) DO UPDATE SET collection_slug=$5`,
+        [guildId, roleId, category, minCount, modCollectionSlug]
+      ).catch(e => console.warn('[Config] trait_roles insert:', e.message));
+    }
 
     const trRes = modColId
       ? await pgPool.query(
